@@ -186,7 +186,7 @@ test('a known drag sets its selection locally', async () => {
   await waitFor(() => expect(client.state.selection?.focus).toBe(1));
   act(() => { fireEvent.pointerMove(stage, { ...point(6), buttons: 1 }); });
   // The focus is found here and sent as a selection, not as a point for the worker to hit.
-  await waitFor(() => expect(commands.at(-1)).toMatchObject({ kind: 'setSelection', payload: { selection: { anchor: 1, focus: 6 } } }));
+  await waitFor(() => expect(commands[commands.length - 1]).toMatchObject({ kind: 'setSelection', payload: { selection: { anchor: 1, focus: 6 } } }));
 });
 
 test('queued_drag_precedes_typing', async () => {

@@ -1,3 +1,4 @@
+import type { PptxFontFace } from '@nimbleoffice/pptx';
 import type { ResolvedFontProps } from '../bundledFonts';
 import type { PptxInThreadEditorProps } from '../PptxEditor';
 import { LEGACY_SYNC_API } from '../runtimeOptions';
@@ -14,6 +15,8 @@ export type PptxWorkerEditorProps = Omit<PptxInThreadEditorProps, 'onReady' | 'r
   readOnly?: false;
   /** Without `Worker`, falls back to the in-thread engine and passes `PptxEditorApi`. */
   onReady?: (api: PptxWorkerEditorApi) => void;
+  /** Faces the engine falls back to for characters the requested family lacks. */
+  fallbackFonts?: readonly PptxFontFace[];
 };
 
 export function PptxWorkerEditor(props: ResolvedFontProps<PptxWorkerEditorProps>) {

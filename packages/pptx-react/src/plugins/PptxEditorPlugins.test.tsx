@@ -1,5 +1,5 @@
 import { GlobalRegistrator } from '@happy-dom/global-registrator';
-import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { StrictMode, useState } from 'react';
@@ -17,7 +17,7 @@ import {
 import { pptxCommandController } from '../commands/createPptxCommandStore';
 import { isMacPlatform } from '../commands/descriptors';
 import type { PptxInThreadEditorProps } from '../PptxEditor';
-import * as publicApi from '../index';
+import '../index';
 import {
   EditorToolbar,
   PptxEditor,

@@ -22,7 +22,7 @@ import type { XlsxPluginEditorAccess } from './createPluginClients';
 import { useXlsxPluginHost } from './useXlsxPluginHost';
 import { isMacPlatform } from '../commands/descriptors';
 import { pluginDefinition } from './defineXlsxPlugin';
-import * as publicApi from '../index';
+import '../index';
 import {
   EditorToolbar,
   ToolbarCommandButton,

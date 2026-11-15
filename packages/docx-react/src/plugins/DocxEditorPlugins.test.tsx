@@ -1,6 +1,6 @@
 import { LEGACY_SYNC_API_PROP } from '../components/DocxEditor/peerless/contracts';
 import { GlobalRegistrator } from '@happy-dom/global-registrator';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import JSZip from 'jszip';
@@ -24,7 +24,7 @@ import {
 } from '@nimbleoffice/docx/yrs/__fixtures__/residentWorker';
 import * as yrs from '@nimbleoffice/docx/yrs';
 import * as wasm from '@nimbleoffice/docx/yrs/wasm/index';
-import * as publicApi from '../index';
+import '../index';
 import {
   DocxEditor,
   DocxPluginToolbar,
