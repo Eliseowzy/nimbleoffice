@@ -6,12 +6,12 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+#[cfg(feature = "docx")]
+use docx_edit::story_checksum;
 #[cfg(feature = "pptx")]
 use nimbleoffice_pptx::ShapeSnapshot;
 #[cfg(feature = "xlsx")]
 use nimbleoffice_xlsx::{CellRef, SheetId};
-#[cfg(feature = "docx")]
-use docx_edit::story_checksum;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "docx")]
 use sha2::{Digest, Sha256};

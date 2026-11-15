@@ -197,7 +197,10 @@ pub fn language_neutral_pptx() -> Vec<u8> {
 }
 
 fn demo_pptx_parts() -> Vec<(String, Vec<u8>)> {
-    ooxml_opc::unzip_parts(include_bytes!("../../../fixtures/demo/nimbleoffice-demo.pptx")).unwrap()
+    ooxml_opc::unzip_parts(include_bytes!(
+        "../../../fixtures/demo/nimbleoffice-demo.pptx"
+    ))
+    .unwrap()
 }
 
 fn write_fixture(label: &str, extension: &str, bytes: &[u8]) -> PathBuf {

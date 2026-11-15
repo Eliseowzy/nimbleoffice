@@ -2,12 +2,12 @@ use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use nimbleoffice_fonts::{BundledFonts, FontPack, FontSource, set_default_font_source};
 use napi::bindgen_prelude::{
     ArrayBuffer, Either, Function, JsObjectValue, Uint8Array, Uint8ArraySlice, Undefined,
 };
 use napi::{Env, Error, JsValue, Result, Status, Unknown, ValueType};
 use napi_derive::napi;
+use nimbleoffice_fonts::{BundledFonts, FontPack, FontSource, set_default_font_source};
 use xlsx_engine::{Document, EngineError, ErrorKind, Host, SnapshotBuilder};
 
 /// Internal, called by the package loader.

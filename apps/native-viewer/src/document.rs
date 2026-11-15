@@ -4,8 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-#[cfg(feature = "xlsx")]
-use nimbleoffice_xlsx::CellRef;
 #[cfg(feature = "docx")]
 use docx_edit::{
     EditingDoc, EngineSession, SimpleFormat, seed_from_docx, seed_from_docx_with_generation,
@@ -14,6 +12,8 @@ use docx_edit::{
 use docx_layout::display_list::DisplayList;
 #[cfg(feature = "docx")]
 use docx_parse::{S9PackageWire, S9ParseOptions, parse_docx_s9_wire};
+#[cfg(feature = "xlsx")]
+use nimbleoffice_xlsx::CellRef;
 #[cfg(feature = "docx")]
 use serde_json::{Value, json};
 use vello::kurbo::Affine;
@@ -1261,11 +1261,11 @@ fn push_notes(target: &mut Vec<Value>, notes: Option<&[docx_parse::Note]>, note_
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use nimbleoffice_pptx::{Primitive as PptxPrimitive, Transform as PptxTransform};
-    use nimbleoffice_xlsx::{CellValue, DrawCmd, SheetId};
     use docx_edit::{
         EditCtx, EditError, EditingDoc, FormatPolicy, Position, SegmentContent, StoryRange,
     };
+    use nimbleoffice_pptx::{Primitive as PptxPrimitive, Transform as PptxTransform};
+    use nimbleoffice_xlsx::{CellValue, DrawCmd, SheetId};
     use vello::kurbo::Point;
     use yrs::Update;
     use yrs::updates::decoder::Decode;
@@ -1517,7 +1517,8 @@ mod tests {
 
     #[test]
     fn two_native_xlsx_sessions_converge_after_interleaved_cell_edits() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/showcase.xlsx");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/showcase.xlsx");
         let mut left = load_collaborative_xlsx(&source, 0, 8_192, 101).unwrap();
         let mut right = load_collaborative_xlsx(&source, 0, 8_192, 202).unwrap();
         assert_eq!(
@@ -1574,8 +1575,8 @@ mod tests {
 
     #[test]
     fn two_native_pptx_sessions_converge_after_interleaved_text_edits() {
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let mut left = load_collaborative_pptx(&source, 8_192, 101).unwrap();
         let mut right = load_collaborative_pptx(&source, 8_192, 202).unwrap();
         assert_eq!(
@@ -1645,8 +1646,8 @@ mod tests {
 
     #[test]
     fn remote_pptx_insertion_before_the_caret_preserves_its_logical_position() {
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let mut local = load_collaborative_pptx(&source, 8_192, 101).unwrap();
         let mut peer = load_collaborative_pptx(&source, 8_192, 202).unwrap();
         let ReferenceDocument::Pptx(reference) = &local.reference else {
@@ -1691,7 +1692,8 @@ mod tests {
 
     #[test]
     fn remote_xlsx_edit_preserves_the_row_column_selection() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/showcase.xlsx");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/showcase.xlsx");
         let mut local = load_collaborative_xlsx(&source, 0, 8_192, 101).unwrap();
         let mut peer = load_collaborative_xlsx(&source, 0, 8_192, 202).unwrap();
         let selected = CellRef::parse_a1("D8").unwrap();
@@ -2574,7 +2576,8 @@ mod tests {
 
     #[test]
     fn saves_reopens_and_preserves_an_untouched_sheet() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/showcase.xlsx");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/showcase.xlsx");
         let source_bytes = fs::read(&source).unwrap();
         let mut document = load_document(&source, 0, 8_192).unwrap();
         let untouched = match &document.reference {
@@ -2666,8 +2669,8 @@ mod tests {
 
     #[test]
     fn loads_demo_presentation_and_audits_positioned_glyphs() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let document = load_document(&path, 0, 8_192).unwrap();
         assert_eq!(
             document.edited_path().unwrap(),
@@ -2720,8 +2723,8 @@ mod tests {
 
     #[test]
     fn pptx_hit_test_places_the_exact_engine_caret_and_types_into_its_story() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let mut document = load_document(&path, 0, 8_192).unwrap();
         let probe = pptx_probe(&document, 0);
         let Some(PptxHit::Text(hit)) = document.pptx_hit_test(
@@ -2785,8 +2788,8 @@ mod tests {
 
     #[test]
     fn pptx_arrow_navigation_stops_at_text_box_edges() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let mut document = load_document(&path, 0, 8_192).unwrap();
         let probe = pptx_probe(&document, 0);
         for direction in [
@@ -2817,8 +2820,8 @@ mod tests {
 
     #[test]
     fn pptx_backspace_and_delete_remove_engine_caret_intervals() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let mut document = load_document(&path, 0, 8_192).unwrap();
         let probe = pptx_probe(&document, 0);
         let before = match &document.reference {
@@ -2852,8 +2855,8 @@ mod tests {
 
     #[test]
     fn pptx_enter_splits_and_backspace_at_the_start_merges_the_paragraph() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let mut document = load_document(&path, 0, 8_192).unwrap();
         let probe = pptx_probe(&document, 0);
         let before = match &document.reference {
@@ -2893,8 +2896,8 @@ mod tests {
 
     #[test]
     fn pptx_save_reopens_text_and_keeps_untouched_slides_byte_identical() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let source = fs::read(&path).unwrap();
         let mut document = load_document(&path, 0, 8_192).unwrap();
         let probe = pptx_probe(&document, 0);
@@ -2995,8 +2998,8 @@ mod tests {
 
     #[test]
     fn pptx_save_refuses_a_paragraph_split_that_would_drop_run_language() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.pptx");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.pptx");
         let mut document = load_document(&path, 0, 8_192).unwrap();
         let probe = pptx_probe(&document, 0);
         assert!(document.pptx_select_hit(probe.hit));
@@ -3030,8 +3033,8 @@ mod tests {
 
     #[test]
     fn edits_saves_and_reopens_docx_through_the_viewer_path() {
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.docx");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.docx");
         let source_before = fs::read(&source).unwrap();
         let mut document = load_document(&source, 0, 8_192).unwrap();
         let (para_id, before, paragraph_count) = match &document.reference {
@@ -3089,8 +3092,8 @@ mod tests {
 
     #[test]
     fn applies_delete_and_enter_through_the_viewer_path() {
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/nimbleoffice-demo.docx");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/nimbleoffice-demo.docx");
         let mut document = load_document(&source, 0, 8_192).unwrap();
         let (para_id, paragraph_count) = match &document.reference {
             ReferenceDocument::Docx(reference) => {

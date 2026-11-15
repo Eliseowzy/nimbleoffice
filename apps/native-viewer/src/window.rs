@@ -10,10 +10,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-#[cfg(feature = "xlsx")]
-use nimbleoffice_xlsx::CellRef;
 #[cfg(feature = "docx")]
 use docx_edit::SimpleFormat;
+#[cfg(feature = "xlsx")]
+use nimbleoffice_xlsx::CellRef;
 #[cfg(target_os = "macos")]
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 #[cfg(target_os = "macos")]
@@ -1945,7 +1945,8 @@ mod tests {
 
     #[test]
     fn worksheet_hit_selects_the_cell_under_the_pointer() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/showcase.xlsx");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/showcase.xlsx");
         let mut document = load_document(&source, 0, 8_192).unwrap();
         let expected = CellRef::parse_a1("B5").unwrap();
         document.xlsx_select_cell(expected);
