@@ -1,0 +1,921 @@
+{
+  "source": "Microsoft Word for Mac 16.114 build 26110224, PDF export",
+  "cases": {
+    "r1000p4502": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1100p4502": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 2,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 83.28
+      }
+    ],
+    "r1247p4502": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 2,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 83.28
+      }
+    ],
+    "r1247p5000": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1400p4502": [
+      {
+        "page": 2,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 2,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 2,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 2,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 3,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 83.28
+      }
+    ],
+    "r1400p5000": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 431.5,
+        "y": 152.16
+      }
+    ],
+    "r1000p4502x2500": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 72.0,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthefinal",
+        "x0": 72.0,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "rowsofthisfloating",
+        "x0": 72.0,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "tableandcontinueon",
+        "x0": 72.0,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "thepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1100p4502x2500": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 72.0,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthefinal",
+        "x0": 72.0,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "rowsofthisfloating",
+        "x0": 72.0,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "tableandcontinueon",
+        "x0": 72.0,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "thepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1247p4502x2500": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 72.0,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthefinal",
+        "x0": 72.0,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "rowsofthisfloating",
+        "x0": 72.0,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "tableandcontinueon",
+        "x0": 72.0,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "thepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1247p5000x2500": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 72.0,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthefinal",
+        "x0": 72.0,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "rowsofthisfloating",
+        "x0": 72.0,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "tableandcontinueon",
+        "x0": 72.0,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "thepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1000p4600": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1000p4700": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1000p4800": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1000p4900": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 138.48
+      }
+    ],
+    "r1100p4600": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1100p4700": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1100p4800": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1100p4900": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1247p4600": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1247p4700": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1247p4800": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1247p4900": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 152.16
+      }
+    ],
+    "r1400p4600": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 431.5,
+        "y": 152.16
+      }
+    ],
+    "r1400p4700": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 431.5,
+        "y": 152.16
+      }
+    ],
+    "r1400p4800": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 431.5,
+        "y": 152.16
+      }
+    ],
+    "r1400p4900": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 1,
+        "text": "page.",
+        "x0": 431.5,
+        "y": 152.16
+      }
+    ]
+  }
+}

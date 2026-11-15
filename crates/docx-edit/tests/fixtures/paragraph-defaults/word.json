@@ -1,0 +1,58 @@
+{
+  "absent": [
+    {
+      "index": 0,
+      "height": 792.0,
+      "lines": [
+        {
+          "y": 83.28,
+          "text": "LINE1"
+        },
+        {
+          "y": 107.28,
+          "text": "LINE2"
+        },
+        {
+          "y": 131.28,
+          "text": "LINE3"
+        },
+        {
+          "y": 155.04,
+          "text": "DIRECT"
+        },
+        {
+          "y": 168.96,
+          "text": "AFTER"
+        }
+      ]
+    }
+  ],
+  "empty": [
+    {
+      "index": 0,
+      "height": 792.0,
+      "lines": [
+        {
+          "y": 83.04,
+          "text": "LINE1"
+        },
+        {
+          "y": 96.72,
+          "text": "LINE2"
+        },
+        {
+          "y": 110.64,
+          "text": "LINE3"
+        },
+        {
+          "y": 124.32,
+          "text": "DIRECT"
+        },
+        {
+          "y": 138.24,
+          "text": "AFTER"
+        }
+      ]
+    }
+  ]
+}

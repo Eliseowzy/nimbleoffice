@@ -1,0 +1,19 @@
+[package]
+name = "xlsx-cli"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Headless server-rendering CLI for the NimbleOffice xlsx core: .xlsx -> PNG."
+
+[[bin]]
+name = "xlsx"
+path = "src/main.rs"
+
+[dependencies]
+nimbleoffice-xlsx = { workspace = true, features = ["raster"] }
+
+[dev-dependencies]
+ooxml-opc.workspace = true
+xlsx-parse.workspace = true
+xlsx-model.workspace = true

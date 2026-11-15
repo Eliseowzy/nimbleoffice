@@ -1,0 +1,144 @@
+{
+  "pages": [
+    {
+      "columnBounds": [
+        {
+          "height": 864,
+          "width": 624,
+          "x": 96,
+          "y": 96
+        }
+      ],
+      "contentBounds": {
+        "height": 864,
+        "width": 624,
+        "x": 96,
+        "y": 96
+      },
+      "height": 1056,
+      "pageIndex": 0,
+      "primitives": [
+        {
+          "baselineY": 115.2,
+          "blockId": 0,
+          "color": "#000000",
+          "docEnd": 19,
+          "docStart": 1,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 21,
+          "fragmentDocStart": 1,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Single-column intr",
+          "toLine": 1,
+          "width": 300,
+          "x": 96
+        },
+        {
+          "baselineY": 200,
+          "blockId": 2,
+          "color": "#000000",
+          "docEnd": 43,
+          "docStart": 30,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 44,
+          "fragmentDocStart": 30,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Column body 0",
+          "toLine": 1,
+          "width": 200,
+          "x": 96
+        },
+        {
+          "baselineY": 300,
+          "blockId": 3,
+          "color": "#000000",
+          "docEnd": 55,
+          "docStart": 42,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 56,
+          "fragmentDocStart": 42,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Column body 1",
+          "toLine": 1,
+          "width": 200,
+          "x": 96
+        },
+        {
+          "baselineY": 400,
+          "blockId": 4,
+          "color": "#000000",
+          "docEnd": 67,
+          "docStart": 54,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 68,
+          "fragmentDocStart": 54,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Column body 2",
+          "toLine": 1,
+          "width": 200,
+          "x": 96
+        },
+        {
+          "baselineY": 500,
+          "blockId": 5,
+          "color": "#000000",
+          "docEnd": 79,
+          "docStart": 66,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 80,
+          "fragmentDocStart": 66,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Column body 3",
+          "toLine": 1,
+          "width": 200,
+          "x": 96
+        },
+        {
+          "baselineY": 600,
+          "blockId": 6,
+          "color": "#000000",
+          "docEnd": 91,
+          "docStart": 78,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 92,
+          "fragmentDocStart": 78,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Column body 4",
+          "toLine": 1,
+          "width": 200,
+          "x": 96
+        },
+        {
+          "baselineY": 700,
+          "blockId": 7,
+          "color": "#000000",
+          "docEnd": 103,
+          "docStart": 90,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 104,
+          "fragmentDocStart": 90,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Column body 5",
+          "toLine": 1,
+          "width": 200,
+          "x": 96
+        }
+      ],
+      "width": 816
+    }
+  ]
+}

@@ -1,0 +1,694 @@
+use ooxml_drawingml::GeometryPathCommand;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+pub const CONTRACT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposalDiffSlide {
+    pub proposal: pptx_edit::Proposal,
+    pub snapshot: pptx_edit::DeckSnapshot,
+    pub text_changes: Vec<pptx_edit::ProposalTextChange>,
+    #[serde(default)]
+    pub shape_changes: Vec<pptx_edit::ProposalShapeChange>,
+    pub frame: SurfaceDisplayList,
+}
+
+impl Serialize for ProposalDiffSlide {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = serde_json::json!({
+            "proposal": self.proposal,
+            "snapshot": self.snapshot,
+            "textChanges": self.text_changes,
+            "frame": self.frame,
+        });
+        if !self.shape_changes.is_empty() {
+            value["shapeChanges"] =
+                serde_json::to_value(&self.shape_changes).map_err(serde::ser::Error::custom)?;
+        }
+        value.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceDisplayList {
+    pub contract_version: u32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Paint>,
+    pub primitives: Vec<Primitive>,
+}
+
+impl SurfaceDisplayList {
+    /// Reports glyph text at any depth in the display list.
+    pub fn has_glyphs(&self) -> bool {
+        fn has_glyphs(primitive: &Primitive) -> bool {
+            match primitive {
+                Primitive::TextBox { lines, .. } => lines
+                    .iter()
+                    .flat_map(|line| &line.runs)
+                    .any(|run| !run.glyphs.is_empty()),
+                Primitive::Chart { primitives, .. } | Primitive::Table { primitives, .. } => {
+                    primitives.iter().any(has_glyphs)
+                }
+                Primitive::Shape { .. }
+                | Primitive::Image { .. }
+                | Primitive::Placeholder { .. } => false,
+            }
+        }
+        self.primitives.iter().any(has_glyphs)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum Paint {
+    Solid {
+        color: String,
+    },
+    Gradient {
+        gradient_type: GradientType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        angle_deg: Option<f32>,
+        stops: Vec<GradientStop>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GradientType {
+    Linear,
+    Radial,
+    Rectangular,
+    Path,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GradientStop {
+    pub position: f32,
+    pub color: String,
+}
+
+/// Bitmap effects with resolved colours.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ImageEffect {
+    BiLevel {
+        threshold: f32,
+    },
+    Grayscale,
+    Alpha {
+        amount: f32,
+    },
+    Luminance {
+        brightness: f32,
+        contrast: f32,
+    },
+    Duotone {
+        shadow: String,
+        highlight: String,
+    },
+    ColorChange {
+        from: String,
+        to: String,
+        #[serde(
+            default = "default_use_alpha",
+            skip_serializing_if = "use_alpha_is_default"
+        )]
+        use_alpha: bool,
+    },
+}
+
+fn default_use_alpha() -> bool {
+    true
+}
+
+fn use_alpha_is_default(value: &bool) -> bool {
+    *value
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stroke {
+    /// Solid colour or first gradient stop.
+    pub color: String,
+    pub width: f32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dashed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint: Option<Paint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_end: Option<StrokeEnd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_end: Option<StrokeEnd>,
+}
+
+/// End dimensions in CSS pixels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StrokeEnd {
+    pub kind: String,
+    pub width: f32,
+    pub length: f32,
+}
+
+/// An `a:outerShdw`: a blurred copy of what the primitive paints, offset and tinted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Shadow {
+    pub color: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub blur: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dx: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dy: f32,
+    /// `sx`/`sy`. The anchor `algn` names is already folded into `dx`/`dy`, so a backend
+    /// scales about the surface origin and then translates.
+    #[serde(default = "unit_scale", skip_serializing_if = "is_unit_scale")]
+    pub scale_x: f32,
+    #[serde(default = "unit_scale", skip_serializing_if = "is_unit_scale")]
+    pub scale_y: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<ShadowPath>,
+}
+
+/// Paths composited before a layered preset's shadow is blurred.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadowPath {
+    pub path: Vec<GeometryPathCommand>,
+    pub fill: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<Stroke>,
+}
+
+fn unit_scale() -> f32 {
+    1.0
+}
+
+fn is_unit_scale(value: &f32) -> bool {
+    *value == 1.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transform {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation_deg: f32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flip_h: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flip_v: bool,
+}
+
+/// Source fractions discarded by `a:srcRect`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageCrop {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub left: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub top: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub right: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bottom: f32,
+}
+
+impl ImageCrop {
+    pub fn is_whole(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The fraction of the source that survives on each axis.
+    pub fn kept(&self) -> (f32, f32) {
+        (1.0 - self.left - self.right, 1.0 - self.top - self.bottom)
+    }
+
+    pub(crate) fn placement(
+        self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) -> (Self, Option<ImageDestination>) {
+        let (kept_x, kept_y) = self.kept();
+        let crop = Self {
+            left: self.left.max(0.0),
+            top: self.top.max(0.0),
+            right: self.right.max(0.0),
+            bottom: self.bottom.max(0.0),
+        };
+        if crop == self || kept_x <= 0.0 || kept_y <= 0.0 {
+            return (self, None);
+        }
+        let (cropped_x, cropped_y) = crop.kept();
+        let destination = ImageDestination {
+            x: x + (-self.left).max(0.0) * w / kept_x,
+            y: y + (-self.top).max(0.0) * h / kept_y,
+            w: w * cropped_x / kept_x,
+            h: h * cropped_y / kept_y,
+        };
+        (crop, Some(destination))
+    }
+}
+
+/// Bitmap destination within the picture frame.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ImageDestination {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// `a:blipFill/a:tile`, as the fractions the picture repeats at.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageTile {
+    pub scale_x: f32,
+    pub scale_y: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum Primitive {
+    Shape {
+        object_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shape_id: Option<String>,
+        name: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        geometry: String,
+        path: Vec<GeometryPathCommand>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        geometry_fallback: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clip: Option<Vec<GeometryPathCommand>>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        even_odd: bool,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        adjust_values: BTreeMap<String, f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fill: Option<Paint>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke: Option<Stroke>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shadow: Option<Shadow>,
+        #[serde(default, skip_serializing_if = "Transform::is_identity")]
+        transform: Transform,
+    },
+    Image {
+        object_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shape_id: Option<String>,
+        name: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asset_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        effects: Vec<ImageEffect>,
+        #[serde(default, skip_serializing_if = "ImageCrop::is_whole")]
+        crop: ImageCrop,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<ImageDestination>,
+        /// `a:tile`: repeat the picture at its own size instead of stretching
+        /// it, scaled by these fractions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tile: Option<ImageTile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<Vec<GeometryPathCommand>>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        geometry_fallback: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke: Option<Stroke>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shadow: Option<Shadow>,
+        #[serde(default, skip_serializing_if = "Transform::is_identity")]
+        transform: Transform,
+    },
+    TextBox {
+        /// `a:rPr/a:effectLst`: the shadow the box's glyphs are drawn with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_shadow: Option<Shadow>,
+        object_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shape_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        story_id: Option<String>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        anchor: TextAnchor,
+        paragraphs: Vec<TextParagraph>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lines: Vec<PositionedTextLine>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        overflow: bool,
+        #[serde(default, skip_serializing_if = "Transform::is_identity")]
+        transform: Transform,
+    },
+    Placeholder {
+        object_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shape_id: Option<String>,
+        name: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Transform::is_identity")]
+        transform: Transform,
+    },
+    /// A plotted chart: one addressable object whose parts paint clipped to
+    /// its rectangle, and whose `label` is the screen-reader summary.
+    Chart {
+        object_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shape_id: Option<String>,
+        name: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        label: String,
+        primitives: Vec<Primitive>,
+        #[serde(default, skip_serializing_if = "Transform::is_identity")]
+        transform: Transform,
+    },
+    /// A laid-out table: one addressable object whose cells paint clipped to
+    /// its rectangle, and whose `label` is the screen-reader summary.
+    Table {
+        object_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shape_id: Option<String>,
+        name: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        label: String,
+        primitives: Vec<Primitive>,
+        #[serde(default, skip_serializing_if = "Transform::is_identity")]
+        transform: Transform,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextAnchor {
+    Top,
+    Center,
+    Bottom,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextParagraph {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<TextAlign>,
+    pub level: u32,
+    pub runs: Vec<TextRun>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextRun {
+    pub text: String,
+    pub font_family: String,
+    pub font_size_pt: f32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub underline: bool,
+    pub color: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionedTextLine {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub column_offset: f32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub baseline: f32,
+    pub start: u32,
+    pub end: u32,
+    pub runs: Vec<PositionedTextRun>,
+    pub caret_stops: Vec<CaretStop>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaretStop {
+    pub position: u32,
+    pub x: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionedTextRun {
+    pub text: String,
+    pub start: u32,
+    pub end: u32,
+    pub x: f32,
+    pub width: f32,
+    pub font_id: u32,
+    pub font_family: String,
+    pub font_size_px: f32,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "is_unstruck")]
+    pub strike: Option<String>,
+    pub color: String,
+    /// Tracking between clusters in pixels.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub letter_spacing_px: f32,
+    /// Pixels this run's baseline sits above the line's; negative is subscript.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub baseline_offset_px: f32,
+    pub glyphs: Vec<PositionedGlyph>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionedGlyph {
+    pub glyph_id: u32,
+    pub cluster: u32,
+    pub x: f32,
+    pub advance: f32,
+    pub x_offset: f32,
+    pub y_offset: f32,
+}
+
+impl Transform {
+    pub fn is_identity(&self) -> bool {
+        self.rotation_deg == 0.0 && !self.flip_h && !self.flip_v
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero(value: &f32) -> bool {
+    *value == 0.0
+}
+
+fn is_unstruck(value: &Option<String>) -> bool {
+    !matches!(value.as_deref(), Some("sngStrike" | "dblStrike"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_detection_walks_tables_and_charts() {
+        let text: Primitive = serde_json::from_str(concat!(
+            r##"{"kind":"textBox","objectId":1,"x":0,"y":0,"w":10,"h":10,"anchor":"top","##,
+            r##""paragraphs":[],"lines":[{"x":0,"y":0,"width":10,"height":10,"baseline":8,"##,
+            r##""start":0,"end":1,"caretStops":[],"runs":[{"text":"a","start":0,"end":1,"##,
+            r##""x":0,"width":5,"fontId":0,"fontFamily":"Arial","fontSizePx":10,"bold":false,"##,
+            r##""italic":false,"underline":false,"color":"#000000","glyphs":[{"glyphId":1,"##,
+            r##""cluster":0,"x":0,"advance":5,"xOffset":0,"yOffset":0}]}]}]}"##
+        ))
+        .unwrap();
+        let container = |kind: &str, child: Primitive| -> Primitive {
+            serde_json::from_value(serde_json::json!({
+                "kind": kind, "objectId": 2, "name": "Container", "label": "Container",
+                "x": 0, "y": 0, "w": 10, "h": 10, "primitives": [child]
+            }))
+            .unwrap()
+        };
+        let mut list = SurfaceDisplayList {
+            contract_version: CONTRACT_VERSION,
+            width: 10.0,
+            height: 10.0,
+            background: None,
+            primitives: Vec::new(),
+        };
+        assert!(!list.has_glyphs());
+        for primitive in [
+            text.clone(),
+            container("table", text.clone()),
+            container("chart", text.clone()),
+            container("chart", container("table", text.clone())),
+        ] {
+            list.primitives = vec![primitive];
+            assert!(list.has_glyphs());
+        }
+        let mut empty = text;
+        if let Primitive::TextBox { lines, .. } = &mut empty {
+            lines[0].runs[0].glyphs.clear();
+        }
+        list.primitives = vec![container("table", container("chart", empty))];
+        assert!(!list.has_glyphs());
+    }
+
+    #[test]
+    fn solid_stroke_keeps_legacy_json_and_reads_missing_paint() {
+        let json = r##"{"color":"#123456","width":2.0,"dashed":true}"##;
+        let stroke: Stroke = serde_json::from_str(json).unwrap();
+        assert!(stroke.paint.is_none());
+        assert_eq!(serde_json::to_string(&stroke).unwrap(), json);
+    }
+
+    #[test]
+    fn identity_transform_is_omitted_from_json() {
+        let list = SurfaceDisplayList {
+            contract_version: CONTRACT_VERSION,
+            width: 100.0,
+            height: 50.0,
+            background: None,
+            primitives: vec![Primitive::Placeholder {
+                object_id: 1,
+                shape_id: None,
+                name: "chart".into(),
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+                label: Some("Chart".into()),
+                transform: Transform::default(),
+            }],
+        };
+
+        let json = serde_json::to_string(&list).expect("serialize display list");
+        assert!(!json.contains("transform"));
+        assert!(json.contains("contractVersion"));
+    }
+
+    #[test]
+    fn geometry_fallback_is_optional_and_only_serializes_when_active() {
+        for legacy in [
+            r#"{"kind":"shape","objectId":1,"name":"Arc","x":0.0,"y":0.0,"w":10.0,"h":10.0,"geometry":"arc","path":[]}"#,
+            r#"{"kind":"image","objectId":1,"name":"Photo","x":0.0,"y":0.0,"w":10.0,"h":10.0}"#,
+        ] {
+            let mut primitive: Primitive = serde_json::from_str(legacy).unwrap();
+            assert_eq!(serde_json::to_string(&primitive).unwrap(), legacy);
+            let (Primitive::Shape {
+                geometry_fallback, ..
+            }
+            | Primitive::Image {
+                geometry_fallback, ..
+            }) = &mut primitive
+            else {
+                unreachable!()
+            };
+            assert!(!*geometry_fallback);
+            *geometry_fallback = true;
+            let json = serde_json::to_string(&primitive).unwrap();
+            assert!(json.contains(r#""geometryFallback":true"#));
+            assert_eq!(serde_json::from_str::<Primitive>(&json).unwrap(), primitive);
+        }
+    }
+
+    #[test]
+    fn an_uncropped_rectangular_image_serializes_as_it_did_before_crops_existed() {
+        let mut image = Primitive::Image {
+            destination: None,
+            geometry_fallback: false,
+            tile: None,
+            object_id: 90,
+            shape_id: Some("slide:0:256:shape:9".into()),
+            name: "Media fixture".into(),
+            x: 1280.0,
+            y: 720.0,
+            w: 0.5,
+            h: 0.25,
+            asset_id: Some("ppt/media/nimbleoffice-mark.png".into()),
+            effects: Vec::new(),
+            crop: ImageCrop::default(),
+            path: None,
+            stroke: None,
+            shadow: None,
+            transform: Transform::default(),
+        };
+        let before = r#"{"kind":"image","objectId":90,"shapeId":"slide:0:256:shape:9","name":"Media fixture","x":1280.0,"y":720.0,"w":0.5,"h":0.25,"assetId":"ppt/media/nimbleoffice-mark.png"}"#;
+        assert_eq!(serde_json::to_string(&image).unwrap(), before);
+        assert_eq!(serde_json::from_str::<Primitive>(before).unwrap(), image);
+
+        let Primitive::Image { crop, path, .. } = &mut image else {
+            unreachable!()
+        };
+        *crop = ImageCrop {
+            top: 0.1,
+            bottom: 0.2,
+            ..ImageCrop::default()
+        };
+        *path = Some(vec![
+            GeometryPathCommand::Move { x: 0.0, y: 0.5 },
+            GeometryPathCommand::Close,
+        ]);
+        let json = serde_json::to_string(&image).unwrap();
+        assert!(json.contains(r#""crop":{"top":0.1,"bottom":0.2}"#));
+        assert!(json.contains(r#""path":[{"type":"move","x":0.0,"y":0.5},{"type":"close"}]"#));
+        assert_eq!(serde_json::from_str::<Primitive>(&json).unwrap(), image);
+    }
+}

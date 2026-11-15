@@ -1,0 +1,53 @@
+pub use pptx_edit::structured::{
+    AnchorScope, CellPosition, ExportComment, ExportDiagnostic, ExportDiagnosticCode, ExportError,
+    ExportFailure, ExportFailureCode, ExportLink, ExportList, ExportMark, ExportNotes,
+    ExportObject, ExportObjectKind, ExportParagraph, ExportPlaceholder, ExportRead, ExportRefusal,
+    ExportRun, ExportRunKind, ExportSeverity, ExportShape, ExportShapeKind, ExportSlide,
+    ExportStory, ExportTable, ExportTableCell, ExportTableRow, IncludedContent, MarkdownAnchor,
+    PptxAnchor, PptxExportOptions, PptxExportResult, PptxMarkdownContent, PptxMarkdownOptions,
+    PptxStructuredContent, ReadingOrder, SourceProvenance, TextSpan, export_outcome_json,
+    snapshot_outcome_json,
+};
+pub use pptx_edit::{
+    BackgroundGuard, DocumentVersion, EditApplication, EditFailure, EditFailureCode, EditHistory,
+    EditOutcome, EditPreview, EditReceipt, EditRefusal, EditRequest, EditSource, EditStep,
+    EditTarget, EditValidation, FillGuard, FindMatch, FindOutcome, FindRequest, FindResponse,
+    FindScope, MAX_REQUEST_BYTES, OutlineGuard, ParagraphText, ReadOutcome, ReadRequest,
+    ReadResponse, RectGuard, ShapeTarget, SlideTarget, StoryTarget, StoryText, TargetEdge,
+    TextField, TextGuard, TextRange, TextTarget, ValidationOutcome, outcome_json,
+    oversized_request,
+};
+pub use pptx_edit::{
+    CaretAnchor, ColorValue, CommandParagraphSource, CommandReadResponse, CommandStorySource,
+    CommentFlavor, CommentReceipt, CommentSnapshot, DeckSnapshot, EditCtx, EditError, EditOrigin,
+    GradientFill, GradientStop as ModelGradientStop, HeaderFooterSettings, HistoryReceipt,
+    InheritedGeometry, ParagraphSnapshot, PictureDraft, PresetShapeDraft, ShapeAdjustReceipt,
+    ShapeDraft, ShapeFill, ShapeFillReceipt, ShapeKind, ShapeReceipt, ShapeRect, ShapeSnapshot,
+    ShapeStroke, ShapeStrokeReceipt, ShapeZOrderReceipt, SlideBackgroundReceipt, SlideDateText,
+    SlideHeaderFooter, SlideHeaderFooterText, SlideLayoutSnapshot, SlideReceipt, SlideSnapshot,
+    StorySnapshot, TableColumnWidth, TableEdit, TableInsertPosition, TableReceipt,
+    TextParagraphDraft, TextReceipt, TextRunDraft, TextRunSnapshot, TextSearchMatch, TextStyle,
+    TextStylePatch, TransformReceipt, UndoCaptureMode, UpdateEvent, UpdateOrigin,
+    UpdateSubscription,
+};
+pub use pptx_edit::{
+    Proposal, ProposalAcceptance, ProposalChange, ProposalChangeKind, ProposalEdit, ProposalError,
+    ProposalPreview, ProposalRequest, ProposalResult, ProposalShapeChange, ProposalShapeChangeKind,
+    ProposalShapeOrder, ProposalStripEntry, ProposalStripStatus, ProposalTextChange,
+    ProposalTextChangeKind,
+};
+pub use pptx_parse::{
+    BlipEffect, Bullet, Comment, CommentAuthor, GraphicFrame, GraphicFrameData, GroupShape,
+    LineSpacing, MediaPart, ParagraphProperties, ParseLimits, Picture, PictureCrop, Placeholder,
+    PptxError, PptxPackage, Presentation as PresentationModel, Relationship, RunProperties, Shape,
+    ShapeBase, ShapeNode, ShapeTransform, Slide, SlideLayout, SlideMaster, SlideReference,
+    TargetMode, TextAutofit, TextBody, TextParagraph as ModelTextParagraph,
+    TextRun as ModelTextRun, TextStyleSet, ThemePart,
+};
+pub use pptx_render::{
+    CONTRACT_VERSION, CaretStop, FontSubstitution, GradientStop, GradientType, HitTestResult,
+    ImageCrop, ImageEffect, Paint, PositionedGlyph, PositionedTextLine, PositionedTextRun,
+    Primitive, ProposalDiffSlide, RenderError, RenderedSlide, Stroke, SurfaceDisplayList,
+    TextAlign, TextAnchor, TextParagraph as DisplayTextParagraph, TextRun as DisplayTextRun,
+    Transform,
+};

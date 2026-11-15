@@ -1,0 +1,1334 @@
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import JSZip from 'jszip';
+import { createFontProvider, resolveGlyphFallbackFace, resolveScriptFallbackFace } from '@nimbleoffice/fonts';
+import type {
+  PresentationHandle,
+  ShapePrimitive,
+  SlidePrimitive,
+  StorySnapshot,
+  TextBoxPrimitive,
+} from '../index';
+import { initWasm, openPresentation, paintSlide, StaleProposalError } from '../index';
+import { PptxDocument, PptxRenderer } from './engine';
+
+const root = resolve(import.meta.dir, '../../../..');
+let handle: PresentationHandle;
+let fixture: Uint8Array;
+let fontBytes: Uint8Array;
+
+beforeAll(async () => {
+  const [wasm, pptx, font] = await Promise.all([
+    readFile(resolve(import.meta.dir, 'generated/pptx_wasm_bg.wasm')),
+    readFile(resolve(root, 'fixtures/demo/nimbleoffice-demo.pptx')),
+    readFile(resolve(root, 'crates/ooxml-text/tests/fonts/LiberationSans-Regular.ttf')),
+  ]);
+  await initWasm(wasm);
+  fixture = pptx;
+  fontBytes = font;
+  handle = openPresentation(pptx, {
+    clientId: 9001,
+    fonts: [{ family: 'Liberation Sans', bytes: font }],
+  });
+});
+
+test('proposals preview real frames, accept atomically, save, and preserve stale errors', () => {
+  const source = openPresentation(fixture, { clientId: 9201, fonts: [{ family: 'Liberation Sans', bytes: fontBytes }] });
+  try {
+    const before = source.snapshot();
+    const slide = before.slides[0];
+    const shape = slide.shapes.find((shape) => shape.textStories.length > 0)!;
+    const story = shape.textStories[0];
+    const end = story.paragraphs[0].runs.reduce((length, run) => length + run.text.length, 0);
+    const updates: Uint8Array[] = [];
+    source.onUpdate((update) => updates.push(update));
+    const proposal = source.propose('review-agent', 'Improve this title', [
+      { type: 'replaceText', storyId: story.id, start: 0, end, text: 'A reviewed title' },
+      { type: 'setShapeRect', slideId: slide.id, shapeId: shape.id, rect: { x: shape.x + 100000, y: shape.y, width: shape.width, height: shape.height } },
+    ]);
+    const frameBefore = source.layoutSlide(0);
+    const frameAfter = source.layoutProposalSlide(proposal.id, 0);
+    expect(frameAfter).not.toEqual(frameBefore);
+    const preview = source.previewProposal(proposal.id);
+    expect(source.snapshot()).toEqual(before);
+    expect(source.canUndo()).toBe(false);
+    expect(updates).toHaveLength(0);
+    expect(source.acceptProposal(proposal.id).snapshot).toEqual(preview.snapshot);
+    expect(updates).toHaveLength(1);
+    const reopened = openPresentation(source.save(), { clientId: 9202 });
+    try {
+      expect(JSON.stringify(reopened.snapshot())).toContain('A reviewed title');
+      expect(reopened.listProposals()).toHaveLength(0);
+    } finally { reopened.dispose(); }
+    expect(source.undo().snapshot).toEqual(before);
+    const stale = source.propose('review-agent', null, [{ type: 'setSlideNotes', slideId: slide.id, text: 'Proposed notes' }]);
+    source.setSlideNotes(slide.id, 'Human notes');
+    expect(() => source.acceptProposal(stale.id)).toThrow(StaleProposalError);
+    expect(source.listProposals()[0].staleTargets).toEqual([slide.id]);
+    expect(source.previewProposal(stale.id).proposal.changes[0].oldText).toBe('Human notes');
+    expect(source.acceptProposal(stale.id, { force: true }).snapshot.slides[0].notes).toBe('Proposed notes');
+    const rejected = source.propose('review-agent', null, [{ type: 'setSlideNotes', slideId: slide.id, text: 'Rejected notes' }]);
+    expect(source.rejectProposal(rejected.id)).toBe(true);
+    expect(source.snapshot().slides[0].notes).toBe('Proposed notes');
+  } finally { source.dispose(); }
+});
+
+afterAll(() => handle.dispose());
+
+for (const fallback of [false, true]) test(`failed ${fallback ? 'fallback ' : ''}font registration frees the renderer and document`, () => {
+  const original = Object.assign(new Error('render resource limit exceeded: more than 256 font faces'), {
+    name: 'PptxResourceLimitError', code: 'font-face-limit',
+  });
+  const register = spyOn(PptxRenderer.prototype, fallback ? 'registerFallbackFont' : 'registerFont')
+    .mockImplementation(() => { throw original; });
+  const freeRenderer = spyOn(PptxRenderer.prototype, 'free');
+  const freeDocument = spyOn(PptxDocument.prototype, 'free');
+  try {
+    let failure: unknown;
+    try {
+      openPresentation(fixture, { clientId: 9304,
+        [fallback ? 'fallbackFonts' : 'fonts']: [{ family: 'Liberation Sans', bytes: fontBytes }] }).dispose();
+    } catch (error) { failure = error; }
+    expect(failure).toBe(original);
+    expect(freeRenderer).toHaveBeenCalledTimes(1);
+    expect(freeDocument).toHaveBeenCalledTimes(1);
+  } finally { register.mockRestore(); freeRenderer.mockRestore(); freeDocument.mockRestore(); }
+});
+
+test('worker handles without retained source still edit and save but cannot fork', () => {
+  const source = openPresentation(fixture, { clientId: 9301, retainSource: false });
+  try {
+    expect(source.snapshot().slides.length).toBeGreaterThan(0);
+    expect(() => source.fork()).toThrow('Presentation source is unavailable for fork');
+    expect(() => source.layouts()).toThrow('Presentation source is unavailable for layouts');
+    const slide = source.snapshot().slides[0]!;
+    const content = source.readContent();
+    if (!content.ok) throw new Error(content.failure.message);
+    const story = content.stories[0]!;
+    source.insertText(story.storyId, 0, 'Worker edit ', {});
+    source.setSlideNotes(slide.id, 'Worker notes');
+    const reopened = openPresentation(source.save(), { clientId: 9303 });
+    try {
+      const saved = reopened.readContent();
+      if (!saved.ok) throw new Error(saved.failure.message);
+      expect(saved.stories.some((item) => item.text === `Worker edit ${story.text}`)).toBe(true);
+      expect(reopened.snapshot().slides[0]!.notes).toBe('Worker notes');
+    } finally { reopened.dispose(); }
+  } finally { source.dispose(); }
+  const retained = openPresentation(fixture, { clientId: 9302 });
+  try {
+    const forked = retained.fork();
+    try { expect(forked.snapshot()).toEqual(retained.snapshot()); } finally { forked.dispose(); }
+    expect(retained.layouts().length).toBeGreaterThan(0);
+  } finally { retained.dispose(); }
+});
+
+test('ordinary text deletion refuses paragraph joins without changing state or history', () => {
+  const source = openPresentation(fixture, { clientId: 9210 });
+  try {
+    const story = source.snapshot().slides.flatMap((slide) => slide.shapes)
+      .flatMap((shape) => shape.textStories).find((story) => story.paragraphs.length > 1)!;
+    const boundary = story.paragraphs[0]!.runs.reduce((length, run) => length + run.text.length, 0);
+    const before = source.snapshot();
+    const version = source.version();
+    for (const remove of [source.deleteText, source.deleteTextProfiled]) {
+      expect(() => remove(story.id, boundary, boundary + 1)).toThrow('paragraph boundary');
+      expect(source.snapshot()).toEqual(before);
+      expect(source.version()).toBe(version);
+      expect(source.canUndo()).toBe(false);
+    }
+  } finally { source.dispose(); }
+});
+
+test('text search returns stable slide and story locations without mutating the deck', () => {
+  const source = openPresentation(fixture, { clientId: 9200 });
+  try {
+    const slide = source.snapshot().slides[0];
+    const receipt = source.addTextBox(slide.id, {
+      name: 'Search fixture',
+      text: 'QueryNeedle queryneedle QUERYNEEDLE',
+      rect: { x: 100000, y: 100000, width: 2000000, height: 500000 },
+      style: {},
+    });
+    const shape = source
+      .snapshot()
+      .slides[0].shapes.find((candidate) => candidate.id === receipt.shapeId)!;
+    const story = shape.textStories[0];
+    const stateWithFixture = source.encodeStateVector();
+
+    expect(source.searchText('queryneedle')).toEqual([
+      {
+        slideIndex: 0,
+        slideId: slide.id,
+        shapeId: shape.id,
+        storyId: story.id,
+        start: 0,
+        end: 11,
+        text: 'QueryNeedle',
+      },
+      {
+        slideIndex: 0,
+        slideId: slide.id,
+        shapeId: shape.id,
+        storyId: story.id,
+        start: 12,
+        end: 23,
+        text: 'queryneedle',
+      },
+      {
+        slideIndex: 0,
+        slideId: slide.id,
+        shapeId: shape.id,
+        storyId: story.id,
+        start: 24,
+        end: 35,
+        text: 'QUERYNEEDLE',
+      },
+    ]);
+    expect(source.searchText('QueryNeedle', { caseSensitive: true })).toHaveLength(1);
+    expect(source.searchText('queryneedle', { limit: 2 })).toHaveLength(2);
+    expect(source.searchText('')).toEqual([]);
+    expect(() => source.searchText('queryneedle', { limit: -1 })).toThrow(RangeError);
+    expect(source.encodeStateVector()).toEqual(stateWithFixture);
+  } finally {
+    source.dispose();
+  }
+});
+
+test('Unicode text search preserves simple-folding matches and UTF-16 offsets', async () => {
+  const text = (await readFile(resolve(root,
+    'crates/pptx-edit/tests/fixtures/unicode-search.txt'), 'utf8')).trimEnd();
+  const source = openPresentation(fixture, { clientId: 9291 });
+  try {
+    const slide = source.snapshot().slides[0];
+    const receipt = source.addTextBox(slide.id, {
+      name: 'Unicode search', text,
+      rect: { x: 100000, y: 100000, width: 2000000, height: 500000 }, style: {},
+    });
+    const cases: Array<[string, string[]]> = [
+      ['i', ['I', 'i']], ['I', ['I', 'i']], ['ı', ['ı']], ['İ', ['İ']],
+      ['ΐ', ['ΐ', 'ΐ']], ['ΐ', ['ΐ', 'ΐ']],
+      ['ΰ', ['ΰ', 'ΰ']], ['ΰ', ['ΰ', 'ΰ']],
+      ['ﬅ', ['ﬅ', 'ﬆ']], ['ﬆ', ['ﬅ', 'ﬆ']],
+    ];
+    for (const [query, expected] of cases) {
+      const matches = source.searchText(query).filter((match) => match.shapeId === receipt.shapeId);
+      expect(matches.map((match) => match.text)).toEqual(expected);
+      for (const match of matches) {
+        expect(match.start).toBe(text.indexOf(match.text));
+        expect(match.end).toBe(match.start + match.text.length);
+      }
+      expect(source.searchText(query, { caseSensitive: true })
+        .filter((match) => match.shapeId === receipt.shapeId).map((match) => match.text))
+        .toEqual([query]);
+    }
+  } finally {
+    source.dispose();
+  }
+});
+
+test('inline proposal diffs reflow and paint marked text without changing hit tests or saved text', async () => {
+  const source = openPresentation(fixture, { clientId: 9203, fonts: [{ family: 'Liberation Sans', bytes: fontBytes }] });
+  try {
+    const slideId = source.snapshot().slides[0].id;
+    const added = source.addTextBox(slideId, {
+      name: 'Inline review', text: 'Old title and shared context',
+      rect: { x: 100000, y: 100000, width: 1800000, height: 4000000 },
+      style: { fontSizePt: 24, fontFamily: 'Liberation Sans' },
+    });
+    const shape = source.snapshot().slides[0].shapes.find((shape) => shape.id === added.shapeId)!;
+    const story = shape.textStories[0];
+    const proposal = source.propose('review-agent', null, [
+      { type: 'replaceText', storyId: story.id, start: 0, end: 3, text: 'A much clearer' },
+    ]);
+    const state = source.encodeStateAsUpdate();
+    source.layoutSlide(0);
+    const hit = source.hitTest(30, 30);
+    const diff = source.layoutProposalDiffSlide(proposal.id, 0);
+    expect(source.hitTest(30, 30)).toEqual(hit);
+    expect(source.encodeStateAsUpdate()).toEqual(state);
+    const box = diff.frame.primitives.find((primitive): primitive is TextBoxPrimitive => primitive.kind === 'textBox' && primitive.storyId === story.id)!;
+    expect(box.lines.length).toBeGreaterThan(1);
+    const runs = box.lines.flatMap((line) => line.runs);
+    expect(runs.some((run) => run.color === '#b91c1c' && run.text.includes('Old'))).toBe(true);
+    expect(runs.some((run) => run.color === '#166534')).toBe(true);
+    expect(diff.textChanges.map((change) => change.kind)).toContain('insertion');
+    expect(diff.textChanges.map((change) => change.kind)).toContain('deletion');
+    const fills: string[] = [];
+    const ctx = new Proxy({ fillStyle: '', fillRect() { fills.push(this.fillStyle); } } as Record<string, any>, {
+      get(target, key) { return key in target ? target[key as string] : () => {}; },
+    }) as CanvasRenderingContext2D;
+    await paintSlide(ctx, { ...diff.frame, background: undefined, primitives: [box] }, 2, 0.75, { textChanges: diff.textChanges });
+    expect(fills).toContain('#fee2e2cc');
+    expect(fills).toContain('#dcfce7cc');
+    expect(fills).toContain('#b91c1c');
+    expect(fills).toContain('#166534');
+    const reopened = openPresentation(source.save());
+    try { expect(JSON.stringify(reopened.snapshot())).not.toContain('A much clearer'); }
+    finally { reopened.dispose(); }
+    source.acceptProposal(proposal.id);
+    expect(JSON.stringify(source.snapshot())).toContain('A much clearer');
+    expect(source.story(story.id).paragraphs[0].runs.some((run) => run.style.color === '#166534')).toBe(false);
+  } finally { source.dispose(); }
+});
+
+describe('PPTX wasm boundary', () => {
+  test('opens shared updates without parsing the file bytes', () => {
+    const source = openPresentation(fixture, { clientId: 9002 });
+    const seed = source.encodeStateAsUpdate();
+    const left = openPresentation(Uint8Array.of(0xff), {
+      clientId: 9003,
+      initialUpdate: seed,
+    });
+    const right = openPresentation(Uint8Array.of(0xff), {
+      clientId: 9004,
+      initialUpdate: seed,
+    });
+
+    expect(left.snapshot()).toEqual(source.snapshot());
+    expect([...left.encodeStateAsUpdate()]).toEqual([...seed]);
+    expect([...right.encodeStateAsUpdate()]).toEqual([...seed]);
+    expect([...left.encodeStateVector()]).toEqual([...right.encodeStateVector()]);
+
+    source.dispose();
+    left.dispose();
+    right.dispose();
+  });
+
+  // the wasm event arrives as `[origin, ...update]`, so a listener that reaches
+  // for `.buffer` must not find the origin tag riding along — and the shape must
+  // not depend on how many other listeners happen to be subscribed.
+  test('delivers exact update buffers regardless of subscriber count', () => {
+    const seed = openPresentation(fixture, { clientId: 9201 });
+    let update: Uint8Array;
+    try {
+      update = seed.encodeStateAsUpdate();
+    } finally {
+      seed.dispose();
+    }
+    for (const extraSubscriber of [false, true]) {
+      const source = openPresentation(Uint8Array.of(0xff), {
+        clientId: extraSubscriber ? 9202 : 9203,
+        initialUpdate: update,
+      });
+      const peer = openPresentation(Uint8Array.of(0xff), {
+        clientId: extraSubscriber ? 9204 : 9205,
+        initialUpdate: update,
+      });
+      const received: Uint8Array[] = [];
+      try {
+        source.onUpdate((bytes, origin) => {
+          if (origin === 'local') received.push(bytes);
+        });
+        if (extraSubscriber) source.onUpdate(() => {});
+
+        const story = firstStory(source.snapshot().slides.flatMap((slide) => slide.shapes));
+        source.insertText(story.id, story.length - 1, ' exact');
+        expect(received).toHaveLength(1);
+        expect(received[0].byteOffset).toBe(0);
+        expect(received[0].buffer.byteLength).toBe(received[0].byteLength);
+
+        peer.applyUpdate(new Uint8Array(received[0].buffer));
+        expect(peer.story(story.id)).toEqual(source.story(story.id));
+      } finally {
+        source.dispose();
+        peer.dispose();
+      }
+    }
+  });
+
+  test('opens, edits, reflows, hit-tests, and observes a local update', () => {
+    const snapshot = handle.snapshot();
+    expect(snapshot.slides.length).toBe(3);
+    const story = firstStory(snapshot.slides.flatMap((slide) => slide.shapes));
+    const insertion = story.length - 1;
+
+    const events: Array<{ origin: string; update: Uint8Array }> = [];
+    const unsubscribe = handle.onUpdate((update, origin) => events.push({ origin, update }));
+    const receipt = handle.insertText(story.id, insertion, ' edited', {
+      bold: true,
+      fontSizePt: 28,
+      color: '#325ee6',
+    });
+    expect(receipt.storyId).toBe(story.id);
+    expect(handle.story(story.id).paragraphs.some((paragraph) =>
+      paragraph.runs.some((run) => run.text.includes('edited'))
+    )).toBe(true);
+
+    const frame = handle.layoutSlide(0);
+    const textBox = frame.primitives.find(
+      (primitive): primitive is TextBoxPrimitive =>
+        primitive.kind === 'textBox' && primitive.storyId === story.id
+    );
+    expect(textBox?.lines.length).toBeGreaterThan(0);
+    const line = textBox!.lines[0];
+    expect(handle.hitTest(line.x, line.y + line.height / 2)?.kind).toBe('text');
+
+    expect(events[0]?.origin).toBe('local');
+    expect(events[0]?.update.length).toBeGreaterThan(0);
+    expect(handle.canUndo()).toBe(true);
+    expect(handle.undo().applied).toBe(true);
+    expect(handle.story(story.id).paragraphs.some((paragraph) =>
+      paragraph.runs.some((run) => run.text.includes('edited'))
+    )).toBe(false);
+    unsubscribe();
+  });
+
+  test('aligns paragraphs, reflows the text box, and undoes in one step', () => {
+    const snapshot = handle.snapshot();
+    const story = firstStory(snapshot.slides.flatMap((slide) => slide.shapes));
+    const laidOut = () =>
+      handle.layoutSlide(0).primitives.find(
+        (primitive): primitive is TextBoxPrimitive =>
+          primitive.kind === 'textBox' && primitive.storyId === story.id
+      );
+    const storedBefore = handle.story(story.id).paragraphs[0].alignment;
+    const renderedBefore = laidOut()?.paragraphs[0]?.align;
+
+    handle.setParagraphAlignment(story.id, 0, 0, 'ctr');
+    expect(handle.story(story.id).paragraphs[0].alignment).toBe('ctr');
+    expect(laidOut()?.paragraphs[0]?.align).toBe('center');
+
+    expect(handle.undo().applied).toBe(true);
+    expect(handle.story(story.id).paragraphs[0].alignment).toBe(storedBefore);
+    expect(laidOut()?.paragraphs[0]?.align).toBe(renderedBefore);
+
+    expect(() =>
+      handle.setParagraphAlignment(story.id, 0, 0, 'middle' as never)
+    ).toThrow();
+  });
+
+  test('sets a shape rectangle in one update and one undo step', () => {
+    const source = openPresentation(fixture, { clientId: 9011 });
+    const slide = source.snapshot().slides[0];
+    const shape = slide.shapes[0];
+    const before = {
+      x: shape.x,
+      y: shape.y,
+      width: shape.width,
+      height: shape.height,
+    };
+    const after = {
+      x: before.x + 120_000,
+      y: before.y + 80_000,
+      width: before.width + 300_000,
+      height: before.height + 200_000,
+    };
+    const updates: Uint8Array[] = [];
+    source.onUpdate((update, origin) => {
+      if (origin === 'local') updates.push(update);
+    });
+
+    expect(source.setShapeRect(slide.id, shape.id, after).after).toEqual(after);
+    expect(updates).toHaveLength(1);
+    expect(shapeSnapshotFrom(source, shape.id)).toMatchObject(after);
+    expect(source.undo().applied).toBe(true);
+    expect(shapeSnapshotFrom(source, shape.id)).toMatchObject(before);
+    expect(source.canUndo()).toBe(false);
+    source.dispose();
+  });
+
+  test('paints the non-justified demo deck with one call per word at its caret stop', async () => {
+    const source = openPresentation(fixture, {
+      clientId: 9013,
+      fonts: [{ family: 'Liberation Sans', bytes: fontBytes }],
+    });
+    const calls: Array<{ text: string; x: number; y: number }> = [];
+    const expected: Array<{ text: string; x: number; y: number }> = [];
+    const ctx = new Proxy(
+      {
+        fillText: (text: string, x: number, y: number) => calls.push({ text, x, y }),
+      } as Record<string, unknown>,
+      {
+        get(target, property) {
+          if (property in target) return target[property as string];
+          return () => undefined;
+        },
+        set(target, property, value) {
+          target[property as string] = value;
+          return true;
+        },
+      }
+    ) as unknown as CanvasRenderingContext2D;
+    try {
+      for (let slideIndex = 0; slideIndex < source.snapshot().slides.length; slideIndex += 1) {
+        const frame = source.layoutSlide(slideIndex);
+        expected.push(...oneCallPerWord(frame.primitives));
+        await paintSlide(ctx, frame);
+      }
+
+      expect(expected.length).toBeGreaterThan(272);
+      expect(calls).toHaveLength(expected.length);
+      expect(calls).toEqual(expected);
+    } finally {
+      source.dispose();
+    }
+  });
+
+  test('paints engine-produced justified word starts at caret positions', async () => {
+    const source = openPresentation(fixture, {
+      clientId: 9012,
+      fonts: [{ family: 'Liberation Sans', bytes: fontBytes }],
+    });
+    try {
+      const shape = source.snapshot().slides[0].shapes.find(
+        (candidate) => candidate.name === 'Subtitle'
+      );
+      const story = shape?.textStories[0];
+      if (!story) throw new Error('subtitle story is missing');
+      source.setParagraphAlignment(story.id, 0, story.length, 'just');
+      const frame = source.layoutSlide(0);
+      const textBox = frame.primitives.find(
+        (primitive): primitive is TextBoxPrimitive =>
+          primitive.kind === 'textBox' && primitive.storyId === story.id
+      );
+      if (!textBox) throw new Error('subtitle layout is missing');
+      expect(textBox.lines.length).toBeGreaterThan(1);
+
+      const calls: Array<{ text: string; x: number; y: number }> = [];
+      const ctx = new Proxy(
+        {
+          fillText: (text: string, x: number, y: number) => calls.push({ text, x, y }),
+        } as Record<string, unknown>,
+        {
+          get(target, property) {
+            if (property in target) return target[property as string];
+            return () => undefined;
+          },
+          set(target, property, value) {
+            target[property as string] = value;
+            return true;
+          },
+        }
+      ) as unknown as CanvasRenderingContext2D;
+      await paintSlide(ctx, { ...frame, background: undefined, primitives: [textBox] });
+
+      const first = textBox.lines[0];
+      const painted = calls.filter((call) => call.y === first.baseline);
+      expect(painted.length).toBeGreaterThan(1);
+      let position = first.start;
+      for (const call of painted) {
+        const caret = first.caretStops.find((stop) => stop.position === position);
+        if (!caret) throw new Error(`caret stop ${position} is missing`);
+        expect(call.x).toBe(caret.x);
+        position += call.text.length;
+      }
+      expect(position).toBe(first.end);
+
+      const last = textBox.lines[textBox.lines.length - 1];
+      expect(calls.filter((call) => call.y === last.baseline)).toEqual(
+        oneCallPerWord([{ ...textBox, lines: [last] }])
+      );
+    } finally {
+      source.dispose();
+    }
+  });
+
+  test('inserts and styles preset shapes with undo and redo', () => {
+    const slide = handle.snapshot().slides[0];
+    const receipt = handle.addShape(slide.id, {
+      name: 'Styled rounded rectangle',
+      geometry: 'roundRect',
+      rect: { x: 900_000, y: 1_000_000, width: 3_100_000, height: 1_400_000 },
+      fill: '#D9EAF7',
+    });
+    expect(shapeSnapshot(receipt.shapeId).geometry).toBe('roundRect');
+    expect(handle.undo().snapshot.slides[0].shapes.some(
+      (shape) => shape.id === receipt.shapeId
+    )).toBe(false);
+    expect(handle.redo().snapshot.slides[0].shapes.some(
+      (shape) => shape.id === receipt.shapeId
+    )).toBe(true);
+
+    handle.setShapeFill(slide.id, receipt.shapeId, '#3367D6');
+    expect(shapeSnapshot(receipt.shapeId).fill?.color?.rgb).toBe('3367D6');
+    expect(handle.undo().applied).toBe(true);
+    expect(shapeSnapshot(receipt.shapeId).fill?.color?.rgb).toBe('D9EAF7');
+    expect(handle.redo().applied).toBe(true);
+
+    handle.setShapeStroke(slide.id, receipt.shapeId, {
+      color: '#EA4335',
+      widthPt: 3,
+    });
+    expect(shapeSnapshot(receipt.shapeId).outline?.width).toBe(38_100);
+    expect(handle.undo().applied).toBe(true);
+    expect(shapeSnapshot(receipt.shapeId).outline).toBeNull();
+    expect(handle.redo().applied).toBe(true);
+
+    handle.setShapeAdjust(slide.id, receipt.shapeId, { adj: 0.32 });
+    expect(shapeSnapshot(receipt.shapeId).adjustValues.adj).toBe(0.32);
+    expect(handle.undo().applied).toBe(true);
+    expect(shapeSnapshot(receipt.shapeId).adjustValues.adj).toBeCloseTo(0.16667);
+    expect(handle.redo().applied).toBe(true);
+
+    const primitive = handle.layoutSlide(0).primitives.find(
+      (candidate): candidate is ShapePrimitive =>
+        candidate.kind === 'shape' && candidate.shapeId === receipt.shapeId
+    );
+    expect(primitive?.fill).toEqual({ kind: 'solid', color: '#3367D6' });
+    expect(primitive?.stroke?.color).toBe('#EA4335');
+    expect(primitive?.adjustValues?.adj).toBeCloseTo(0.32);
+
+    handle.setShapeFill(slide.id, receipt.shapeId, null);
+    handle.setShapeStroke(slide.id, receipt.shapeId, {});
+    const cleared = handle.layoutSlide(0).primitives.find(
+      (candidate): candidate is ShapePrimitive =>
+        candidate.kind === 'shape' && candidate.shapeId === receipt.shapeId
+    );
+    expect(cleared?.fill).toBeUndefined();
+    expect(cleared?.stroke).toBeUndefined();
+  });
+
+  test('a session opened from an update saves when the source file is attached', () => {
+    const seeded = openPresentation(fixture, { clientId: 9007 });
+    const seed = seeded.encodeStateAsUpdate();
+
+    const attached = openPresentation(fixture, { clientId: 9008, initialUpdate: seed });
+    const slide = attached.snapshot().slides[0];
+    attached.moveShape(slide.id, slide.shapes[0].id, 777_000, 888_000);
+    const reopened = openPresentation(attached.save(), { clientId: 9009 });
+    const moved = reopened.snapshot().slides[0].shapes[0];
+    expect([moved.x, moved.y]).toEqual([777_000, 888_000]);
+
+    const bare = openPresentation(Uint8Array.of(0xff), { clientId: 9010, initialUpdate: seed });
+    expect(() => bare.save()).toThrow(/source file bytes/);
+
+    seeded.dispose();
+    attached.dispose();
+    reopened.dispose();
+    bare.dispose();
+  });
+
+  test('save with fonts fits edited autofit text in a renderer of its own', async () => {
+    const zip = new JSZip();
+    const ns = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"';
+    const rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    zip.file('[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>');
+    zip.file('_rels/.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${rel}/officeDocument" Target="ppt/presentation.xml"/></Relationships>`);
+    zip.file('ppt/presentation.xml', `<p:presentation ${ns}><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>`);
+    zip.file('ppt/_rels/presentation.xml.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${rel}/slide" Target="slides/slide1.xml"/></Relationships>`);
+    zip.file('ppt/slides/slide1.xml', `<p:sld ${ns}><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Text"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="100000" y="100000"/><a:ext cx="2476500" cy="952500"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr><p:txBody><a:bodyPr><a:normAutofit/></a:bodyPr><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" sz="2400"><a:latin typeface="Liberation Sans"/></a:rPr><a:t>Start</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`);
+    const bytes = await zip.generateAsync({ type: 'uint8array' });
+    const slide = async (saved: Uint8Array) => (await JSZip.loadAsync(saved)).file('ppt/slides/slide1.xml')!.async('string');
+    const edit = (target: PresentationHandle) => {
+      const story = firstStory(target.snapshot().slides[0].shapes);
+      target.insertText(story.id, 5, ' words that must shrink to stay inside the box'.repeat(8));
+    };
+    const fonts = [{ family: 'Liberation Sans', bytes: fontBytes }];
+    const bare = openPresentation(bytes, { clientId: 9301 });
+    const loaded = openPresentation(bytes, { clientId: 9302, fonts });
+    try {
+      edit(bare);
+      edit(loaded);
+      const plain = await slide(bare.save());
+      expect(plain).not.toContain('fontScale');
+      const fitted = await slide(bare.save({ fonts }));
+      expect(fitted).toMatch(/<a:normAutofit fontScale="\d+"/);
+      expect(await slide(loaded.save())).toBe(fitted);
+      expect(await slide(bare.save())).toBe(plain);
+    } finally {
+      bare.dispose();
+      loaded.dispose();
+    }
+  });
+
+  test('edits survive a save and reopen', () => {
+    const source = openPresentation(fixture, { clientId: 9005 });
+    const slide = source.snapshot().slides[0];
+    const shape = slide.shapes.find((candidate) => candidate.sourceId !== 0)!;
+    source.moveShape(slide.id, shape.id, 1_234_000, 2_345_000);
+    const story = firstStory(slide.shapes);
+    source.insertText(story.id, 0, 'Saved: ');
+
+    const reopened = openPresentation(source.save(), { clientId: 9006 });
+    const snapshot = reopened.snapshot();
+    const moved = snapshot.slides[0].shapes.find(
+      (candidate) => candidate.sourceId === shape.sourceId
+    );
+    expect([moved?.x, moved?.y]).toEqual([1_234_000, 2_345_000]);
+    const text = snapshot.slides
+      .flatMap((candidate) => candidate.shapes)
+      .flatMap((candidate) => candidate.textStories)
+      .find((candidate) => candidate.id === story.id);
+    expect(text?.paragraphs[0]?.runs[0]?.text.startsWith('Saved: ')).toBe(true);
+
+    source.dispose();
+    reopened.dispose();
+  });
+
+  test('anchors a legacy comment and carries it through a save', () => {
+    const deck = openPresentation(fixture, { clientId: 9201 });
+    expect(deck.snapshot().commentFlavor).toBeUndefined();
+    expect(deck.comments()).toEqual([]);
+
+    const slideId = deck.snapshot().slides[0].id;
+    const receipt = deck.addComment(slideId, {
+      author: 'Ada Lovelace',
+      initials: 'AL',
+      text: 'Does this claim hold?',
+      created: '2026-09-01T21:40:00.000',
+      xEmu: 914_400,
+      yEmu: 457_200,
+    });
+    expect(receipt.slideId).toBe(slideId);
+    expect(receipt.parentId).toBeNull();
+    expect(receipt.resolved).toBe(false);
+
+    const [comment] = deck.comments();
+    expect([comment.author, comment.initials]).toEqual(['Ada Lovelace', 'AL']);
+    expect([comment.xEmu, comment.yEmu]).toEqual([914_400, 457_200]);
+    expect(deck.snapshot().comments).toHaveLength(1);
+
+    const reopened = openPresentation(deck.save(), { clientId: 9202 });
+    expect(reopened.comments()[0]?.text).toBe('Does this claim hold?');
+    expect(reopened.snapshot().commentFlavor).toBeUndefined();
+
+    deck.removeComment(receipt.commentId);
+    expect(deck.comments()).toEqual([]);
+
+    deck.dispose();
+    reopened.dispose();
+  });
+
+  test('legacy decks save replies and refuse status and a flavour switch', () => {
+    const deck = openPresentation(fixture, { clientId: 9203 });
+    const receipt = deck.addComment(deck.snapshot().slides[0].id, {
+      author: 'Ada',
+      initials: 'AL',
+      text: 'Root.',
+      created: '2026-09-01T21:40:00.000',
+    });
+
+    const reply = deck.replyToComment(receipt.commentId, {
+      author: 'Grace',
+      initials: 'GH',
+      text: 'Agreed.',
+      created: '2026-09-01T21:41:00.000',
+    });
+    expect(reply.parentId).toBe(receipt.commentId);
+    const reopened = openPresentation(deck.save());
+    expect(reopened.comments().find(comment => comment.text === 'Agreed.')?.parentId).toBe(reopened.comments()[0].id);
+    reopened.dispose();
+    expect(() => deck.setCommentStatus(receipt.commentId, true)).toThrow();
+    expect(() => deck.setCommentFlavor('modern')).toThrow();
+
+    deck.dispose();
+  });
+
+  test('a modern thread keeps its reply and resolved state across a save', () => {
+    const deck = openPresentation(fixture, { clientId: 9204 });
+    expect(deck.setCommentFlavor('modern')).toBe('modern');
+
+    const root = deck.addComment(deck.snapshot().slides[0].id, {
+      author: 'Ada Lovelace',
+      initials: 'AL',
+      text: 'Does this claim hold?',
+      created: '2026-09-01T21:40:00.000',
+    });
+    const reply = deck.replyToComment(root.commentId, {
+      author: 'Grace Hopper',
+      initials: 'GH',
+      text: 'Checked, it holds.',
+      created: '2026-09-01T21:41:00.000',
+    });
+    expect(reply.parentId).toBe(root.commentId);
+    expect(deck.setCommentStatus(root.commentId, true).resolved).toBe(true);
+
+    const reopened = openPresentation(deck.save(), { clientId: 9205 });
+    expect(reopened.snapshot().commentFlavor).toBe('modern');
+    const comments = reopened.comments();
+    expect(comments).toHaveLength(2);
+    const roots = comments.filter((candidate) => candidate.parentId === null);
+    const replies = comments.filter((candidate) => candidate.parentId !== null);
+    expect(roots[0]?.resolved).toBe(true);
+    expect(replies[0]?.text).toBe('Checked, it holds.');
+    expect(replies[0]?.parentId).toBe(roots[0]?.id);
+
+    deck.dispose();
+    reopened.dispose();
+  });
+});
+
+function shapeSnapshot(shapeId: string) {
+  return shapeSnapshotFrom(handle, shapeId);
+}
+
+function shapeSnapshotFrom(source: PresentationHandle, shapeId: string) {
+  const shape = source.snapshot().slides[0].shapes.find((candidate) => candidate.id === shapeId);
+  if (!shape) throw new Error(`shape ${shapeId} was not found`);
+  return shape;
+}
+
+function firstStory(shapes: Array<{ textStories: StorySnapshot[]; children: unknown[] }>): StorySnapshot {
+  for (const shape of shapes) {
+    if (shape.textStories[0]) return shape.textStories[0];
+  }
+  throw new Error('fixture has no text story');
+}
+
+function oneCallPerWord(
+  primitives: SlidePrimitive[]
+): Array<{ text: string; x: number; y: number }> {
+  const calls: Array<{ text: string; x: number; y: number }> = [];
+  for (const primitive of primitives) {
+    if (primitive.kind === 'textBox') {
+      for (const line of primitive.lines) {
+        for (const run of line.runs) {
+          const starts = [0];
+          for (let offset = 1; offset < run.text.length; offset += 1) {
+            if (/\s/u.test(run.text[offset - 1])) starts.push(offset);
+          }
+          starts.forEach((start, index) => {
+            const stop = line.caretStops.find((candidate) => candidate.position === run.start + start);
+            calls.push({
+              text: run.text.slice(start, starts[index + 1]),
+              x: start === 0 && run.glyphs[0]?.cluster !== run.start ? run.x : (stop?.x ?? Number.NaN),
+              y: line.baseline,
+            });
+          });
+        }
+      }
+    } else if (primitive.kind === 'chart' || primitive.kind === 'table') {
+      calls.push(...oneCallPerWord(primitive.primitives));
+    } else if (primitive.kind === 'placeholder' && primitive.label) {
+      calls.push({
+        text: primitive.label,
+        x: primitive.x + primitive.w / 2,
+        y: primitive.y + primitive.h / 2,
+      });
+    }
+  }
+  return calls;
+}
+
+test('inserted pictures render, synchronize, arrange and reopen with their bytes', () => {
+  const source = openPresentation(fixture, { clientId: 9401, fonts: [{ family: 'Liberation Sans', bytes: fontBytes }] });
+  const peer = openPresentation(fixture, { clientId: 9402, fonts: [{ family: 'Liberation Sans', bytes: fontBytes }] });
+  const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10]);
+  try {
+    const slide = source.snapshot().slides[0];
+    const added = source.addPicture(slide.id, {
+      name: 'Shared picture', rect: { x: 10, y: 20, width: 3000, height: 4000 },
+      contentType: 'image/png', mediaBase64: Buffer.from(bytes).toString('base64'),
+    });
+    const assetId = `pending-media:${added.shapeId}`;
+    expect(source.layoutSlide(0).primitives.some((p) => p.kind === 'image' && p.assetId === assetId)).toBe(true);
+    expect(source.mediaBytes(assetId)).toEqual(bytes);
+    peer.applyUpdate(source.encodeStateAsUpdate());
+    expect(peer.mediaBytes(assetId)).toEqual(bytes);
+    expect(peer.snapshot()).toEqual(source.snapshot());
+    source.sendShapeToBack(slide.id, added.shapeId);
+    expect(source.snapshot().slides[0].shapes[0].id).toBe(added.shapeId);
+    source.bringShapeForward(slide.id, added.shapeId);
+    expect(source.snapshot().slides[0].shapes[1].id).toBe(added.shapeId);
+    source.sendShapeBackward(slide.id, added.shapeId);
+    source.bringShapeToFront(slide.id, added.shapeId);
+    expect(source.snapshot().slides[0].shapes.slice(-1)[0].id).toBe(added.shapeId);
+    const reopened = openPresentation(source.save(), { clientId: 9403 });
+    try {
+      const picture = reopened.snapshot().slides[0].shapes.slice(-1)[0];
+      expect(picture.name).toBe('Shared picture');
+      expect(reopened.mediaBytes(picture.mediaPartPath!)).toEqual(bytes);
+    } finally { reopened.dispose(); }
+  } finally { source.dispose(); peer.dispose(); }
+});
+
+describe('host undo and comment controls', () => {
+  for (const mode of ['auto', 'manual'] as const) {
+    test(`setStoryParagraphs restores the entire story in one ${mode} undo`, () => {
+      const seed = openPresentation(fixture, { clientId: 9970 });
+      let bytes: Uint8Array;
+      try {
+        const story = seed.snapshot().slides[0].shapes.find((shape) => shape.textStories.length)!.textStories[0];
+        seed.setStoryParagraphs(story.id, ['A', 'Keep this paragraph.'].map((text) => ({ runs: [{ text, style: {} }] })));
+        bytes = seed.save();
+      } finally { seed.dispose(); }
+      const deck = openPresentation(bytes, { clientId: 9971 });
+      try {
+        deck.setUndoCaptureMode(mode);
+        const original = deck.snapshot().slides[0].shapes.find((shape) => shape.textStories.length)!.textStories[0];
+        expect(original.paragraphs.map((paragraph) => paragraph.runs.map((run) => run.text).join('')))
+          .toEqual(['A', 'Keep this paragraph.']);
+        expect(deck.canUndo()).toBe(false);
+        const replacement = deck.setStoryParagraphs(original.id,
+          ['Left', 'Right'].map((text) => ({ runs: [{ text, style: {} }] })));
+        expect(replacement.paragraphs.map((paragraph) => paragraph.runs.map((run) => run.text).join('')))
+          .toEqual(['Left', 'Right']);
+        expect(deck.undo().applied).toBe(true);
+        expect(deck.story(original.id)).toEqual(original);
+        expect(deck.canUndo()).toBe(false);
+        expect(deck.redo().applied).toBe(true);
+        expect(deck.story(original.id)).toEqual(replacement);
+      } finally { deck.dispose(); }
+    });
+  }
+
+  test('manual capture groups different operations and keeps explicit boundaries', () => {
+    const deck = openPresentation(fixture, { clientId: 9981 });
+    try {
+      const before = deck.snapshot();
+      const story = before.slides[0].shapes.find((shape) => shape.textStories.length)!.textStories[0];
+      expect(deck.undoCaptureMode()).toBe('auto');
+      deck.setUndoCaptureMode('manual');
+      deck.insertText(story.id, 0, 'First ');
+      deck.setUndoCaptureMode('manual');
+      deck.addComment(before.slides[0].id, { author: 'Host', text: 'Grouped', created: '2026-09-23T00:00:00Z' });
+      const grouped = deck.snapshot();
+      deck.addUndoBoundary();
+      deck.insertText(story.id, 0, 'Second ');
+      expect(deck.undo().snapshot).toEqual(grouped);
+      expect(deck.undo().snapshot).toEqual(before);
+      expect(deck.redo().snapshot).toEqual(grouped);
+      expect(() => deck.setUndoCaptureMode('invalid' as 'auto')).toThrow();
+      expect(deck.undoCaptureMode()).toBe('manual');
+      deck.setUndoCaptureMode('auto');
+      expect(deck.canRedo()).toBe(true);
+    } finally { deck.dispose(); }
+  });
+
+  test('caret anchors follow typing, undo, redo and remote edits as plain data', () => {
+    const deck = openPresentation(fixture, { clientId: 9982 });
+    const peer = openPresentation(fixture, { clientId: 9983, initialUpdate: deck.encodeStateAsUpdate() });
+    try {
+      const story = deck.snapshot().slides[0].shapes.find((shape) => shape.textStories.length)!
+        .textStories[0];
+      const first = deck.story(story.id).paragraphs[0].runs[0].text[0];
+      deck.addUndoBoundary();
+      deck.insertText(story.id, 0, first);
+      const anchor = JSON.parse(JSON.stringify(deck.anchorCaret(story.id, 1)));
+      expect(Object.keys(anchor).sort()).toEqual(['position', 'storyId']);
+      deck.undo();
+      expect(deck.resolveCaretAnchor(anchor)).toBe(0);
+      deck.redo();
+      expect(deck.resolveCaretAnchor(anchor)).toBe(1);
+      peer.applyUpdate(deck.encodeStateAsUpdate());
+      peer.insertText(story.id, 0, 'Remote ');
+      deck.applyUpdate(peer.encodeStateAsUpdate());
+      expect(deck.resolveCaretAnchor(anchor)).toBe(8);
+      expect(peer.resolveCaretAnchor(anchor)).toBe(8);
+      expect(() => deck.anchorCaret(story.id, 100_000)).toThrow();
+      expect(() => deck.resolveCaretAnchor({ storyId: story.id, position: 'not base64!' })).toThrow();
+    } finally {
+      peer.dispose();
+      deck.dispose();
+    }
+  });
+
+  test('moves modern comments without losing their thread or exported position', async () => {
+    const bytes = await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/modern-comments.pptx'));
+    const deck = openPresentation(bytes, { clientId: 9982 });
+    try {
+      const before = deck.comments();
+      const root = before.find((comment) => !comment.parentId)!;
+      const expected = before.map((comment) => comment.id === root.id
+        ? { ...comment, xEmu: 914400, yEmu: 1828800 } : comment);
+      deck.setCommentPosition(root.id, { xEmu: 914400, yEmu: 1828800 });
+      expect(() => deck.setCommentPosition(root.id, { xEmu: NaN, yEmu: 0 })).toThrow();
+      expect(() => deck.setCommentPosition('missing', { xEmu: 1, yEmu: 2 })).toThrow();
+      for (let cycle = 0; cycle < 3; cycle++) {
+        expect(deck.comments()).toEqual(expected);
+        const reopened = openPresentation(deck.save(), { clientId: 9983 });
+        try { expect(reopened.comments()).toEqual(expected); } finally { reopened.dispose(); }
+        deck.undo();
+        expect(deck.comments()).toEqual(before);
+        deck.redo();
+      }
+    } finally { deck.dispose(); }
+  });
+});
+
+test('a fallback font draws the characters the run face has no glyph for', async () => {
+  const arabic = new Uint8Array(
+    await readFile(resolve(root, 'packages/fonts/assets/NotoSansArabic-Regular.ttf'))
+  );
+  const source = openPresentation(fixture, {
+    clientId: 9301,
+    fonts: [{ family: 'Liberation Sans', bytes: fontBytes }],
+    fallbackFonts: [{ family: 'Noto Sans Arabic', bytes: arabic }],
+  });
+  try {
+    const story = source
+      .snapshot()
+      .slides[0].shapes.find((shape) => shape.textStories.length > 0)!.textStories[0];
+    source.insertText(story.id, 0, 'مرحبا ');
+    const runs = source
+      .layoutSlide(0)
+      .primitives.filter(
+        (primitive): primitive is TextBoxPrimitive =>
+          primitive.kind === 'textBox' && primitive.storyId === story.id
+      )
+      .flatMap((box) => box.lines.flatMap((line) => line.runs));
+    const drawn = runs.find((run) => run.text.includes('مرحبا'));
+    expect(drawn?.fontFamily).toBe('Noto Sans Arabic');
+    expect(runs.some((run) => run.fontFamily === 'Liberation Sans')).toBe(true);
+  } finally {
+    source.dispose();
+  }
+});
+
+test('zero registered fonts render every slide with text and shapes', () => {
+  const source = openPresentation(fixture, { fonts: [] });
+  try {
+    const frames = source.snapshot().slides.map((_, index) => source.layoutSlide(index));
+    expect(frames).toHaveLength(handle.snapshot().slides.length);
+    expect(frames.every((frame) => frame.primitives.length > 0)).toBe(true);
+    const primitives = frames.flatMap((frame) => frame.primitives);
+    expect(primitives.some((primitive) => primitive.kind === 'shape')).toBe(true);
+    expect(primitives.some((primitive) => primitive.kind === 'textBox' && primitive.lines.some((line) =>
+      line.runs.some((run) => run.text.length > 0 && run.width > 0 && run.glyphs.some((glyph) => glyph.advance > 0))
+    ))).toBe(true);
+  } finally { source.dispose(); }
+});
+
+test('Selawik mixed scripts draw through coverage and CJK fallbacks without missing glyphs', async () => {
+  const provider = createFontProvider();
+  const selawik = new Uint8Array(await provider.resolve('Segoe UI', false, false)!());
+  const coverage = resolveGlyphFallbackFace('Segoe UI', false, false, 'powerpoint')!;
+  const coverageBytes = new Uint8Array(await provider.resolveGlyphFallback!('Segoe UI', false, false, 'powerpoint')!());
+  const cjk = resolveScriptFallbackFace('cjk-sc', false, false)!;
+  const cjkBytes = new Uint8Array(await provider.resolveScriptFallback('cjk-sc', false, false)!());
+  const source = openPresentation(fixture, {
+    clientId: 9302,
+    fonts: [{ family: 'Segoe UI', bytes: selawik }],
+    fallbackFonts: [
+      { family: cjk.family, bytes: cjkBytes },
+      { family: coverage.family, bytes: coverageBytes },
+    ],
+  });
+  try {
+    const added = source.addTextBox(source.snapshot().slides[0].id, {
+      name: 'Glyph coverage',
+      text: 'Latin ἀ Ӂ 中',
+      rect: { x: 100000, y: 100000, width: 8000000, height: 2000000 },
+      style: { fontSizePt: 24, fontFamily: 'Segoe UI' },
+    });
+    const story = source.snapshot().slides[0].shapes.find(shape => shape.id === added.shapeId)!.textStories[0];
+    const runs = source.layoutSlide(0).primitives
+      .filter((primitive): primitive is TextBoxPrimitive => primitive.kind === 'textBox' && primitive.storyId === story.id)
+      .flatMap(box => box.lines.flatMap(line => line.runs));
+    expect(runs.find(run => run.text.includes('Latin'))?.fontFamily).toBe('Segoe UI');
+    for (const character of ['ἀ', 'Ӂ']) {
+      expect(runs.find(run => run.text.includes(character))?.fontFamily).toBe(coverage.family);
+    }
+    expect(runs.find(run => run.text.includes('中'))?.fontFamily).toBe(cjk.family);
+    const glyphs = runs.flatMap(run => run.glyphs);
+    expect(glyphs.length).toBeGreaterThan(0);
+    expect(glyphs.every(glyph => glyph.glyphId !== 0)).toBe(true);
+  } finally {
+    source.dispose();
+  }
+});
+
+test('structural proposal reads include inserted and deleted slides by ID', () => {
+  const source = openPresentation(fixture, { clientId: 9202 });
+  try {
+    const before = source.snapshot();
+    const removed = before.slides[0]!.id;
+    const proposal = source.propose('agent', null, [
+      { type: 'insertSlide', ref: 'draft', afterSlideId: null },
+      { type: 'setSlideNotes', slideId: '@draft', text: 'Draft notes' },
+      { type: 'deleteSlide', slideId: removed },
+    ]);
+    const entries = source.proposalSlideStrip(proposal.id);
+    expect(entries.find(entry => entry.slideId === removed)).toMatchObject({ status: 'deleted', previewIndex: null });
+    const inserted = entries.find(entry => entry.status === 'inserted')!;
+    expect(inserted).toMatchObject({ slideId: proposal.refs!.draft, liveIndex: null, previewIndex: 0 });
+    expect(source.layoutProposalDiffSlideById(proposal.id, inserted.slideId).snapshot.slides[0]!.notes).toBe('Draft notes');
+    expect(source.layoutProposalDiffSlideById(proposal.id, removed).frame).toBeDefined();
+    expect(source.snapshot()).toEqual(before);
+    source.acceptProposal(proposal.id);
+    source.undo();
+    expect(source.snapshot()).toEqual(before);
+  } finally { source.dispose(); }
+});
+
+test('shape proposals resolve refs, retain deleted geometry, and undo atomically', async () => {
+  const bytes = await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/proposal-shapes.pptx'));
+  const source = openPresentation(bytes, { clientId: 9203 });
+  try {
+    const before = source.snapshot();
+    const slide = before.slides[0]!;
+    const rect = { x: 100000, y: 100000, width: 1000000, height: 500000 };
+    const proposal = source.propose('agent', null, [
+      { type: 'addTextBox', ref: 'box', slideId: slide.id, draft: { name: 'New box', rect, text: '', style: {} } },
+      { type: 'replaceText', storyId: '@box', start: 0, end: 0, text: 'Filled box' },
+      { type: 'setShapeRect', slideId: slide.id, shapeId: '@box', rect: { ...rect, x: 300000 } },
+      { type: 'addShape', ref: 'shape', slideId: slide.id, draft: { name: 'New shape', rect, geometry: 'rect' } },
+      { type: 'addPicture', ref: 'image', slideId: slide.id, draft: { name: 'New image', rect, contentType: 'image/png', mediaBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' } },
+      { type: 'removeShape', slideId: slide.id, shapeId: slide.shapes[0]!.id },
+    ]);
+    const diff = source.layoutProposalDiffSlideById(proposal.id, slide.id);
+    expect(diff.shapeChanges).toContainEqual({ shapeId: proposal.refs!.box, kind: 'inserted' });
+    expect(diff.shapeChanges).toContainEqual({ shapeId: slide.shapes[0]!.id, kind: 'deleted' });
+    expect(diff.frame.primitives.some(primitive => 'shapeId' in primitive && primitive.shapeId === slide.shapes[0]!.id)).toBe(true);
+    expect(source.snapshot()).toEqual(before);
+    source.acceptProposal(proposal.id);
+    expect(source.snapshot().slides[0]!.shapes.some(shape => shape.id === proposal.refs!.image)).toBe(true);
+    source.undo();
+    expect(source.snapshot()).toEqual(before);
+  } finally { source.dispose(); }
+});
+
+test('picture proposals expose a typed decoded media cap for individual and cumulative media', async () => {
+  const source = openPresentation(await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/proposal-shapes.pptx')));
+  try {
+    const slideId = source.snapshot().slides[0]!.id;
+    const picture = (size: number): import('../proposals').ProposalEdit => ({ type: 'addPicture', slideId, draft: {
+      name: 'Large picture', rect: { x: 0, y: 0, width: 100000, height: 100000 }, contentType: 'image/png', mediaBase64: Buffer.alloc(size).toString('base64'),
+    } });
+    for (const edits of [[picture(8 * 1024 * 1024 + 1)], [picture(4 * 1024 * 1024), picture(4 * 1024 * 1024 + 1)]]) {
+      let failure: unknown;
+      try { source.propose('agent', null, edits); } catch (error) { failure = error; }
+      expect(failure).toMatchObject({ name: 'ProposalPictureMediaTooLargeError', code: 'proposalPictureMediaTooLarge', limitBytes: 8 * 1024 * 1024 });
+      expect(source.listProposals()).toHaveLength(0);
+    }
+  } finally { source.dispose(); }
+});
+
+test('paragraph proposals preview complete rewrites, properties and refs through the loader', async () => {
+  const source = openPresentation(await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/proposal-shapes.pptx')));
+  try {
+    const slide = source.snapshot().slides[0]!;
+    const shape = slide.shapes[0]!;
+    const story = shape.textStories[0]!;
+    source.setStoryParagraphs(story.id, ['Keep', 'Remove me', 'Tail'].map(text => ({ runs: [{ text, style: {} }] })));
+    const before = source.snapshot();
+    const proposal = source.propose('agent', null, [{ type: 'setStoryParagraphs', storyId: story.id, paragraphs: [
+      { alignment: 'ctr', bullet: true, runs: [{ text: 'Keep', style: { bold: true } }] },
+      { alignment: 'r', bullet: false, runs: [{ text: 'Tail', style: {} }] },
+    ] }]);
+    expect(proposal.changes[0]).toMatchObject({ oldText: 'Keep\nRemove me\nTail', newText: 'Keep\nTail' });
+    expect(proposal.changes[0]!.before).toEqual(before.slides[0]!.shapes[0]);
+    const diff = source.layoutProposalDiffSlide(proposal.id, 0);
+    expect(diff.shapeChanges).toContainEqual({ shapeId: shape.id, kind: 'changed' });
+    expect(diff.textChanges.some(change => change.kind === 'deletion')).toBe(true);
+    expect(diff.snapshot.slides[0]!.shapes[0]!.textStories[0]!.paragraphs.flatMap(p => p.runs).map(r => r.text).join('')).toContain('Remove me');
+    expect(source.snapshot()).toEqual(before);
+    const preview = source.previewProposal(proposal.id);
+    expect(proposal.changes[0]!.after).toEqual(preview.snapshot.slides[0]!.shapes[0]);
+    expect(source.acceptProposal(proposal.id).snapshot).toEqual(preview.snapshot);
+    const reopened = openPresentation(source.save());
+    try {
+      const paragraphs = reopened.snapshot().slides[0]!.shapes[0]!.textStories[0]!.paragraphs;
+      expect(paragraphs.map(p => p.runs.map(r => r.text).join(''))).toEqual(['Keep', 'Tail']);
+      expect(paragraphs[0]).toMatchObject({ alignment: 'ctr', runs: [{ text: 'Keep', style: { bold: true } }] });
+      expect(JSON.parse(paragraphs[0]!.bulletJson!)).toEqual({ type: 'character', value: '•' });
+    } finally { reopened.dispose(); }
+    expect(source.undo().snapshot).toEqual(before);
+    const rejected = source.propose('agent', null, [{ type: 'setStoryParagraphs', storyId: story.id, paragraphs: [{ runs: [] }] }]);
+    expect(source.rejectProposal(rejected.id)).toBe(true);
+    expect(source.snapshot()).toEqual(before);
+    const created = source.propose('agent', null, [
+      { type: 'addTextBox', ref: 'box', slideId: slide.id, draft: { name: 'Bullets', rect: { x: 0, y: 0, width: 1000000, height: 500000 }, text: '', style: {} } },
+      { type: 'setStoryParagraphs', storyId: '@box', paragraphs: [{ bullet: true, runs: [{ text: 'From ref', style: {} }] }] },
+    ]);
+    expect(source.layoutProposalDiffSlideById(created.id, slide.id).shapeChanges).toContainEqual({ shapeId: created.refs!.box, kind: 'inserted' });
+    source.acceptProposal(created.id);
+    expect(source.snapshot().slides[0]!.shapes.find(s => s.id === created.refs!.box)!.textStories[0]!.paragraphs[0]!.runs[0]!.text).toBe('From ref');
+    expect(source.undo().snapshot).toEqual(before);
+    expect(() => source.propose('agent', null, [{ type: 'setStoryParagraphs', storyId: story.id, paragraphs: [] }])).toThrow();
+    expect(source.listProposals()).toEqual([]);
+    const stale = source.propose('agent', null, [{ type: 'setStoryParagraphs', storyId: story.id, paragraphs: [{ runs: [{ text: 'Proposed', style: {} }] }] }]);
+    source.insertText(story.id, 0, 'User ');
+    expect(() => source.acceptProposal(stale.id)).toThrow(StaleProposalError);
+    source.removeShape(slide.id, shape.id);
+    expect(() => source.acceptProposal(stale.id, { force: true })).toThrow();
+  } finally { source.dispose(); }
+});
+
+test.each([{ bullet: true }, { alignment: 'ctr' as const }])('paragraph property proposal %j marks a canvas shape without text marks', async property => {
+  const source = openPresentation(await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/proposal-shapes.pptx')));
+  try {
+    const shape = source.snapshot().slides[0]!.shapes[0]!;
+    const proposal = source.propose('agent', null, [{ type: 'setStoryParagraphs', storyId: shape.textStories[0]!.id,
+      paragraphs: [{ ...property, runs: [{ text: 'alpha', style: {} }] }] }]);
+    const diff = source.layoutProposalDiffSlide(proposal.id, 0);
+    expect(diff.textChanges).toEqual([]);
+    expect(diff.shapeChanges).toContainEqual({ shapeId: shape.id, kind: 'changed' });
+  } finally { source.dispose(); }
+});
+
+test.each(['setSlideLayout', 'setSlideBackground'] as const)('%s proposals render by ID and index, accept, reject and undo through the loader', async type => {
+  const source = openPresentation(await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/proposal-slide-props.pptx')));
+  try {
+    const before = source.snapshot();
+    const slide = before.slides[0]!;
+    const edit: import('../proposals').ProposalEdit = type === 'setSlideLayout'
+      ? { type, slideId: slide.id, layoutPartPath: 'ppt/slideLayouts/slideLayout2.xml', mapping: [[slide.shapes[0]!.id, 8]] }
+      : { type, slideId: slide.id, background: { type: 'solid', color: { rgb: '123456' } } };
+    const proposal = source.propose('agent', null, [edit]);
+    expect(proposal.changes).toMatchObject([{ slideId: slide.id, shapeId: null, kind: 'content' }]);
+    expect(source.proposalSlideStrip(proposal.id)[0]!.status).toBe('changed');
+    const diff = source.layoutProposalDiffSlideById(proposal.id, slide.id);
+    expect(source.layoutProposalDiffSlide(proposal.id, 0).frame).toEqual(diff.frame);
+    expect(JSON.stringify(diff.frame)).toContain('#123456');
+    if (type === 'setSlideLayout') {
+      expect(diff.media?.find(asset => asset.assetId === 'ppt/media/proposal-pixel.png')!.bytes.byteLength).toBeGreaterThan(0);
+      expect(JSON.stringify(diff.frame)).toContain('ppt/media/proposal-pixel.png');
+      expect(diff.snapshot.slides[0]!.shapes[0]!.placeholder).toMatchObject({ index: 4 });
+    }
+    expect(source.snapshot()).toEqual(before);
+    source.rejectProposal(proposal.id);
+    expect(source.listProposals()).toHaveLength(0);
+    const accepted = source.propose('agent', null, [edit]);
+    const preview = source.previewProposal(accepted.id).snapshot;
+    source.acceptProposal(accepted.id);
+    expect(source.snapshot()).toEqual(preview);
+    source.undo();
+    expect(source.snapshot()).toEqual(before);
+  } finally { source.dispose(); }
+});
+
+test('slide background refs, clear and invalid slide properties share proposal validation', async () => {
+  const source = openPresentation(await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/proposal-slide-props.pptx')));
+  try {
+    const before = source.snapshot();
+    const slide = before.slides[0]!;
+    const background = { type: 'solid', color: { rgb: '123456' } };
+    const proposal = source.propose('agent', null, [
+      { type: 'insertSlide', ref: 'new', afterSlideId: null, layoutPartPath: slide.layoutPartPath! },
+      { type: 'setSlideLayout', slideId: '@new', layoutPartPath: 'ppt/slideLayouts/slideLayout2.xml' },
+      { type: 'setSlideBackground', slideId: '@new', background },
+    ]);
+    expect(source.previewProposal(proposal.id).snapshot.slides[0]!.background).toEqual(background);
+    source.acceptProposal(proposal.id);
+    source.undo();
+    expect(source.snapshot()).toEqual(before);
+    for (const edit of [
+      { type: 'setSlideLayout', slideId: slide.id, layoutPartPath: 'unknown.xml' },
+      { type: 'setSlideBackground', slideId: slide.id, background: { type: 'solid', color: { rgb: 'bad' } } },
+      { type: 'setSlideBackground', slideId: 'missing', background: null },
+    ] satisfies import('../proposals').ProposalEdit[]) {
+      expect(() => source.propose('agent', null, [edit])).toThrow();
+      expect(source.listProposals()).toHaveLength(0);
+      expect(source.snapshot()).toEqual(before);
+    }
+  } finally { source.dispose(); }
+});
+
+test('slide property proposal stale targets survive loader preview and forced acceptance', async () => {
+  const bytes = await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/proposal-slide-props.pptx'));
+  for (const type of ['setSlideLayout', 'setSlideBackground'] as const) {
+    const source = openPresentation(bytes);
+    try {
+      const slide = source.snapshot().slides[0]!;
+      const edit: import('../proposals').ProposalEdit = type === 'setSlideLayout'
+        ? { type, slideId: slide.id, layoutPartPath: 'ppt/slideLayouts/slideLayout2.xml' }
+        : { type, slideId: slide.id, background: { type: 'solid', color: { rgb: '123456' } } };
+      const proposal = source.propose('agent', null, [edit]);
+      source.setSlideNotes(slide.id, 'Human notes');
+      const stale = source.layoutProposalDiffSlide(proposal.id, 0).proposal.staleTargets;
+      expect(stale).toEqual(type === 'setSlideLayout' ? [slide.id] : []);
+      if (type === 'setSlideLayout') expect(() => source.acceptProposal(proposal.id)).toThrow(StaleProposalError);
+      source.acceptProposal(proposal.id, { force: true });
+      expect(source.snapshot().slides[0]!.notes).toBe('Human notes');
+    } finally { source.dispose(); }
+  }
+});
+
+test.each(['insertTableRow', 'deleteTableRow', 'insertTableColumn', 'deleteTableColumn'] as const)('%s proposals preview table structure by ID and index, accept, reject and undo', async type => {
+  const zip = await JSZip.loadAsync(await readFile(resolve(root, 'crates/pptx-render/tests/fixtures/table-basic.pptx')));
+  const path = 'ppt/slides/slide1.xml';
+  zip.file(path, (await zip.file(path)!.async('string')).replace(/ (gridSpan|rowSpan|hMerge|vMerge)="[^"]*"/gu, ''));
+  const source = openPresentation(await zip.generateAsync({ type: 'uint8array' }), { fonts: [{ family: 'Liberation Sans', bytes: fontBytes }] });
+  try {
+    const before = source.snapshot();
+    const slide = before.slides[0]!;
+    const shape = slide.shapes[0]!;
+    const edit: import('../proposals').ProposalEdit = type === 'insertTableRow' || type === 'insertTableColumn'
+      ? { type, slideId: slide.id, shapeId: shape.id, index: 0, position: 'after', cells: ['New cell'] }
+      : { type, slideId: slide.id, shapeId: shape.id, index: 0 };
+    const proposal = source.propose('agent', null, [edit]);
+    expect(proposal.changes).toMatchObject([{ slideId: slide.id, shapeId: shape.id, kind: 'content' }]);
+    expect(source.proposalSlideStrip(proposal.id)[0]!.status).toBe('changed');
+    const diff = source.layoutProposalDiffSlideById(proposal.id, slide.id);
+    expect(source.layoutProposalDiffSlide(proposal.id, 0).frame).toEqual(diff.frame);
+    expect(diff.shapeChanges).toEqual([{ shapeId: shape.id, kind: 'changed' }]);
+    const table = diff.snapshot.slides[0]!.shapes[0]!.graphic as { rows: unknown[]; grid: number[] };
+    const rows = type === 'insertTableRow' ? 4 : type === 'deleteTableRow' ? 2 : 3;
+    const columns = type === 'insertTableColumn' ? 4 : type === 'deleteTableColumn' ? 2 : 3;
+    expect([table.rows.length, table.grid.length]).toEqual([rows, columns]);
+    expect(diff.snapshot.slides[0]!.shapes[0]!.textStories).toHaveLength(rows * columns);
+    if (type.startsWith('insert')) expect(JSON.stringify(diff.frame)).toContain('New cell');
+    expect(source.snapshot()).toEqual(before);
+    source.rejectProposal(proposal.id);
+    expect(source.listProposals()).toHaveLength(0);
+    const accepted = source.propose('agent', null, [edit]);
+    const preview = source.previewProposal(accepted.id).snapshot;
+    source.acceptProposal(accepted.id);
+    expect(source.snapshot()).toEqual(preview);
+    source.undo();
+    expect(source.snapshot()).toEqual(before);
+    expect(source.canUndo()).toBe(false);
+    const stale = source.propose('agent', null, [edit]);
+    source.insertTableRow(slide.id, shape.id, 0, 'before');
+    expect(source.listProposals()[0]!.staleTargets).toEqual([shape.id]);
+    expect(() => source.acceptProposal(stale.id)).toThrow(StaleProposalError);
+  } finally { source.dispose(); }
+});
+
+test('table proposals can replace text in an inserted row and reject invalid table edits atomically', async () => {
+  const zip = await JSZip.loadAsync(await readFile(resolve(root, 'crates/pptx-render/tests/fixtures/table-basic.pptx')));
+  const path = 'ppt/slides/slide1.xml';
+  zip.file(path, (await zip.file(path)!.async('string')).replace(/ (gridSpan|rowSpan|hMerge|vMerge)="[^"]*"/gu, ''));
+  const source = openPresentation(await zip.generateAsync({ type: 'uint8array' }));
+  try {
+    const before = source.snapshot();
+    const slide = before.slides[0]!;
+    const shape = slide.shapes[0]!;
+    const insert: import('../proposals').ProposalEdit = { type: 'insertTableRow', slideId: slide.id, shapeId: shape.id, index: 0, position: 'after' };
+    const draft = source.propose('agent', null, [insert]);
+    const storyId = source.previewProposal(draft.id).snapshot.slides[0]!.shapes[0]!.textStories[3]!.id;
+    source.rejectProposal(draft.id);
+    const proposal = source.propose('agent', null, [insert, { type: 'replaceText', storyId, start: 0, end: 0, text: 'Reviewed cell' }]);
+    expect(source.layoutProposalDiffSlide(proposal.id, 0).snapshot.slides[0]!.shapes[0]!.textStories[3]!.paragraphs[0]!.runs.map(run => run.text).join('')).toBe('Reviewed cell');
+    source.acceptProposal(proposal.id);
+    source.undo();
+    expect(source.snapshot()).toEqual(before);
+    for (const edit of [{ ...insert, index: 99 }, { ...insert, cells: ['A', 'B', 'C', 'D'] }]) {
+      expect(() => source.propose('agent', null, [{ type: 'setSlideNotes', slideId: slide.id, text: 'Must not stage' }, edit])).toThrow();
+      expect(source.snapshot()).toEqual(before);
+      expect(source.listProposals()).toHaveLength(0);
+    }
+  } finally { source.dispose(); }
+});
+
+test.each(['front', 'back', 'forward', 'backward'] as const)('reorderShape %s proposals preview stacking, accept, reject and undo', async to => {
+  const source = openPresentation(await readFile(resolve(root, 'crates/pptx-edit/tests/fixtures/proposal-shapes.pptx')), { fonts: [{ family: 'Liberation Sans', bytes: fontBytes }] });
+  try {
+    const before = source.snapshot();
+    const slide = before.slides[0]!;
+    const from = to === 'back' || to === 'backward' ? 1 : 0;
+    const shape = slide.shapes[from]!;
+    const edit = { type: 'reorderShape', slideId: slide.id, shapeId: shape.id, to } as const;
+    const proposal = source.propose('agent', null, [edit]);
+    expect(proposal.changes).toMatchObject([{ shapeId: shape.id, kind: 'content', beforeIndex: from, afterIndex: 1 - from }]);
+    const preview = source.previewProposal(proposal.id).snapshot;
+    expect(preview.slides[0]!.shapes.map(shape => shape.id)).toEqual(slide.shapes.map(shape => shape.id).reverse());
+    const diff = source.layoutProposalDiffSlideById(proposal.id, slide.id);
+    expect(source.layoutProposalDiffSlide(proposal.id, 0)).toEqual(diff);
+    expect(diff.snapshot.slides[0]!.shapes.map(shape => shape.id)).toEqual(preview.slides[0]!.shapes.map(shape => shape.id));
+    expect(diff.shapeChanges).toEqual([{ shapeId: shape.id, kind: 'reordered' }]);
+    const shapeIds = slide.shapes.map(shape => shape.id);
+    expect([...new Set(diff.frame.primitives.flatMap(primitive => primitive.shapeId && shapeIds.includes(primitive.shapeId) ? [primitive.shapeId] : []))]).toEqual([...shapeIds].reverse());
+    expect(source.proposalSlideStrip(proposal.id)[0]!.status).toBe('changed');
+    expect(source.snapshot()).toEqual(before);
+    expect(source.rejectProposal(proposal.id)).toBe(true);
+    const accepted = source.propose('agent', null, [edit]);
+    source.acceptProposal(accepted.id);
+    expect(source.snapshot()).toEqual(preview);
+    source.undo();
+    expect(source.snapshot()).toEqual(before);
+    expect(source.canUndo()).toBe(false);
+    for (const invalid of [{ ...edit, to: 'up' }, { ...edit, slideId: 'missing' }, { ...edit, shapeId: 'missing' }, { ...edit, extra: true }]) {
+      expect(() => source.propose('agent', null, [invalid as unknown as import('../proposals').ProposalEdit])).toThrow();
+      expect(source.snapshot()).toEqual(before);
+      expect(source.listProposals()).toHaveLength(0);
+    }
+    const stale = source.propose('agent', null, [edit]);
+    source.bringShapeToFront(slide.id, slide.shapes[0]!.id);
+    expect(source.listProposals()[0]!.staleTargets).toEqual([shape.id]);
+    expect(() => source.acceptProposal(stale.id)).toThrow(StaleProposalError);
+  } finally { source.dispose(); }
+});

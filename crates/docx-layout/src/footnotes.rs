@@ -1,0 +1,1704 @@
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+
+use crate::LayoutError;
+use crate::regions::{DocumentRegions, format_number};
+use crate::types::{
+    BlockExtent, BlockId, Fragment, Layout, LayoutBlock, NoteAreaContract, NoteLayoutItemContract,
+    Page, PageFloatBand, ParagraphBlock, Run, RunFormatting, TextRun,
+};
+
+pub const FOOTNOTE_SEPARATOR_HEIGHT: f64 = 12.0;
+pub const FOOTNOTE_COLUMN_GAP_PX: f64 = 24.0;
+pub const MAX_FOOTNOTE_LAYOUT_PASSES: usize = 6;
+/// Page layouts the settling fallback may spend; a long document gets fewer passes.
+pub const FOOTNOTE_SETTLE_PAGE_BUDGET: usize = 8000;
+pub const MAX_FOOTNOTE_SETTLE_PASSES: usize = 48;
+const FOOTNOTE_FONT_SIZE_PT: f64 = 8.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderedMap<K, V> {
+    entries: Vec<(K, V)>,
+}
+
+impl<K: PartialEq, V> OrderedMap<K, V> {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value)
+    }
+
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value)
+    }
+
+    pub fn set(&mut self, key: K, value: V) {
+        if let Some(current) = self.get_mut(&key) {
+            *current = value;
+        } else {
+            self.entries.push((key, value));
+        }
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (K, V)> {
+        self.entries.iter()
+    }
+}
+
+impl<K: PartialEq, V> Default for OrderedMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: PartialEq, V> FromIterator<(K, V)> for OrderedMap<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let mut map = Self::new();
+        for (key, value) in iter {
+            map.set(key, value);
+        }
+        map
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NoteKind {
+    #[default]
+    Footnote,
+    Endnote,
+}
+
+impl NoteKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Footnote => "footnote",
+            Self::Endnote => "endnote",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteSeparatorHeights {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub footnote: BTreeMap<usize, f64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endnote: BTreeMap<usize, f64>,
+    /// Width overrides keyed by caller section and `f64::to_bits`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub footnote_widths: BTreeMap<usize, BTreeMap<u64, f64>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endnote_widths: BTreeMap<usize, BTreeMap<u64, f64>>,
+}
+
+impl NoteSeparatorHeights {
+    pub fn get(&self, kind: NoteKind, section_index: usize) -> Option<f64> {
+        match kind {
+            NoteKind::Footnote => self.footnote.get(&section_index).copied(),
+            NoteKind::Endnote => self.endnote.get(&section_index).copied(),
+        }
+    }
+
+    pub fn height(&self, kind: NoteKind, section_index: usize) -> f64 {
+        self.get(kind, section_index)
+            .unwrap_or(FOOTNOTE_SEPARATOR_HEIGHT)
+    }
+
+    pub fn insert_for_width(
+        &mut self,
+        kind: NoteKind,
+        section_index: usize,
+        width: f64,
+        height: f64,
+    ) {
+        match kind {
+            NoteKind::Footnote => &mut self.footnote_widths,
+            NoteKind::Endnote => &mut self.endnote_widths,
+        }
+        .entry(section_index)
+        .or_default()
+        .insert(width.to_bits(), height);
+    }
+
+    pub fn get_for_page(&self, kind: NoteKind, page: &Page) -> Option<f64> {
+        let margins = page.body_margins.as_ref().unwrap_or(&page.margins);
+        let width = (page.size.w - margins.left - margins.right).max(1.0);
+        match kind {
+            NoteKind::Footnote => &self.footnote_widths,
+            NoteKind::Endnote => &self.endnote_widths,
+        }
+        .get(&page.region_section_index)
+        .and_then(|widths| widths.get(&width.to_bits()))
+        .copied()
+        .or_else(|| self.get(kind, page.region_section_index))
+    }
+
+    pub fn height_for_page(&self, kind: NoteKind, page: &Page) -> f64 {
+        self.get_for_page(kind, page)
+            .unwrap_or(FOOTNOTE_SEPARATOR_HEIGHT)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteAnchor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_start: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_end: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteContent {
+    pub id: i64,
+    #[serde(default)]
+    pub note_kind: NoteKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_number: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default)]
+    pub blocks: Vec<LayoutBlock>,
+    #[serde(default)]
+    pub measures: Vec<BlockExtent>,
+    pub height: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<NoteAnchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_mark_follows: Option<bool>,
+}
+
+impl NoteContent {
+    pub fn map_id(&self) -> i64 {
+        note_reference_map_id(self.id, self.note_kind)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteLayoutInput {
+    #[serde(default)]
+    pub contents: Vec<NoteContent>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoteRefLocation {
+    pub note_id: i64,
+    pub note_kind: NoteKind,
+    pub pm_pos: f64,
+    pub table_block_id: Option<BlockId>,
+    pub row_index: Option<usize>,
+}
+
+impl NoteRefLocation {
+    pub fn map_id(&self) -> i64 {
+        note_reference_map_id(self.note_id, self.note_kind)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotePresentation {
+    pub display_number: i64,
+    pub display_label: String,
+    pub anchor: NoteAnchor,
+}
+
+pub struct StabilizedNoteLayout {
+    pub layout: Layout,
+    pub page_note_map: OrderedMap<u32, Vec<i64>>,
+    pub reserved_heights: OrderedMap<u32, f64>,
+    pub converged: bool,
+}
+
+pub fn note_reference_map_id(note_id: i64, kind: NoteKind) -> i64 {
+    match kind {
+        NoteKind::Footnote => note_id,
+        NoteKind::Endnote => -note_id.abs() - 1,
+    }
+}
+
+pub fn collect_note_refs(blocks: &[LayoutBlock]) -> Vec<NoteRefLocation> {
+    struct TableContext<'a> {
+        id: &'a BlockId,
+        row_index: usize,
+    }
+
+    fn collect_paragraph(
+        paragraph: &ParagraphBlock,
+        table: Option<&TableContext<'_>>,
+        refs: &mut Vec<NoteRefLocation>,
+    ) {
+        for run in &paragraph.runs {
+            let Run::Text(text) = run else {
+                continue;
+            };
+            let (note_id, note_kind) = if let Some(id) = text.fmt.footnote_ref_id {
+                (id as i64, NoteKind::Footnote)
+            } else if let Some(id) = text.fmt.endnote_ref_id {
+                (id as i64, NoteKind::Endnote)
+            } else {
+                continue;
+            };
+            refs.push(NoteRefLocation {
+                note_id,
+                note_kind,
+                pm_pos: text.pm_start.unwrap_or(0.0),
+                table_block_id: table.map(|context| context.id.clone()),
+                row_index: table.map(|context| context.row_index),
+            });
+        }
+    }
+
+    fn walk(
+        blocks: &[LayoutBlock],
+        table: Option<&TableContext<'_>>,
+        refs: &mut Vec<NoteRefLocation>,
+    ) {
+        for block in blocks {
+            match block {
+                LayoutBlock::Paragraph(paragraph) => collect_paragraph(paragraph, table, refs),
+                LayoutBlock::Table(table_block) => {
+                    for (row_index, row) in table_block.rows.iter().enumerate() {
+                        let own_context;
+                        let context = if let Some(table) = table {
+                            table
+                        } else {
+                            own_context = TableContext {
+                                id: &table_block.id,
+                                row_index,
+                            };
+                            &own_context
+                        };
+                        for cell in &row.cells {
+                            walk(&cell.blocks, Some(context), refs);
+                        }
+                    }
+                }
+                LayoutBlock::TextBox(text_box) => {
+                    for paragraph in &text_box.content {
+                        collect_paragraph(paragraph, table, refs);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut refs = Vec::new();
+    walk(blocks, None, &mut refs);
+    refs
+}
+
+fn fragment_pm_range(fragment: &Fragment) -> (Option<f64>, Option<f64>) {
+    match fragment {
+        Fragment::Paragraph(value) => (value.pm_start, value.pm_end),
+        Fragment::Table(value) => (value.pm_start, value.pm_end),
+        Fragment::Image(value) => (value.pm_start, value.pm_end),
+        Fragment::Shape(value) => (value.pm_start, value.pm_end),
+        Fragment::Chart(value) => (value.pm_start, value.pm_end),
+        Fragment::TextBox(value) => (value.pm_start, value.pm_end),
+        Fragment::Reserved(_) => (None, None),
+    }
+}
+
+fn fragment_matches_ref(fragment: &Fragment, reference: &NoteRefLocation) -> bool {
+    if let (Some(table_id), Some(row_index)) = (&reference.table_block_id, reference.row_index) {
+        return matches!(
+            fragment,
+            Fragment::Table(table)
+                if &table.block_id == table_id
+                    && row_index >= table.row_start
+                    && row_index < table.row_end
+        );
+    }
+    let (start, end) = fragment_pm_range(fragment);
+    start.is_some_and(|start| start >= 0.0 && reference.pm_pos >= start)
+        && end.is_some_and(|end| end >= 0.0 && reference.pm_pos < end)
+}
+
+pub fn map_note_anchors_to_pages(
+    pages: &[Page],
+    refs: &[NoteRefLocation],
+) -> OrderedMap<u32, Vec<i64>> {
+    let mut result = OrderedMap::new();
+    for reference in refs {
+        if let Some(page) = pages.iter().find(|page| {
+            page.fragments
+                .iter()
+                .any(|fragment| fragment_matches_ref(fragment, reference))
+        }) {
+            append_unique(&mut result, page.number, reference.map_id());
+        }
+    }
+    result
+}
+
+fn append_unique(map: &mut OrderedMap<u32, Vec<i64>>, page_number: u32, map_id: i64) {
+    if let Some(ids) = map.get_mut(&page_number) {
+        if !ids.contains(&map_id) {
+            ids.push(map_id);
+        }
+    } else {
+        map.set(page_number, vec![map_id]);
+    }
+}
+
+fn page_for_map_id<'a>(
+    pages: &'a [Page],
+    anchors: &OrderedMap<u32, Vec<i64>>,
+    map_id: i64,
+) -> Option<&'a Page> {
+    let page_number = anchors
+        .iter()
+        .find(|(_, ids)| ids.contains(&map_id))
+        .map(|(page_number, _)| *page_number)?;
+    pages.iter().find(|page| page.number == page_number)
+}
+
+pub fn map_notes_to_pages(
+    pages: &[Page],
+    refs: &[NoteRefLocation],
+    regions: &DocumentRegions,
+) -> OrderedMap<u32, Vec<i64>> {
+    let anchors = map_note_anchors_to_pages(pages, refs);
+    let mut result = OrderedMap::new();
+    for reference in refs {
+        let map_id = reference.map_id();
+        let Some(anchor_page) = page_for_map_id(pages, &anchors, map_id) else {
+            continue;
+        };
+        let properties = regions.note_properties(
+            anchor_page.region_section_index,
+            reference.note_kind.as_str(),
+        );
+        let default_position = match reference.note_kind {
+            NoteKind::Footnote => "pageBottom",
+            NoteKind::Endnote => "docEnd",
+        };
+        let target = match properties.position.as_deref().unwrap_or(default_position) {
+            "docEnd" => pages.last().unwrap_or(anchor_page),
+            "sectEnd" => pages
+                .iter()
+                .rev()
+                .find(|page| page.region_section_index == anchor_page.region_section_index)
+                .unwrap_or(anchor_page),
+            _ => anchor_page,
+        };
+        append_unique(&mut result, target.number, map_id);
+    }
+    result
+}
+
+pub fn build_note_presentations(
+    refs: &[NoteRefLocation],
+    pages: &[Page],
+    regions: &DocumentRegions,
+) -> OrderedMap<i64, NotePresentation> {
+    let anchors = map_note_anchors_to_pages(pages, refs);
+    let mut result = OrderedMap::new();
+    let mut counters = HashMap::<String, i64>::new();
+    for reference in refs {
+        let map_id = reference.map_id();
+        if result.get(&map_id).is_some() {
+            continue;
+        }
+        let Some(page) = page_for_map_id(pages, &anchors, map_id) else {
+            continue;
+        };
+        let properties =
+            regions.note_properties(page.region_section_index, reference.note_kind.as_str());
+        let key = match properties.num_restart.as_deref() {
+            Some("eachPage") => format!("{}:page:{}", reference.note_kind.as_str(), page.number),
+            Some("eachSect") => format!(
+                "{}:section:{}",
+                reference.note_kind.as_str(),
+                page.section_id
+                    .clone()
+                    .unwrap_or_else(|| page.region_section_index.to_string())
+            ),
+            _ => format!("{}:continuous", reference.note_kind.as_str()),
+        };
+        let display_number = counters
+            .get(&key)
+            .copied()
+            .unwrap_or(properties.num_start.unwrap_or(1));
+        counters.insert(key, display_number + 1);
+        result.set(
+            map_id,
+            NotePresentation {
+                display_number,
+                display_label: format_number(
+                    display_number,
+                    properties.num_fmt.as_deref().unwrap_or("decimal"),
+                ),
+                anchor: NoteAnchor {
+                    doc_start: Some(reference.pm_pos),
+                    doc_end: Some(reference.pm_pos + 1.0),
+                },
+            },
+        );
+    }
+    result
+}
+
+pub fn assign_note_presentations(
+    contents: &mut [NoteContent],
+    presentations: &OrderedMap<i64, NotePresentation>,
+) {
+    for content in contents {
+        let Some(presentation) = presentations.get(&content.map_id()) else {
+            continue;
+        };
+        content.display_number = Some(presentation.display_number);
+        content
+            .display_label
+            .clone_from(&Some(presentation.display_label.clone()));
+        content.anchor = Some(presentation.anchor.clone());
+    }
+}
+
+pub fn apply_note_presentation(
+    blocks: &mut Vec<LayoutBlock>,
+    display_number: i64,
+    display_label: &str,
+) {
+    if blocks.is_empty() {
+        blocks.push(LayoutBlock::Paragraph(ParagraphBlock {
+            sdt_groups: None,
+            id: BlockId::Str(format!("fn-empty-{display_number}")),
+            para_id: None,
+            runs: Vec::new(),
+            attrs: None,
+            pm_start: None,
+            pm_end: None,
+        }));
+    }
+    for block in blocks.iter_mut() {
+        let LayoutBlock::Paragraph(paragraph) = block else {
+            continue;
+        };
+        for run in &mut paragraph.runs {
+            match run {
+                Run::Text(text) if text.fmt.font_size.is_none() => {
+                    text.fmt.font_size = Some(FOOTNOTE_FONT_SIZE_PT);
+                }
+                Run::Tab(tab) if tab.fmt.font_size.is_none() => {
+                    tab.fmt.font_size = Some(FOOTNOTE_FONT_SIZE_PT);
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(LayoutBlock::Paragraph(first)) = blocks.first_mut() else {
+        return;
+    };
+    let font_family = first.runs.iter().find_map(|run| match run {
+        Run::Text(text) => text
+            .fmt
+            .font_family
+            .as_ref()
+            .filter(|family| !family.is_empty())
+            .cloned(),
+        _ => None,
+    });
+    first.runs.insert(
+        0,
+        Run::Text(TextRun {
+            fmt: RunFormatting {
+                font_family,
+                font_size: Some(FOOTNOTE_FONT_SIZE_PT),
+                superscript: Some(true),
+                ..Default::default()
+            },
+            text: format!("{display_label}  "),
+            pm_start: None,
+            pm_end: None,
+            inline_sdt_widget: None,
+        }),
+    );
+}
+
+pub trait HasHeight {
+    fn height(&self) -> f64;
+}
+
+impl<T: HasHeight + ?Sized> HasHeight for &T {
+    fn height(&self) -> f64 {
+        (*self).height()
+    }
+}
+
+impl HasHeight for NoteContent {
+    fn height(&self) -> f64 {
+        self.height
+    }
+}
+
+pub fn distribute_notes_into_columns<T: HasHeight>(items: Vec<T>, columns: u64) -> Vec<Vec<T>> {
+    let columns = columns.max(1) as usize;
+    if columns == 1 || items.len() <= 1 {
+        return vec![items];
+    }
+    let target = items.iter().map(HasHeight::height).sum::<f64>() / columns as f64;
+    let mut result = vec![Vec::new()];
+    let mut column_height = 0.0;
+    for item in items {
+        if result.len() < columns
+            && column_height > 0.0
+            && column_height + item.height() / 2.0 > target
+        {
+            result.push(Vec::new());
+            column_height = 0.0;
+        }
+        column_height += item.height();
+        result.last_mut().expect("column exists").push(item);
+    }
+    result
+}
+
+fn content_map(contents: &[NoteContent]) -> OrderedMap<i64, &NoteContent> {
+    contents
+        .iter()
+        .map(|content| (content.map_id(), content))
+        .collect()
+}
+
+pub fn footnote_columns_by_page(pages: &[Page], regions: &DocumentRegions) -> OrderedMap<u32, u64> {
+    pages
+        .iter()
+        .map(|page| {
+            (
+                page.number,
+                regions.footnote_columns(page.region_section_index),
+            )
+        })
+        .collect()
+}
+
+pub fn calculate_note_reserved_heights(
+    page_note_map: &OrderedMap<u32, Vec<i64>>,
+    contents: &[NoteContent],
+    pages: &[Page],
+    separator_heights: &NoteSeparatorHeights,
+    regions: &DocumentRegions,
+) -> OrderedMap<u32, f64> {
+    let contents = content_map(contents);
+    let pages_by_number: BTreeMap<_, _> = pages.iter().map(|page| (page.number, page)).collect();
+    let mut reserved = OrderedMap::new();
+    for (page_number, note_ids) in page_note_map.iter() {
+        let page = pages_by_number.get(page_number).copied();
+        let section_index = page.map_or(0, |page| page.region_section_index);
+        let mut total_height = 0.0;
+        for kind in [NoteKind::Footnote, NoteKind::Endnote] {
+            let heights: Vec<Height> = note_ids
+                .iter()
+                .filter_map(|id| contents.get(id).copied())
+                .filter(|content| content.note_kind == kind && content.height > 0.0)
+                .map(|content| Height(content.height))
+                .collect();
+            if heights.is_empty() {
+                continue;
+            }
+            let columns = if kind == NoteKind::Footnote {
+                regions.footnote_columns(section_index)
+            } else {
+                1
+            };
+            let tallest = distribute_notes_into_columns(heights, columns)
+                .iter()
+                .map(|column| column.iter().map(HasHeight::height).sum::<f64>())
+                .fold(0.0_f64, f64::max);
+            let separator_height = page.map_or_else(
+                || separator_heights.height(kind, section_index),
+                |page| separator_heights.height_for_page(kind, page),
+            );
+            total_height += tallest + separator_height;
+        }
+        if total_height > 0.0 {
+            reserved.set(*page_number, total_height);
+        }
+    }
+    reserved
+}
+
+#[derive(Clone, Copy)]
+struct Height(f64);
+
+impl HasHeight for Height {
+    fn height(&self) -> f64 {
+        self.0
+    }
+}
+
+pub fn reserved_heights_equal(left: &OrderedMap<u32, f64>, right: &OrderedMap<u32, f64>) -> bool {
+    left.entries.len() == right.entries.len()
+        && left
+            .iter()
+            .all(|(page, height)| right.get(page).copied() == Some(*height))
+}
+
+fn reserved_heights_cover(
+    reserved: &OrderedMap<u32, f64>,
+    required: &OrderedMap<u32, f64>,
+) -> bool {
+    required
+        .iter()
+        .all(|(page, height)| reserved.get(page).copied().unwrap_or(0.0) >= *height)
+}
+
+/// The pages `reserved` keeps more note space on than `required` asks for, in page order, or
+/// `None` when some page's notes need more than `reserved` keeps.
+pub fn reservation_surplus_pages(
+    reserved: &OrderedMap<u32, f64>,
+    required: &OrderedMap<u32, f64>,
+) -> Option<Vec<u32>> {
+    if !reserved_heights_cover(reserved, required) {
+        return None;
+    }
+    let mut pages: Vec<u32> = reserved
+        .iter()
+        .filter(|(page, height)| *height > required.get(page).copied().unwrap_or(0.0))
+        .map(|(page, _)| *page)
+        .collect();
+    pages.sort_unstable();
+    Some(pages)
+}
+
+fn merge_reserved_heights(
+    left: &OrderedMap<u32, f64>,
+    right: &OrderedMap<u32, f64>,
+) -> OrderedMap<u32, f64> {
+    let mut merged = left.clone();
+    for (page, height) in right.iter() {
+        merged.set(*page, merged.get(page).copied().unwrap_or(0.0).max(*height));
+    }
+    merged
+}
+
+type PageStart = (Option<u64>, usize);
+
+fn page_starts(pages: &[Page]) -> BTreeMap<u32, PageStart> {
+    pages
+        .iter()
+        .filter_map(|page| {
+            let fragment = page.fragments.first()?;
+            let line = match fragment {
+                Fragment::Paragraph(value) => value.from_line,
+                Fragment::Table(value) => value.row_start,
+                _ => 0,
+            };
+            Some((
+                page.number,
+                (fragment_pm_range(fragment).0.map(f64::to_bits), line),
+            ))
+        })
+        .collect()
+}
+
+fn page_rooms(pages: &[Page]) -> BTreeMap<u32, f64> {
+    pages
+        .iter()
+        .map(|page| {
+            let margins = page.body_margins.as_ref().unwrap_or(&page.margins);
+            (page.number, page.size.h - margins.top - margins.bottom)
+        })
+        .collect()
+}
+
+/// Keeps a page's reservation only while the page still starts where it did when the
+/// reservation was made: there the reservation decides which lines stay on the page, so
+/// dropping it would bring them back. Pages that now start elsewhere hold other content and
+/// take what that content needs, and so does a page whose notes outgrow it, where keeping
+/// the space would only push more pages out.
+fn settle_reserved_heights(
+    reserved: &OrderedMap<u32, f64>,
+    required: &OrderedMap<u32, f64>,
+    previous: &BTreeMap<u32, PageStart>,
+    current: &BTreeMap<u32, PageStart>,
+    rooms: &BTreeMap<u32, f64>,
+) -> OrderedMap<u32, f64> {
+    let mut pages: Vec<u32> = reserved
+        .iter()
+        .chain(required.iter())
+        .map(|(page, _)| *page)
+        .collect();
+    pages.sort_unstable();
+    pages.dedup();
+    let mut settled = OrderedMap::new();
+    for page in pages {
+        let need = required.get(&page).copied().unwrap_or(0.0);
+        let kept = reserved.get(&page).copied().unwrap_or(0.0);
+        let same_page = current.get(&page).is_some() && previous.get(&page) == current.get(&page);
+        let fits = rooms.get(&page).is_some_and(|room| kept.max(need) <= *room);
+        let height = if same_page && fits {
+            kept.max(need)
+        } else {
+            need
+        };
+        if height > 0.0 {
+            settled.set(page, height);
+        }
+    }
+    settled
+}
+
+pub fn stabilize_note_layout<F>(
+    mut layout_with_reserved: F,
+    refs: &[NoteRefLocation],
+    contents: &[NoteContent],
+    separator_heights: &NoteSeparatorHeights,
+    initial_layout: Layout,
+    regions: &DocumentRegions,
+) -> Result<StabilizedNoteLayout, LayoutError>
+where
+    F: FnMut(&OrderedMap<u32, f64>) -> Result<Layout, LayoutError>,
+{
+    let mut page_note_map = map_notes_to_pages(&initial_layout.pages, refs, regions);
+    let mut reserved = calculate_note_reserved_heights(
+        &page_note_map,
+        contents,
+        &initial_layout.pages,
+        separator_heights,
+        regions,
+    );
+    if reserved.is_empty() {
+        return Ok(StabilizedNoteLayout {
+            layout: initial_layout,
+            page_note_map,
+            reserved_heights: reserved,
+            converged: true,
+        });
+    }
+
+    let mut layout = initial_layout;
+    let mut converged = false;
+    for _ in 0..MAX_FOOTNOTE_LAYOUT_PASSES {
+        layout = layout_with_reserved(&reserved)?;
+        page_note_map = map_notes_to_pages(&layout.pages, refs, regions);
+        let next = calculate_note_reserved_heights(
+            &page_note_map,
+            contents,
+            &layout.pages,
+            separator_heights,
+            regions,
+        );
+        if reserved_heights_equal(&reserved, &next) {
+            reserved = next;
+            converged = true;
+            break;
+        }
+        reserved = next;
+    }
+
+    if !converged {
+        let mut fallback = reserved;
+        let mut covered = false;
+        let mut starts = page_starts(&layout.pages);
+        let settle_passes = (FOOTNOTE_SETTLE_PAGE_BUDGET / layout.pages.len().max(1))
+            .clamp(MAX_FOOTNOTE_LAYOUT_PASSES, MAX_FOOTNOTE_SETTLE_PASSES);
+        for pass in 0..settle_passes + MAX_FOOTNOTE_LAYOUT_PASSES {
+            layout = layout_with_reserved(&fallback)?;
+            page_note_map = map_notes_to_pages(&layout.pages, refs, regions);
+            let required = calculate_note_reserved_heights(
+                &page_note_map,
+                contents,
+                &layout.pages,
+                separator_heights,
+                regions,
+            );
+            if reserved_heights_cover(&fallback, &required) {
+                covered = true;
+                break;
+            }
+            let next_starts = page_starts(&layout.pages);
+            fallback = if pass < settle_passes {
+                settle_reserved_heights(
+                    &fallback,
+                    &required,
+                    &starts,
+                    &next_starts,
+                    &page_rooms(&layout.pages),
+                )
+            } else {
+                merge_reserved_heights(&fallback, &required)
+            };
+            starts = next_starts;
+        }
+        if !covered {
+            layout = layout_with_reserved(&fallback)?;
+            page_note_map = map_notes_to_pages(&layout.pages, refs, regions);
+        }
+        reserved = fallback;
+    }
+
+    stamp_note_pages(&mut layout, &page_note_map, regions);
+    Ok(StabilizedNoteLayout {
+        layout,
+        page_note_map,
+        reserved_heights: reserved,
+        converged,
+    })
+}
+
+pub fn stamp_note_pages(
+    layout: &mut Layout,
+    page_note_map: &OrderedMap<u32, Vec<i64>>,
+    regions: &DocumentRegions,
+) {
+    for page in &mut layout.pages {
+        let Some(ids) = page_note_map.get(&page.number) else {
+            continue;
+        };
+        page.footnote_ids = Some(ids.iter().map(|id| *id as f64).collect());
+        let columns = regions.footnote_columns(page.region_section_index);
+        if columns > 1 {
+            page.footnote_columns = Some(columns as f64);
+        }
+    }
+}
+
+fn fragment_bottom(fragment: &Fragment) -> f64 {
+    match fragment {
+        Fragment::Paragraph(value) => value.y + value.height,
+        Fragment::Table(value) => value.y + value.height,
+        Fragment::Image(value) => value.y + value.height,
+        Fragment::Shape(value) => value.y + value.height,
+        Fragment::Chart(value) => value.y + value.height,
+        Fragment::TextBox(value) => value.y + value.height,
+        Fragment::Reserved(value) => value.y + value.height,
+    }
+}
+
+fn note_item(content: &NoteContent) -> NoteLayoutItemContract {
+    NoteLayoutItemContract {
+        kind: Some(content.note_kind.as_str().to_owned()),
+        id: Some(content.id),
+        display_label: content.display_label.clone().or_else(|| {
+            content
+                .display_number
+                .map(|display_number| display_number.to_string())
+        }),
+        blocks: Some(
+            content
+                .blocks
+                .iter()
+                .filter_map(|block| {
+                    serde_json::to_string(&block)
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s))
+                        .ok()
+                })
+                .collect(),
+        ),
+        measures: Some(
+            content
+                .measures
+                .iter()
+                .filter_map(|measure| {
+                    serde_json::to_string(&measure)
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s))
+                        .ok()
+                })
+                .collect(),
+        ),
+        height: Some(content.height),
+        anchor_doc_start: content
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.doc_start)
+            .map(|value| value as i64),
+        anchor_doc_end: content
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.doc_end)
+            .map(|value| value as i64),
+        custom_mark_follows: content.custom_mark_follows,
+    }
+}
+
+pub(crate) fn note_area_bottom(mut limit: f64, needed: f64, bands: &[PageFloatBand]) -> f64 {
+    if needed <= 0.0 {
+        return limit;
+    }
+    for band in bands.iter().rev() {
+        if band.bottom <= limit - needed {
+            break;
+        }
+        if band.top < limit {
+            limit = band.top;
+        }
+    }
+    limit
+}
+
+fn note_group_height(group: &[&NoteContent], columns: u64, separator_height: f64) -> f64 {
+    distribute_notes_into_columns(group.to_vec(), columns)
+        .iter()
+        .map(|column| column.iter().map(|content| content.height).sum::<f64>())
+        .fold(0.0_f64, f64::max)
+        + separator_height
+}
+
+pub fn attach_note_areas(
+    layout: &mut Layout,
+    page_note_map: &OrderedMap<u32, Vec<i64>>,
+    contents: &[NoteContent],
+    separator_heights: &NoteSeparatorHeights,
+    regions: &DocumentRegions,
+) {
+    let contents = content_map(contents);
+    for page in &mut layout.pages {
+        let Some(ids) = page_note_map.get(&page.number) else {
+            continue;
+        };
+        let mut groups = OrderedMap::<NoteKind, Vec<&NoteContent>>::new();
+        for content in ids.iter().filter_map(|id| contents.get(id).copied()) {
+            if let Some(group) = groups.get_mut(&content.note_kind) {
+                group.push(content);
+            } else {
+                groups.set(content.note_kind, vec![content]);
+            }
+        }
+        let margins = page.body_margins.as_ref().unwrap_or(&page.margins);
+        let content_bottom = page.size.h - margins.bottom;
+        let last_body_bottom = page
+            .fragments
+            .iter()
+            .map(fragment_bottom)
+            .fold(margins.top, f64::max);
+        let needed = if page.float_bands.is_empty() {
+            0.0
+        } else {
+            groups
+                .iter()
+                .map(|(kind, group)| {
+                    let columns = if *kind == NoteKind::Footnote {
+                        regions.footnote_columns(page.region_section_index)
+                    } else {
+                        1
+                    };
+                    note_group_height(
+                        group,
+                        columns,
+                        separator_heights.height_for_page(*kind, page),
+                    )
+                })
+                .sum()
+        };
+        let note_bottom = note_area_bottom(content_bottom, needed, &page.float_bands);
+        let mut bottom_cursor = note_bottom;
+        let mut beneath_text_cursor = last_body_bottom;
+        let mut areas = Vec::new();
+        for (kind, group) in groups.iter() {
+            let properties = regions.note_properties(page.region_section_index, kind.as_str());
+            let default_position = match kind {
+                NoteKind::Footnote => "pageBottom",
+                NoteKind::Endnote => "docEnd",
+            };
+            let placement = properties
+                .position
+                .unwrap_or_else(|| default_position.to_owned());
+            let columns = if *kind == NoteKind::Footnote {
+                regions.footnote_columns(page.region_section_index)
+            } else {
+                1
+            };
+            let height = note_group_height(
+                group,
+                columns,
+                separator_heights.height_for_page(*kind, page),
+            );
+            let y = if placement == "beneathText" {
+                let mut y = beneath_text_cursor.min(note_bottom - height);
+                let first = page.float_bands.partition_point(|band| band.bottom <= y);
+                if page
+                    .float_bands
+                    .get(first)
+                    .is_some_and(|band| band.top < y + height)
+                {
+                    y = bottom_cursor - height;
+                    bottom_cursor = y;
+                }
+                beneath_text_cursor = y + height;
+                y
+            } else {
+                bottom_cursor -= height;
+                bottom_cursor
+            };
+            areas.push(NoteAreaContract {
+                page_index: None,
+                section_id: page.section_id.clone(),
+                kind: Some(kind.as_str().to_owned()),
+                placement: Some(placement),
+                y: Some(y),
+                height: Some(height),
+                columns: Some(columns),
+                separator: separator_heights.get_for_page(*kind, page).map(|height| {
+                    crate::types::NoteLayoutItemContract {
+                        height: Some(height),
+                        ..Default::default()
+                    }
+                }),
+                notes: Some(group.iter().map(|content| note_item(content)).collect()),
+            });
+        }
+        if !areas.is_empty() {
+            page.note_areas = Some(areas);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::regions::{NoteProperties, NoteSettings, RegionSection};
+    use crate::types::{PageMargins, ParagraphFragment, Size, TableFragment};
+
+    fn block(value: serde_json::Value) -> LayoutBlock {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn page(number: u32, section: usize, fragments: Vec<Fragment>) -> Page {
+        Page {
+            number,
+            fragments,
+            float_bands: Vec::new(),
+            opening_fragment_geometry: None,
+            body_margins: None,
+            body_anchor_margins: None,
+            margins: PageMargins {
+                top: 96.0,
+                right: 96.0,
+                bottom: 96.0,
+                left: 96.0,
+                header: None,
+                footer: None,
+            },
+            size: Size {
+                w: 816.0,
+                h: 1056.0,
+            },
+            orientation: None,
+            section_index: Some(section as u64),
+            region_section_index: section,
+            header_footer_refs: None,
+            footnote_ids: None,
+            footnote_reserved_height: None,
+            footnote_columns: None,
+            columns: None,
+            section_id: Some(section.to_string()),
+            section_page_index: None,
+            section_page_number: None,
+            page_label: None,
+            page_numbering: None,
+            header_distance: None,
+            footer_distance: None,
+            page_borders: None,
+            watermark: None,
+            vertical_align: None,
+            note_areas: None,
+            parity_filler: None,
+        }
+    }
+
+    fn paragraph_fragment(start: f64, end: f64) -> Fragment {
+        Fragment::Paragraph(ParagraphFragment {
+            horizontal_frame: None,
+            block_id: BlockId::Str("p".to_owned()),
+            x: 96.0,
+            y: 96.0,
+            width: 624.0,
+            pm_start: Some(start),
+            pm_end: Some(end),
+            from_line: 0,
+            to_line: 1,
+            height: 20.0,
+            carried_from_prev: None,
+            carried_to_next: None,
+            resolved_lines: None,
+        })
+    }
+
+    fn layout(pages: Vec<Page>) -> Layout {
+        Layout {
+            page_size: Size {
+                w: 816.0,
+                h: 1056.0,
+            },
+            pages,
+            columns: None,
+            headers: None,
+            footers: None,
+            page_gap: None,
+            partial: false,
+            cached_page_totals: false,
+        }
+    }
+
+    fn content(id: i64, kind: NoteKind, height: f64) -> NoteContent {
+        NoteContent {
+            id,
+            note_kind: kind,
+            display_number: None,
+            display_label: None,
+            blocks: Vec::new(),
+            measures: Vec::new(),
+            height,
+            anchor: None,
+            custom_mark_follows: None,
+        }
+    }
+
+    #[test]
+    fn collects_footnotes_endnotes_and_outer_table_rows() {
+        let blocks = vec![
+            block(json!({
+                "kind": "paragraph",
+                "id": "p1",
+                "runs": [
+                    {"kind": "text", "text": "a", "pmStart": 10, "footnoteRefId": 7},
+                    {"kind": "text", "text": "b", "pmStart": 11, "endnoteRefId": 7}
+                ]
+            })),
+            block(json!({
+                "kind": "table",
+                "id": "t1",
+                "rows": [{
+                    "id": "r1",
+                    "cells": [{
+                        "id": "c1",
+                        "blocks": [{
+                            "kind": "paragraph",
+                            "id": "cp",
+                            "runs": [{"kind": "text", "text": "c", "pmStart": 20, "footnoteRefId": 8}]
+                        }]
+                    }]
+                }]
+            })),
+        ];
+
+        let refs = collect_note_refs(&blocks);
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].map_id(), 7);
+        assert_eq!(refs[1].map_id(), -8);
+        assert_eq!(refs[2].table_block_id, Some(BlockId::Str("t1".to_owned())));
+        assert_eq!(refs[2].row_index, Some(0));
+    }
+
+    #[test]
+    fn maps_split_table_rows_to_their_actual_pages() {
+        let fragment = |start, end| {
+            Fragment::Table(TableFragment {
+                block_id: BlockId::Str("t1".to_owned()),
+                x: 96.0,
+                y: 96.0,
+                width: 624.0,
+                pm_start: Some(5.0),
+                pm_end: Some(80.0),
+                row_start: start,
+                row_end: end,
+                height: 40.0,
+                is_floating: None,
+                carried_from_prev: None,
+                carried_to_next: None,
+                header_row_count: None,
+                clip_top: None,
+                clip_bottom: None,
+                cell_clips: None,
+            })
+        };
+        let pages = vec![
+            page(1, 0, vec![fragment(0, 2)]),
+            page(2, 0, vec![fragment(2, 4)]),
+        ];
+        let refs = vec![
+            NoteRefLocation {
+                note_id: 1,
+                note_kind: NoteKind::Footnote,
+                pm_pos: 10.0,
+                table_block_id: Some(BlockId::Str("t1".to_owned())),
+                row_index: Some(1),
+            },
+            NoteRefLocation {
+                note_id: 2,
+                note_kind: NoteKind::Footnote,
+                pm_pos: 20.0,
+                table_block_id: Some(BlockId::Str("t1".to_owned())),
+                row_index: Some(2),
+            },
+        ];
+
+        let mapped = map_note_anchors_to_pages(&pages, &refs);
+        assert_eq!(mapped.get(&1), Some(&vec![1]));
+        assert_eq!(mapped.get(&2), Some(&vec![2]));
+    }
+
+    #[test]
+    fn places_endnotes_at_document_end_without_id_collisions() {
+        let pages = vec![
+            page(1, 0, vec![paragraph_fragment(0.0, 20.0)]),
+            page(2, 0, vec![paragraph_fragment(20.0, 40.0)]),
+        ];
+        let refs = vec![
+            NoteRefLocation {
+                note_id: 1,
+                note_kind: NoteKind::Footnote,
+                pm_pos: 5.0,
+                table_block_id: None,
+                row_index: None,
+            },
+            NoteRefLocation {
+                note_id: 1,
+                note_kind: NoteKind::Endnote,
+                pm_pos: 6.0,
+                table_block_id: None,
+                row_index: None,
+            },
+        ];
+
+        let mapped = map_notes_to_pages(&pages, &refs, &DocumentRegions::default());
+        assert_eq!(mapped.get(&1), Some(&vec![1]));
+        assert_eq!(mapped.get(&2), Some(&vec![-2]));
+    }
+
+    #[test]
+    fn balances_footnotes_but_stacks_endnotes_separately() {
+        let page_map = [(1, vec![1, 2, 3, 4, -2, -3])].into_iter().collect();
+        let pages = vec![page(1, 1, Vec::new())];
+        let regions = DocumentRegions {
+            note_settings: NoteSettings {
+                footnote_columns: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let contents = vec![
+            content(1, NoteKind::Footnote, 10.0),
+            content(2, NoteKind::Footnote, 10.0),
+            content(3, NoteKind::Footnote, 10.0),
+            content(4, NoteKind::Footnote, 10.0),
+            content(1, NoteKind::Endnote, 8.0),
+            content(2, NoteKind::Endnote, 9.0),
+        ];
+
+        let reserved = calculate_note_reserved_heights(
+            &page_map,
+            &contents,
+            &pages,
+            &NoteSeparatorHeights {
+                footnote: [(0, 12.0), (1, 16.0)].into_iter().collect(),
+                endnote: [(0, 12.0), (1, 64.0)].into_iter().collect(),
+                ..Default::default()
+            },
+            &regions,
+        );
+        assert_eq!(reserved.get(&1), Some(&(20.0 + 16.0 + 17.0 + 64.0)));
+    }
+
+    #[test]
+    fn restarts_labels_per_page_and_uses_authored_format() {
+        let pages = vec![
+            page(1, 0, vec![paragraph_fragment(0.0, 10.0)]),
+            page(2, 0, vec![paragraph_fragment(10.0, 20.0)]),
+        ];
+        let refs = vec![
+            NoteRefLocation {
+                note_id: 1,
+                note_kind: NoteKind::Footnote,
+                pm_pos: 2.0,
+                table_block_id: None,
+                row_index: None,
+            },
+            NoteRefLocation {
+                note_id: 2,
+                note_kind: NoteKind::Footnote,
+                pm_pos: 12.0,
+                table_block_id: None,
+                row_index: None,
+            },
+        ];
+        let regions = DocumentRegions {
+            note_settings: NoteSettings {
+                footnote: NoteProperties {
+                    num_fmt: Some("upperRoman".to_owned()),
+                    num_start: Some(3),
+                    num_restart: Some("eachPage".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let presentations = build_note_presentations(&refs, &pages, &regions);
+        assert_eq!(presentations.get(&1).unwrap().display_label, "III");
+        assert_eq!(presentations.get(&2).unwrap().display_label, "III");
+    }
+
+    #[test]
+    fn separator_widths_follow_page_geometry_while_columns_follow_the_caller() {
+        let mut narrow = page(1, 0, Vec::new());
+        narrow.size.w = 288.0;
+        let wide = page(2, 0, Vec::new());
+        let mut pages = layout(vec![narrow, wide]);
+        let contents = vec![
+            content(1, NoteKind::Footnote, 20.0),
+            content(2, NoteKind::Footnote, 20.0),
+        ];
+        let page_map = [(1, vec![1]), (2, vec![2])].into_iter().collect();
+        let regions = DocumentRegions {
+            note_settings: NoteSettings {
+                footnote_columns: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut heights = NoteSeparatorHeights {
+            footnote: [(0, 48.0)].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&heights).unwrap(),
+            json!({"footnote": {"0": 48.0}})
+        );
+        assert_eq!(
+            heights.height_for_page(NoteKind::Footnote, &pages.pages[1]),
+            48.0
+        );
+        heights.insert_for_width(NoteKind::Footnote, 0, 96.0, 48.0);
+        heights.insert_for_width(NoteKind::Footnote, 0, 624.0, 16.0);
+        let reserved =
+            calculate_note_reserved_heights(&page_map, &contents, &pages.pages, &heights, &regions);
+        assert_eq!(reserved.get(&1), Some(&68.0));
+        assert_eq!(reserved.get(&2), Some(&36.0));
+        attach_note_areas(&mut pages, &page_map, &contents, &heights, &regions);
+        for (page, separator_height) in pages.pages.iter().zip([48.0, 16.0]) {
+            let area = &page.note_areas.as_ref().unwrap()[0];
+            assert_eq!(area.columns, Some(2));
+            assert_eq!(area.height, Some(20.0 + separator_height));
+            assert_eq!(
+                area.separator.as_ref().unwrap().height,
+                Some(separator_height)
+            );
+        }
+    }
+
+    #[test]
+    fn stabilization_reenters_until_reservations_match_the_latest_layout() {
+        let initial = layout(vec![page(1, 0, vec![paragraph_fragment(0.0, 10.0)])]);
+        let shifted = layout(vec![
+            page(1, 0, Vec::new()),
+            page(2, 0, vec![paragraph_fragment(0.0, 10.0)]),
+        ]);
+        let refs = vec![NoteRefLocation {
+            note_id: 1,
+            note_kind: NoteKind::Footnote,
+            pm_pos: 5.0,
+            table_block_id: None,
+            row_index: None,
+        }];
+        let contents = vec![content(1, NoteKind::Footnote, 20.0)];
+        let mut passes = 0;
+        let result = stabilize_note_layout(
+            |_| {
+                passes += 1;
+                Ok(shifted.clone())
+            },
+            &refs,
+            &contents,
+            &NoteSeparatorHeights::default(),
+            initial,
+            &DocumentRegions::default(),
+        )
+        .unwrap();
+
+        assert!(result.converged);
+        assert_eq!(passes, 2);
+        assert_eq!(result.reserved_heights.get(&2), Some(&32.0));
+        assert_eq!(result.layout.pages[1].footnote_ids, Some(vec![1.0]));
+    }
+
+    #[test]
+    fn alternating_reservations_keep_one_covering_every_page() {
+        let on_first = layout(vec![
+            page(1, 0, vec![paragraph_fragment(0.0, 10.0)]),
+            page(2, 0, Vec::new()),
+        ]);
+        let on_second = layout(vec![
+            page(1, 0, Vec::new()),
+            page(2, 0, vec![paragraph_fragment(0.0, 10.0)]),
+        ]);
+        let refs = vec![NoteRefLocation {
+            note_id: 1,
+            note_kind: NoteKind::Footnote,
+            pm_pos: 5.0,
+            table_block_id: None,
+            row_index: None,
+        }];
+        let contents = vec![content(1, NoteKind::Footnote, 20.0)];
+        let result = stabilize_note_layout(
+            |reserved| {
+                Ok(if reserved.get(&1).is_some() {
+                    on_second.clone()
+                } else {
+                    on_first.clone()
+                })
+            },
+            &refs,
+            &contents,
+            &NoteSeparatorHeights::default(),
+            on_first.clone(),
+            &DocumentRegions::default(),
+        )
+        .unwrap();
+
+        assert!(!result.converged);
+        assert_eq!(result.reserved_heights.get(&1), Some(&32.0));
+        assert_eq!(result.reserved_heights.get(&2), Some(&32.0));
+        let required = calculate_note_reserved_heights(
+            &result.page_note_map,
+            &contents,
+            &result.layout.pages,
+            &NoteSeparatorHeights::default(),
+            &DocumentRegions::default(),
+        );
+        assert_eq!(
+            reservation_surplus_pages(&result.reserved_heights, &required),
+            Some(vec![1])
+        );
+        assert_eq!(
+            reservation_surplus_pages(&required, &result.reserved_heights),
+            None
+        );
+    }
+
+    #[test]
+    fn settling_keeps_a_reservation_only_where_the_page_starts_as_before() {
+        let reserved: OrderedMap<u32, f64> =
+            [(1, 30.0), (2, 40.0), (3, 25.0)].into_iter().collect();
+        let required: OrderedMap<u32, f64> =
+            [(1, 10.0), (2, 15.0), (4, 20.0)].into_iter().collect();
+        let previous = BTreeMap::from([(1, (Some(0), 0)), (2, (Some(9), 0)), (3, (Some(20), 0))]);
+        let current = BTreeMap::from([
+            (1, (Some(0), 0)),
+            (2, (Some(12), 0)),
+            (3, (Some(20), 0)),
+            (4, (Some(31), 0)),
+        ]);
+        let rooms = BTreeMap::from([(1, 100.0), (2, 100.0), (3, 100.0), (4, 100.0)]);
+        let settled = settle_reserved_heights(&reserved, &required, &previous, &current, &rooms);
+        assert_eq!(settled.get(&1), Some(&30.0));
+        assert_eq!(settled.get(&2), Some(&15.0));
+        assert_eq!(settled.get(&3), Some(&25.0));
+        assert_eq!(settled.get(&4), Some(&20.0));
+
+        let short = BTreeMap::from([(1, 20.0), (2, 100.0), (3, 100.0), (4, 100.0)]);
+        let settled = settle_reserved_heights(&reserved, &required, &previous, &current, &short);
+        assert_eq!(settled.get(&1), Some(&10.0));
+    }
+
+    #[test]
+    fn attaches_typed_beneath_text_note_area() {
+        let mut output = layout(vec![page(1, 0, vec![paragraph_fragment(0.0, 10.0)])]);
+        let map = [(1, vec![1])].into_iter().collect();
+        let contents = vec![content(1, NoteKind::Footnote, 20.0)];
+        let regions = DocumentRegions {
+            sections: vec![RegionSection {
+                note_settings: NoteSettings {
+                    footnote: NoteProperties {
+                        position: Some("beneathText".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        attach_note_areas(
+            &mut output,
+            &map,
+            &contents,
+            &NoteSeparatorHeights::default(),
+            &regions,
+        );
+        let area = &output.pages[0].note_areas.as_ref().unwrap()[0];
+        assert_eq!(area.placement.as_deref(), Some("beneathText"));
+        assert_eq!(area.y, Some(116.0));
+        assert_eq!(area.height, Some(32.0));
+    }
+
+    #[test]
+    fn bottom_notes_clear_a_detached_footer_band_and_reserve_the_skipped_space() {
+        let mut original = page(1, 0, Vec::new());
+        original.size.h = 500.0;
+        let mut paginator = crate::page_flow::Paginator::new(
+            original.size.clone(),
+            original.margins.clone(),
+            serde_json::from_value(json!({"count": 1, "gap": 0})).unwrap(),
+            Some([("1".to_owned(), 154.0)].into_iter().collect()),
+        )
+        .unwrap();
+        paginator.set_section_page_float_bands(vec![crate::types::SectionPageFloatBands {
+            default: vec![PageFloatBand {
+                top: 200.0,
+                bottom: 300.0,
+                odd_page: None,
+            }],
+            ..Default::default()
+        }]);
+        let idx = paginator.get_current();
+        assert_eq!(paginator.state(idx).content_limit, 46.0);
+        let mut output = layout(paginator.pages);
+        let map = [(1, vec![1])].into_iter().collect();
+        attach_note_areas(
+            &mut output,
+            &map,
+            &[content(1, NoteKind::Footnote, 142.0)],
+            &NoteSeparatorHeights::default(),
+            &DocumentRegions::default(),
+        );
+        let page = &output.pages[0];
+        let area = &page.note_areas.as_ref().unwrap()[0];
+        assert_eq!(area.y, Some(46.0));
+        assert_eq!(area.height, Some(154.0));
+        assert_eq!(page.footnote_reserved_height, Some(358.0));
+        assert!(page.float_bands.iter().all(|band| {
+            area.y.unwrap() + area.height.unwrap() <= band.top || area.y.unwrap() >= band.bottom
+        }));
+    }
+
+    #[test]
+    fn body_text_stays_above_notes_and_the_skipped_footer_gap() {
+        let mut input: crate::types::Input = serde_json::from_value(json!({
+            "measured": [{
+                "block": {"kind": "paragraph", "id": "body",
+                          "runs": [{"kind": "text", "text": "Body"}]},
+                "measure": {"kind": "paragraph", "totalHeight": 140,
+                            "lines": vec![json!({
+                                "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 4,
+                                "width": 40, "ascent": 15, "descent": 5, "lineHeight": 20
+                            }); 7]}
+            }],
+            "options": {
+                "pageSize": {"w": 500, "h": 700},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "footnoteReservedHeights": {"1": 154},
+                "sectionPageFloatBands": [{"default": [{"top": 400, "bottom": 500}]}]
+            }
+        }))
+        .unwrap();
+        let mut output = crate::place::layout_document(&mut input).unwrap();
+        let map = [(1, vec![1])].into_iter().collect();
+        attach_note_areas(
+            &mut output,
+            &map,
+            &[content(1, NoteKind::Footnote, 142.0)],
+            &NoteSeparatorHeights::default(),
+            &DocumentRegions::default(),
+        );
+        assert_eq!(output.pages.len(), 1);
+        let page = &output.pages[0];
+        let area = &page.note_areas.as_ref().unwrap()[0];
+        assert_eq!(area.y, Some(246.0));
+        assert_eq!(page.footnote_reserved_height, Some(358.0));
+        assert!(
+            page.fragments
+                .iter()
+                .all(|fragment| fragment_bottom(fragment) <= area.y.unwrap())
+        );
+        assert!(area.y.unwrap() + area.height.unwrap() <= 400.0);
+    }
+
+    #[test]
+    fn note_clearance_walks_up_a_band_chain_and_keeps_touching_edges_clear() {
+        let band = |top, bottom| PageFloatBand {
+            top,
+            bottom,
+            odd_page: None,
+        };
+        let bands = [band(200.0, 300.0), band(310.0, 320.0)];
+        assert_eq!(note_area_bottom(404.0, 154.0, &bands), 200.0);
+        assert_eq!(note_area_bottom(404.0, 84.0, &bands), 404.0);
+        assert_eq!(note_area_bottom(404.0, 154.0, &[]), 404.0);
+    }
+
+    #[test]
+    fn beneath_text_notes_clear_bands_without_overlapping_bottom_notes() {
+        let mut output = layout(vec![page(1, 0, vec![paragraph_fragment(0.0, 10.0)])]);
+        output.pages[0].size.h = 500.0;
+        output.pages[0].float_bands = vec![PageFloatBand {
+            top: 120.0,
+            bottom: 200.0,
+            odd_page: None,
+        }];
+        let map = [(1, vec![1, -2])].into_iter().collect();
+        let contents = [
+            content(1, NoteKind::Footnote, 20.0),
+            content(1, NoteKind::Endnote, 20.0),
+        ];
+        let regions = DocumentRegions {
+            note_settings: NoteSettings {
+                footnote: NoteProperties {
+                    position: Some("beneathText".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        attach_note_areas(
+            &mut output,
+            &map,
+            &contents,
+            &NoteSeparatorHeights::default(),
+            &regions,
+        );
+        let areas = output.pages[0].note_areas.as_ref().unwrap();
+        assert_eq!(areas[0].y, Some(372.0));
+        assert_eq!(areas[1].y, Some(340.0));
+        assert_eq!(
+            areas[1].y.unwrap() + areas[1].height.unwrap(),
+            areas[0].y.unwrap()
+        );
+    }
+
+    #[test]
+    fn presentation_uses_note_font_and_label() {
+        let mut blocks = vec![block(json!({
+            "kind": "paragraph",
+            "id": "fn",
+            "runs": [{"kind": "text", "text": "note", "fontFamily": "Cambria"}]
+        }))];
+
+        apply_note_presentation(&mut blocks, 3, "III");
+        let LayoutBlock::Paragraph(paragraph) = &blocks[0] else {
+            panic!("paragraph expected");
+        };
+        let Run::Text(marker) = &paragraph.runs[0] else {
+            panic!("text expected");
+        };
+        assert_eq!(marker.text, "III  ");
+        assert_eq!(marker.fmt.font_family.as_deref(), Some("Cambria"));
+        assert_eq!(marker.fmt.superscript, Some(true));
+    }
+}

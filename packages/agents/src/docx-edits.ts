@@ -1,0 +1,626 @@
+import { tableAnchors, yrsToDocument, type SectionPropertyPatch, type SectionStartKind, type DocxEditStep, type DocxParagraphInput, type DocxParagraphTarget, type TableCellAnchor, type TablePayload, type YrsSession, type YrsStorySegment } from '@nimbleoffice/docx/yrs';
+import type { BlockContent, ParagraphContent, Run, TextFormatting, ParagraphFormatting } from '@nimbleoffice/docx/types/document';
+import { plainText } from './prototype';
+import { DocumentToolError, type TableCellPosition } from './types';
+
+export interface TableCell {
+  story: string;
+  tableIndex: number;
+  rows: number;
+  columns: number;
+  anchors: TableCellAnchor[];
+  anchor: TableCellAnchor;
+  mergedRows: Set<number>;
+}
+
+export interface ParagraphStyle { id: string; name?: string; isDefault: boolean }
+
+type Pilcrow = Extract<YrsStorySegment, { kind: 'pilcrow' }>;
+const PROTECTED = new Set(['ins', 'del', 'hyperlink', 'rPrChange']);
+const runAttributes = (attributes: Record<string, unknown>) => Object.fromEntries(Object.entries(attributes).filter(([key]) => !PROTECTED.has(key)));
+const PARAGRAPH_PROPERTIES = new Set([
+  'pStyle', 'numPr', 'numPrFromStyle', '_originalFormatting', 'defaultTextFormatting',
+  'alignment', 'spaceBefore', 'spaceAfter', 'spaceBeforeLines', 'spaceAfterLines',
+  'beforeAutospacing', 'afterAutospacing', 'lineSpacing', 'lineSpacingRule', 'spacingExplicit',
+  'indentLeft', 'indentRight', 'indentFirstLine', 'hangingIndent', 'borders', 'shading', 'tabs',
+  'pageBreakBefore', 'keepNext', 'keepLines', 'widowControl', 'contextualSpacing', 'snapToGrid',
+  'autoSpaceDE', 'autoSpaceDN', 'outlineLevel', 'bidi',
+]);
+const ONE_OFF = new Set(['pageBreakBefore', 'frame']);
+const LIST_PROPERTIES = [...PARAGRAPH_PROPERTIES,
+  'listNumFmt', 'listIsBullet', 'listMarker', 'listMarkerHidden', 'listMarkerBold', 'listMarkerItalic', 'listMarkerColor',
+  'listMarkerFontFamily', 'listMarkerFontSize', 'listMarkerSuffix', 'listLevelNumFmts', 'listAbstractNumId', 'adjustRightInd',
+].filter(key => !ONE_OFF.has(key));
+
+export function tableCells(story: string, segments: readonly YrsStorySegment[]): Map<string, TableCell> {
+  const cells = new Map<string, TableCell>();
+  let tableIndex = 0;
+  for (const segment of segments) {
+    if (segment.kind !== 'embed' || segment.embedKind !== 'table') continue;
+    const payload = segment.payload as unknown as TablePayload;
+    if (Array.isArray(payload.rows)) {
+      const { anchors, columns } = tableAnchors(payload);
+      const mergedRows = new Set<number>();
+      payload.rows.forEach((row, index) => {
+        if (row.cells.some(cell => {
+          const original = cell.tcPr?._originalFormatting as Record<string, unknown> | undefined;
+          return cell.tcPr?.vMerge !== undefined || original?.vMerge !== undefined;
+        })) mergedRows.add(index);
+      });
+      for (const anchor of anchors) {
+        if (anchor.rowspan > 1) for (let row = anchor.row; row < anchor.row + anchor.rowspan; row++) mergedRows.add(row);
+        if (anchor.story) cells.set(anchor.story, { story, tableIndex, rows: payload.rows.length, columns, anchors, anchor, mergedRows });
+      }
+    }
+    tableIndex++;
+  }
+  return cells;
+}
+
+export function cellPosition(cell: TableCell): TableCellPosition {
+  const { rowspan, colspan } = cell.anchor;
+  return { story: cell.story, index: cell.tableIndex + 1, row: cell.anchor.row + 1, column: cell.anchor.column + 1, rows: cell.rows, columns: cell.columns, ...(rowspan > 1 && { rowSpan: rowspan }), ...(colspan > 1 && { colSpan: colspan }) };
+}
+
+export function resolveStyle(styles: readonly ParagraphStyle[], wanted: string): string {
+  const key = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const target = key(wanted);
+  const found = styles.find(style => style.id === wanted) ?? styles.find(style => key(style.id) === target || (style.name !== undefined && key(style.name) === target));
+  if (found) return found.id;
+  const shared = (value: string) => { let length = 0; while (length < value.length && value[length] === target[length]) length++; return length; };
+  const nearby = styles.map(style => ({ id: style.id, score: Math.max(shared(key(style.id)), shared(key(style.name ?? ''))) }))
+    .sort((a, b) => b.score - a.score).slice(0, 12).map(style => style.id);
+  throw new DocumentToolError('UNKNOWN_STYLE', `Paragraph style "${wanted}" is not defined in this document. Use one of validStyles.`, { style: wanted, validStyles: nearby });
+}
+
+export function lineText(text: string) {
+  plainText(text);
+  if (/[\t\r\n\u000b\u000c￼]/.test(text)) throw new DocumentToolError('INVALID_ARGUMENT', 'Paragraph and cell text is one line of plain text: no tabs, line breaks or object placeholders.');
+}
+
+export function commentBody(author: string, text: string) {
+  plainText(author);
+  plainText(text);
+  if (/[\t\r\n\u000b\u000c\ufffc\ufffe\uffff]/.test(author) || /[\t\r\u000b\u000c\ufffc\ufffe\uffff]/.test(text)) {
+    throw new DocumentToolError('INVALID_ARGUMENT', 'Comment author is one line and comment text is plain text, one paragraph per line: no tabs, carriage returns, object placeholders or noncharacters.');
+  }
+  return text.split('\n').map(line => ({ type: 'paragraph', formatting: {}, content: line ? [{ type: 'run', formatting: {}, content: [{ type: 'text', text: line }] }] : [] }));
+}
+
+export function requireParagraph(draft: YrsSession, target: DocxParagraphTarget) {
+  if (!draft.hasStory(target.story) || draft.paragraphIdCount(target.story, target.paraId) === 0) {
+    throw new DocumentToolError('UNKNOWN_REF', 'An earlier edit in this batch removed this paragraph.');
+  }
+}
+
+export function hostEdit(draft: YrsSession, step: DocxEditStep) {
+  const result = draft.applyEdits({ expectVersion: draft.version(), source: 'agent', history: 'none', steps: [step] });
+  if (!result.ok) throw new DocumentToolError(result.failure.code.toUpperCase().replaceAll('-', '_'), result.failure.message);
+  return result.receipts[0];
+}
+
+export function deleteParagraph(draft: YrsSession, target: DocxParagraphTarget) {
+  if (draft.paragraphSpans(target.story).length < 2) {
+    throw new DocumentToolError('LAST_PARAGRAPH', 'A table cell or story keeps at least one paragraph. Use delete_table_row to remove a row.');
+  }
+  hostEdit(draft, { op: 'deleteParagraphs', story: target.story, firstParaId: target.paraId, lastParaId: target.paraId });
+}
+
+export function notInTable(): never {
+  throw new DocumentToolError('NOT_IN_TABLE', 'This paragraph is not in a table cell. Use a ref whose outline entry has table.');
+}
+
+function locate(draft: YrsSession, parent: string, story: string): TableCell {
+  return tableCells(parent, draft.storySegments(parent)).get(story) ?? notInTable();
+}
+
+function covering(anchors: readonly TableCellAnchor[], row: number, column: number) {
+  return anchors.find(anchor => anchor.row <= row && row < anchor.row + anchor.rowspan && anchor.column <= column && column < anchor.column + anchor.colspan);
+}
+
+function requireUnmergedRow(cell: TableCell) {
+  if (cell.mergedRows.has(cell.anchor.row)) {
+    throw new DocumentToolError('UNSUPPORTED_TARGET', 'This row participates in a vertical merge. Choose another row.');
+  }
+}
+
+export function insertTableRow(draft: YrsSession, target: DocxParagraphTarget, parent: string, position: 'before' | 'after', texts: readonly string[]): DocxParagraphTarget[] {
+  const cell = locate(draft, parent, target.story);
+  requireUnmergedRow(cell);
+  const { story, tableIndex, columns, anchors, anchor } = cell;
+  const templates = Array.from({ length: columns }, (_, column) => covering(anchors, anchor.row, column)?.story);
+  const receipt = draft.insertRow({ story, tableIndex, row: anchor.row, column: anchor.column }, position === 'before' ? 'above' : 'below');
+  if (receipt.createdStoryIds.length !== texts.length) {
+    throw new DocumentToolError('UNSUPPORTED_TARGET', 'A vertically merged cell crosses this row boundary. Insert next to another row.');
+  }
+  return receipt.createdStoryIds.map((cell, column) => {
+    const paraId = receipt.newParaIds[column];
+    const template = templates[column];
+    const source: YrsStorySegment[] = template ? draft.storySegments(template) : [];
+    const properties = source.find((segment): segment is Pilcrow => segment.kind === 'pilcrow')?.properties;
+    for (const [key, value] of Object.entries(properties ?? {})) {
+      if (PARAGRAPH_PROPERTIES.has(key)) draft.setParagraphAttr(paraId, key, value);
+    }
+    const run = source.find(segment => segment.kind === 'text');
+    const attrs = runAttributes(run?.attributes ?? {});
+    if (texts[column]) draft.applyRawOps(cell, [{ op: 'insert', index: 0, text: texts[column], attrs }]);
+    return { story: cell, paraId };
+  });
+}
+
+export function deleteTableRow(draft: YrsSession, target: DocxParagraphTarget, parent: string): boolean {
+  const cell = locate(draft, parent, target.story);
+  requireUnmergedRow(cell);
+  if (cell.rows === 1) {
+    throw new DocumentToolError('UNSUPPORTED_TARGET', 'A table keeps at least one row.');
+  }
+  const { story, tableIndex, anchor } = cell;
+  const at = { story, tableIndex, row: anchor.row, column: anchor.column };
+  return draft.deleteRow({ anchor: at, head: at }).deletedTable;
+}
+
+export function mergeCells(draft: YrsSession, from: DocxParagraphTarget, to: DocxParagraphTarget, parent: string) {
+  const first = locate(draft, parent, from.story);
+  const [a, b] = [first.anchor, locate(draft, parent, to.story).anchor];
+  const top = Math.min(a.row, b.row);
+  const left = Math.min(a.column, b.column);
+  const bottom = Math.max(a.row + a.rowspan, b.row + b.rowspan);
+  const right = Math.max(a.column + a.colspan, b.column + b.colspan);
+  const inside = first.anchors.filter(cell => cell.row >= top && cell.row + cell.rowspan <= bottom && cell.column >= left && cell.column + cell.colspan <= right);
+  if (inside.length < 2) throw new DocumentToolError('INVALID_ARGUMENT', 'from and to are in the same cell. Name paragraphs of two different corner cells.');
+  if (inside.reduce((area, cell) => area + cell.rowspan * cell.colspan, 0) !== (bottom - top) * (right - left)) {
+    throw new DocumentToolError('UNSUPPORTED_TARGET', 'This range cuts through a merged cell or a gap in the table. Choose corners that enclose whole cells.');
+  }
+  const at = (anchor: TableCellAnchor) => ({ story: first.story, tableIndex: first.tableIndex, row: anchor.row, column: anchor.column });
+  draft.mergeCells({ anchor: at(a), head: at(b) });
+  const story = inside[0].story;
+  const paragraphs = draft.storySegments(story).filter((segment): segment is Pilcrow => segment.kind === 'pilcrow').map(({ paraId }) => ({ story, paraId }));
+  return { rowSpan: bottom - top, colSpan: right - left, paragraphs };
+}
+
+export function insertSectionBreak(draft: YrsSession, target: DocxParagraphTarget, kind: SectionStartKind) {
+  requireParagraph(draft, target);
+  hostEdit(draft, { op: 'insertSectionBreakAfter', target: { story: target.story, paraId: target.paraId }, kind });
+}
+
+export function setSection(draft: YrsSession, section: string, properties: SectionPropertyPatch) {
+  hostEdit(draft, { op: 'setSectionProperties', section, properties });
+}
+
+/** The zero-based list level of a paragraph with these pilcrow properties, or undefined outside a list. */
+export function listLevel(properties: Record<string, unknown>): number | undefined {
+  const numPr = properties.numPr as { numId?: number | null; ilvl?: number | null } | null | undefined;
+  return numPr?.numId ? numPr.ilvl ?? 0 : undefined;
+}
+
+function paragraphMarkAttrs(formatting: TextFormatting | null | undefined): Record<string, unknown> | undefined {
+  if (!formatting) return undefined;
+  const attrs: Record<string, unknown> = {};
+  const pick = (source: object, keys: readonly string[]) => Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => keys.includes(key) && value != null),
+  );
+  for (const key of ['bold', 'italic', 'allCaps', 'smallCaps', 'emboss', 'imprint', 'hidden', 'rtl'] as const) {
+    if (formatting[key]) attrs[key] = true;
+  }
+  if (formatting.underline && formatting.underline.style !== 'none') attrs.underline = pick(formatting.underline, ['style', 'color']);
+  if (formatting.strike || formatting.doubleStrike) attrs.strike = { double: formatting.doubleStrike || false };
+  if (formatting.color && !formatting.color.auto) attrs.textColor = pick(formatting.color, ['rgb', 'themeColor', 'themeTint', 'themeShade']);
+  const fill = formatting.shading?.fill;
+  const shadingHighlight = (!formatting.shading?.pattern || formatting.shading.pattern === 'clear') && fill?.rgb && !fill.auto
+    ? (fill.rgb.startsWith('#') ? fill.rgb : `#${fill.rgb}`) : undefined;
+  const highlight = formatting.highlight && formatting.highlight !== 'none' ? formatting.highlight : shadingHighlight;
+  if (highlight) attrs.highlight = highlight;
+  if (formatting.fontSize != null || formatting.fontSizeCs != null) {
+    attrs.fontSize = Object.fromEntries(Object.entries({ size: formatting.fontSize, sizeCs: formatting.fontSizeCs }).filter(([, value]) => value != null));
+  }
+  if (formatting.fontFamily) attrs.fontFamily = pick(formatting.fontFamily, ['ascii', 'hAnsi', 'eastAsia', 'cs', 'asciiTheme', 'hAnsiTheme', 'eastAsiaTheme', 'csTheme']);
+  if (formatting.vertAlign === 'superscript' || formatting.vertAlign === 'subscript') attrs[formatting.vertAlign] = true;
+  const spacing = pick(formatting, ['spacing', 'position', 'scale', 'kerning']);
+  if (Object.keys(spacing).length) attrs.characterSpacing = spacing;
+  if (formatting.shadow) attrs.textShadow = true;
+  if (formatting.outline) attrs.textOutline = true;
+  if (formatting.emphasisMark && formatting.emphasisMark !== 'none') attrs.emphasisMark = { type: formatting.emphasisMark };
+  if (formatting.snapToGrid === false) attrs.snapToGrid = false;
+  if (formatting.effect && formatting.effect !== 'none') attrs.textEffect = { effect: formatting.effect };
+  if (formatting.modernEffects) attrs.modernTextEffects = { effects: formatting.modernEffects };
+  if (formatting.styleId) attrs.runStyle = { styleId: formatting.styleId };
+  return attrs;
+}
+
+const BLOCK_EMBEDS = new Set(['table', 'blockSdt', 'pageBreak', 'columnBreak']);
+
+function paragraphSegments(draft: YrsSession, target: DocxParagraphTarget) {
+  const segments = draft.storySegments(target.story);
+  const end = segments.findIndex(segment => segment.kind === 'pilcrow' && segment.paraId === target.paraId);
+  let start = end;
+  while (start > 0 && segments[start - 1].kind !== 'pilcrow') start--;
+  while (start < end) {
+    const segment = segments[start];
+    if (segment.kind !== 'embed' || !BLOCK_EMBEDS.has(segment.embedKind)) break;
+    start++;
+  }
+  return { content: segments.slice(start, end), mark: segments[end] as Pilcrow };
+}
+
+function formatParagraph(draft: YrsSession, target: DocxParagraphTarget, delta: Parameters<YrsSession['formatTextTarget']>[1]) {
+  const result = draft.formatTextTarget({ kind: 'paragraph', story: target.story, paraId: target.paraId }, delta);
+  if (!result.ok) throw new DocumentToolError(result.failure.code.toUpperCase().replaceAll('-', '_'), result.failure.message);
+}
+
+function inlineLength(child: ParagraphContent): number {
+  switch (child.type) {
+    case 'run': return child.content.reduce((length, part) => {
+      if (part.type === 'text') return length + part.text.length;
+      if (part.type === 'symbol') {
+        const codePoint = Number.parseInt(part.char, 16);
+        return length + (Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint).length : 0);
+      }
+      if (['instrText', 'fieldChar', 'footnoteRefMark', 'endnoteRefMark', 'separator', 'continuationSeparator'].includes(part.type)) return length;
+      if (part.type === 'break' && part.breakType && part.breakType !== 'textWrapping') return length;
+      return length + 1;
+    }, 0);
+    case 'hyperlink': return (child.structuredChildren ?? child.children).reduce((length, part) =>
+      length + (part.type === 'run' ? inlineLength(part) : ['simpleField', 'complexField', 'inlineSdt', 'mathEquation'].includes(part.type) ? 1 : 0), 0);
+    case 'complexField': return 1 + [...(child.structuredCode?.inline ?? []), ...(child.structuredResult?.inline ?? [])]
+      .filter(part => part.type === 'hyperlink' || part.type === 'simpleField').reduce((length, part) => length + inlineLength(part), 0);
+    case 'insertion': case 'deletion': case 'moveFrom': case 'moveTo': return child.content.reduce((length, part) => length + inlineLength(part), 0);
+    case 'simpleField': case 'inlineSdt': case 'mathEquation': return 1;
+    default: return 0;
+  }
+}
+
+function openingRun(draft: YrsSession, target: DocxParagraphTarget, source: NonNullable<ReturnType<YrsSession['materializeDocx']>>, inheritance: ReturnType<YrsSession['runInheritance']>, atOffset?: number): { run?: Run; offset: number; tableRun?: TextFormatting; tableParagraph?: ParagraphFormatting; paragraphFormatting?: ParagraphFormatting } | undefined {
+  const key = JSON.stringify([target.story, target.paraId]);
+  // Lookup IDs exist only in this read projection, including for paragraphs without saved IDs.
+  const view: YrsSession = { ...draft, storyParagraphIds: story => draft.paragraphSpans(story).map(({ paraId }) => JSON.stringify([story, paraId])) };
+  const pkg = yrsToDocument(view, source).package;
+  const find = (blocks: readonly BlockContent[], tableRun?: TextFormatting, tableParagraph?: ParagraphFormatting): ReturnType<typeof openingRun> => {
+    for (const block of blocks) {
+      if (block.type === 'paragraph' && block.paraId === key) {
+        let offset = 0;
+        for (const child of block.content) {
+          const length = inlineLength(child);
+          if (child.type === 'run' && child.content.some(part => part.type === 'text' && part.text.length > 0)
+            && (atOffset === undefined || (offset <= atOffset && atOffset < offset + length))) {
+            return { run: child, offset, tableRun, tableParagraph, paragraphFormatting: block.formatting };
+          }
+          offset += length;
+        }
+        return { offset: 0, tableRun, tableParagraph, paragraphFormatting: block.formatting };
+      }
+      if (block.type === 'table') {
+        const baseline = inheritance.tableAttributes(block);
+        for (const [rowIndex, row] of block.rows.entries()) for (const [cellIndex, cell] of row.cells.entries()) {
+          const cellFormatting = baseline.rows[rowIndex]?.[cellIndex];
+          const run = find(cell.content, cellFormatting?.runFormatting ?? undefined, cellFormatting?.paragraphFormatting ?? undefined);
+          if (run) return run;
+        }
+      }
+      const run = block.type === 'blockSdt' ? find(block.content, tableRun, tableParagraph) : undefined;
+      if (run) return run;
+    }
+  };
+  return find([
+    ...pkg.document.content,
+    ...[pkg.headers, pkg.footers].flatMap(parts => [...(parts?.values() ?? [])].flatMap(part => part.content)),
+    ...[...(pkg.footnotes ?? []), ...(pkg.endnotes ?? [])].flatMap(note => note.content),
+  ]);
+}
+
+function anchorRunFormat(draft: YrsSession, target: DocxParagraphTarget) {
+  const { content, mark } = paragraphSegments(draft, target);
+  const source = draft.materializeDocx();
+  const inheritance = draft.runInheritance(source?.package.styles);
+  let attrs: Record<string, unknown> | undefined;
+  let formatting: TextFormatting | undefined;
+  let tableParagraph: ParagraphFormatting | undefined;
+  let tableRun: TextFormatting | undefined;
+  try {
+    const selected = source ? openingRun(draft, target, source, inheritance) : undefined;
+    tableParagraph = selected?.tableParagraph;
+    tableRun = selected?.tableRun;
+    let offset = 0;
+    const run = selected?.run && content.find(segment => {
+      const start = offset;
+      offset += segment.kind === 'text' ? segment.text.length : 1;
+      return start <= selected.offset && selected.offset < offset;
+    });
+    if (selected?.run && run?.kind === 'text') {
+      attrs = runAttributes(run.attributes);
+      const runStyle = attrs.runStyle as { styleId?: string } | undefined;
+      const direct = selected.run.formatting;
+      formatting = direct;
+      const inherited = inheritance.attributes(typeof mark.properties.pStyle === 'string' ? mark.properties.pStyle : null, runStyle?.styleId ?? null, selected.tableRun);
+      for (const key of ['boldCs', 'italicCs'] as const) attrs[key] ??= direct?.[key] ?? inherited[key] ?? false;
+    }
+  } finally { inheritance.dispose(); }
+  return { attrs, formatting, tableParagraph, tableRun, styles: source?.package.styles, markProperties: mark.properties };
+}
+
+function applyAnchorRunFormat(draft: YrsSession, created: readonly DocxParagraphTarget[], paragraphs: readonly DocxParagraphInput[], attrs: Record<string, unknown>, formatting: TextFormatting | undefined) {
+  created.forEach(({ story, paraId }, index) => {
+    const { text } = paragraphs[index];
+    if (!text) return;
+    draft.setParagraphAttr(paraId, '_originalRunBoundaries', [{ text, formatting: formatting ?? {} }]);
+    const current = paragraphSegments(draft, { story, paraId }).content;
+    const cleared = Object.fromEntries(current.flatMap(segment => Object.keys(runAttributes(segment.attributes)).map(key => [key, null])));
+    formatParagraph(draft, { story, paraId }, { other: { ...cleared, ...attrs } });
+  });
+}
+
+function setInheritedRunFormat(draft: YrsSession, created: readonly DocxParagraphTarget[], paragraphs: readonly DocxParagraphInput[], inherited: readonly Record<string, unknown>[]) {
+  created.forEach(({ story, paraId }, index) => {
+    const { text } = paragraphs[index];
+    if (!text) return;
+    const current = paragraphSegments(draft, { story, paraId }).content;
+    const cleared = Object.fromEntries(current.flatMap(segment => Object.keys(runAttributes(segment.attributes)).map(key => [key, null])));
+    formatParagraph(draft, { story, paraId }, { other: { ...cleared, ...inherited[index] } });
+  });
+}
+
+const LIST_DERIVED = ['listNumFmt', 'listIsBullet', 'listMarker', 'listMarkerHidden', 'listMarkerBold', 'listMarkerItalic', 'listMarkerColor', 'listMarkerFontFamily', 'listMarkerFontSize', 'listMarkerSuffix', 'listLevelNumFmts', 'listAbstractNumId', 'listStartOverride'];
+const DIRECT_FLATTENED = new Set([...PARAGRAPH_PROPERTIES, 'cnfStyle', 'adjustRightInd'].filter(key => !['pStyle', '_originalFormatting', 'defaultTextFormatting', 'numPrFromStyle'].includes(key)));
+
+function directProperties(anchor: Record<string, unknown>, inherited: ParagraphFormatting | undefined): Record<string, unknown> {
+  const original = anchor._originalFormatting;
+  const direct: Record<string, unknown> = { ...(original && typeof original === 'object' ? original : {}) };
+  for (const key of ['alignment', 'widowControl', 'autoSpaceDE', 'autoSpaceDN', 'adjustRightInd', 'bidi', 'cnfStyle'] as const) {
+    const value = anchor[key] ?? undefined;
+    if (JSON.stringify(value ?? null) !== JSON.stringify(direct[key] ?? inherited?.[key] ?? null)) direct[key] = value;
+  }
+  const sameNumPr = (left: unknown, right: unknown) => {
+    const a = left as ParagraphFormatting['numPr'] | null;
+    const b = right as ParagraphFormatting['numPr'] | null;
+    return a != null && b != null && a.numId === b.numId && (a.ilvl ?? 0) === (b.ilvl ?? 0);
+  };
+  const styleNumbering = direct.numPrFromStyle ?? anchor.numPrFromStyle;
+  if ((direct.numPr == null || sameNumPr(direct.numPr, styleNumbering)) && sameNumPr(anchor.numPr, styleNumbering ?? inherited?.numPr)) {
+    delete direct.numPr;
+  } else if (!sameNumPr(anchor.numPr, direct.numPr)) {
+    direct.numPr = anchor.numPr ?? undefined;
+  }
+  delete direct.numPrFromStyle;
+  return Object.fromEntries(Object.entries(direct).filter(([key, value]) => key !== 'styleId' && !ONE_OFF.has(key) && value !== undefined));
+}
+
+function applyDirectProperties(draft: YrsSession, target: DocxParagraphTarget, current: Record<string, unknown> | undefined, direct: Record<string, unknown>, effective: string | null, anchor: Record<string, unknown>) {
+  const set = (key: string, value: unknown) => {
+    if (JSON.stringify(current?.[key] ?? null) !== JSON.stringify(value ?? null)) draft.setParagraphAttr(target.paraId, key, value ?? null);
+  };
+  set('_originalFormatting', { ...(effective ? { styleId: effective } : {}), ...direct });
+  for (const [key, value] of Object.entries(direct)) {
+    if (key === 'runProperties') {
+      const anchorStyle = typeof anchor.pStyle === 'string' ? anchor.pStyle : null;
+      if (effective === anchorStyle) set('defaultTextFormatting', anchor.defaultTextFormatting ?? null);
+      continue;
+    }
+    if (key !== 'numPrFromStyle' && DIRECT_FLATTENED.has(key)) set(key, value);
+  }
+  if ('numPr' in direct) {
+    set('numPrFromStyle', null);
+    for (const key of LIST_DERIVED) set(key, anchor[key] ?? null);
+  }
+}
+
+function copiedProperties(anchor: Record<string, unknown>, original: unknown): Record<string, unknown> {
+  const properties: Record<string, unknown> = { ...anchor };
+  if (original && typeof original === 'object') properties._originalFormatting = Object.fromEntries(Object.entries(original as Record<string, unknown>).filter(([key]) => !ONE_OFF.has(key)));
+  return properties;
+}
+
+function applyCopiedProperties(draft: YrsSession, story: string, created: readonly DocxParagraphTarget[], properties: Record<string, unknown>, keys: readonly string[]) {
+  const current = new Map(draft.storySegments(story).flatMap((segment): Array<[string, Record<string, unknown>]> => segment.kind === 'pilcrow' ? [[segment.paraId, segment.properties]] : []));
+  created.forEach(({ paraId }) => {
+    for (const key of keys) {
+      const value = properties[key] ?? null;
+      if (JSON.stringify(current.get(paraId)?.[key] ?? null) !== JSON.stringify(value)) draft.setParagraphAttr(paraId, key, value);
+    }
+  });
+}
+
+export function insertParagraphsWithAnchorFormat(draft: YrsSession, target: DocxParagraphTarget, paragraphs: readonly DocxParagraphInput[]): DocxParagraphTarget[] {
+  const { attrs, formatting } = anchorRunFormat(draft, target);
+  const created = hostEdit(draft, { op: 'insertParagraphs', target, at: 'end', paragraphs }).newParagraphs;
+  if (attrs) applyAnchorRunFormat(draft, created, paragraphs, attrs, formatting);
+  return created;
+}
+
+export function insertParagraphsBefore(draft: YrsSession, target: DocxParagraphTarget, paragraphs: readonly DocxParagraphInput[], runFormat?: 'style' | 'anchor'): DocxParagraphTarget[] {
+  const anchor = anchorRunFormat(draft, target);
+  const { markProperties } = anchor;
+  const anchorStyle = typeof markProperties.pStyle === 'string' ? markProperties.pStyle : null;
+  const inheritance = draft.runInheritance(anchor.styles);
+  let created: DocxParagraphTarget[] = [];
+  let inherited: Record<string, unknown>[] = [];
+  try {
+    const direct = directProperties(markProperties, inheritance.paragraphFormatting(anchorStyle, anchor.tableParagraph));
+    const effective = paragraphs.map(({ styleId }) => styleId ?? anchorStyle);
+    inherited = effective.map(style => inheritance.attributes(style, null, anchor.tableRun));
+    const seeded = paragraphs.map(({ text }, index) => effective[index] ? { text, styleId: effective[index] } : { text });
+    created = hostEdit(draft, { op: 'insertParagraphs', target, at: 'start', paragraphs: seeded }).newParagraphs;
+    const current = new Map(draft.storySegments(target.story).flatMap((segment): Array<[string, Record<string, unknown>]> => segment.kind === 'pilcrow' ? [[segment.paraId, segment.properties]] : []));
+    created.forEach((entry, index) => {
+      applyDirectProperties(draft, entry, current.get(entry.paraId), direct, effective[index], markProperties);
+    });
+  } finally { inheritance.dispose(); }
+  if (runFormat === 'anchor' && anchor.attrs) applyAnchorRunFormat(draft, created, paragraphs, anchor.attrs, anchor.formatting);
+  else setInheritedRunFormat(draft, created, paragraphs, inherited);
+  return created;
+}
+
+/** Inserts paragraphs after a list item with its list, level, style and paragraph formatting; text takes its last plain run's formatting. */
+export function continueList(draft: YrsSession, target: DocxParagraphTarget, paragraphs: readonly DocxParagraphInput[]): DocxParagraphTarget[] {
+  const segments = draft.storySegments(target.story);
+  const end = segments.findIndex(segment => segment.kind === 'pilcrow' && segment.paraId === target.paraId);
+  const anchor = segments[end] as Pilcrow;
+  if (listLevel(anchor.properties) === undefined) {
+    throw new DocumentToolError('UNSUPPORTED_TARGET', 'This paragraph is not a list item. Use a ref whose outline entry has list, or omit list.');
+  }
+  let run: YrsStorySegment | undefined;
+  let runOffset: number | undefined;
+  let offset = 0;
+  for (const segment of paragraphSegments(draft, target).content) {
+    if (segment.kind === 'text' && !segment.attributes.hyperlink) {
+      run = segment;
+      runOffset = offset;
+    }
+    offset += segment.kind === 'text' ? segment.text.length : 1;
+  }
+  const source = draft.materializeDocx();
+  const inheritance = draft.runInheritance(source?.package.styles);
+  let formatting: TextFormatting | undefined;
+  let paragraphFormatting: ParagraphFormatting | undefined;
+  try {
+    const selected = source ? openingRun(draft, target, source, inheritance, runOffset) : undefined;
+    paragraphFormatting = selected?.paragraphFormatting;
+    formatting = run ? selected?.run?.formatting
+      : (paragraphFormatting ?? (anchor.properties._originalFormatting as ParagraphFormatting | undefined))?.runProperties;
+  } finally { inheritance.dispose(); }
+  const attrs = run ? runAttributes(run.attributes)
+    : paragraphMarkAttrs(anchor.properties.defaultTextFormatting as TextFormatting | null | undefined);
+  const created = hostEdit(draft, { op: 'insertParagraphs', target, at: 'end', paragraphs: paragraphs.map(({ text, styleId }) => ({ text: attrs ? '' : text, styleId })) }).newParagraphs;
+  applyCopiedProperties(draft, target.story, created, copiedProperties(anchor.properties, paragraphFormatting ?? anchor.properties._originalFormatting), LIST_PROPERTIES);
+  created.forEach(({ story, paraId }, index) => {
+    const { text } = paragraphs[index];
+    if (attrs && text) {
+      draft.setParagraphAttr(paraId, '_originalRunBoundaries', [{ text, formatting: formatting ?? {} }]);
+      draft.applyRawOps(story, [{ op: 'insert', index: draft.locateParagraph(story, paraId).start, text, attrs }]);
+    }
+  });
+  return created;
+}
+
+export function commentRoot(session: YrsSession, id: string) {
+  const comments = new Map(session.listComments().map(comment => [comment.id, comment]));
+  const seen = new Set<string>();
+  let comment = comments.get(id);
+  if (!comment) throw new DocumentToolError('UNKNOWN_REF', "Unknown comment ID. List office_outline with story 'comments'.");
+  while (comment.parentId !== null) {
+    if (seen.has(comment.id)) throw new DocumentToolError('INVALID_ARGUMENT', 'Comment thread has cyclic parents.');
+    seen.add(comment.id);
+    const parent = comments.get(comment.parentId);
+    if (!parent) throw new DocumentToolError('UNSUPPORTED_TARGET', 'Comment thread has a missing parent.');
+    comment = parent;
+  }
+  return comment;
+}
+
+export function commentRanges(session: YrsSession, id: string) {
+  let anchors: ReturnType<YrsSession['resolveComment']>;
+  try { anchors = session.resolveComment(id); }
+  catch { throw new DocumentToolError('UNSUPPORTED_TARGET', 'Comment thread has an unresolved anchor.'); }
+  const ranges = anchors.filter(anchor => anchor.end > anchor.start).map(anchor => {
+    const paragraphs = session.paragraphSpans(anchor.story)
+      .map(p => ({ ...p, ...session.locateParagraph(anchor.story, p.paraId) }));
+    const point = (offset: number, end: boolean) => {
+      const paragraph = paragraphs.find(p => p.start <= offset && offset <= p.end && (!end || p.start < offset))
+        ?? paragraphs.find(p => p.start <= offset && offset <= p.end);
+      if (!paragraph) throw new DocumentToolError('UNSUPPORTED_TARGET', 'Comment anchor is outside editable paragraphs.');
+      return { paraId: paragraph.paraId, offset: offset - paragraph.start };
+    };
+    if (session.listStories().stories.find(story => story.story === anchor.story)?.root !== 'body') {
+      throw new DocumentToolError('UNSUPPORTED_TARGET', 'Comment replies need a document body anchor.');
+    }
+    return { story: anchor.story, start: point(anchor.start, false), end: point(anchor.end, true) };
+  });
+  if (!ranges.length) throw new DocumentToolError('UNSUPPORTED_TARGET', 'Comment thread has no live text anchor.');
+  return ranges;
+}
+
+const COMMENT_MARKERS = new Set(['bookmarkStart', 'bookmarkEnd', 'commentRangeStart', 'commentRangeEnd', 'moveFromRangeStart', 'moveFromRangeEnd', 'moveToRangeStart', 'moveToRangeEnd']);
+
+function guardedText(node: unknown): string {
+  if (Array.isArray(node)) return node.map(guardedText).join('');
+  if (!node || typeof node !== 'object') return '';
+  const item = node as { type?: string; text?: string };
+  if (item.type === 'text') return item.text ?? '';
+  const record = node as Record<string, unknown>;
+  let text = '';
+  for (const key of ['structuredChildren', 'structuredResult', 'content', 'children', 'fieldResult', 'inline']) {
+    if (key === 'children' && record.structuredChildren !== undefined) continue;
+    if (key === 'content' && record.structuredResult !== undefined) continue;
+    if (key === 'fieldResult' && record.structuredResult !== undefined) continue;
+    text += guardedText(record[key]);
+  }
+  return text;
+}
+
+export function replaceCommentText(session: YrsSession, id: string, find: string, replace: string): number {
+  plainText(find);
+  plainText(replace);
+  if (!find || /[\t\r\n\u000b\u000c\ufffc\ufffe\uffff]/.test(find) || /[\t\r\n\u000b\u000c\ufffc\ufffe\uffff]/.test(replace)) {
+    throw new DocumentToolError('INVALID_ARGUMENT', 'Comment find and replace are one line of plain text: no tabs, line breaks, object placeholders or noncharacters.');
+  }
+  const comment = session.listComments().find(entry => entry.id === id);
+  if (!comment) throw new DocumentToolError('UNKNOWN_REF', "Unknown comment ID. List office_outline with story 'comments'.");
+  const body: Array<Record<string, unknown>> = typeof comment.body === 'string'
+    ? [{ type: 'paragraph', formatting: {}, content: comment.body ? [{ type: 'run', formatting: {}, content: [{ type: 'text', text: comment.body }] }] : [] }]
+    : Array.isArray(comment.body) ? structuredClone(comment.body) as Array<Record<string, unknown>> : [];
+  if (body.some(paragraph => paragraph?.type !== 'paragraph')) {
+    throw new DocumentToolError('UNSUPPORTED_TARGET', 'This comment holds more than plain paragraphs, which replace_comment_text leaves unchanged.');
+  }
+  interface Segment { part: { type?: string; text?: string }; start: number; end: number }
+  const plans: Array<{ paragraph: Record<string, unknown>; occurrences: Array<[number, number]>; segments: Segment[] }> = [];
+  let replacements = 0;
+  for (const paragraph of body) {
+    if (paragraph?.type !== 'paragraph' || !Array.isArray(paragraph.content)) continue;
+    let text = '';
+    const segments: Segment[] = [];
+    const guarded: Array<[number, number]> = [];
+    const barriers = new Set<number>();
+    for (const item of paragraph.content as Array<Record<string, unknown>>) {
+      if (item?.type === 'run' && Array.isArray(item.content)) {
+        for (const part of item.content as Array<{ type?: string; text?: string }>) {
+          if (part?.type === 'text' && typeof part.text === 'string') {
+            segments.push({ part, start: text.length, end: text.length + part.text.length });
+            text += part.text;
+          } else barriers.add(text.length);
+        }
+      } else if (item && COMMENT_MARKERS.has(item.type as string)) barriers.add(text.length);
+      else {
+        const start = text.length;
+        text += guardedText(item);
+        guarded.push([start, text.length]);
+        barriers.add(start);
+        barriers.add(text.length);
+      }
+    }
+    const occurrences: Array<[number, number]> = [];
+    for (let at = text.indexOf(find); at >= 0; at = text.indexOf(find, at + find.length)) {
+      const end = at + find.length;
+      if (guarded.some(([start, stop]) => start < end && at < stop) || [...barriers].some(point => at < point && point < end)) {
+        throw new DocumentToolError('UNSUPPORTED_TARGET', 'The text crosses a field, hyperlink or other non-run content in this comment, which replace_comment_text leaves unchanged.');
+      }
+      occurrences.push([at, end]);
+    }
+    if (occurrences.length) { plans.push({ paragraph, occurrences, segments }); replacements += occurrences.length; }
+  }
+  if (!replacements) {
+    const excerpt = commentText(comment.body).replace(/\n$/, '').slice(0, 80);
+    throw new DocumentToolError('NO_MATCH', `Comment ${id} does not contain ${JSON.stringify(find.slice(0, 80))}. Comment text begins ${JSON.stringify(excerpt)}.`);
+  }
+  for (const { occurrences, segments } of plans) {
+    for (const [start, end] of [...occurrences].reverse()) {
+      const touched = segments.filter(segment => segment.start < end && start < segment.end);
+      const first = touched[0];
+      const last = touched[touched.length - 1];
+      for (const segment of touched) {
+        const prefix = segment === first ? (segment.part.text ?? '').slice(0, start - segment.start) : '';
+        const suffix = segment === last ? (segment.part.text ?? '').slice(end - segment.start) : '';
+        segment.part.text = prefix + (segment === first ? replace : '') + suffix;
+      }
+    }
+  }
+  session.updateComment(id, { body });
+  return replacements;
+}
+
+export function commentText(body: unknown): string {
+  if (typeof body === 'string') return body;
+  if (Array.isArray(body)) return body.map(commentText).join('');
+  if (!body || typeof body !== 'object') return '';
+  const node = body as { type?: string; text?: string; content?: unknown; children?: unknown; rows?: Array<{ cells: unknown[] }> };
+  if (node.type === 'text') return node.text ?? '';
+  const content = node.content ?? node.children ?? node.rows?.flatMap(row => row.cells);
+  return commentText(content) + (node.type === 'paragraph' ? '\n' : '');
+}

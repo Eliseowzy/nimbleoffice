@@ -1,0 +1,133 @@
+//! Pagination look-ahead planning.
+
+use crate::LayoutError;
+use crate::hooks::KeepWithNextScan;
+use crate::types::{
+    ColumnLayout, LayoutBlock, MeasuredBlock, PageMargins, SectionBreakType, SectionPageRestart,
+    Size,
+};
+
+/// Page-flow geometry for one section.
+#[derive(Debug, Clone)]
+pub struct SectionLayoutConfig {
+    pub page_size: Size,
+    pub margins: PageMargins,
+    /// Sections without explicit columns inherit `{ count: 1 }`.
+    pub columns: Option<ColumnLayout>,
+}
+
+/// Returns the single-column fallback.
+pub fn default_columns() -> ColumnLayout {
+    ColumnLayout {
+        count: 1.0,
+        gap: 0.0,
+        equal_width: None,
+        separator: None,
+        columns: None,
+    }
+}
+
+/// Collects one config per section break plus the final section config.
+pub fn collect_section_configs(
+    measured: &[MeasuredBlock],
+    initial_config: &SectionLayoutConfig,
+    final_config: SectionLayoutConfig,
+) -> (Vec<SectionLayoutConfig>, Vec<usize>) {
+    let mut configs: Vec<SectionLayoutConfig> = Vec::new();
+    let mut break_indices: Vec<usize> = Vec::new();
+    let mut previous_config = initial_config.clone();
+    for (i, mb) in measured.iter().enumerate() {
+        let LayoutBlock::SectionBreak(sb) = &mb.block else {
+            continue;
+        };
+        let config = SectionLayoutConfig {
+            page_size: sb
+                .page_size
+                .clone()
+                .unwrap_or_else(|| previous_config.page_size.clone()),
+            margins: sb
+                .margins
+                .clone()
+                .unwrap_or_else(|| previous_config.margins.clone()),
+            columns: sb.columns.clone(),
+        };
+        configs.push(config.clone());
+        break_indices.push(i);
+        previous_config = config;
+    }
+    configs.push(final_config);
+    (configs, break_indices)
+}
+
+/// Look-ahead consumed by the placement walk.
+pub struct LayoutPlan {
+    /// One config per section break, plus a trailing final-section config.
+    pub section_configs: Vec<SectionLayoutConfig>,
+    /// Block index of each section break, 1-to-1 with the inner configs.
+    pub break_indices: Vec<usize>,
+    /// Break type entering section `i + 1`; trailing entry is the body's.
+    pub section_break_types: Vec<Option<SectionBreakType>>,
+    pub section_page_restarts: Vec<Option<SectionPageRestart>>,
+    pub(crate) region_section_indices: Option<Vec<usize>>,
+    /// Keep-with-next groups keyed by head, plus their interior-member set.
+    pub keep_with_next: KeepWithNextScan,
+    pub(crate) section_marks: Vec<bool>,
+}
+
+impl LayoutPlan {
+    pub(crate) fn region_section_index(&self, section_index: usize) -> usize {
+        self.region_section_indices
+            .as_ref()
+            .and_then(|indices| indices.get(section_index))
+            .copied()
+            .unwrap_or(section_index)
+    }
+
+    pub(crate) fn section_page_restart(&self, section_index: usize) -> Option<SectionPageRestart> {
+        let region_index = self.region_section_index(section_index);
+        if section_index > 0 && self.region_section_index(section_index - 1) == region_index {
+            return None;
+        }
+        self.section_page_restarts
+            .get(region_index)
+            .copied()
+            .flatten()
+    }
+}
+
+/// Gathers pagination look-ahead into one plan.
+pub fn prescan(
+    measured: &[MeasuredBlock],
+    body_config: &SectionLayoutConfig,
+    final_config: SectionLayoutConfig,
+    body_break_type: Option<SectionBreakType>,
+) -> Result<LayoutPlan, LayoutError> {
+    let section_marks = crate::measure_blocks::measured_section_break_marks(
+        measured,
+        body_break_type,
+        final_config.columns.as_ref(),
+    );
+    let (section_configs, break_indices) =
+        collect_section_configs(measured, body_config, final_config);
+    let region_section_indices =
+        crate::regions::section_region_indices(measured.iter().map(|measured| &measured.block));
+    let mut section_break_types: Vec<Option<SectionBreakType>> = break_indices
+        .iter()
+        .map(|&i| match &measured[i].block {
+            LayoutBlock::SectionBreak(sb) => sb.break_type,
+            _ => None,
+        })
+        .collect();
+    section_break_types.push(body_break_type);
+    let keep_with_next =
+        crate::keep_together::analyze_keep_with_next_with_marks(measured, &section_marks);
+    Ok(LayoutPlan {
+        section_configs,
+        break_indices,
+        section_break_types,
+        section_page_restarts: Vec::new(),
+        region_section_indices,
+        keep_with_next,
+        section_marks,
+    })
+}

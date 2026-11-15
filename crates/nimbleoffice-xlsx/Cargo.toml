@@ -1,0 +1,44 @@
+[package]
+name = "nimbleoffice-xlsx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Typed native Rust facade for XLSX parsing, editing, calculation, rendering, and serialization."
+readme = "README.md"
+keywords = ["xlsx", "spreadsheet", "ooxml", "excel"]
+categories = ["parser-implementations", "rendering"]
+
+[features]
+default = ["fonts", "raster", "fonts-latin", "fonts-intl", "fonts-cjk"]
+fonts = ["nimbleoffice-fonts/manager", "dep:ooxml-text", "xlsx-raster?/fonts"]
+fonts-latin = ["fonts", "nimbleoffice-fonts/fonts-latin"]
+fonts-intl = ["fonts", "nimbleoffice-fonts/fonts-intl"]
+fonts-cjk = ["fonts", "nimbleoffice-fonts/fonts-cjk"]
+raster = ["dep:xlsx-raster"]
+fuzzing = []
+
+[dependencies]
+nimbleoffice-fonts = { workspace = true }
+ooxml-drawingml = { workspace = true, features = ["chart"] }
+ooxml-opc.workspace = true
+ooxml-text = { workspace = true, optional = true }
+xlsx-model.workspace = true
+xlsx-parse.workspace = true
+xlsx-calc.workspace = true
+xlsx-ops.workspace = true
+xlsx-render.workspace = true
+xlsx-raster = { workspace = true, optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+yrs = "0.27.3"
+
+[dev-dependencies]
+xlsx-calc = { workspace = true, features = ["test-counters"] }
+xlsx-model = { workspace = true, features = ["test-counters"] }
+xlsx-parse = { workspace = true, features = ["test-counters", "test-oracle"] }
+xlsx-render = { workspace = true, features = ["test-counters"] }
+png = "0.18"
+proptest = "1"

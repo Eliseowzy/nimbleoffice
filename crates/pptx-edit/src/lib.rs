@@ -1,0 +1,688 @@
+//! Collaborative yrs-backed PPTX deck model.
+
+use std::cell::RefCell;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use pptx_parse::PptxPackage;
+use sha2::{Digest, Sha256};
+use yrs::updates::decoder::{Decode, Decoder, DecoderV1};
+use yrs::updates::encoder::Encode;
+use yrs::{
+    ClientID, Doc, IdSet, OffsetKind, Options, ReadTxn, StateVector, StickyIndex, Subscription,
+    Transact, Update, WriteTxn,
+};
+
+mod batch;
+mod comments;
+mod deck;
+mod effects;
+mod inherit;
+mod metafile;
+mod model;
+mod outline_gradients;
+pub mod paragraph;
+mod peer;
+mod proposal_diff;
+mod proposals;
+mod remote_cleanup;
+mod replay;
+mod save;
+mod search;
+mod source_run_properties;
+mod staging;
+mod story;
+pub mod structured;
+mod table;
+mod target;
+mod undo;
+
+pub use batch::{
+    BackgroundGuard, DocumentVersion, EditApplication, EditFailure, EditFailureCode, EditHistory,
+    EditOutcome, EditPreview, EditReceipt, EditRefusal, EditRequest, EditSource, EditStep,
+    EditTarget, EditValidation, FillGuard, MAX_REQUEST_BYTES, OutlineGuard, RectGuard, SlideTarget,
+    TargetEdge, TextGuard, ValidationOutcome, outcome_json, oversized_request,
+};
+#[doc(hidden)]
+pub use deck::baseline_snapshot;
+#[doc(hidden)]
+pub use metafile::MetafileSvgCache;
+pub use model::*;
+pub use ooxml_drawingml::{ColorValue, GradientFill, GradientStop, ShapeFill};
+#[doc(hidden)]
+pub use peer::{PeerError, PeerFont};
+pub use proposal_diff::*;
+pub use proposals::*;
+pub use search::TextSearchMatch;
+#[doc(hidden)]
+pub use story::{baseline_story, style_from_run_properties};
+pub use table::{TableColumnWidth, TableEdit, TableInsertPosition, TableReceipt};
+#[cfg(any(feature = "engine", test))]
+pub use target::{CommandParagraphSource, CommandReadResponse, CommandStorySource};
+pub use target::{
+    FindMatch, FindOutcome, FindRequest, FindResponse, FindScope, ParagraphText, ReadOutcome,
+    ReadRequest, ReadResponse, ShapeTarget, StoryTarget, StoryText, TextField, TextRange,
+    TextTarget,
+};
+#[cfg(any(feature = "engine", test))]
+pub use undo::HistoryReceipt;
+pub use undo::{DeckUndoManager, UndoCaptureMode};
+
+#[cfg(feature = "engine")]
+#[doc(hidden)]
+pub mod engine;
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
+pub(crate) const META: &str = "pptx:meta";
+pub(crate) const SLIDE_ORDER: &str = "pptx:slide-order";
+pub(crate) const SLIDES: &str = "pptx:slides";
+pub(crate) const SHAPES: &str = "pptx:shapes";
+pub(crate) const STORIES: &str = "pptx:stories";
+pub(crate) const COMMENTS: &str = "pptx:comments";
+pub(crate) const REMOTE_ORIGIN: &str = "pptx:remote";
+pub(crate) const HYDRATE_ORIGIN: &str = "pptx:hydrate";
+pub(crate) const MIGRATE_ORIGIN: &str = "pptx:migrate";
+pub(crate) const PILCROW_KIND: &str = "pilcrow";
+pub(crate) const KIND: &str = "_kind";
+pub(crate) const PARA_ID: &str = "paraId";
+pub(crate) const BOOTSTRAP_CLIENT_ID: u64 = (1_u64 << 53) - 1;
+pub const MAX_SAFE_CLIENT_ID: u64 = BOOTSTRAP_CLIENT_ID - 1;
+pub const MAX_UPDATE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STATE_VECTOR_ENTRIES: u32 = 65_536;
+
+pub type UpdateSubscription = Subscription;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaretAnchor {
+    story_id: String,
+    position: StickyIndex,
+}
+
+pub struct DeckSession {
+    pub(crate) doc: Doc,
+    client_id: u64,
+    id_counter: AtomicU64,
+    package: Arc<PptxPackage>,
+    undo: RefCell<DeckUndoManager>,
+    table_edits: RefCell<std::collections::HashMap<String, Vec<String>>>,
+    discarded_tables: RefCell<Vec<String>>,
+    collaborative: std::cell::Cell<bool>,
+    proposals: RefCell<proposals::ProposalStore>,
+    /// Bumped on every committed transaction via `_epoch_observer`, so a value
+    /// uniquely identifies the doc's state for memoized computations.
+    epoch: Arc<AtomicU64>,
+    /// Scopes version tokens to this session object.
+    version_nonce: AtomicU64,
+    baseline_epoch: u64,
+    replay_state: RefCell<replay::ReplayState>,
+    _epoch_observer: UpdateSubscription,
+    state_update: RefCell<Option<(u64, Arc<Vec<u8>>)>>,
+    remote_deletions: remote_cleanup::RemoteDeletions,
+    metafile_svgs: RefCell<MetafileSvgCache>,
+}
+
+fn watch_epoch(doc: &Doc) -> EditResult<(Arc<AtomicU64>, UpdateSubscription)> {
+    let epoch = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&epoch);
+    // After-transaction callbacks run before any update observer, so a version read from inside
+    // an update callback already reflects the transaction being published.
+    let observer = doc
+        .observe_after_transaction(move |txn| {
+            if !txn.delete_set().is_empty() || txn.after_state() != txn.before_state() {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .map_err(|error| EditError::Observer(error.to_string()))?;
+    Ok((epoch, observer))
+}
+
+impl DeckSession {
+    pub fn open(bytes: &[u8], client_id: u64) -> EditResult<Self> {
+        let package =
+            pptx_parse::parse_pptx(bytes).map_err(|error| EditError::Parse(error.to_string()))?;
+        Self::from_package_with_source(package, bytes, client_id)
+    }
+
+    /// Opens an edit session from an already parsed package. The fingerprint
+    /// is taken from a re-zip of the package; prefer
+    /// [`Self::from_package_with_source`] when the file bytes are at hand, so
+    /// peers can match them against the update.
+    pub fn from_package(package: PptxPackage, client_id: u64) -> EditResult<Self> {
+        let fingerprint = {
+            let bytes = pptx_parse::write_pptx(&package)
+                .map_err(|error| EditError::Parse(error.to_string()))?;
+            format!("{:x}", Sha256::digest(bytes))
+        };
+        Self::from_package_with_fingerprint(package, fingerprint, client_id)
+    }
+
+    /// Opens an edit session from a parsed package, fingerprinting the file
+    /// bytes it was parsed from.
+    pub fn from_package_with_source(
+        package: PptxPackage,
+        source: &[u8],
+        client_id: u64,
+    ) -> EditResult<Self> {
+        let fingerprint = format!("{:x}", Sha256::digest(source));
+        Self::from_package_with_fingerprint(package, fingerprint, client_id)
+    }
+
+    fn from_package_with_fingerprint(
+        package: PptxPackage,
+        fingerprint: String,
+        client_id: u64,
+    ) -> EditResult<Self> {
+        validate_client_id(client_id)?;
+        let baseline = {
+            let bootstrap = doc_with_client_id(BOOTSTRAP_CLIENT_ID);
+            deck::seed_doc(&bootstrap, &package, &fingerprint)?;
+            bootstrap
+                .transact()
+                .encode_state_as_update_v1(&StateVector::default())
+        };
+        let doc = session_doc(client_id);
+        hydrate_doc_owned(&doc, baseline)?;
+        deck::validated_snapshot(&doc, &package)?;
+        Self::assemble(
+            doc,
+            client_id,
+            0,
+            Arc::new(package),
+            batch::mint_nonce(client_id, 0),
+        )
+    }
+
+    pub fn open_from_update(update: &[u8], client_id: u64) -> EditResult<Self> {
+        validate_client_id(client_id)?;
+        if update.len() > MAX_UPDATE_BYTES {
+            return Err(EditError::InvalidUpdate(format!(
+                "update exceeds {MAX_UPDATE_BYTES} bytes"
+            )));
+        }
+        let doc = session_doc(client_id);
+        hydrate_doc(&doc, update)?;
+        deck::migrate_doc(&doc)?;
+        collect_garbage(&doc, None);
+        let (package, _) = deck::validate_doc(&doc)?;
+        Self::assemble(
+            doc,
+            client_id,
+            0,
+            Arc::new(package),
+            batch::mint_nonce(client_id, 0),
+        )
+    }
+
+    pub(crate) fn assemble(
+        doc: Doc,
+        client_id: u64,
+        id_counter: u64,
+        package: Arc<PptxPackage>,
+        version_nonce: u64,
+    ) -> EditResult<Self> {
+        let undo = DeckUndoManager::new(&doc, client_id)?;
+        let (epoch, _epoch_observer) = watch_epoch(&doc)?;
+        Ok(Self {
+            doc,
+            client_id,
+            id_counter: AtomicU64::new(id_counter),
+            package,
+            undo: RefCell::new(undo),
+            table_edits: Default::default(),
+            discarded_tables: Default::default(),
+            collaborative: Default::default(),
+            proposals: Default::default(),
+            epoch,
+            version_nonce: AtomicU64::new(version_nonce),
+            baseline_epoch: 0,
+            replay_state: Default::default(),
+            _epoch_observer,
+            state_update: RefCell::new(None),
+            remote_deletions: Default::default(),
+            metafile_svgs: Default::default(),
+        })
+    }
+
+    /// Like [`Self::open_from_update`], but re-attaches the source file the
+    /// update was seeded from, so the session can save. The bytes must hash to
+    /// the fingerprint recorded in the update.
+    pub fn open_from_update_with_source(
+        update: &[u8],
+        source: &[u8],
+        client_id: u64,
+    ) -> EditResult<Self> {
+        let session = Self::open_from_update(update, client_id)?;
+        if !session.seeded_from(source)? {
+            return Err(EditError::Parse(
+                "source bytes do not match the fingerprint recorded in the update".to_owned(),
+            ));
+        }
+        session.attach_source(source)
+    }
+
+    /// Whether `source` hashes to the fingerprint recorded in the update.
+    pub(crate) fn seeded_from(&self, source: &[u8]) -> EditResult<bool> {
+        Ok(deck::fingerprint_from_doc(&self.doc)? == format!("{:x}", Sha256::digest(source)))
+    }
+
+    /// Re-attaches the matching source, importing what the stored package lacks.
+    pub(crate) fn attach_source(self, source: &[u8]) -> EditResult<Self> {
+        let package = parse_source_package(self.package(), source)?;
+        self.attach_source_package(package)
+    }
+
+    /// Attaches matching source bytes; a different fingerprint leaves the session unchanged.
+    pub fn attach_source_if_matching(self, source: &[u8]) -> EditResult<Self> {
+        if self.seeded_from(source)? {
+            self.attach_source(source)
+        } else {
+            Ok(self)
+        }
+    }
+
+    #[cfg(feature = "engine")]
+    pub(crate) fn attach_source_owned(self, source: Vec<u8>) -> EditResult<Self> {
+        let package = parse_source_package(self.package(), &source)?;
+        drop(source);
+        self.attach_source_package(package)
+    }
+
+    fn attach_source_package(self, mut package: PptxPackage) -> EditResult<Self> {
+        let mut import = deck::SourceImport::new(self.package().clone(), &package);
+        comments::import_source_comments(&self, &mut import)?;
+        deck::import_source_render_data(&self.doc, &mut import)?;
+        source_run_properties::import_source(
+            &self,
+            &mut import,
+            source_run_properties::SourceProperty::Baseline,
+        )?;
+        deck::import_source_ole_pictures(&self.doc, import.source)?;
+        effects::import_source(&mut import);
+        for property in [
+            source_run_properties::SourceProperty::Spacing,
+            source_run_properties::SourceProperty::Kern,
+            source_run_properties::SourceProperty::Caps,
+            source_run_properties::SourceProperty::Strike,
+            source_run_properties::SourceProperty::Color,
+        ] {
+            source_run_properties::import_source(&self, &mut import, property)?;
+        }
+        story::import_source_numbering_restarts(&self.doc, import.source)?;
+        outline_gradients::import_source(&self, &mut import)?;
+        import.sync_package_json(&self.doc, self.package())?;
+        effects::preserve_theme_styles(&mut package, self.package());
+        collect_garbage(&self.doc, None);
+        Ok(Self {
+            package: Arc::new(package),
+            baseline_epoch: self.epoch(),
+            ..self
+        })
+    }
+
+    pub fn client_id(&self) -> u64 {
+        self.client_id
+    }
+
+    pub fn package(&self) -> &PptxPackage {
+        &self.package
+    }
+
+    pub fn yrs_doc(&self) -> &Doc {
+        &self.doc
+    }
+
+    pub fn encode_state_vector_v1(&self) -> Vec<u8> {
+        self.doc.transact().state_vector().encode_v1()
+    }
+
+    pub fn encode_state_as_update_v1(&self) -> Vec<u8> {
+        (*self.state_update_v1()).clone()
+    }
+
+    pub(crate) fn state_update_v1(&self) -> Arc<Vec<u8>> {
+        let epoch = self.epoch();
+        if let Some((cached_epoch, update)) = &*self.state_update.borrow()
+            && *cached_epoch == epoch
+        {
+            return Arc::clone(update);
+        }
+        let update = Arc::new(
+            self.doc
+                .transact()
+                .encode_state_as_update_v1(&StateVector::default()),
+        );
+        *self.state_update.borrow_mut() = Some((epoch, Arc::clone(&update)));
+        update
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// The optimistic-concurrency token of the committed deck state.
+    ///
+    /// It changes with every committed change, local or remote, undo and redo included. It is
+    /// scoped to this session: a token from another session, even of the same file, never
+    /// matches.
+    pub fn version(&self) -> DocumentVersion {
+        batch::version_token(self.version_nonce.load(Ordering::Relaxed), self.epoch())
+    }
+
+    /// Invalidates every version handed out so far; `entropy` is mixed into the new nonce.
+    #[cfg(feature = "engine")]
+    pub(crate) fn rotate_version(&self, entropy: u64) {
+        self.version_nonce.store(
+            batch::mint_nonce(self.client_id, entropy),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn encode_diff_v1(&self, remote_state_vector: &[u8]) -> EditResult<Vec<u8>> {
+        let state_vector =
+            decode_state_vector_v1(remote_state_vector).map_err(EditError::InvalidStateVector)?;
+        Ok(self.doc.transact().encode_diff_v1(&state_vector))
+    }
+
+    pub fn apply_update_v1(&self, bytes: &[u8]) -> EditResult<DeckSnapshot> {
+        if bytes.len() > MAX_UPDATE_BYTES {
+            return Err(EditError::InvalidUpdate(format!(
+                "update exceeds {MAX_UPDATE_BYTES} bytes"
+            )));
+        }
+        let incoming = decode_update_v1(bytes).map_err(EditError::InvalidUpdate)?;
+        let staged = doc_with_client_id(self.client_id);
+        hydrate_doc(&staged, &self.encode_state_as_update_v1())?;
+        let carried = remote_cleanup::apply_staged_update(
+            &mut staged.transact_mut_with(REMOTE_ORIGIN),
+            incoming,
+        )
+        .map_err(|error| EditError::InvalidUpdate(error.to_string()))?;
+        let (_, snapshot) = deck::validate_doc(&staged)?;
+        let watched: std::collections::BTreeSet<String> = self
+            .undo
+            .borrow()
+            .tracked_tables()
+            .chain(self.table_edits.borrow().keys())
+            .cloned()
+            .collect();
+        let logs: Vec<_> = watched
+            .iter()
+            .map(|id| (id, table::edit_log(&self.doc, id)))
+            .collect();
+
+        let diff = staged
+            .transact()
+            .encode_state_as_update_v1(&self.doc.transact().state_vector());
+        let diff = decode_update_v1(&diff).map_err(EditError::InvalidUpdate)?;
+        let mut integration = self
+            .remote_deletions
+            .integrate(self.doc.transact_mut_with(REMOTE_ORIGIN));
+        integration.carry(&carried);
+        integration
+            .apply_update(diff)
+            .map_err(|error| EditError::InvalidUpdate(error.to_string()))?;
+        drop(integration);
+        for (id, before) in logs {
+            let after = table::edit_log(&self.doc, id);
+            if after != before {
+                self.undo.borrow_mut().drop_table(&self.doc, id)?;
+                self.settle_table_edits(id, &before, &after);
+            }
+        }
+        if !self.undo.borrow().ever_kept() {
+            collect_garbage(&self.doc, Some(&carried));
+        }
+        Ok(snapshot)
+    }
+
+    /// A remote update whose integration also deleted formatting it did not carry is followed by
+    /// a local delete-only update with those deletions, for peers.
+    pub fn observe_update_v1<F>(&self, callback: F) -> EditResult<Subscription>
+    where
+        F: Fn(UpdateEvent) + 'static,
+    {
+        let remote_deletions = self.remote_deletions.clone();
+        self.doc
+            .observe_update_v1(move |txn, event| {
+                let remote = txn
+                    .origin()
+                    .is_some_and(|origin| origin.as_ref() == REMOTE_ORIGIN.as_bytes());
+                let origin = if remote {
+                    UpdateOrigin::Remote
+                } else {
+                    UpdateOrigin::Local
+                };
+                let update = UpdateEvent {
+                    update: event.update.clone(),
+                    origin,
+                };
+                let _ = catch_unwind(AssertUnwindSafe(|| callback(update)));
+                if !remote {
+                    return;
+                }
+                if let Some(update) = remote_deletions.residual_update_v1(txn) {
+                    let update = UpdateEvent {
+                        update,
+                        origin: UpdateOrigin::Local,
+                    };
+                    let _ = catch_unwind(AssertUnwindSafe(|| callback(update)));
+                }
+            })
+            .map_err(|error| EditError::Observer(error.to_string()))
+    }
+
+    pub fn undo(&self) -> bool {
+        self.undo.borrow_mut().undo()
+    }
+
+    pub fn redo(&self) -> bool {
+        self.undo.borrow_mut().redo()
+    }
+
+    /// Clears local undo and redo history.
+    pub fn clear_undo_history(&self) {
+        self.undo.borrow_mut().clear();
+    }
+
+    /// Marks this session as part of a shared session: structural table operations are refused
+    /// from now on, and local structural table undo and redo items are dropped.
+    pub fn set_collaborative(&self) -> EditResult<()> {
+        self.collaborative.set(true);
+        self.proposals.borrow_mut().previews.clear();
+        let mut undo = self.undo.borrow_mut();
+        let tables: Vec<_> = undo.tracked_tables().cloned().collect();
+        for id in &tables {
+            undo.drop_table(&self.doc, id)?;
+        }
+        Ok(())
+    }
+
+    pub fn is_collaborative(&self) -> bool {
+        self.collaborative.get()
+    }
+
+    /// Shape ids of tables whose local structural edit lost to a concurrent remote structural
+    /// edit since the last call. The remote structure is kept and the local edit is discarded.
+    pub fn take_discarded_table_edits(&self) -> Vec<String> {
+        std::mem::take(&mut *self.discarded_tables.borrow_mut())
+    }
+
+    fn settle_table_edits(&self, shape_id: &str, before: &table::EditLog, after: &table::EditLog) {
+        let mut edits = self.table_edits.borrow_mut();
+        let Some(local) = edits.get_mut(shape_id) else {
+            return;
+        };
+        let lineage = after.lineage();
+        let count = local.len();
+        local.retain(|generation| {
+            !before.edits.contains_key(generation) || lineage.contains(generation.as_str())
+        });
+        if local.len() < count {
+            let mut discarded = self.discarded_tables.borrow_mut();
+            if !discarded.iter().any(|id| id == shape_id) {
+                discarded.push(shape_id.to_owned());
+            }
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.undo.borrow().can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.undo.borrow().can_redo()
+    }
+
+    pub fn undo_capture_mode(&self) -> UndoCaptureMode {
+        self.undo.borrow().capture_mode()
+    }
+
+    pub fn set_undo_capture_mode(&self, mode: UndoCaptureMode) {
+        self.undo.borrow_mut().set_capture_mode(mode);
+    }
+
+    pub(crate) fn automatic_undo_barrier(&self) {
+        if self.undo_capture_mode() == UndoCaptureMode::Auto {
+            self.add_undo_barrier();
+        }
+    }
+
+    pub fn add_undo_barrier(&self) {
+        self.undo.borrow_mut().add_undo_barrier();
+    }
+
+    pub(crate) fn transact_for(&self, context: &EditCtx) -> yrs::TransactionMut<'_> {
+        match context.origin {
+            EditOrigin::Local => self.doc.transact_mut_with(self.client_id),
+            EditOrigin::Agent => self.doc.transact_mut_with("pptx:agent"),
+            EditOrigin::Remote => self.doc.transact_mut_with(REMOTE_ORIGIN),
+            EditOrigin::System => self.doc.transact_mut_with("pptx:system"),
+        }
+    }
+
+    pub(crate) fn next_id(&self, prefix: &str) -> String {
+        let counter = self.id_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}:{}:{counter}", self.client_id)
+    }
+}
+
+pub(crate) fn doc_with_client_id(client_id: u64) -> Doc {
+    Doc::with_options(doc_options(client_id))
+}
+
+/// Defers Yrs GC while undo items or keep flags left by replay reference deleted parents.
+pub(crate) fn session_doc(client_id: u64) -> Doc {
+    let mut options = doc_options(client_id);
+    options.skip_gc = true;
+    Doc::with_options(options)
+}
+
+fn collect_garbage(doc: &Doc, scope: Option<&IdSet>) {
+    doc.transact_mut_with(HYDRATE_ORIGIN).gc(scope);
+}
+
+fn doc_options(client_id: u64) -> Options {
+    let mut options = Options::with_client_id(ClientID::new(client_id));
+    options.offset_kind = OffsetKind::Utf16;
+    options
+}
+
+fn validate_client_id(client_id: u64) -> EditResult<()> {
+    if client_id == 0 || client_id > MAX_SAFE_CLIENT_ID {
+        return Err(EditError::InvalidClientId(client_id));
+    }
+    Ok(())
+}
+
+fn parse_source_package(package: &PptxPackage, source: &[u8]) -> EditResult<PptxPackage> {
+    if package.models_connectors() {
+        pptx_parse::parse_pptx(source)
+    } else {
+        pptx_parse::parse_pptx_without_connectors(source)
+    }
+    .map_err(|error| EditError::Parse(error.to_string()))
+}
+
+fn hydrate_doc(doc: &Doc, bytes: &[u8]) -> EditResult<()> {
+    let update = decode_update_v1(bytes).map_err(EditError::InvalidUpdate)?;
+    hydrate_decoded(doc, update)
+}
+
+fn hydrate_doc_owned(doc: &Doc, bytes: Vec<u8>) -> EditResult<()> {
+    let update = decode_update_v1(&bytes).map_err(EditError::InvalidUpdate)?;
+    drop(bytes);
+    hydrate_decoded(doc, update)
+}
+
+fn hydrate_decoded(doc: &Doc, update: Update) -> EditResult<()> {
+    let mut txn = doc.transact_mut_with(HYDRATE_ORIGIN);
+    txn.apply_update(update)
+        .map_err(|error| EditError::InvalidUpdate(error.to_string()))?;
+    // An empty container carries no items, so an update cannot carry it either.
+    // Every peer registers the roots the same way, which stays convergent.
+    txn.get_or_insert_array(SLIDE_ORDER);
+    for root in [META, SLIDES, SHAPES, STORIES, COMMENTS] {
+        txn.get_or_insert_map(root);
+    }
+    Ok(())
+}
+
+fn decode_update_v1(bytes: &[u8]) -> Result<Update, String> {
+    let mut decoder = DecoderV1::from(bytes);
+    let update = Update::decode(&mut decoder).map_err(|error| error.to_string())?;
+    if !decoder
+        .read_to_end()
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Err("update contains trailing bytes".to_owned());
+    }
+    Ok(update)
+}
+
+fn decode_state_vector_v1(bytes: &[u8]) -> Result<StateVector, String> {
+    validate_state_vector_entry_count(bytes)?;
+    let mut decoder = DecoderV1::from(bytes);
+    let state_vector = StateVector::decode(&mut decoder).map_err(|error| error.to_string())?;
+    if !decoder
+        .read_to_end()
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Err("state vector contains trailing bytes".to_owned());
+    }
+    Ok(state_vector)
+}
+
+fn validate_state_vector_entry_count(bytes: &[u8]) -> Result<(), String> {
+    let Some((&first, _)) = bytes.split_first() else {
+        return Err("state vector is empty".to_owned());
+    };
+    let mut value = u32::from(first & 0x7f);
+    let mut shift = 7;
+    let mut used = 1;
+    let mut byte = first;
+    while byte & 0x80 != 0 {
+        if used == 5 || used >= bytes.len() {
+            return Err("invalid state vector entry count".to_owned());
+        }
+        byte = bytes[used];
+        if used == 4 && byte > 0x0f {
+            return Err("invalid state vector entry count".to_owned());
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        shift += 7;
+        used += 1;
+    }
+    if value > MAX_STATE_VECTOR_ENTRIES {
+        return Err(format!(
+            "state vector contains {value} entries, exceeds the {MAX_STATE_VECTOR_ENTRIES}-entry limit"
+        ));
+    }
+    if value as usize > bytes.len().saturating_sub(used) / 2 {
+        return Err("state vector entry count exceeds its payload".to_owned());
+    }
+    Ok(())
+}

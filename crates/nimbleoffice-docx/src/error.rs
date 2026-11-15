@@ -1,0 +1,156 @@
+use std::fmt;
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    #[cfg(feature = "fonts")]
+    FontSource(nimbleoffice_fonts::FontError),
+    Parse(docx_parse::ParseError),
+    NotAWordDocument(String),
+    Edit(docx_edit::EditError),
+    Operation(docx_edit::OpError),
+    Layout(docx_layout::LayoutError),
+    DisplayList(String),
+    ParagraphNotFound(String),
+    /// More than one body paragraph has the ID.
+    AmbiguousParagraph(String),
+    UnsupportedParagraphEdit(String),
+    Font(String),
+    Image(String),
+    ResourceLimit(String),
+    RenderTooLarge {
+        width: u32,
+        height: u32,
+        max: u32,
+    },
+    RenderAreaTooLarge {
+        width: u32,
+        height: u32,
+        max_pixels: u64,
+    },
+    Render(String),
+    /// A structured export refused its options.
+    Export(docx_edit::structured::ExportFailure),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(feature = "fonts")]
+            Self::FontSource(error) => error.fmt(formatter),
+            Self::Parse(error) => error.fmt(formatter),
+            Self::NotAWordDocument(message) => formatter.write_str(message),
+            Self::Edit(error) => error.fmt(formatter),
+            Self::Operation(error) => error.fmt(formatter),
+            Self::Layout(error) => error.fmt(formatter),
+            Self::DisplayList(error) => formatter.write_str(error),
+            Self::ParagraphNotFound(id) => write!(formatter, "paragraph {id:?} was not found"),
+            Self::AmbiguousParagraph(id) => {
+                write!(formatter, "more than one paragraph has the ID {id:?}")
+            }
+            Self::UnsupportedParagraphEdit(id) => {
+                write!(
+                    formatter,
+                    "paragraph {id:?} is not a plain single-run paragraph"
+                )
+            }
+            Self::Font(error) => formatter.write_str(error),
+            Self::Image(error) => formatter.write_str(error),
+            Self::ResourceLimit(error) => formatter.write_str(error),
+            Self::RenderTooLarge { width, height, max } => write!(
+                formatter,
+                "requested render is {width}x{height}px, exceeds the {max}px per-side cap; lower the page dimensions"
+            ),
+            Self::RenderAreaTooLarge {
+                width,
+                height,
+                max_pixels,
+            } => write!(
+                formatter,
+                "requested render is {width}x{height}px, exceeds the {max_pixels}-pixel allocation cap; lower the page dimensions"
+            ),
+            Self::Render(error) => formatter.write_str(error),
+            Self::Export(failure) => failure.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "fonts")]
+            Self::FontSource(error) => Some(error),
+            Self::Parse(error) => Some(error),
+            Self::Edit(error) => Some(error),
+            Self::Operation(error) => Some(error),
+            Self::Layout(error) => Some(error),
+            Self::Export(failure) => Some(failure),
+            Self::NotAWordDocument(_)
+            | Self::DisplayList(_)
+            | Self::ParagraphNotFound(_)
+            | Self::AmbiguousParagraph(_)
+            | Self::UnsupportedParagraphEdit(_)
+            | Self::Font(_)
+            | Self::Image(_)
+            | Self::ResourceLimit(_)
+            | Self::RenderTooLarge { .. }
+            | Self::RenderAreaTooLarge { .. }
+            | Self::Render(_) => None,
+        }
+    }
+}
+
+impl From<docx_parse::ParseError> for Error {
+    fn from(error: docx_parse::ParseError) -> Self {
+        match error {
+            docx_parse::ParseError::Container(message)
+                if message.starts_with("not a Word document") =>
+            {
+                Self::NotAWordDocument(message)
+            }
+            error => Self::Parse(error),
+        }
+    }
+}
+
+impl From<docx_edit::EditError> for Error {
+    fn from(error: docx_edit::EditError) -> Self {
+        Self::Edit(error)
+    }
+}
+
+impl From<docx_edit::OpError> for Error {
+    fn from(error: docx_edit::OpError) -> Self {
+        Self::Operation(error)
+    }
+}
+
+impl From<docx_layout::LayoutError> for Error {
+    fn from(error: docx_layout::LayoutError) -> Self {
+        Self::Layout(error)
+    }
+}
+
+impl From<docx_edit::structured::ExportFailure> for Error {
+    fn from(failure: docx_edit::structured::ExportFailure) -> Self {
+        Self::Export(failure)
+    }
+}
+
+impl From<docx_edit::structured::ExportError> for Error {
+    fn from(error: docx_edit::structured::ExportError) -> Self {
+        match error {
+            docx_edit::structured::ExportError::Parse(message) => {
+                Self::Edit(docx_edit::EditError::InvalidUpdate(message))
+            }
+            docx_edit::structured::ExportError::Refused(failure) => Self::Export(failure),
+        }
+    }
+}
+
+#[cfg(feature = "fonts")]
+impl From<nimbleoffice_fonts::FontError> for Error {
+    fn from(error: nimbleoffice_fonts::FontError) -> Self {
+        Self::FontSource(error)
+    }
+}

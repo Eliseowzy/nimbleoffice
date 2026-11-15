@@ -1,0 +1,3171 @@
+//! The data contracts pagination reads and writes.
+//!
+//! Three families live here. *Blocks* ([`LayoutBlock`]) describe document
+//! content; *extents* ([`BlockExtent`]) are the measurement results paired with
+//! them in a [`MeasuredBlock`]; *fragments* ([`Fragment`]) and [`Page`] are what
+//! placement produces. [`Input`] is the `{ measured, options }` envelope; the
+//! result is a [`Layout`].
+//!
+//! Serialization conventions hold across the whole module and are load-bearing
+//! for the JSON boundary: every field is camelCase, an absent `Option` is
+//! omitted rather than emitted as null, and unknown incoming fields are
+//! ignored so a producer may send more than pagination reads. An unrecognized
+//! `kind` tag on a block, run or extent deserializes to that union's
+//! `Unsupported` variant, which lets the engine refuse a document deliberately
+//! instead of failing to parse it.
+//!
+//! Fields pagination never inspects — revision markers, content-control
+//! payloads, chart models, DrawingML scene data — are typed as
+//! [`serde_json::Value`] so they survive a round trip untouched.
+//!
+//! Numeric fields are `f64` even where a count would do, because the values
+//! arrive from and return to a JavaScript host that has a single number type,
+//! and intermediate arithmetic must agree with it.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+// ---------------------------------------------------------------------------
+// shared scalars
+// ---------------------------------------------------------------------------
+
+/// A block's identity, numeric or string, passed through to fragments verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BlockId {
+    Num(f64),
+    Str(String),
+}
+
+/// `{ w, h }` page-size pair.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Size {
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Body margins, plus the `w:header` / `w:footer` band distances. Only the two
+/// distances are optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageMargins {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer: Option<f64>,
+}
+
+/// One authored unequal-width column.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<f64>,
+}
+
+/// `w:cols`. `count` is `f64` because column width divides by it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnLayout {
+    pub count: f64,
+    pub gap: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equal_width: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub separator: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<ColumnDefinition>>,
+}
+
+/// `w:type` on a section break: how the *next* section starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SectionBreakType {
+    Continuous,
+    NextPage,
+    EvenPage,
+    OddPage,
+    NextColumn,
+}
+
+// ---------------------------------------------------------------------------
+// runs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum UnderlineSpec {
+    Flag(bool),
+    Styled {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        style: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HyperlinkInfo {
+    pub href: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_default_style: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_location: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFontSlots {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h_ansi: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub east_asia: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii_theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h_ansi_theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub east_asia_theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cs_theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunLanguageSlots {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub east_asia: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFormatting {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underline: Option<UnderlineSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strike: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_slots: Option<RunFontSlots>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size_cs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bold_cs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub italic_cs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complex_script: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<RunLanguageSlots>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub letter_spacing: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superscript: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscript: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all_caps: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub small_caps: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_px: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horizontal_scale: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kerning_min_pt: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imprint: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emboss: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_shadow: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_outline: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emphasis_mark: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtl: Option<bool>,
+    /// Run-level `w:snapToGrid` (§17.3.2). Absent is the OOXML default (on);
+    /// `Some(false)` disables grid snapping for lines containing this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snap_to_grid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_effect: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modern_effects: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hyperlink: Option<HyperlinkInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footnote_ref_id: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endnote_ref_id: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_ids: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_insertion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_deletion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_revision_id: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_change: Option<crate::display_list::Revision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_order: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi_level: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextRun {
+    #[serde(flatten)]
+    pub fmt: RunFormatting,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_sdt_widget: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabRun {
+    #[serde(flatten)]
+    pub fmt: RunFormatting,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_glyphs: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AxisPosition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub align: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos_offset: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRunPosition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horizontal: Option<AxisPosition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vertical: Option<AxisPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_simple_pos: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simple_pos: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_doc: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRun {
+    pub src: String,
+    pub width: f64,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<ImageRunPosition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub css_float: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist_top: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist_bottom: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist_left: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist_right: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop_top: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop_right: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop_bottom: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop_left: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_deg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flip_h: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flip_v: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_bounds: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_polygon: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_overlap: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_in_cell: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_change_aspect: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_extent: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline: Option<CellBorderSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decorative: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink: Option<HyperlinkInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_shape: Option<Box<ShapeBlock>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_chart: Option<Box<ChartBlock>>,
+    /// Laid-out OMML equation painted in place of an image; its bottom edge
+    /// sits `baseline_depth` below the baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_math: Option<Box<ooxml_text::math::MathLayout>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_depth: Option<f64>,
+    /// VML `o:hr` picture: alone on its line, the line is the picture's height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizontal_rule: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_insertion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_deletion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_revision_id: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineBreakRun {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldRun {
+    #[serde(flatten)]
+    pub fmt: RunFormatting,
+    pub field_type: String,
+    /// Raw Word field type token, kept when `field_type` collapsed it to a
+    /// coarse category. Carried for announcement, and read to number SEQ
+    /// fields (see [`crate::sequence_fields`]); never evaluated otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_type: Option<String>,
+    /// Raw field instruction text, carried for a11y announcement. Only a SEQ
+    /// field's is read, to number it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    /// The result the field shows: Word's cached result, or a SEQ field's
+    /// recomputed number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// `w:fldLock`: Word keeps the cached result when it updates fields.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    /// Sequences (lower-case names) of SEQ fields nested in this field's code
+    /// or result, which the field's single run doesn't show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_sequences: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+/// The host-scoped name of a layout reservation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ReservationRef {
+    pub owner: String,
+    pub id: String,
+}
+
+/// Inline space a host reserves: measured as an atom, never painted, and
+/// owning no document positions (`pm_start == pm_end`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReservedRun {
+    pub reservation: ReservationRef,
+    pub width: f64,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+/// Inline content of a paragraph. An unknown `kind` becomes `Unsupported`, and
+/// a paragraph containing one cannot be placed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum Run {
+    #[serde(rename = "text")]
+    Text(TextRun),
+    #[serde(rename = "tab")]
+    Tab(TabRun),
+    #[serde(rename = "image")]
+    Image(ImageRun),
+    #[serde(rename = "lineBreak")]
+    LineBreak(LineBreakRun),
+    #[serde(rename = "field")]
+    Field(FieldRun),
+    #[serde(rename = "reserved")]
+    Reserved(ReservedRun),
+    #[serde(other, rename = "unsupported")]
+    Unsupported,
+}
+
+impl Run {
+    /// Document start offset, regardless of run flavor.
+    pub fn pm_start(&self) -> Option<f64> {
+        match self {
+            Run::Text(r) => r.pm_start,
+            Run::Tab(r) => r.pm_start,
+            Run::Image(r) => r.pm_start,
+            Run::LineBreak(r) => r.pm_start,
+            Run::Field(r) => r.pm_start,
+            Run::Reserved(r) => r.pm_start,
+            Run::Unsupported => None,
+        }
+    }
+
+    /// Document end offset, regardless of run flavor.
+    pub fn pm_end(&self) -> Option<f64> {
+        match self {
+            Run::Text(r) => r.pm_end,
+            Run::Tab(r) => r.pm_end,
+            Run::Image(r) => r.pm_end,
+            Run::LineBreak(r) => r.pm_end,
+            Run::Field(r) => r.pm_end,
+            Run::Reserved(r) => r.pm_end,
+            Run::Unsupported => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// paragraph attributes
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphSpacing {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_auto: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_auto: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_lines: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_lines: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_rule: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpacingExplicit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphIndent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_line: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hanging: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TabStop {
+    pub val: String,
+    pub pos: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BorderStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParagraphBorders {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<BorderStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<BorderStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<BorderStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<BorderStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub between: Option<BorderStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar: Option<BorderStyle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ListNumPr {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_id: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ilvl: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphAttrs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leading_inline_box: Option<LeadingInlineBox>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub justification_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_source_content: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub horizontal_rules: Vec<HorizontalRule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spacing: Option<ParagraphSpacing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spacing_explicit: Option<SpacingExplicit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indent: Option<ParagraphIndent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_next: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_lines: Option<bool>,
+    /// Authored false for default-on `w:widowControl`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub widow_control: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_break_before: Option<bool>,
+    /// Opens with a hard `w:br w:type="page"` run rather than `w:pageBreakBefore`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_break_before_run: Option<bool>,
+    /// Internal full-width reflow after a split floating table.
+    #[serde(skip)]
+    pub split_float_reflow_break: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_style_id: Option<String>,
+    /// Display name of the paragraph's style, read by STYLEREF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contextual_spacing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bidi: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub borders: Option<ParagraphBorders>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shading: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tabs: Option<Vec<TabStop>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_pr: Option<ListNumPr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_is_bullet: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker_hidden: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker_font_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker_font_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker_bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker_italic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker_suffix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_marker_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_tab_stop_twips: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_font_size: Option<f64>,
+    /// Size in pt of an unsized run in this paragraph (the style chain's, not the mark's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_font_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_font_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppress_empty_paragraph_height: Option<bool>,
+    /// Effective paragraph-level `w:snapToGrid` (§17.3.1) resolved from the
+    /// direct pPr child AND the paragraph-mark rPr (absent is the OOXML
+    /// default, on). `Some(false)` opts the whole paragraph out of
+    /// document-grid snapping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snap_to_grid: Option<bool>,
+    /// Effective `w:autoSpaceDE` (§17.3.1.11) — the space Word inserts
+    /// between East Asian and Latin text. Absent is the OOXML default (on);
+    /// `Some(false)` opts the paragraph out.
+    #[serde(rename = "autoSpaceDE", skip_serializing_if = "Option::is_none")]
+    pub auto_space_de: Option<bool>,
+    /// Effective `w:autoSpaceDN` (§17.3.1.12) — the same between East Asian
+    /// text and numbers.
+    #[serde(rename = "autoSpaceDN", skip_serializing_if = "Option::is_none")]
+    pub auto_space_dn: Option<bool>,
+    /// The document's `w:characterSpacingControl` is `compressPunctuation`
+    /// (§17.15.1.18): fullwidth pause marks and brackets set in half an em.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compress_punctuation: Option<bool>,
+    /// Section grid pitch in px (`w:docGrid w:linePitch`), set by the
+    /// section-grid resolve pass for the paragraph's section and already
+    /// gated to an activating grid type. `None` disables snapping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_grid_pitch_px: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_pr_ins: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_pr_del: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LeadingInlineBox {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HorizontalRule {
+    pub width: Option<f64>,
+    pub width_percent: Option<f64>,
+    pub height: f64,
+    pub alignment: String,
+    pub no_shade: bool,
+    pub color: String,
+    pub pm_start: f64,
+    pub pm_end: f64,
+}
+
+impl HorizontalRule {
+    pub(crate) fn rendered_width(&self, content_width: f64) -> f64 {
+        self.width_percent
+            .map(|percent| content_width * percent / 100.0)
+            .or(self.width)
+            .unwrap_or(content_width)
+            .clamp(0.0, content_width.max(0.0))
+    }
+
+    pub(crate) fn advance_width(&self, content_width: f64) -> f64 {
+        self.rendered_width(content_width) + 2.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SdtGroup {
+    pub id: String,
+    pub sdt_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeating_item: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_state: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<Value>,
+}
+
+// ---------------------------------------------------------------------------
+// flow blocks
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub para_id: Option<String>,
+    pub runs: Vec<Run>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<ParagraphAttrs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CellBorderSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(
+        rename = "ooxmlStyle",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ooxml_style: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CellBorders {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<CellBorderSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<CellBorderSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<CellBorderSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<CellBorderSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BoxEdges {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
+}
+
+/// Typed `tblW`/`tcW`/row-before/after preferred width.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreferredWidth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TableCell {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_direction: Option<String>,
+    pub id: BlockId,
+    pub blocks: Vec<LayoutBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub col_span: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_span: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width_value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_width: Option<PreferredWidth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_content_width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_content_width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vertical_align: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub borders: Option<CellBorders>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding: Option<BoxEdges>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_wrap: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_marker: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TableRow {
+    pub id: BlockId,
+    pub cells: Vec<TableCell>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height_rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_header: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cant_split: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_before: Option<PreferredWidth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_after: Option<PreferredWidth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_ins: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_del: Option<Value>,
+}
+
+impl TableRow {
+    /// Word's `w:trHeight w:hRule="exact"` fixed-height row: measurement treats
+    /// it as a verbatim block and pagination must not split it mid-row. The
+    /// `height.is_some()` conjunct mirrors measurement — an `exact` rule with
+    /// no height value carries no fixed size and stays splittable.
+    pub fn is_exact_height(&self) -> bool {
+        self.height_rule.as_deref() == Some("exact") && self.height.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FloatingTablePosition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horz_anchor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tblp_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tblp_x_spec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vert_anchor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tblp_y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tblp_y_spec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_from_text: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_from_text: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottom_from_text: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_from_text: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    pub rows: Vec<TableRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column_widths: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_widths: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_width: Option<PreferredWidth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_layout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_algorithm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_cascade: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub justification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bidi: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub floating: Option<FloatingTablePosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_mode: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_margin_left: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_margin_right: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_spacing: Option<f64>,
+    /// Report the cell edges without a visible border as view-only guides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gridlines: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAnchor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_anchored: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_h: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_v: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind_doc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<ImageRunPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_overlap: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_in_cell: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_polygon: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    pub src: String,
+    pub width: f64,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_deg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flip_h: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flip_v: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_bounds: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<ImageAnchor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hlink_href: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hlink_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decorative: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline: Option<CellBorderSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+/// Complex DrawingML payloads remain opaque to pagination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    pub shape_type: String,
+    pub geometry_path: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<Value>,
+    pub width: f64,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_text: Option<Vec<ParagraphBlock>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_sequences: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_measures: Option<Vec<ParagraphExtent>>,
+    pub children: Vec<ShapeBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_body_properties: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_distances: Option<BoxEdges>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<ImageRunPosition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind_doc: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decorative: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_end: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    pub chart: Value,
+    pub width: f64,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<ImageRunPosition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind_doc: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_end: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionBreakBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub break_type: Option<SectionBreakType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margins: Option<PageMargins>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<ColumnLayout>,
+}
+
+impl SectionBreakBlock {
+    /// Whether block-SDT geometry replaces a missing caller section entry.
+    pub fn is_self_describing(&self) -> bool {
+        self.sdt_groups
+            .as_ref()
+            .is_some_and(|groups| !groups.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageBreakBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_mark_ineligible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnBreakBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+/// Block space a host reserves beside a paragraph: unbreakable, never
+/// painted, and without document positions. `width` defaults to the column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReservedBlock {
+    pub id: BlockId,
+    pub reservation: ReservationRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextBoxBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdt_groups: Option<Vec<SdtGroup>>,
+    pub id: BlockId,
+    pub width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_style: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margins: Option<BoxEdges>,
+    pub content: Vec<ParagraphBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub css_float: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<ImageRunPosition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist_top: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist_bottom: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist_left: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist_right: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+}
+
+#[allow(clippy::large_enum_variant)]
+/// A document block. An unknown `kind` becomes `Unsupported`, which placement
+/// refuses rather than dropping the content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum LayoutBlock {
+    #[serde(rename = "paragraph")]
+    Paragraph(ParagraphBlock),
+    #[serde(rename = "table")]
+    Table(TableBlock),
+    #[serde(rename = "image")]
+    Image(ImageBlock),
+    #[serde(rename = "shape")]
+    Shape(ShapeBlock),
+    #[serde(rename = "chart")]
+    Chart(ChartBlock),
+    #[serde(rename = "textBox")]
+    TextBox(TextBoxBlock),
+    #[serde(rename = "sectionBreak")]
+    SectionBreak(SectionBreakBlock),
+    #[serde(rename = "pageBreak")]
+    PageBreak(PageBreakBlock),
+    #[serde(rename = "columnBreak")]
+    ColumnBreak(ColumnBreakBlock),
+    #[serde(rename = "reserved")]
+    Reserved(ReservedBlock),
+    #[serde(other, rename = "unsupported")]
+    Unsupported,
+}
+
+// ---------------------------------------------------------------------------
+// structural equality
+// ---------------------------------------------------------------------------
+//
+// Equality across the block tree masks `pm_start`, `pm_end`, `doc_start` and
+// `doc_end`: those absolute document positions shift on every edit without
+// changing how a block measures, and the resident layout walk reuses a retained
+// measurement for every block that compares equal. So that a new field cannot
+// silently escape that decision, each variant and each field is spelled out —
+// adding either stops compiling until it is classified.
+//
+// Numbers compare as numbers, so `-0.0` equals `0.0` where the serialized
+// fingerprint this replaced saw a change. Both measure identically, so the
+// retained measurement stays right, but a serialized zero can keep its old sign
+// until something else dirties its block.
+
+impl PartialEq for LayoutBlock {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Paragraph(a), Self::Paragraph(b)) => a == b,
+            (Self::Table(a), Self::Table(b)) => a == b,
+            (Self::Image(a), Self::Image(b)) => a == b,
+            (Self::Shape(a), Self::Shape(b)) => a == b,
+            (Self::Chart(a), Self::Chart(b)) => a == b,
+            (Self::TextBox(a), Self::TextBox(b)) => a == b,
+            (Self::SectionBreak(a), Self::SectionBreak(b)) => a == b,
+            (Self::PageBreak(a), Self::PageBreak(b)) => a == b,
+            (Self::ColumnBreak(a), Self::ColumnBreak(b)) => a == b,
+            (Self::Reserved(a), Self::Reserved(b)) => a == b,
+            (Self::Unsupported, Self::Unsupported) => true,
+            (Self::Paragraph(_), _)
+            | (Self::Table(_), _)
+            | (Self::Image(_), _)
+            | (Self::Shape(_), _)
+            | (Self::Chart(_), _)
+            | (Self::TextBox(_), _)
+            | (Self::SectionBreak(_), _)
+            | (Self::PageBreak(_), _)
+            | (Self::ColumnBreak(_), _)
+            | (Self::Reserved(_), _)
+            | (Self::Unsupported, _) => false,
+        }
+    }
+}
+
+impl LayoutBlock {
+    /// Identity used for delta bookkeeping; every block kind that can place
+    /// a fragment has one.
+    pub fn block_id(&self) -> Option<&BlockId> {
+        match self {
+            Self::Paragraph(block) => Some(&block.id),
+            Self::Table(block) => Some(&block.id),
+            Self::Image(block) => Some(&block.id),
+            Self::Shape(block) => Some(&block.id),
+            Self::Chart(block) => Some(&block.id),
+            Self::TextBox(block) => Some(&block.id),
+            Self::SectionBreak(block) => Some(&block.id),
+            Self::PageBreak(block) => Some(&block.id),
+            Self::ColumnBreak(block) => Some(&block.id),
+            Self::Reserved(block) => Some(&block.id),
+            Self::Unsupported => None,
+        }
+    }
+
+    /// Document start offset, regardless of block flavor.
+    pub fn pm_start(&self) -> Option<f64> {
+        match self {
+            Self::Paragraph(block) => block.pm_start,
+            Self::Table(block) => block.pm_start,
+            Self::Image(block) => block.pm_start,
+            Self::Shape(block) => block.pm_start,
+            Self::Chart(block) => block.pm_start,
+            Self::TextBox(block) => block.pm_start,
+            Self::PageBreak(block) => block.pm_start,
+            Self::ColumnBreak(block) => block.pm_start,
+            Self::SectionBreak(_) | Self::Reserved(_) | Self::Unsupported => None,
+        }
+    }
+}
+
+impl PartialEq for Run {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Tab(a), Self::Tab(b)) => a == b,
+            (Self::Image(a), Self::Image(b)) => a == b,
+            (Self::LineBreak(a), Self::LineBreak(b)) => a == b,
+            (Self::Field(a), Self::Field(b)) => a == b,
+            (Self::Reserved(a), Self::Reserved(b)) => a == b,
+            (Self::Unsupported, Self::Unsupported) => true,
+            (Self::Text(_), _)
+            | (Self::Tab(_), _)
+            | (Self::Image(_), _)
+            | (Self::LineBreak(_), _)
+            | (Self::Field(_), _)
+            | (Self::Reserved(_), _)
+            | (Self::Unsupported, _) => false,
+        }
+    }
+}
+
+impl PartialEq for TextRun {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            fmt: _,
+            text: _,
+            inline_sdt_widget: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.fmt == other.fmt
+            && self.text == other.text
+            && self.inline_sdt_widget == other.inline_sdt_widget
+    }
+}
+
+impl PartialEq for TabRun {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            fmt: _,
+            width: _,
+            leader_glyphs: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.fmt == other.fmt
+            && self.width == other.width
+            && self.leader_glyphs == other.leader_glyphs
+    }
+}
+
+impl PartialEq for ImageRun {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            src: _,
+            width: _,
+            height: _,
+            alt: _,
+            shape_type: _,
+            transform: _,
+            position: _,
+            wrap_type: _,
+            display_mode: _,
+            css_float: _,
+            dist_top: _,
+            dist_bottom: _,
+            dist_left: _,
+            dist_right: _,
+            crop_top: _,
+            crop_right: _,
+            crop_bottom: _,
+            crop_left: _,
+            opacity: _,
+            rotation_deg: _,
+            flip_h: _,
+            flip_v: _,
+            rotation_bounds: _,
+            wrap_text: _,
+            wrap_polygon: _,
+            allow_overlap: _,
+            layout_in_cell: _,
+            no_change_aspect: _,
+            effect_extent: _,
+            effects: _,
+            outline: _,
+            decorative: _,
+            hyperlink: _,
+            inline_shape: _,
+            inline_chart: _,
+            inline_math: _,
+            baseline_depth: _,
+            horizontal_rule: _,
+            is_insertion: _,
+            is_deletion: _,
+            change_author: _,
+            change_date: _,
+            change_revision_id: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.src == other.src
+            && self.width == other.width
+            && self.height == other.height
+            && self.alt == other.alt
+            && self.shape_type == other.shape_type
+            && self.transform == other.transform
+            && self.position == other.position
+            && self.wrap_type == other.wrap_type
+            && self.display_mode == other.display_mode
+            && self.css_float == other.css_float
+            && self.dist_top == other.dist_top
+            && self.dist_bottom == other.dist_bottom
+            && self.dist_left == other.dist_left
+            && self.dist_right == other.dist_right
+            && self.crop_top == other.crop_top
+            && self.crop_right == other.crop_right
+            && self.crop_bottom == other.crop_bottom
+            && self.crop_left == other.crop_left
+            && self.opacity == other.opacity
+            && self.rotation_deg == other.rotation_deg
+            && self.flip_h == other.flip_h
+            && self.flip_v == other.flip_v
+            && self.rotation_bounds == other.rotation_bounds
+            && self.wrap_text == other.wrap_text
+            && self.wrap_polygon == other.wrap_polygon
+            && self.allow_overlap == other.allow_overlap
+            && self.layout_in_cell == other.layout_in_cell
+            && self.no_change_aspect == other.no_change_aspect
+            && self.effect_extent == other.effect_extent
+            && self.effects == other.effects
+            && self.outline == other.outline
+            && self.decorative == other.decorative
+            && self.hyperlink == other.hyperlink
+            && self.inline_shape == other.inline_shape
+            && self.inline_chart == other.inline_chart
+            && self.inline_math == other.inline_math
+            && self.baseline_depth == other.baseline_depth
+            && self.horizontal_rule == other.horizontal_rule
+            && self.is_insertion == other.is_insertion
+            && self.is_deletion == other.is_deletion
+            && self.change_author == other.change_author
+            && self.change_date == other.change_date
+            && self.change_revision_id == other.change_revision_id
+    }
+}
+
+impl PartialEq for ReservedRun {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            reservation: _,
+            width: _,
+            height: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.reservation == other.reservation
+            && self.width == other.width
+            && self.height == other.height
+    }
+}
+
+impl PartialEq for ReservedBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            id: _,
+            reservation: _,
+            width: _,
+            height: _,
+        } = other;
+        self.id == other.id
+            && self.reservation == other.reservation
+            && self.width == other.width
+            && self.height == other.height
+    }
+}
+
+impl PartialEq for LineBreakRun {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        true
+    }
+}
+
+impl PartialEq for FieldRun {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            fmt: _,
+            field_type: _,
+            raw_type: _,
+            instruction: _,
+            fallback: _,
+            locked: _,
+            nested_sequences: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.fmt == other.fmt
+            && self.field_type == other.field_type
+            && self.raw_type == other.raw_type
+            && self.instruction == other.instruction
+            && self.fallback == other.fallback
+            && self.locked == other.locked
+            && self.nested_sequences == other.nested_sequences
+    }
+}
+
+impl PartialEq for ParagraphBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            sdt_groups: _,
+            id: _,
+            para_id: _,
+            runs: _,
+            attrs: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.sdt_groups == other.sdt_groups
+            && self.id == other.id
+            && self.para_id == other.para_id
+            && self.runs == other.runs
+            && self.attrs == other.attrs
+    }
+}
+
+impl PartialEq for TableBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            sdt_groups: _,
+            id: _,
+            rows: _,
+            column_widths: _,
+            grid_widths: _,
+            width: _,
+            width_type: _,
+            preferred_width: _,
+            layout_mode: _,
+            table_layout: _,
+            width_algorithm: _,
+            style_cascade: _,
+            background: _,
+            justification: _,
+            bidi: _,
+            indent: _,
+            floating: _,
+            compatibility_mode: _,
+            cell_margin_left: _,
+            cell_margin_right: _,
+            cell_spacing: _,
+            gridlines: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.sdt_groups == other.sdt_groups
+            && self.id == other.id
+            && self.rows == other.rows
+            && self.column_widths == other.column_widths
+            && self.grid_widths == other.grid_widths
+            && self.width == other.width
+            && self.width_type == other.width_type
+            && self.preferred_width == other.preferred_width
+            && self.layout_mode == other.layout_mode
+            && self.table_layout == other.table_layout
+            && self.width_algorithm == other.width_algorithm
+            && self.style_cascade == other.style_cascade
+            && self.background == other.background
+            && self.justification == other.justification
+            && self.bidi == other.bidi
+            && self.indent == other.indent
+            && self.floating == other.floating
+            && self.compatibility_mode == other.compatibility_mode
+            && self.cell_margin_left == other.cell_margin_left
+            && self.cell_margin_right == other.cell_margin_right
+            && self.cell_spacing == other.cell_spacing
+            && self.gridlines == other.gridlines
+    }
+}
+
+impl PartialEq for ImageBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            sdt_groups: _,
+            id: _,
+            src: _,
+            width: _,
+            height: _,
+            alt: _,
+            shape_type: _,
+            transform: _,
+            opacity: _,
+            rotation_deg: _,
+            flip_h: _,
+            flip_v: _,
+            rotation_bounds: _,
+            anchor: _,
+            hlink_href: _,
+            hlink_title: _,
+            decorative: _,
+            crop: _,
+            effects: _,
+            outline: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.sdt_groups == other.sdt_groups
+            && self.id == other.id
+            && self.src == other.src
+            && self.width == other.width
+            && self.height == other.height
+            && self.alt == other.alt
+            && self.shape_type == other.shape_type
+            && self.transform == other.transform
+            && self.opacity == other.opacity
+            && self.rotation_deg == other.rotation_deg
+            && self.flip_h == other.flip_h
+            && self.flip_v == other.flip_v
+            && self.rotation_bounds == other.rotation_bounds
+            && self.anchor == other.anchor
+            && self.hlink_href == other.hlink_href
+            && self.hlink_title == other.hlink_title
+            && self.decorative == other.decorative
+            && self.crop == other.crop
+            && self.effects == other.effects
+            && self.outline == other.outline
+    }
+}
+
+impl PartialEq for ShapeBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            sdt_groups: _,
+            id: _,
+            shape_type: _,
+            geometry_path: _,
+            fill: _,
+            stroke: _,
+            transform: _,
+            width: _,
+            height: _,
+            x: _,
+            y: _,
+            inner_text: _,
+            nested_sequences: _,
+            inner_measures: _,
+            children: _,
+            scene: _,
+            effects: _,
+            text_body_properties: _,
+            wrap_distances: _,
+            position: _,
+            wrap_type: _,
+            wrap_text: _,
+            relative_height: _,
+            behind_doc: _,
+            decorative: _,
+            title: _,
+            description: _,
+            doc_start: _,
+            doc_end: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.sdt_groups == other.sdt_groups
+            && self.id == other.id
+            && self.shape_type == other.shape_type
+            && self.geometry_path == other.geometry_path
+            && self.fill == other.fill
+            && self.stroke == other.stroke
+            && self.transform == other.transform
+            && self.width == other.width
+            && self.height == other.height
+            && self.x == other.x
+            && self.y == other.y
+            && self.inner_text == other.inner_text
+            && self.nested_sequences == other.nested_sequences
+            && self.inner_measures == other.inner_measures
+            && self.children == other.children
+            && self.scene == other.scene
+            && self.effects == other.effects
+            && self.text_body_properties == other.text_body_properties
+            && self.wrap_distances == other.wrap_distances
+            && self.position == other.position
+            && self.wrap_type == other.wrap_type
+            && self.wrap_text == other.wrap_text
+            && self.relative_height == other.relative_height
+            && self.behind_doc == other.behind_doc
+            && self.decorative == other.decorative
+            && self.title == other.title
+            && self.description == other.description
+    }
+}
+
+impl PartialEq for ChartBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            sdt_groups: _,
+            id: _,
+            chart: _,
+            width: _,
+            height: _,
+            position: _,
+            wrap_type: _,
+            wrap_text: _,
+            relative_height: _,
+            behind_doc: _,
+            doc_start: _,
+            doc_end: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.sdt_groups == other.sdt_groups
+            && self.id == other.id
+            && self.chart == other.chart
+            && self.width == other.width
+            && self.height == other.height
+            && self.position == other.position
+            && self.wrap_type == other.wrap_type
+            && self.wrap_text == other.wrap_text
+            && self.relative_height == other.relative_height
+            && self.behind_doc == other.behind_doc
+    }
+}
+
+impl PartialEq for PageBreakBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            section_mark_ineligible: _,
+            sdt_groups: _,
+            id: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.sdt_groups == other.sdt_groups
+            && self.id == other.id
+            && self.section_mark_ineligible == other.section_mark_ineligible
+    }
+}
+
+impl PartialEq for ColumnBreakBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            sdt_groups: _,
+            id: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.sdt_groups == other.sdt_groups && self.id == other.id
+    }
+}
+
+impl PartialEq for TextBoxBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            sdt_groups: _,
+            id: _,
+            width: _,
+            height: _,
+            fill_color: _,
+            outline_width: _,
+            outline_color: _,
+            outline_style: _,
+            margins: _,
+            content: _,
+            display_mode: _,
+            css_float: _,
+            wrap_type: _,
+            wrap_text: _,
+            anchor_target: _,
+            position: _,
+            dist_top: _,
+            dist_bottom: _,
+            dist_left: _,
+            dist_right: _,
+            pm_start: _,
+            pm_end: _,
+        } = other;
+        self.sdt_groups == other.sdt_groups
+            && self.id == other.id
+            && self.width == other.width
+            && self.height == other.height
+            && self.fill_color == other.fill_color
+            && self.outline_width == other.outline_width
+            && self.outline_color == other.outline_color
+            && self.outline_style == other.outline_style
+            && self.margins == other.margins
+            && self.content == other.content
+            && self.display_mode == other.display_mode
+            && self.css_float == other.css_float
+            && self.wrap_type == other.wrap_type
+            && self.wrap_text == other.wrap_text
+            && self.anchor_target == other.anchor_target
+            && self.position == other.position
+            && self.dist_top == other.dist_top
+            && self.dist_bottom == other.dist_bottom
+            && self.dist_left == other.dist_left
+            && self.dist_right == other.dist_right
+    }
+}
+
+// ---------------------------------------------------------------------------
+// extents (measurement results)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypesetRowSegment {
+    pub head_run: usize,
+    pub head_char: usize,
+    pub tail_run: usize,
+    pub tail_char: usize,
+    pub left_offset: f64,
+    pub available_width: f64,
+    pub width: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypesetRunAdvance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_char: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_char: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_order: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypesetClusterAdvance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_char: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_char: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_offset: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi_level: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_order: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypesetBidiSlice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_char: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_char: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi_level: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_order: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_order: Option<u64>,
+}
+
+/// One measured line. `head_*` / `tail_*` bound the line's run and character
+/// range, `float_skip_before` is vertical room the line had to skip past a
+/// float, and `left_offset` / `right_offset` are the exclusions measurement
+/// already applied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypesetRow {
+    pub head_run: usize,
+    pub head_char: usize,
+    pub tail_run: usize,
+    pub tail_char: usize,
+    pub width: f64,
+    pub ascent: f64,
+    pub descent: f64,
+    pub line_height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synthetic_fallback: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_offset: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_offset: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<TypesetRowSegment>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub float_skip_before: Option<f64>,
+    /// Extra first-line px after a marker overruns its hanging indent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker_tab_offset: Option<f64>,
+    /// First-line px an inline (zero-hanging) list marker takes before the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_inline_width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_advances: Option<Vec<TypesetRunAdvance>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_advances: Option<Vec<TypesetClusterAdvance>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi_slices: Option<Vec<TypesetBidiSlice>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphExtent {
+    pub lines: Vec<TypesetRow>,
+    pub total_height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageExtent {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeExtent {
+    pub width: f64,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_measures: Option<Vec<ParagraphExtent>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChartExtent {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableCellExtent {
+    pub blocks: Vec<BlockExtent>,
+    pub width: f64,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub col_span: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_span: Option<f64>,
+    /// Contiguous boundary band above this cell's row (max of the cell's top
+    /// border and the bottom border of the cells above); the row's content
+    /// starts below it. Only set when `tblCellSpacing` is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_band: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableRowExtent {
+    pub cells: Vec<TableCellExtent>,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableExtent {
+    pub rows: Vec<TableRowExtent>,
+    pub column_widths: Vec<f64>,
+    pub total_width: f64,
+    pub total_height: f64,
+    /// Outer width of the table's bottom border band, drawn below the last
+    /// row: `total_height` (and the last fragment's height) reach the band's
+    /// outer edge. Only set when `tblCellSpacing` is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_band: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextBoxExtent {
+    pub width: f64,
+    pub height: f64,
+    pub inner_measures: Vec<ParagraphExtent>,
+}
+
+/// A block's measurement result. Break blocks measure to a bare placeholder
+/// because they occupy no space of their own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum BlockExtent {
+    #[serde(rename = "paragraph")]
+    Paragraph(ParagraphExtent),
+    #[serde(rename = "image")]
+    Image(ImageExtent),
+    #[serde(rename = "shape")]
+    Shape(ShapeExtent),
+    #[serde(rename = "chart")]
+    Chart(ChartExtent),
+    #[serde(rename = "table")]
+    Table(TableExtent),
+    #[serde(rename = "textBox")]
+    TextBox(TextBoxExtent),
+    #[serde(rename = "sectionBreak")]
+    SectionBreak,
+    #[serde(rename = "pageBreak")]
+    PageBreak,
+    #[serde(rename = "columnBreak")]
+    ColumnBreak,
+    #[serde(other, rename = "unsupported")]
+    Unsupported,
+}
+
+/// A block paired with its measure. Placement requires the two kinds to agree;
+/// a mismatch is a contract violation, not a recoverable input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeasuredBlock {
+    pub block: LayoutBlock,
+    pub measure: BlockExtent,
+}
+
+// ---------------------------------------------------------------------------
+// layout options
+// ---------------------------------------------------------------------------
+
+/// Document-level pagination inputs. `footnote_reserved_heights` is keyed by
+/// decimal page number, and the paginator subtracts each entry from that page's
+/// content limit before body flow sees it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LayoutOptions {
+    #[serde(default)]
+    pub contract_version: Option<u32>,
+    pub page_size: Option<Size>,
+    pub margins: Option<PageMargins>,
+    pub final_page_size: Option<Size>,
+    pub final_margins: Option<PageMargins>,
+    pub columns: Option<ColumnLayout>,
+    pub page_gap: Option<f64>,
+    pub default_line_height: Option<f64>,
+    pub header_content_heights: Option<Value>,
+    pub footer_content_heights: Option<Value>,
+    pub title_page: Option<bool>,
+    pub even_and_odd_headers: Option<bool>,
+    pub footnote_reserved_heights: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_separator_heights: Option<crate::footnotes::NoteSeparatorHeights>,
+    pub body_break_type: Option<SectionBreakType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_page_restarts: Option<Vec<Option<SectionPageRestart>>>,
+    /// Per section, the body margins of the pages that show a header or
+    /// footer other than the default one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_page_margins: Option<Vec<SectionPageMargins>>,
+    /// Variant body margins indexed by physical section when callers are shared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_section_page_margins: Option<Vec<SectionPageMargins>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_page_float_bands: Option<Vec<SectionPageFloatBands>>,
+    #[serde(default)]
+    pub sections: Option<Vec<SectionLayoutContract>>,
+}
+
+/// Body margins for a section's first page under `w:titlePg` and its even
+/// pages under `w:evenAndOddHeaders`, each widened by the band that page
+/// shows. `None` where the flag is off: those pages use the section margins.
+/// `restart` is the section's `w:pgNumType w:start`, whose parity decides
+/// which pages are even.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionPageMargins {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<PageMargins>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub even: Option<PageMargins>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<u64>,
+}
+
+/// A full-width float exclusion in page coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageFloatBand {
+    pub top: f64,
+    pub bottom: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub odd_page: Option<bool>,
+}
+
+/// Float bands for each header/footer variant a section shows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SectionPageFloatBands {
+    pub default: Vec<PageFloatBand>,
+    pub first: Option<Vec<PageFloatBand>>,
+    pub even: Option<Vec<PageFloatBand>>,
+    /// Authored margins for float anchors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_margins: Option<PageMargins>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionPageRestart {
+    pub start: u64,
+    pub align_parity: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionLayoutContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margins: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<ColumnLayout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_footer_refs: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_numbering: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_borders: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_settings: Option<Value>,
+}
+
+/// The `{ measured, options }` envelope the engine paginates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Input {
+    pub measured: Vec<MeasuredBlock>,
+    #[serde(default)]
+    pub options: LayoutOptions,
+}
+
+// ---------------------------------------------------------------------------
+// fragments and pages (output)
+// ---------------------------------------------------------------------------
+
+use crate::resolve_lines::ResolvedLine;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HorizontalFrame {
+    pub margin_left: f64,
+    pub content_width: f64,
+    pub column_x: f64,
+    pub column_width: f64,
+}
+
+/// One page's slice of a paragraph: the measured line window
+/// `[from_line, to_line)`, its own document range, and the run slices those
+/// lines resolve to. `carried_from_prev` / `carried_to_next` mark a split.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphFragment {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horizontal_frame: Option<HorizontalFrame>,
+    pub block_id: BlockId,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+    pub from_line: usize,
+    pub to_line: usize,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_from_prev: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_to_next: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_lines: Option<Vec<ResolvedLine>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellClip {
+    pub row: usize,
+    pub cell: usize,
+    pub top: f64,
+    pub bottom: f64,
+}
+
+/// One page's slice of a table: rows `[row_start, row_end)`, plus
+/// `clip_top` / `clip_bottom` when the boundary cuts through a row that broke
+/// mid-content, and `header_row_count` when this fragment repeats the header
+/// band.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableFragment {
+    pub block_id: BlockId,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+    pub row_start: usize,
+    pub row_end: usize,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_floating: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_from_prev: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_to_next: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_row_count: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_top: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_bottom: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_clips: Option<Vec<CellClip>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageFragment {
+    pub block_id: BlockId,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_anchored: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeFragment {
+    pub block_id: BlockId,
+    #[serde(skip)]
+    pub wrap_offset_x: Option<f64>,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_end: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_anchored: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartFragment {
+    pub block_id: BlockId,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_end: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_anchored: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextBoxFragment {
+    pub block_id: BlockId,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm_end: Option<f64>,
+    pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_floating: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<f64>,
+}
+
+/// The space a [`ReservedBlock`] takes on a page.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReservedFragment {
+    pub block_id: BlockId,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// A positioned piece of a block on one page. Break blocks produce none.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Fragment {
+    Paragraph(ParagraphFragment),
+    Table(TableFragment),
+    Image(ImageFragment),
+    Shape(ShapeFragment),
+    Chart(ChartFragment),
+    TextBox(TextBoxFragment),
+    Reserved(ReservedFragment),
+}
+
+impl Fragment {
+    /// Sets the placement coordinates.
+    pub fn set_xy(&mut self, x: f64, y: f64) {
+        match self {
+            Fragment::Paragraph(f) => {
+                f.x = x;
+                f.y = y;
+            }
+            Fragment::Table(f) => {
+                f.x = x;
+                f.y = y;
+            }
+            Fragment::Image(f) => {
+                f.x = x;
+                f.y = y;
+            }
+            Fragment::Shape(f) => {
+                f.x = x;
+                f.y = y;
+            }
+            Fragment::Chart(f) => {
+                f.x = x;
+                f.y = y;
+            }
+            Fragment::TextBox(f) => {
+                f.x = x;
+                f.y = y;
+            }
+            Fragment::Reserved(f) => {
+                f.x = x;
+                f.y = y;
+            }
+        }
+    }
+
+    /// `(y, height, lead)` for a flow-placed fragment, `None` for a float.
+    /// `lead` approximates the first row or line — the unit Word relocates
+    /// whole — as the fragment's mean; per-row heights are not carried here.
+    pub fn flow_box(&self) -> Option<(f64, f64, f64)> {
+        let share = |height: f64, units: usize| height / units.max(1) as f64;
+        match self {
+            Fragment::Paragraph(f) => Some((
+                f.y,
+                f.height,
+                share(f.height, f.to_line.saturating_sub(f.from_line)),
+            )),
+            Fragment::Table(f) => (f.is_floating != Some(true)).then(|| {
+                (
+                    f.y,
+                    f.height,
+                    share(f.height, f.row_end.saturating_sub(f.row_start)),
+                )
+            }),
+            Fragment::Image(f) => {
+                (f.is_anchored != Some(true)).then_some((f.y, f.height, f.height))
+            }
+            Fragment::Shape(f) => {
+                (f.is_anchored != Some(true)).then_some((f.y, f.height, f.height))
+            }
+            Fragment::Chart(f) => {
+                (f.is_anchored != Some(true)).then_some((f.y, f.height, f.height))
+            }
+            Fragment::TextBox(f) => {
+                (f.is_floating != Some(true)).then_some((f.y, f.height, f.height))
+            }
+            Fragment::Reserved(f) => Some((f.y, f.height, f.height)),
+        }
+    }
+
+    /// Moves the fragment down the page.
+    pub fn shift_y(&mut self, delta: f64) {
+        match self {
+            Fragment::Paragraph(f) => f.y += delta,
+            Fragment::Table(f) => f.y += delta,
+            Fragment::Image(f) => f.y += delta,
+            Fragment::Shape(f) => f.y += delta,
+            Fragment::Chart(f) => f.y += delta,
+            Fragment::TextBox(f) => f.y += delta,
+            Fragment::Reserved(f) => f.y += delta,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderFooterRefs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_default: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_first: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_even: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer_default: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer_first: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer_even: Option<String>,
+}
+
+impl HeaderFooterRefs {
+    /// Takes each reference a later section authors, keeping the ones it leaves unset.
+    pub fn inherit(&mut self, authored: &HeaderFooterRefs) {
+        for (inherited, authored) in [
+            (&mut self.header_default, &authored.header_default),
+            (&mut self.header_first, &authored.header_first),
+            (&mut self.header_even, &authored.header_even),
+            (&mut self.footer_default, &authored.footer_default),
+            (&mut self.footer_first, &authored.footer_first),
+            (&mut self.footer_even, &authored.footer_even),
+        ] {
+            if authored.is_some() {
+                inherited.clone_from(authored);
+            }
+        }
+    }
+}
+
+/// One paginated page: its geometry, the fragments placed on it in paint order,
+/// and the section-derived metadata a renderer needs for page numbering, header
+/// and footer selection, borders and note areas.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Page {
+    pub number: u32,
+    pub fragments: Vec<Fragment>,
+    #[serde(skip)]
+    pub(crate) float_bands: Vec<PageFloatBand>,
+    #[serde(skip)]
+    pub(crate) opening_fragment_geometry: Option<Box<crate::page_flow::OpeningFragmentGeometry>>,
+    pub margins: PageMargins,
+    /// Body flow margins when they differ from the anchor frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_margins: Option<PageMargins>,
+    /// Effective body anchor margins before float exclusions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_anchor_margins: Option<PageMargins>,
+    pub size: Size,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_index: Option<u64>,
+    #[serde(skip)]
+    pub region_section_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_footer_refs: Option<HeaderFooterRefs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footnote_ids: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footnote_reserved_height: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footnote_columns: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<ColumnLayout>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_page_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_page_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_numbering: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_borders: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vertical_align: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_areas: Option<Vec<NoteAreaContract>>,
+    /// Automatic parity filler: suppress header/footer bands, keep the sheet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parity_filler: Option<bool>,
+}
+
+impl Page {
+    pub fn has_float_bands(&self) -> bool {
+        !self.float_bands.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HeaderFooterLayout {
+    pub height: f64,
+    pub fragments: Vec<Fragment>,
+}
+
+/// The paginator's complete result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Layout {
+    pub page_size: Size,
+    pub pages: Vec<Page>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<ColumnLayout>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, HeaderFooterLayout>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footers: Option<BTreeMap<String, HeaderFooterLayout>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_gap: Option<f64>,
+    /// Covers only part of the document.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
+    /// While `partial`, NUMPAGES renders the field's cached result.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cached_page_totals: bool,
+}
+
+// ---------------------------------------------------------------------------
+// additive contracts
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_page_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_page_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_numbering: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_distance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_distance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_borders: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_align: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_areas: Option<Vec<NoteAreaContract>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageMarginsContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gutter: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ColumnLayoutContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<ColumnDefinition>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionBreakContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_footer_refs: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_numbering: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_borders: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_align: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_settings: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteLayoutItemContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measures: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_doc_start: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_doc_end: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_mark_follows: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteAreaContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separator: Option<NoteLayoutItemContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<NoteLayoutItemContract>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayNoteRegionContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separator_primitives: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primitives: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_ids: Option<Vec<i64>>,
+}
+
+/// Comment/reviewer presentation attached to display primitives.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayCommentMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<bool>,
+}
+
+/// Scoped clip/group metadata.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayClipGroupMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayClipGroupPrimitiveContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primitives: Option<Vec<Value>>,
+    #[serde(default, flatten)]
+    pub attrs: DisplayPrimitiveMetadata,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayPrimitiveMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_history: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_doc_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_order: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi_level: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decorative: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aria_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aria_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_object: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<DisplayCommentMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_group: Option<DisplayClipGroupMetadata>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayListContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayPageContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_primitive_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_areas: Option<Vec<NoteAreaContract>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionedGlyphContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_order: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi_level: Option<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayTextContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_glyphs: Option<LeaderGlyphContract>,
+    /// Modern w14 text effects payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modern_effects: Option<Value>,
+    /// GlyphRun only: resolved CSS font shorthand for the fillText safety net
+    /// when glyph outlines are unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_font: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DisplayRectContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayLineContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    /// Owner class of the retained border recipe (`cell`/`fragment`/...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_owner: Option<String>,
+    /// Owning table grid cell for table-border/table-cut lines (mirrors the
+    /// `TableCellRef` the line carries through its flattened DocAttrs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<Value>,
+    /// Enclosing table-fragment identity for table-border/table-cut lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayImageContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flip_h: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flip_v: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_frame: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayShapeContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_paint: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_extent: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayDecorationContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_slice: Option<HighlightSliceContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaderGlyphContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glyph: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtl: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HighlightSliceContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub includes_trailing_whitespace: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayListBuildContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_areas: Option<Vec<NoteAreaContract>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_comment_ids: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_authors: Option<Vec<DisplayCommentAuthorContract>>,
+}
+
+/// Additive header/footer envelope and watermark metadata.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayHeaderFooterContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DisplayWatermarkContractMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decorative: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayCommentAuthorContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn optional_inline_chart_round_trips_and_changes_measurement_identity() {
+        let legacy: ImageRun = serde_json::from_value(json!({
+            "src": "", "width": 192.0, "height": 96.0
+        }))
+        .unwrap();
+        assert!(legacy.inline_chart.is_none());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("inlineChart")
+                .is_none()
+        );
+        let chart = json!({
+            "id": "chart:inline", "width": 192.0, "height": 96.0,
+            "chart": {
+                "chartType": "column",
+                "series": [{"name": "Sales", "categories": ["Q1"], "values": [2.0]}]
+            }
+        });
+        let mut inline = legacy.clone();
+        inline.inline_chart = Some(Box::new(serde_json::from_value(chart.clone()).unwrap()));
+        assert_ne!(legacy, inline);
+        let value = serde_json::to_value(&inline).unwrap();
+        assert_eq!(value["inlineChart"], chart);
+        assert_eq!(serde_json::from_value::<ImageRun>(value).unwrap(), inline);
+        let mut edited = inline.clone();
+        edited.inline_chart.as_mut().unwrap().chart["series"][0]["values"][0] = json!(4.0);
+        assert_ne!(inline, edited);
+    }
+
+    #[test]
+    fn optional_table_layout_round_trips_and_changes_measurement_identity() {
+        let legacy: TableBlock = serde_json::from_value(json!({"id": 0, "rows": []})).unwrap();
+        assert_eq!(legacy.table_layout, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("tableLayout")
+                .is_none()
+        );
+        let mut fixed = legacy.clone();
+        fixed.table_layout = Some("fixed".to_owned());
+        assert_ne!(legacy, fixed);
+        let value = serde_json::to_value(&fixed).unwrap();
+        assert_eq!(value["tableLayout"], "fixed");
+        assert_eq!(serde_json::from_value::<TableBlock>(value).unwrap(), fixed);
+        let mut autofit = fixed.clone();
+        autofit.table_layout = Some("autofit".to_owned());
+        assert_ne!(fixed, autofit);
+    }
+
+    #[test]
+    fn old_optional_contracts_deserialize_to_noop_defaults() {
+        let primitive: DisplayPrimitiveMetadata = serde_json::from_value(json!({})).unwrap();
+        let build: DisplayListBuildContractMetadata = serde_json::from_value(json!({})).unwrap();
+        let row: TypesetRow = serde_json::from_value(json!({
+            "headRun": 0,
+            "headChar": 0,
+            "tailRun": 0,
+            "tailChar": 0,
+            "width": 0.0,
+            "ascent": 0.0,
+            "descent": 0.0,
+            "lineHeight": 0.0
+        }))
+        .unwrap();
+
+        assert_eq!(primitive, DisplayPrimitiveMetadata::default());
+        assert_eq!(build, DisplayListBuildContractMetadata::default());
+        assert!(row.run_advances.is_none());
+        assert!(row.cluster_advances.is_none());
+        assert!(row.bidi_slices.is_none());
+    }
+
+    #[test]
+    fn present_optional_contracts_round_trip_camel_case() {
+        let value = json!({
+            "contractVersion": 1,
+            "noteAreas": [{
+                "pageIndex": 0,
+                "kind": "footnote",
+                "placement": "pageBottom",
+                "notes": [{ "id": 7, "displayLabel": "1" }]
+            }],
+            "resolvedCommentIds": [4]
+        });
+        let contract: DisplayListBuildContractMetadata =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(contract).unwrap(), value);
+
+        let attrs_value = json!({
+            "linkTitle": "ScreenTip",
+            "logicalOrder": 3,
+            "bidiLevel": 1,
+            "decorative": true,
+            "clipGroup": { "id": "cell-1", "opacity": 0.5 }
+        });
+        let attrs: DisplayPrimitiveMetadata = serde_json::from_value(attrs_value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(attrs).unwrap(), attrs_value);
+    }
+}
+
+/// Which generation of Word's table pagination a document lays out with,
+/// from `w:compat/w:compatSetting[@w:name="compatibilityMode"]`.
+///
+/// Word <= 2010 (`compatibilityMode` < 15, absent = 12) is [`Legacy`]:
+/// page-anchored floating tables share the page's body budget with a deadline
+/// and the text before their anchor wraps beside them. Word 2013+
+/// (`compatibilityMode` >= 15) is [`Word2013`].
+///
+/// [`Legacy`]: WordLayoutEra::Legacy
+/// [`Word2013`]: WordLayoutEra::Word2013
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordLayoutEra {
+    Legacy,
+    Word2013,
+}
+
+impl From<Option<u8>> for WordLayoutEra {
+    fn from(compatibility_mode: Option<u8>) -> Self {
+        match compatibility_mode {
+            Some(mode) if mode >= 15 => Self::Word2013,
+            _ => Self::Legacy,
+        }
+    }
+}
+
+impl TableBlock {
+    /// The Word generation whose table pagination this table follows.
+    pub fn layout_era(&self) -> WordLayoutEra {
+        WordLayoutEra::from(self.compatibility_mode)
+    }
+}

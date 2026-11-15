@@ -1,0 +1,76 @@
+import { version as fontsVersion } from '../package.json';
+import { version as fontsCjkVersion } from '../../fonts-cjk/package.json';
+import { version as fontsLatinVersion } from '../../fonts-latin/package.json';
+import { version as fontsIntlVersion } from '../../fonts-intl/package.json';
+import { loadFontBytes } from './bytes';
+import type { FontDecoder } from './decode';
+import { loadPackedFontBytes, readPackedFontBytes, isBaseLatinFont, isLatinFont, isCjkFont, sliceDecoder, sliceRefOf } from './packed';
+import type { BundledFontFace } from './manifest';
+import { fontProvider, type BundledFontSource } from './provider';
+
+export interface CdnFontOptions {
+  baseUrl?: string | URL;
+  cjkBaseUrl?: string | URL;
+}
+
+const BASE_URL = `https://cdn.jsdelivr.net/npm/@nimbleoffice/fonts-latin@${fontsLatinVersion}/assets/`;
+const CJK_BASE_URL = `https://cdn.jsdelivr.net/npm/@nimbleoffice/fonts-cjk@${fontsCjkVersion}/assets/`;
+const INTL_BASE_URL = `https://cdn.jsdelivr.net/npm/@nimbleoffice/fonts-intl@${fontsIntlVersion}/assets/`;
+const DECODER_URL = `https://cdn.jsdelivr.net/npm/@nimbleoffice/fonts@${fontsVersion}/dist/decoder/fontpack.wasm`;
+const BASE_LATIN_URL = `https://cdn.jsdelivr.net/npm/@nimbleoffice/fonts@${fontsVersion}/assets/`;
+
+function assetBase(value: string | URL): URL {
+  const href = String(value);
+  const base = href.endsWith('/') ? href : `${href}/`;
+  return new URL(
+    base,
+    typeof location === 'undefined' ? undefined : location.href,
+  );
+}
+
+/** Loads pinned CDN fonts without bundling font assets or add-ons. */
+export function createFontProvider(
+  options: CdnFontOptions = {},
+  runtime?: { decoder?: FontDecoder; /** @internal Entries this call creates are dropped once settled; concurrent requests still share one decode. */ retain?: boolean },
+): BundledFontSource {
+  const base = assetBase(options.baseUrl ?? BASE_URL);
+  const cjkBase = assetBase(
+    options.cjkBaseUrl ?? options.baseUrl ?? CJK_BASE_URL,
+  );
+  const intlBase = assetBase(options.baseUrl ?? INTL_BASE_URL);
+  const decoderUrl = options.baseUrl === undefined
+    ? new URL(DECODER_URL)
+    : new URL('decoder/fontpack.wasm', base);
+  const bytes = (packed: typeof loadPackedFontBytes) => (face: BundledFontFace) => {
+    if (face.file.endsWith('.ttf.zst') || face.file.endsWith('.otf.zst')) {
+      return packed(
+        face,
+        async (dependency) => new URL(
+          dependency.file,
+          isBaseLatinFont(face.file) ? assetBase(options.baseUrl ?? BASE_LATIN_URL) : isLatinFont(face.file) ? base : isCjkFont(face.file) ? cjkBase : intlBase,
+        ),
+        30_000,
+        decoderUrl,
+        undefined,
+        runtime,
+      );
+    }
+    return loadFontBytes(
+      face,
+      new URL(face.file, face.script?.startsWith('cjk-') ? cjkBase : base),
+      30_000,
+    );
+  };
+  return fontProvider(bytes(loadPackedFontBytes), bytes(readPackedFontBytes), (face) => {
+    const ref = sliceRefOf(face.file);
+    return ref && {
+      ref,
+      base: cjkBase.href,
+      url: async (file) => new URL(file, cjkBase),
+      timeoutMs: 30_000,
+      decode: sliceDecoder(decoderUrl, runtime?.decoder),
+      decoder: runtime?.decoder,
+      retain: runtime?.retain,
+    };
+  });
+}

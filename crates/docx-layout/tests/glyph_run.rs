@@ -1,0 +1,2032 @@
+//! Glyph-run shaping, fallback, geometry, and determinism tests.
+
+use docx_layout::display_list::{
+    DisplayList, GlyphRunPrimitive, Primitive, TextRunPrimitive, build_display_list_json,
+    build_display_list_json_with_fonts,
+};
+use docx_layout::hit::{caret_rect, hit_test, range_rects};
+use ooxml_text::{FontId, FontStore, ShapeDirection, kern_features, shape, shape_with_direction};
+
+const LIBERATION: &[u8] = include_bytes!("../../ooxml-text/tests/fonts/LiberationSans-Regular.ttf");
+
+const FRAG_X: f64 = 96.0;
+const FRAG_WIDTH: f64 = 624.0;
+
+fn store_with_liberation() -> FontStore {
+    let mut s = FontStore::new();
+    s.register(LIBERATION.to_vec()).expect("fixture registers");
+    s
+}
+
+#[test]
+fn default_echo_facts_do_not_repeat_default_fields() {
+    let store = store_with_liberation();
+    let json = build_display_list_json_with_fonts(
+        &build_input("a", 10.0, None, false, Some(&[0])),
+        &store,
+    )
+    .unwrap();
+    let list: DisplayList = serde_json::from_str(&json).unwrap();
+    let facts = list.pages[0]
+        .primitives
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => run.echo.as_ref(),
+            _ => None,
+        })
+        .unwrap();
+    let bytes = serde_json::to_vec(facts).unwrap();
+    println!("ECHO_FACT_BYTES {}", bytes.len());
+    assert!(
+        bytes.len() <= 40,
+        "default echo facts exceed the byte budget"
+    );
+    let decoded: docx_layout::display_list::EchoRunFacts = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(&decoded, facts);
+    let mut nondefault = facts.clone();
+    nondefault.kern = true;
+    nondefault.kerning = 12.0;
+    nondefault.primary_font = false;
+    nondefault.letter_spacing = 2.0;
+    nondefault.position = -2.0;
+    nondefault.scale = 80.0;
+    nondefault.can_empty = true;
+    nondefault.stretch = Some(40.5);
+    nondefault.center_width = Some(528.0);
+    let decoded: docx_layout::display_list::EchoRunFacts =
+        serde_json::from_slice(&serde_json::to_vec(&nondefault).unwrap()).unwrap();
+    assert_eq!(decoded, nondefault);
+}
+
+#[test]
+fn echo_facts_keep_resolved_indents_and_character_spacing() {
+    let store = store_with_liberation();
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input("a", 10.0, None, false, Some(&[0]))).unwrap();
+    input["measured"][0]["block"]["attrs"] = serde_json::json!({ "indent": { "right": 96.0 } });
+    input["measured"][0]["block"]["runs"][0]["letterSpacing"] = serde_json::json!(2.0);
+    let json = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&json).unwrap();
+    let facts = list.pages[0]
+        .primitives
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => run.echo.as_ref(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(facts.x, 96.0);
+    assert_eq!(facts.right, 624.0);
+    assert_eq!(facts.letter_spacing, 2.0);
+    assert!(facts.primary_font);
+    assert!(!facts.can_empty);
+}
+
+#[test]
+fn echo_facts_decline_conflicting_font_slots() {
+    let store = store_with_liberation();
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input("a", 10.0, None, false, Some(&[0]))).unwrap();
+    input["measured"][0]["block"]["runs"][0]["fontSlots"] = serde_json::json!({
+        "ascii": "Liberation Sans", "hAnsi": "Other"
+    });
+    let json = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&json).unwrap();
+    let facts = list.pages[0]
+        .primitives
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => run.echo.as_ref(),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!facts.primary_font);
+}
+
+fn echo_facts_of(input: &str) -> Vec<docx_layout::display_list::EchoRunFacts> {
+    let store = store_with_liberation();
+    let json = build_display_list_json_with_fonts(input, &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&json).unwrap();
+    list.pages[0]
+        .primitives
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => Some(run.echo.clone()),
+            _ => None,
+        })
+        .map(|facts| facts.expect("every glyph run carries echo facts"))
+        .collect()
+}
+
+#[test]
+fn echo_facts_mark_a_justified_line_that_stretches() {
+    let stretched = echo_facts_of(&build_input(
+        "Hello world foo",
+        90.0,
+        Some("justify"),
+        true,
+        Some(&[0]),
+    ));
+    assert!(!stretched.is_empty());
+    for facts in &stretched {
+        assert_eq!(facts.stretch, Some(90.0));
+        assert_eq!(facts.center_width, None);
+    }
+}
+
+#[test]
+fn echo_facts_keep_the_unstretched_closing_line_of_a_justified_paragraph() {
+    let closing = echo_facts_of(&build_input(
+        "Hello world foo",
+        90.0,
+        Some("justify"),
+        false,
+        Some(&[0]),
+    ));
+    let left = echo_facts_of(&build_input(
+        "Hello world foo",
+        90.0,
+        None,
+        false,
+        Some(&[0]),
+    ));
+    assert_eq!(closing, left);
+    assert!(
+        closing
+            .iter()
+            .all(|facts| facts.stretch.is_none() && facts.center_width.is_none())
+    );
+}
+
+#[test]
+fn echo_facts_give_a_centered_line_its_centering_width() {
+    let centered = echo_facts_of(&build_input(
+        "Hello",
+        40.0,
+        Some("center"),
+        false,
+        Some(&[0]),
+    ));
+    assert!(!centered.is_empty());
+    for facts in &centered {
+        assert_eq!(facts.x, FRAG_X);
+        assert_eq!(facts.right, FRAG_X + FRAG_WIDTH);
+        assert_eq!(facts.center_width, Some(FRAG_WIDTH));
+        assert_eq!(facts.stretch, None);
+    }
+}
+
+#[test]
+fn echo_facts_decline_right_aligned_lines() {
+    let facts = echo_facts_of_optional(&build_input(
+        "Hello",
+        40.0,
+        Some("right"),
+        false,
+        Some(&[0]),
+    ));
+    assert!(!facts.is_empty());
+    assert!(facts.iter().all(Option::is_none));
+}
+
+fn echo_facts_of_optional(input: &str) -> Vec<Option<docx_layout::display_list::EchoRunFacts>> {
+    let store = store_with_liberation();
+    let json = build_display_list_json_with_fonts(input, &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&json).unwrap();
+    list.pages[0]
+        .primitives
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => Some(run.echo.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Build a one-paragraph, one-line display-list input. `chain` is the
+/// `fontChains` value for `"liberation sans|0|0"` (None ⇒ no fontChains at all,
+/// the browser-measured shape). `trailing_break` appends a `<w:br>` run so a
+/// last line still justifies. Text runs are 1 document position per char
+/// starting at position 1.
+fn build_input(
+    text: &str,
+    line_width: f64,
+    alignment: Option<&str>,
+    trailing_break: bool,
+    chain: Option<&[u32]>,
+) -> String {
+    let char_count = text.chars().count() as i64;
+    let pm_start = 1i64;
+    let pm_end_run = pm_start + char_count;
+
+    let mut runs = vec![serde_json::json!({
+        "kind": "text",
+        "text": text,
+        "pmStart": pm_start,
+        "pmEnd": pm_end_run,
+        "fontFamily": "Liberation Sans",
+        "fontSize": 12.0
+    })];
+    if trailing_break {
+        runs.push(serde_json::json!({ "kind": "lineBreak", "pmStart": pm_end_run }));
+    }
+
+    let mut block = serde_json::json!({
+        "kind": "paragraph",
+        "id": 0,
+        "runs": runs,
+        "pmStart": pm_start,
+        "pmEnd": pm_end_run + 1
+    });
+    if let Some(a) = alignment {
+        block["attrs"] = serde_json::json!({ "alignment": a });
+    }
+
+    let mut input = serde_json::json!({
+        "measured": [{
+            "block": block,
+            "measure": {
+                "kind": "paragraph",
+                "totalHeight": 20.0,
+                "lines": [{
+                    "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": char_count,
+                    "width": line_width, "ascent": 16.0, "descent": 4.0, "lineHeight": 20.0
+                }]
+            }
+        }],
+        "options": {},
+        "layout": {
+            "pages": [{
+                "size": {"w": 816.0, "h": 1056.0},
+                "margins": {"top": 96.0, "right": 96.0, "bottom": 96.0, "left": 96.0},
+                "number": 1,
+                "fragments": [{
+                    "kind": "paragraph",
+                    "blockId": 0,
+                    "x": FRAG_X, "y": 96.0, "width": FRAG_WIDTH, "height": 20.0,
+                    "fromLine": 0, "toLine": 1,
+                    "pmStart": pm_start, "pmEnd": pm_end_run + 1
+                }]
+            }]
+        }
+    });
+    if let Some(ids) = chain {
+        input["fontChains"] = serde_json::json!({ "liberation sans|0|0": ids });
+    }
+    input.to_string()
+}
+
+fn browser_text_run(
+    store: &FontStore,
+    family: &str,
+    font: FontId,
+    text: &str,
+    formatting: serde_json::Value,
+) -> TextRunPrimitive {
+    browser_text_run_with_chain(store, family, &[font.to_u32()], text, formatting)
+}
+
+fn browser_text_run_with_chain(
+    store: &FontStore,
+    family: &str,
+    chain: &[u32],
+    text: &str,
+    formatting: serde_json::Value,
+) -> TextRunPrimitive {
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input(text, 0.0, None, false, None)).unwrap();
+    let run = &mut input["measured"][0]["block"]["runs"][0];
+    run["fontFamily"] = serde_json::json!(family);
+    run.as_object_mut()
+        .unwrap()
+        .extend(formatting.as_object().unwrap().clone());
+    let chains = serde_json::json!({
+        (format!(
+            "{}|{}|{}",
+            family.to_lowercase(),
+            u8::from(formatting["bold"].as_bool().unwrap_or(false)),
+            u8::from(formatting["italic"].as_bool().unwrap_or(false))
+        )): chain
+    });
+    let measure = ooxml_text::measure_paragraph_json(
+        store,
+        &serde_json::json!({
+            "block": input["measured"][0]["block"],
+            "maxWidth": FRAG_WIDTH,
+            "fontChains": chains,
+            "authoritativeShaping": formatting["authoritativeShaping"].as_bool().unwrap_or(false),
+            "defaults": {"fontSize": 12.0, "fontFamily": family}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut measure: serde_json::Value = serde_json::from_str(&measure).unwrap();
+    if formatting["authoritativeShaping"].as_bool() == Some(true) {
+        for line in measure["lines"].as_array_mut().unwrap() {
+            let line = line.as_object_mut().unwrap();
+            line.remove("bidiSlices");
+            line.remove("clusterAdvances");
+        }
+    }
+    input["measured"][0]["measure"] = measure;
+    input["fontChains"] = chains;
+    let output = build_display_list_json_with_fonts(&input.to_string(), store).unwrap();
+    let list: DisplayList = serde_json::from_str(&output).unwrap();
+    list.pages[0]
+        .primitives
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::Text(run) if run.text == text => Some(run.clone()),
+            _ => None,
+        })
+        .expect("browser text run")
+}
+
+fn shaped_width(store: &FontStore, font: FontId, text: &str) -> f64 {
+    shape(store, font, text, 16.0, &kern_features(false))
+        .unwrap()
+        .iter()
+        .map(|glyph| f64::from(glyph.x_advance))
+        .sum()
+}
+
+#[test]
+fn browser_painted_nonbreaking_hyphen_uses_the_resolved_glyph_text() {
+    let mut store = FontStore::new();
+    let font = store
+        .register(include_bytes!("../../../packages/fonts/assets/Carlito-Regular.ttf").to_vec())
+        .unwrap();
+    let text = "co\u{2011}op";
+    for formatting in [
+        serde_json::json!({"allCaps": true}),
+        serde_json::json!({"textShadow": true}),
+    ] {
+        let run = browser_text_run(&store, "Calibri", font, text, formatting);
+        let primitive = serde_json::to_value(&run).unwrap();
+        assert_eq!(primitive["paintText"], "co-op");
+        assert_eq!(run.text, text);
+        assert_eq!(
+            primitive["paintText"]
+                .as_str()
+                .unwrap()
+                .encode_utf16()
+                .count(),
+            text.encode_utf16().count()
+        );
+        assert_eq!((run.attrs.doc_start, run.attrs.doc_end), (Some(1), Some(6)));
+    }
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input(text, 40.0, None, false, None)).unwrap();
+    input["measured"][0]["block"]["runs"][0]["allCaps"] = serde_json::json!(true);
+    let output = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&output).unwrap();
+    let primitive = list.pages[0]
+        .primitives
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::Text(run) => Some(serde_json::to_value(run).unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(primitive["text"], text);
+    assert!(primitive.get("paintText").is_none());
+
+    let font = store
+        .register(include_bytes!("../../../packages/fonts/assets/Inter-Regular.ttf").to_vec())
+        .unwrap();
+    let run = browser_text_run(
+        &store,
+        "Inter",
+        font,
+        text,
+        serde_json::json!({"allCaps": true}),
+    );
+    assert_eq!(run.text, text);
+    assert!(
+        serde_json::to_value(run)
+            .unwrap()
+            .get("paintText")
+            .is_none()
+    );
+}
+
+#[test]
+fn browser_canvas_clusters_paint_the_same_nonbreaking_hyphen_stand_in() {
+    let mut store = FontStore::new();
+    let base = store
+        .register(include_bytes!("../../../packages/fonts/assets/Carlito-Regular.ttf").to_vec())
+        .unwrap();
+    let font = store.register_named_substitute(base, "MS Gothic").unwrap();
+    let formatting = serde_json::json!({"allCaps": true});
+    let run = browser_text_run(
+        &store,
+        "MS Gothic",
+        font,
+        "co\u{2011}op",
+        formatting.clone(),
+    );
+    let control = browser_text_run(&store, "MS Gothic", font, "co-op", formatting);
+    assert_eq!(run.text, "co\u{2011}op");
+    let clusters = run.attrs.canvas_clusters.as_ref().unwrap();
+    assert_eq!(clusters[2].text, "-");
+    let control_clusters = control.attrs.canvas_clusters.as_ref().unwrap();
+    assert_eq!(clusters.len(), control_clusters.len());
+    for (cluster, control) in clusters.iter().zip(control_clusters.iter()) {
+        assert_eq!(cluster.text, control.text);
+        assert_eq!(cluster.offset, control.offset);
+    }
+    assert_eq!(clusters[2].source_range, Some(2..5));
+    assert_eq!(control_clusters[2].source_range, Some(2..3));
+}
+
+#[test]
+fn browser_transformed_cluster_carets_follow_source_boundaries() {
+    let mut store = FontStore::new();
+    let base = store
+        .register(include_bytes!("../../../packages/fonts/assets/Carlito-Regular.ttf").to_vec())
+        .unwrap();
+    let font = store.register_named_substitute(base, "MS PGothic").unwrap();
+    for (text, all_caps) in [("wim", true), ("co\u{2011}op", false), ("aßw", true)] {
+        for spacing in [-1.0, 2.0] {
+            let run = browser_text_run(
+                &store,
+                "MS PGothic",
+                font,
+                text,
+                serde_json::json!({
+                    "allCaps": all_caps,
+                    "textShadow": true,
+                    "letterSpacing": spacing,
+                    "horizontalScale": 80.0
+                }),
+            );
+            let clusters = run.attrs.canvas_clusters.as_ref().unwrap();
+            let painted: String = clusters
+                .iter()
+                .map(|cluster| cluster.text.as_str())
+                .collect();
+            let expected_paint = if all_caps {
+                text.to_uppercase()
+            } else {
+                text.to_owned()
+            };
+            assert_eq!(painted, expected_paint.replace('\u{2011}', "-"));
+            let list: DisplayList = serde_json::from_value(serde_json::json!({
+                "pages": [{
+                    "pageIndex": 0, "width": 816, "height": 1056,
+                    "primitives": [serde_json::to_value(Primitive::Text(run.clone())).unwrap()]
+                }]
+            }))
+            .unwrap();
+            let scale = run
+                .horizontal_scale
+                .as_ref()
+                .and_then(|n| n.as_f64())
+                .unwrap_or(100.0)
+                / 100.0
+                * run
+                    .substitute_scale
+                    .as_ref()
+                    .and_then(|n| n.as_f64())
+                    .unwrap_or(1.0);
+            let mut differs_from_uniform = false;
+            for (index, (byte, _)) in text.char_indices().enumerate() {
+                let cluster = clusters
+                    .iter()
+                    .find(|cluster| cluster.source_range.as_ref().unwrap().start == byte)
+                    .unwrap();
+                let range = cluster.source_range.as_ref().unwrap();
+                assert!(text.get(range.clone()).is_some());
+                let position = 1 + text[..byte].encode_utf16().count() as i64;
+                let x = run.x.as_f64().unwrap() + cluster.offset.as_f64().unwrap() * scale;
+                let uniform = run.x.as_f64().unwrap()
+                    + run.width.as_f64().unwrap() * index as f64 / text.chars().count() as f64;
+                differs_from_uniform |= (x - uniform).abs() > 0.01;
+                assert!((caret_rect(&list, position).unwrap().x - x).abs() < 0.002);
+                assert_eq!(
+                    hit_test(&list, 0, x, run.baseline_y.as_f64().unwrap()),
+                    Some(position)
+                );
+            }
+            assert!(differs_from_uniform, "{text:?}, {spacing}");
+            let end = 1 + text.encode_utf16().count() as i64;
+            let x = run.x.as_f64().unwrap() + run.width.as_f64().unwrap();
+            assert!((caret_rect(&list, end).unwrap().x - x).abs() < 0.002);
+        }
+    }
+}
+
+#[test]
+fn browser_painted_nonbreaking_hyphen_keeps_substitute_width_correction() {
+    let mut store = FontStore::new();
+    let base = store
+        .register(include_bytes!("../../../packages/fonts/assets/Carlito-Regular.ttf").to_vec())
+        .unwrap();
+    let view = store
+        .register_named_substitute(base, "Arial Narrow")
+        .unwrap();
+    let text = "co\u{2011}operate";
+    let run = browser_text_run(
+        &store,
+        "Arial Narrow",
+        view,
+        text,
+        serde_json::json!({"textShadow": true}),
+    );
+    let scale = run.substitute_scale.as_ref().unwrap().as_f64().unwrap();
+    let expected = shaped_width(&store, view, text) / shaped_width(&store, base, text);
+    assert!((scale - expected).abs() < 1e-5);
+    assert_eq!(run.text, text);
+}
+
+#[test]
+fn browser_painted_all_caps_use_substitute_widths() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let text = "Narrow headings avii";
+    for family in ["Arial Narrow", "Aptos"] {
+        let view = store.register_named_substitute(base, family).unwrap();
+        let run = browser_text_run(
+            &store,
+            family,
+            view,
+            text,
+            serde_json::json!({"allCaps": true}),
+        );
+        let painted = text.to_uppercase();
+        let own_width = shaped_width(&store, base, &painted);
+        let view_width = shaped_width(&store, view, &painted);
+        let scale = run.substitute_scale.as_ref().unwrap().as_f64().unwrap();
+        assert!(run.horizontal_scale.is_none());
+        assert!(run.letter_spacing.is_none());
+        assert!((scale - view_width / own_width).abs() < 1e-5, "{family}");
+        assert!(
+            (own_width * scale - run.width.as_f64().unwrap()).abs() < 0.002,
+            "{family}"
+        );
+        assert_eq!(run.x.as_f64(), Some(FRAG_X));
+        assert_eq!(run.text, text);
+        assert!(run.all_caps);
+    }
+}
+
+#[test]
+fn browser_painted_matching_arial_keeps_its_horizontal_scale() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let view = store.register_named_substitute(base, "Arial").unwrap();
+    assert_eq!(view, base);
+    for formatting in [
+        serde_json::json!({"allCaps": true}),
+        serde_json::json!({"textShadow": true}),
+    ] {
+        let run = browser_text_run(&store, "Arial", view, "Plain Arial", formatting);
+        assert!(run.horizontal_scale.is_none());
+        assert!(run.substitute_scale.is_none());
+        assert!(
+            !serde_json::to_string(&run)
+                .unwrap()
+                .contains("substituteScale")
+        );
+    }
+}
+
+#[test]
+fn browser_painted_japanese_substitutes_keep_cjk_outlines_at_full_scale() {
+    let mut store = FontStore::new();
+    let font = nimbleoffice_fonts::decode(
+        include_bytes!("../../../packages/fonts-cjk/assets/NotoSansJP-Regular.otf.zst"),
+        None,
+        64 << 20,
+    )
+    .unwrap();
+    let base = store.register(font).unwrap();
+    for family in [
+        "MS Mincho",
+        "ＭＳ 明朝",
+        "MS Gothic",
+        "ＭＳ ゴシック",
+        "MS PMincho",
+        "ＭＳ Ｐ明朝",
+        "MS PGothic",
+        "ＭＳ Ｐゴシック",
+        "MS UI Gothic",
+    ] {
+        let view = store.register_named_substitute(base, family).unwrap();
+        let text = "1111111111中あア";
+        let width = shaped_width(&store, view, text);
+        let numeric_auto_space = 0.25 * 16.0;
+        assert!(
+            (width - shaped_width(&store, base, text)).abs() > 0.01,
+            "{family}"
+        );
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let metrics =
+                ooxml_text::family_metrics::family_metrics(&family.to_lowercase(), bold, italic)
+                    .unwrap();
+            assert!(std::ptr::eq(
+                store.family_widths(view).unwrap().unwrap(),
+                metrics
+            ));
+            for formatting in [
+                serde_json::json!({"allCaps": true, "bold": bold, "italic": italic}),
+                serde_json::json!({"textShadow": true, "bold": bold, "italic": italic}),
+            ] {
+                let run = browser_text_run(&store, family, view, text, formatting);
+                assert!(run.substitute_scale.is_none(), "{family} {bold} {italic}");
+                assert!(run.horizontal_scale.is_none(), "{family} {bold} {italic}");
+                let clusters = run.attrs.canvas_clusters.as_deref().unwrap();
+                assert_eq!(clusters.len(), 13, "{family}");
+                for (index, cluster) in clusters.iter().take(10).enumerate() {
+                    assert_eq!(
+                        cluster.offset.as_f64(),
+                        Some(index as f64 * 8.0),
+                        "{family}"
+                    );
+                }
+                assert_eq!(
+                    clusters[10].offset.as_f64(),
+                    Some(80.0 + numeric_auto_space),
+                    "{family}"
+                );
+                assert_eq!(
+                    clusters[11].offset.as_f64(),
+                    Some(96.0 + numeric_auto_space),
+                    "{family}"
+                );
+                let katakana_x = 96.0 + numeric_auto_space + shaped_width(&store, view, "あ");
+                assert!(
+                    (clusters[12].offset.as_f64().unwrap() - katakana_x).abs() < 0.001,
+                    "{family}"
+                );
+                assert!(
+                    (run.width.as_f64().unwrap() - width - numeric_auto_space).abs() < 0.002,
+                    "{family} {bold} {italic}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn browser_painted_substitutes_skip_near_unity_corrections() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let mut metrics = ooxml_text::word_fonts::requested_line_metrics("Lucida Bright").unwrap();
+    metrics.advance_scale = 1.0005;
+    let view = store.register_substitute(base, metrics).unwrap();
+    let run = browser_text_run(
+        &store,
+        "Lucida Bright",
+        view,
+        "near unity",
+        serde_json::json!({"textShadow": true}),
+    );
+    assert!(run.horizontal_scale.is_none());
+    assert!(run.substitute_scale.is_none());
+    let scaled = browser_text_run(
+        &store,
+        "Lucida Bright",
+        view,
+        "near unity",
+        serde_json::json!({"textShadow": true, "horizontalScale": 150.0}),
+    );
+    assert_eq!(
+        scaled.horizontal_scale.as_ref().unwrap().as_f64(),
+        Some(150.0)
+    );
+    assert!(scaled.substitute_scale.is_none());
+}
+
+#[test]
+fn browser_painted_substitute_keeps_existing_character_scale() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let view = store
+        .register_named_substitute(base, "Arial Narrow")
+        .unwrap();
+    let text = "Narrow headings";
+    let run = browser_text_run(
+        &store,
+        "Arial Narrow",
+        view,
+        text,
+        serde_json::json!({"allCaps": true, "horizontalScale": 150.0}),
+    );
+    let painted = text.to_uppercase();
+    let own_width = shaped_width(&store, base, &painted);
+    let ratio = shaped_width(&store, view, &painted) / own_width;
+    let scale = run.substitute_scale.as_ref().unwrap().as_f64().unwrap();
+    assert!((scale - ratio).abs() < 1e-5);
+    assert_eq!(run.horizontal_scale.as_ref().unwrap().as_f64(), Some(150.0));
+    assert!((own_width * scale * 1.5 - run.width.as_f64().unwrap()).abs() < 0.002);
+    assert_eq!(run.x.as_f64(), Some(FRAG_X));
+}
+
+#[test]
+fn browser_painted_effects_use_table_and_static_substitute_widths() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let text = "0123456789";
+    for family in ["Segoe UI Semilight", "Lucida Bright"] {
+        let view = store.register_named_substitute(base, family).unwrap();
+        for effect in ["textShadow", "emboss", "imprint", "textOutline"] {
+            let run = browser_text_run(
+                &store,
+                family,
+                view,
+                text,
+                serde_json::json!({(effect): true}),
+            );
+            let scale = run.substitute_scale.as_ref().unwrap().as_f64().unwrap();
+            assert!(run.horizontal_scale.is_none());
+            assert!(
+                (shaped_width(&store, base, text) * scale - run.width.as_f64().unwrap()).abs()
+                    < 0.002,
+                "{family} {effect}"
+            );
+        }
+    }
+}
+
+#[test]
+fn browser_painted_small_caps_use_the_measured_casing_ratio() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let view = store.register_named_substitute(base, "Aptos").unwrap();
+    let text = "Abc WIDE ij";
+    for authoritative in [false, true] {
+        let formatting =
+            serde_json::json!({"smallCaps": true, "authoritativeShaping": authoritative});
+        let run = browser_text_run(&store, "Aptos", view, text, formatting.clone());
+        let own = browser_text_run(&store, "Aptos", base, text, formatting);
+        let scale = run.substitute_scale.as_ref().unwrap().as_f64().unwrap();
+        assert!(run.horizontal_scale.is_none());
+        assert!((own.width.as_f64().unwrap() * scale - run.width.as_f64().unwrap()).abs() < 0.002);
+        assert!(run.small_caps);
+    }
+}
+
+#[test]
+fn browser_painted_substitute_leaders_keep_measured_repeat_positions() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let view = store
+        .register_named_substitute(base, "Arial Narrow")
+        .unwrap();
+    let advance = shaped_width(&store, view, ".");
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input("\t", advance * 3.0, None, false, None)).unwrap();
+    input["measured"][0]["block"]["runs"] = serde_json::json!([{
+        "kind": "tab", "pmStart": 1, "pmEnd": 2, "width": advance * 3.0,
+        "fontFamily": "Arial Narrow", "fontSize": 12.0,
+        "leaderGlyphs": {"glyph": ".", "count": 3, "advance": advance}
+    }]);
+    input["fontChains"] = serde_json::json!({"arial narrow|0|0": [view.to_u32()]});
+    let output = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&output).unwrap();
+    let run = list.pages[0]
+        .primitives
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::Text(run) if run.text == "..." => Some(run),
+            _ => None,
+        })
+        .unwrap();
+    let scale = run.substitute_scale.as_ref().unwrap().as_f64().unwrap();
+    assert!(run.horizontal_scale.is_none());
+    let leader = run.attrs.leader_glyphs.as_ref().unwrap();
+    assert!((leader.advance.as_ref().unwrap().as_f64().unwrap() - advance).abs() < 0.001);
+    assert!((shaped_width(&store, base, ".") * scale - advance).abs() < 0.001);
+    assert_eq!(run.x.as_f64(), Some(FRAG_X));
+}
+
+#[test]
+fn browser_painted_substitute_keeps_measured_tracking() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let view = store
+        .register_named_substitute(base, "Arial Narrow")
+        .unwrap();
+    let run = browser_text_run(
+        &store,
+        "Arial Narrow",
+        view,
+        "tracked heading",
+        serde_json::json!({"allCaps": true, "letterSpacing": 10.0}),
+    );
+    assert!(run.substitute_scale.is_some());
+    assert!(run.horizontal_scale.is_none());
+    assert_eq!(run.letter_spacing.as_ref().unwrap().as_f64(), Some(10.0));
+}
+
+#[test]
+fn browser_painted_fallback_text_has_no_primary_substitute_correction() {
+    let mut store = store_with_liberation();
+    let base = FontId::from_u32(0);
+    let view = store
+        .register_named_substitute(base, "Arial Narrow")
+        .unwrap();
+    let text = "مرحبا";
+    assert!(text.chars().all(|ch| !store.covers(view, ch).unwrap()));
+    let fallback = store
+        .register(
+            include_bytes!("../../../packages/fonts/assets/NotoNaskhArabic-Regular.ttf").to_vec(),
+        )
+        .unwrap();
+    assert!(text.chars().all(|ch| store.covers(fallback, ch).unwrap()));
+    let run = browser_text_run_with_chain(
+        &store,
+        "Arial Narrow",
+        &[view.to_u32(), fallback.to_u32()],
+        text,
+        serde_json::json!({"textShadow": true}),
+    );
+    assert!(run.substitute_scale.is_none());
+    assert!(run.horizontal_scale.is_none());
+}
+
+fn build_rtl_mixed_input() -> String {
+    let pm_start = 1i64;
+    let hebrew = "אבג";
+    let latin = " abc";
+    let hebrew_chars = hebrew.chars().count() as i64;
+    let latin_chars = latin.chars().count() as i64;
+    let hebrew_end = pm_start + hebrew_chars;
+    let pm_end = hebrew_end + latin_chars;
+
+    serde_json::json!({
+        "measured": [{
+            "block": {
+                "kind": "paragraph",
+                "id": 0,
+                "runs": [
+                    {
+                        "kind": "text",
+                        "text": hebrew,
+                        "pmStart": pm_start,
+                        "pmEnd": hebrew_end,
+                        "fontFamily": "Liberation Sans",
+                        "fontSize": 12.0
+                    },
+                    {
+                        "kind": "text",
+                        "text": latin,
+                        "pmStart": hebrew_end,
+                        "pmEnd": pm_end,
+                        "fontFamily": "Liberation Sans",
+                        "fontSize": 12.0
+                    }
+                ],
+                "attrs": { "bidi": true },
+                "pmStart": pm_start,
+                "pmEnd": pm_end
+            },
+            "measure": {
+                "kind": "paragraph",
+                "totalHeight": 20.0,
+                "lines": [{
+                    "headRun": 0, "headChar": 0, "tailRun": 1, "tailChar": latin_chars,
+                    "width": 160.0, "ascent": 16.0, "descent": 4.0, "lineHeight": 20.0
+                }]
+            }
+        }],
+        "fontChains": { "liberation sans|0|0": [0] },
+        "options": {},
+        "layout": {
+            "pages": [{
+                "size": {"w": 816.0, "h": 1056.0},
+                "margins": {"top": 96.0, "right": 96.0, "bottom": 96.0, "left": 96.0},
+                "number": 1,
+                "fragments": [{
+                    "kind": "paragraph",
+                    "blockId": 0,
+                    "x": FRAG_X, "y": 96.0, "width": FRAG_WIDTH, "height": 20.0,
+                    "fromLine": 0, "toLine": 1,
+                    "pmStart": pm_start, "pmEnd": pm_end
+                }]
+            }]
+        }
+    })
+    .to_string()
+}
+
+fn glyph_runs(dl: &DisplayList) -> Vec<&GlyphRunPrimitive> {
+    dl.pages[0]
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::GlyphRun(g) => Some(g),
+            _ => None,
+        })
+        .collect()
+}
+
+fn max_glyph_x(g: &GlyphRunPrimitive) -> f64 {
+    g.glyphs.iter().map(|gl| gl.x).fold(f64::MIN, f64::max)
+}
+
+fn min_glyph_x(g: &GlyphRunPrimitive) -> f64 {
+    g.glyphs.iter().map(|gl| gl.x).fold(f64::MAX, f64::min)
+}
+
+#[test]
+fn nonbreaking_hyphen_paints_a_covered_glyph_with_original_clusters() {
+    let store = store_with_liberation();
+    let font = FontId::from_u32(0);
+    let text = "co\u{2011}operate";
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input(text, 0.0, None, false, Some(&[0]))).unwrap();
+    let measure = ooxml_text::measure_paragraph_json(
+        &store,
+        &serde_json::json!({
+            "block": input["measured"][0]["block"],
+            "maxWidth": FRAG_WIDTH,
+            "fontChains": input["fontChains"],
+            "defaults": {"fontSize": 12.0, "fontFamily": "Liberation Sans"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    input["measured"][0]["measure"] = serde_json::from_str(&measure).unwrap();
+    let json = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&json).unwrap();
+    assert!(
+        list.pages[0]
+            .primitives
+            .iter()
+            .all(|primitive| !matches!(primitive, Primitive::Text(_)))
+    );
+    let runs = glyph_runs(&list);
+    assert_eq!(runs.len(), 1);
+    let run = runs[0];
+    assert_eq!(run.text, text);
+    assert_eq!(
+        run.paint_text.as_deref().map(String::as_str),
+        Some("co\u{2010}operate")
+    );
+    assert_eq!(
+        (run.attrs.doc_start, run.attrs.doc_end),
+        (Some(1), Some(11))
+    );
+    let hyphen = run.glyphs.iter().find(|glyph| glyph.cluster == 2).unwrap();
+    assert_eq!(
+        hyphen.id,
+        u32::from(store.glyph_id(font, '\u{2010}').unwrap().unwrap())
+    );
+    assert_eq!(run.glyphs[3].cluster, 5);
+    let rects = range_rects(&list, 3, 4);
+    assert_eq!(rects.len(), 1);
+    assert!((rects[0].width - hyphen.advance).abs() < 0.01);
+}
+
+#[test]
+fn emits_glyph_runs_when_fonts_resolve() {
+    let store = store_with_liberation();
+    let input = build_input("Hello world", 60.0, None, false, Some(&[0]));
+    let json = build_display_list_json_with_fonts(&input, &store).expect("builds");
+
+    assert!(json.contains(r#""kind":"glyphRun""#), "kind tag: {json}");
+    assert!(json.contains(r#""fontId":0"#), "camelCase fontId: {json}");
+    assert!(
+        !json.contains(r#""wordSpacing""#),
+        "non-justified line omits wordSpacing: {json}"
+    );
+
+    let dl: DisplayList = serde_json::from_str(&json).unwrap();
+    let runs = glyph_runs(&dl);
+    assert_eq!(runs.len(), 1, "single-font run ⇒ one GlyphRun");
+    let g = runs[0];
+
+    assert_eq!(g.text, "Hello world", "source text preserved");
+    assert_eq!(g.font_id, 0);
+    assert_eq!(g.size, 16.0, "12pt ⇒ 16px");
+    assert_eq!(g.attrs.doc_start, Some(1), "doc positions carried");
+    assert_eq!(g.attrs.doc_end, Some(12));
+    assert!(!g.glyphs.is_empty(), "non-empty glyphs");
+
+    // LTR glyph pen origins strictly increase
+    for w in g.glyphs.windows(2) {
+        assert!(w[1].x > w[0].x, "glyph x must increase: {:?}", g.glyphs);
+    }
+    // clusters are byte indices into the run text
+    for gl in &g.glyphs {
+        assert!(
+            (gl.cluster as usize) < g.text.len(),
+            "cluster {} out of range for {:?}",
+            gl.cluster,
+            g.text
+        );
+    }
+    // no TextRunPrimitive left behind for the shaped run
+    assert!(
+        !json.contains(r#""kind":"text""#),
+        "shaped run must not also emit a text primitive: {json}"
+    );
+}
+
+#[test]
+fn falls_back_to_text_run_without_fonts() {
+    // fontChains present, but the store is empty, so every run fails to shape
+    // and falls back to a TextRunPrimitive
+    let empty = FontStore::new();
+    let with_chains = build_input("Hello world", 60.0, None, false, Some(&[0]));
+    let out_fallback = build_display_list_json_with_fonts(&with_chains, &empty).expect("builds");
+    assert!(
+        !out_fallback.contains("glyphRun"),
+        "no GlyphRun without fonts: {out_fallback}"
+    );
+    assert!(
+        out_fallback.contains(r#""kind":"text""#),
+        "TextRunPrimitive emitted"
+    );
+    assert!(!out_fallback.contains("paintClip"));
+
+    let no_chains = build_input("Hello world", 60.0, None, false, None);
+    let out_without_chains = build_display_list_json(&no_chains).expect("builds");
+    assert_eq!(
+        out_fallback, out_without_chains,
+        "fallback must be byte-identical to the browser-measured path"
+    );
+}
+
+#[test]
+fn unresolved_family_falls_back_per_run() {
+    // fonts registered, but the run's family has no chain entry ⇒ that run falls
+    // back to TextRunPrimitive (gate is per-run, not all-or-nothing)
+    let store = store_with_liberation();
+    // chain keyed for a DIFFERENT family than the run's "Liberation Sans"
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input("Hello", 40.0, None, false, None)).unwrap();
+    input["fontChains"] = serde_json::json!({ "some other font|0|0": [0] });
+    let json = build_display_list_json_with_fonts(&input.to_string(), &store).expect("builds");
+    assert!(
+        !json.contains("glyphRun"),
+        "unresolved family ⇒ no GlyphRun: {json}"
+    );
+    assert!(json.contains(r#""kind":"text""#));
+}
+
+#[test]
+fn synthetic_measurement_emits_a_horizontal_paint_clip() {
+    let store = store_with_liberation();
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input("wide", 16.0, None, false, Some(&[0]))).unwrap();
+    input["measured"][0]["block"]["runs"][0]["textShadow"] = serde_json::json!(true);
+
+    let registered_json =
+        build_display_list_json_with_fonts(&input.to_string(), &store).expect("builds");
+    let registered: DisplayList = serde_json::from_str(&registered_json).unwrap();
+    let registered_run = registered.pages[0]
+        .primitives
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::Text(run) => Some(run),
+            _ => None,
+        })
+        .expect("browser text run");
+    assert!(registered_run.paint_clip.is_none());
+    assert!(!registered_json.contains("paintClip"));
+
+    input["measured"][0]["measure"]["lines"][0]["syntheticFallback"] = serde_json::json!(true);
+    let empty = FontStore::new();
+    let fallback_json =
+        build_display_list_json_with_fonts(&input.to_string(), &empty).expect("builds");
+    let fallback: DisplayList = serde_json::from_str(&fallback_json).unwrap();
+    let fallback_run = fallback.pages[0]
+        .primitives
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::Text(run) => Some(run),
+            _ => None,
+        })
+        .expect("synthetic text run");
+    let clip = fallback_run.paint_clip.as_ref().expect("paint clip");
+    assert_eq!(clip.x, Some(fallback_run.x.clone()));
+    assert_eq!(clip.w, Some(fallback_run.width.clone()));
+    assert_eq!(clip.y, None);
+    assert_eq!(clip.h, None);
+    assert!(fallback_json.contains(r#""paintClip":{"x":"#));
+}
+
+#[test]
+fn justified_line_glyph_x_reaches_usable_width() {
+    let mut store = FontStore::new();
+    let id = store.register(LIBERATION.to_vec()).unwrap();
+
+    let text = "Hello world foo bar";
+    // shape the exact run to learn its natural advance, then pin the measured
+    // line width to it so the justification slack is exact
+    let glyphs = shape(&store, id, text, 16.0, &[]).unwrap();
+    let shaped_width: f64 = glyphs.iter().map(|g| g.x_advance as f64).sum();
+    let last_adv = glyphs.last().unwrap().x_advance as f64;
+    let usable_width = FRAG_WIDTH; // no indents
+
+    // trailing <w:br> makes this (last) line justify
+    let input = build_input(text, shaped_width, Some("justify"), true, Some(&[0]));
+    let json = build_display_list_json_with_fonts(&input, &store).expect("builds");
+    assert!(
+        json.contains(r#""wordSpacing""#),
+        "justified line carries wordSpacing: {json}"
+    );
+
+    let dl: DisplayList = serde_json::from_str(&json).unwrap();
+    let g = glyph_runs(&dl)[0];
+    let max_x = max_glyph_x(g);
+
+    // the rightmost glyph origin lands one trailing advance short of the usable
+    // right edge — i.e. the stretched glyphs reach the margin
+    let right_edge = FRAG_X + usable_width;
+    assert!(
+        (max_x - (right_edge - last_adv)).abs() < 1.0,
+        "justified rightmost glyph x {max_x} should be ~{} (edge {right_edge} - last adv {last_adv})",
+        right_edge - last_adv
+    );
+
+    // and it is far past where the same run sits unjustified
+    let natural = build_input(text, shaped_width, None, false, Some(&[0]));
+    let ndl: DisplayList =
+        serde_json::from_str(&build_display_list_json_with_fonts(&natural, &store).unwrap())
+            .unwrap();
+    let n_max = max_glyph_x(glyph_runs(&ndl)[0]);
+    assert!(
+        max_x > n_max + 100.0,
+        "justification must push glyphs right: {max_x} vs natural {n_max}"
+    );
+}
+
+#[test]
+fn splits_a_run_across_fallback_fonts() {
+    let mut store = FontStore::new();
+    store.register(LIBERATION.to_vec()).unwrap(); // id 0
+    store.register(LIBERATION.to_vec()).unwrap(); // id 1 — stands in for a fallback face
+
+    // 'あ' is uncovered by Liberation, so the chain's terminal font (id 1) takes
+    // it while the Latin chars resolve to id 0 ⇒ three same-font subranges
+    let input = build_input("a\u{3042}b", 30.0, None, false, Some(&[0, 1]));
+    let dl: DisplayList =
+        serde_json::from_str(&build_display_list_json_with_fonts(&input, &store).unwrap()).unwrap();
+    let runs = glyph_runs(&dl);
+    assert_eq!(runs.len(), 3, "one GlyphRun per same-font subrange");
+
+    assert_eq!((runs[0].text.as_str(), runs[0].font_id), ("a", 0));
+    assert_eq!((runs[1].text.as_str(), runs[1].font_id), ("\u{3042}", 1));
+    assert_eq!((runs[2].text.as_str(), runs[2].font_id), ("b", 0));
+
+    // per-subrange doc positions split by char offset; the last closes on the
+    // segment's pm_end
+    assert_eq!(
+        (runs[0].attrs.doc_start, runs[0].attrs.doc_end),
+        (Some(1), Some(2))
+    );
+    assert_eq!(
+        (runs[1].attrs.doc_start, runs[1].attrs.doc_end),
+        (Some(2), Some(3))
+    );
+    assert_eq!(
+        (runs[2].attrs.doc_start, runs[2].attrs.doc_end),
+        (Some(3), Some(4))
+    );
+
+    // the pen keeps flowing across subranges (each cluster is byte 0 of its own
+    // single-char text, so positions come from the accumulated advance)
+    assert!(runs[1].glyphs[0].x > runs[0].glyphs[0].x);
+    assert!(runs[2].glyphs[0].x > runs[1].glyphs[0].x);
+    for g in &runs {
+        assert_eq!(g.glyphs[0].cluster, 0, "single-char subrange cluster is 0");
+    }
+}
+
+#[test]
+fn rtl_paragraph_reorders_mixed_direction_glyph_runs_visually() {
+    let store = store_with_liberation();
+    let input = build_rtl_mixed_input();
+    let json_a = build_display_list_json_with_fonts(&input, &store).expect("builds");
+    let json_b = build_display_list_json_with_fonts(&input, &store).expect("builds");
+    assert_eq!(json_a, json_b, "RTL display-list output is deterministic");
+
+    let dl: DisplayList = serde_json::from_str(&json_a).unwrap();
+    let runs = glyph_runs(&dl);
+    assert_eq!(
+        runs.len(),
+        3,
+        "Hebrew, neutral space, and Latin should split into UBA level runs"
+    );
+
+    let hebrew = runs.iter().find(|g| g.text == "אבג").expect("Hebrew run");
+    let space = runs.iter().find(|g| g.text == " ").expect("space run");
+    let latin = runs.iter().find(|g| g.text == "abc").expect("Latin run");
+
+    assert_eq!(hebrew.rtl, Some(true), "Hebrew level run is RTL");
+    assert_eq!(space.rtl, Some(true), "neutral separator follows RTL base");
+    assert_eq!(latin.rtl, None, "Latin level run stays LTR");
+    assert!(
+        min_glyph_x(latin) < min_glyph_x(hebrew),
+        "RTL paragraph visual order should place the embedded Latin run left of Hebrew: latin {:?}, hebrew {:?}",
+        latin.glyphs,
+        hebrew.glyphs
+    );
+
+    assert_eq!(
+        (hebrew.attrs.doc_start, hebrew.attrs.doc_end),
+        (Some(1), Some(4)),
+        "Hebrew doc span remains logical"
+    );
+    assert_eq!(
+        (latin.attrs.doc_start, latin.attrs.doc_end),
+        (Some(5), Some(8)),
+        "Latin doc span remains logical"
+    );
+    assert_eq!(
+        (space.attrs.doc_start, space.attrs.doc_end),
+        (Some(4), Some(5)),
+        "separator doc span remains logical"
+    );
+    assert!(
+        hebrew.glyphs.first().unwrap().cluster > hebrew.glyphs.last().unwrap().cluster,
+        "RTL GlyphRun clusters should be visual-order descending: {:?}",
+        hebrew.glyphs
+    );
+}
+
+#[test]
+fn hit_test_and_range_rects_resolve_over_glyph_runs() {
+    let store = store_with_liberation();
+    let input = build_input("Hello world", 80.0, None, false, Some(&[0]));
+    let dl: DisplayList =
+        serde_json::from_str(&build_display_list_json_with_fonts(&input, &store).unwrap()).unwrap();
+    let g = glyph_runs(&dl)[0];
+    let baseline = g.glyphs[0].y;
+
+    // click near the run's left edge lands at/near doc_start
+    let left_pos = hit_test(&dl, 0, g.glyphs[0].x + 1.0, baseline).expect("left hit");
+    assert!(
+        (1..=12).contains(&left_pos),
+        "left pos {left_pos} inside the run span"
+    );
+
+    // click past the run's right edge resolves further along than the left
+    let right_pos = hit_test(&dl, 0, max_glyph_x(g) + 2.0, baseline).expect("right hit");
+    assert!(
+        right_pos > left_pos,
+        "right click resolves further: {right_pos} vs {left_pos}"
+    );
+
+    // whole-run range yields one rect covering the run's x-extent
+    let rects = range_rects(&dl, 1, 12);
+    assert_eq!(rects.len(), 1);
+    let r = &rects[0];
+    assert!(r.width > 0.0, "range rect has width");
+    assert!(
+        (r.x - g.glyphs[0].x).abs() < 2.0,
+        "range rect starts at the run's left edge: {} vs {}",
+        r.x,
+        g.glyphs[0].x
+    );
+}
+
+fn measure_tracking_input(store: &FontStore, input: &mut serde_json::Value, max_width: f64) {
+    let measure = ooxml_text::measure_paragraph_json(
+        store,
+        &serde_json::json!({
+            "block": input["measured"][0]["block"],
+            "maxWidth": max_width,
+            "fontChains": input["fontChains"],
+            "authoritativeShaping": true,
+            "defaults": {"fontFamily": "Liberation Sans", "fontSize": 12.0}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let measure: serde_json::Value = serde_json::from_str(&measure).unwrap();
+    let fragment = &mut input["layout"]["pages"][0]["fragments"][0];
+    fragment["width"] = serde_json::json!(max_width);
+    fragment["height"] = measure["totalHeight"].clone();
+    fragment["toLine"] = serde_json::json!(measure["lines"].as_array().unwrap().len());
+    let end = input["measured"][0]["block"]["pmEnd"].clone();
+    input["layout"]["pages"][0]["fragments"][0]["pmEnd"] = end;
+    input["measured"][0]["measure"] = measure;
+}
+
+fn tracking_input(
+    store: &FontStore,
+    text: &str,
+    spacing: Option<f64>,
+    max_width: f64,
+    rtl: bool,
+) -> serde_json::Value {
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input(text, 0.0, None, false, Some(&[0]))).unwrap();
+    let end = 1 + text.encode_utf16().count() as i64;
+    input["measured"][0]["block"]["pmEnd"] = serde_json::json!(end + 1);
+    let run = &mut input["measured"][0]["block"]["runs"][0];
+    run["pmEnd"] = serde_json::json!(end);
+    if let Some(spacing) = spacing {
+        run["letterSpacing"] = serde_json::json!(spacing);
+    }
+    if rtl {
+        run["rtl"] = serde_json::json!(true);
+        input["measured"][0]["block"]["attrs"] = serde_json::json!({"bidi": true});
+    }
+    measure_tracking_input(store, &mut input, max_width);
+    input
+}
+
+fn tracking_list(
+    store: &FontStore,
+    input: &serde_json::Value,
+    whole_runs: bool,
+    reconcile: bool,
+) -> DisplayList {
+    let mut input = input.clone();
+    if whole_runs {
+        for line in input["measured"][0]["measure"]["lines"]
+            .as_array_mut()
+            .unwrap()
+        {
+            let line = line.as_object_mut().unwrap();
+            line.remove("clusterAdvances");
+            line.remove("bidiSlices");
+            if !reconcile {
+                line.remove("runAdvances");
+            }
+        }
+    }
+    serde_json::from_str(&build_display_list_json_with_fonts(&input.to_string(), store).unwrap())
+        .unwrap()
+}
+
+fn assert_tracking_glyphs(store: &FontStore, list: &DisplayList, spacing: f64) {
+    let runs = glyph_runs(list);
+    assert!(!runs.is_empty());
+    for run in runs {
+        let direction = if run.rtl == Some(true) {
+            ShapeDirection::Rtl
+        } else {
+            ShapeDirection::Ltr
+        };
+        let shaped = shape_with_direction(
+            store,
+            FontId::from_u32(run.font_id),
+            &run.text,
+            16.0,
+            &kern_features(false),
+            direction,
+        )
+        .unwrap();
+        assert_eq!(run.glyphs.len(), shaped.len());
+        let mut bounds: Vec<usize> = shaped.iter().map(|glyph| glyph.cluster as usize).collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        bounds.push(run.text.len());
+        let mut pen = run.glyphs[0].x - f64::from(shaped[0].x_offset);
+        for (index, (placed, raw)) in run.glyphs.iter().zip(&shaped).enumerate() {
+            let mut advance = f64::from(raw.x_advance);
+            if shaped
+                .get(index + 1)
+                .is_none_or(|next| next.cluster != raw.cluster)
+            {
+                let start = raw.cluster as usize;
+                let end = bounds[bounds.binary_search(&start).unwrap() + 1];
+                let text = &run.text[start..end];
+                advance += spacing * text.chars().count() as f64;
+                advance += run
+                    .word_spacing
+                    .as_ref()
+                    .and_then(|n| n.as_f64())
+                    .unwrap_or(0.0)
+                    * text.chars().filter(|&ch| ch == ' ').count() as f64;
+            }
+            assert_eq!(placed.id, raw.glyph_id);
+            assert_eq!(placed.cluster, raw.cluster);
+            assert!((placed.x - pen - f64::from(raw.x_offset)).abs() < 0.001);
+            assert!((placed.advance - advance).abs() < 0.001);
+            pen += advance;
+        }
+    }
+}
+
+fn assert_tracking_width(input: &serde_json::Value, list: &DisplayList) {
+    let measured: f64 = input["measured"][0]["measure"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line["width"].as_f64().unwrap())
+        .sum();
+    let advances: f64 = glyph_runs(list)
+        .iter()
+        .flat_map(|run| &run.glyphs)
+        .map(|glyph| glyph.advance)
+        .sum();
+    assert!(
+        (advances - measured).abs() < 0.01,
+        "{advances} != {measured}"
+    );
+}
+
+fn assert_tracking_without_reconciliation(text: &str, spacing: f64, rtl: bool) {
+    let store = store_with_liberation();
+    let input = tracking_input(&store, text, Some(spacing), FRAG_WIDTH, rtl);
+    let exact = tracking_list(&store, &input, true, true);
+    let natural = tracking_list(&store, &input, true, false);
+    assert_eq!(glyph_runs(&exact).len(), 1);
+    assert_eq!(glyph_runs(&natural).len(), 1);
+    assert_tracking_glyphs(&store, &exact, spacing);
+    assert_tracking_glyphs(&store, &natural, spacing);
+    assert_tracking_width(&input, &exact);
+    assert_tracking_width(&input, &natural);
+    for (exact, natural) in glyph_runs(&exact)[0]
+        .glyphs
+        .iter()
+        .zip(&glyph_runs(&natural)[0].glyphs)
+    {
+        assert_eq!(exact.x, natural.x);
+        assert_eq!(exact.advance, natural.advance);
+    }
+    let clusters = tracking_list(&store, &input, false, true);
+    assert_tracking_glyphs(&store, &clusters, spacing);
+    assert_tracking_width(&input, &clusters);
+}
+
+#[test]
+fn glyph_run_expanded_spacing_advances_every_character_including_the_last() {
+    assert_tracking_without_reconciliation("ABCD", 40.0 / 1440.0 * 96.0, false);
+}
+
+#[test]
+fn glyph_run_condensed_spacing_advances_every_character_including_the_last() {
+    assert_tracking_without_reconciliation("ABCD", -20.0 / 1440.0 * 96.0, false);
+}
+
+#[test]
+fn glyph_run_combining_cluster_keeps_spacing_after_its_last_glyph() {
+    let store = store_with_liberation();
+    let text = "x\u{301}B";
+    let shaped = shape(
+        &store,
+        FontId::from_u32(0),
+        text,
+        16.0,
+        &kern_features(false),
+    )
+    .unwrap();
+    assert!(
+        shaped
+            .windows(2)
+            .any(|pair| pair[0].cluster == pair[1].cluster)
+    );
+    for spacing in [40.0 / 1440.0 * 96.0, -20.0 / 1440.0 * 96.0] {
+        assert_tracking_without_reconciliation(text, spacing, false);
+    }
+}
+
+#[test]
+fn glyph_run_surrogate_pair_counts_as_one_spacing() {
+    assert_tracking_without_reconciliation("A\u{1f600}B", 40.0 / 1440.0 * 96.0, false);
+}
+
+#[test]
+fn glyph_run_rtl_spacing_follows_visual_glyph_order() {
+    let store = store_with_liberation();
+    let shaped = shape_with_direction(
+        &store,
+        FontId::from_u32(0),
+        "אבג",
+        16.0,
+        &kern_features(false),
+        ShapeDirection::Rtl,
+    )
+    .unwrap();
+    assert!(
+        shaped
+            .windows(2)
+            .all(|pair| pair[0].cluster > pair[1].cluster)
+    );
+    for spacing in [40.0 / 1440.0 * 96.0, -20.0 / 1440.0 * 96.0] {
+        assert_tracking_without_reconciliation("אבג", spacing, true);
+        assert_tracking_without_reconciliation("א\u{5b0}בג", spacing, true);
+    }
+}
+
+#[test]
+fn glyph_run_without_spacing_keeps_unspaced_positions_and_advances() {
+    let store = store_with_liberation();
+    let omitted = tracking_input(&store, "ABCD", None, FRAG_WIDTH, false);
+    let zero = tracking_input(&store, "ABCD", Some(0.0), FRAG_WIDTH, false);
+    let omitted = tracking_list(&store, &omitted, true, true);
+    let zero = tracking_list(&store, &zero, true, true);
+    assert_eq!(glyph_runs(&omitted)[0].glyphs, glyph_runs(&zero)[0].glyphs);
+    assert_tracking_without_reconciliation("ABCD", 0.0, false);
+}
+
+#[test]
+fn glyph_run_spacing_crosses_word_boundaries() {
+    for spacing in [40.0 / 1440.0 * 96.0, -20.0 / 1440.0 * 96.0] {
+        assert_tracking_without_reconciliation("A B C", spacing, false);
+    }
+}
+
+#[test]
+fn glyph_run_spacing_survives_line_splits() {
+    let store = store_with_liberation();
+    for spacing in [40.0 / 1440.0 * 96.0, -20.0 / 1440.0 * 96.0] {
+        let input = tracking_input(&store, "ABCDABCD", Some(spacing), 32.0, false);
+        assert!(
+            input["measured"][0]["measure"]["lines"]
+                .as_array()
+                .unwrap()
+                .len()
+                > 1
+        );
+        let list = tracking_list(&store, &input, true, true);
+        assert_tracking_glyphs(&store, &list, spacing);
+        assert_tracking_width(&input, &list);
+        let text: String = glyph_runs(&list)
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect();
+        assert_eq!(text, "ABCDABCD");
+    }
+}
+
+#[test]
+fn glyph_run_spacing_and_justification_share_space_advances() {
+    let store = store_with_liberation();
+    for spacing in [40.0 / 1440.0 * 96.0, -20.0 / 1440.0 * 96.0] {
+        let mut input = tracking_input(&store, "A B C", Some(spacing), FRAG_WIDTH, false);
+        input["measured"][0]["block"]["attrs"] = serde_json::json!({"alignment": "justify"});
+        input["measured"][0]["block"]["pmEnd"] = serde_json::json!(8);
+        input["measured"][0]["block"]["runs"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"kind": "lineBreak", "pmStart": 6}));
+        measure_tracking_input(&store, &mut input, FRAG_WIDTH);
+        for whole_runs in [true, false] {
+            let list = tracking_list(&store, &input, whole_runs, true);
+            assert_tracking_glyphs(&store, &list, spacing);
+            let runs = glyph_runs(&list);
+            assert!(runs.iter().any(|run| run.word_spacing.is_some()));
+            let last = runs.last().unwrap().glyphs.last().unwrap();
+            assert!((last.x + last.advance - FRAG_X - FRAG_WIDTH).abs() < 0.01);
+        }
+    }
+}
+
+#[test]
+fn glyph_run_trailing_spacing_separates_adjacent_runs_and_tabs() {
+    let store = store_with_liberation();
+    let spacing = 40.0 / 1440.0 * 96.0;
+    for tab in [false, true] {
+        let mut input = tracking_input(&store, "AB", Some(spacing), FRAG_WIDTH, false);
+        let mut second = input["measured"][0]["block"]["runs"][0].clone();
+        second["text"] = serde_json::json!("CD");
+        second["pmStart"] = serde_json::json!(if tab { 4 } else { 3 });
+        second["pmEnd"] = serde_json::json!(if tab { 6 } else { 5 });
+        let runs = input["measured"][0]["block"]["runs"]
+            .as_array_mut()
+            .unwrap();
+        if tab {
+            runs.push(serde_json::json!({
+                "kind": "tab", "pmStart": 3, "pmEnd": 4,
+                "fontFamily": "Liberation Sans", "fontSize": 12, "letterSpacing": spacing
+            }));
+        }
+        runs.push(second);
+        input["measured"][0]["block"]["pmEnd"] = serde_json::json!(if tab { 7 } else { 6 });
+        measure_tracking_input(&store, &mut input, FRAG_WIDTH);
+        let list = tracking_list(&store, &input, true, true);
+        let runs = glyph_runs(&list);
+        assert_eq!(runs.len(), 2);
+        assert_tracking_glyphs(&store, &list, spacing);
+        if tab {
+            assert!((runs[1].glyphs[0].x - FRAG_X - 48.0).abs() < 0.001);
+        } else {
+            let last = runs[0].glyphs.last().unwrap();
+            assert!((last.x + last.advance - runs[1].glyphs[0].x).abs() < 0.001);
+            assert_tracking_width(&input, &list);
+        }
+    }
+}
+
+#[test]
+fn spaced_run_carets_hits_and_selection_follow_painted_glyphs() {
+    let store = store_with_liberation();
+    for twips in [40.0, -20.0] {
+        let spacing = twips / 1440.0 * 96.0;
+        let mut input = tracking_input(&store, "WimA", Some(spacing), FRAG_WIDTH, false);
+        input["measured"][0]["block"]["runs"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "kind": "text", "text": "BC", "pmStart": 5, "pmEnd": 7,
+                "fontFamily": "Liberation Sans", "fontSize": 12.0
+            }));
+        input["measured"][0]["block"]["pmEnd"] = serde_json::json!(8);
+        measure_tracking_input(&store, &mut input, FRAG_WIDTH);
+        for whole_runs in [false, true] {
+            let list = tracking_list(&store, &input, whole_runs, true);
+            let runs = glyph_runs(&list);
+            let mut origins = std::collections::BTreeMap::new();
+            for run in &runs {
+                for glyph in &run.glyphs {
+                    origins.insert(run.attrs.doc_start.unwrap() + glyph.cluster as i64, glyph.x);
+                }
+            }
+            assert_eq!(origins.len(), 6);
+            let baseline = runs[0].glyphs[0].y;
+            for position in 1..=5 {
+                let x = origins[&position];
+                let caret = caret_rect(&list, position).unwrap();
+                assert!((caret.x - x).abs() < 0.01, "{twips}: {position}");
+                assert_eq!(hit_test(&list, 0, x, baseline), Some(position));
+                if position < 5 {
+                    let next = origins[&(position + 1)];
+                    let midpoint = (x + next) / 2.0;
+                    assert_eq!(
+                        hit_test(&list, 0, midpoint - 0.05, baseline),
+                        Some(position)
+                    );
+                    assert_eq!(
+                        hit_test(&list, 0, midpoint + 0.05, baseline),
+                        Some(position + 1)
+                    );
+                }
+            }
+            let last = runs
+                .iter()
+                .find_map(|run| {
+                    run.glyphs
+                        .iter()
+                        .find(|glyph| run.attrs.doc_start.unwrap() + glyph.cluster as i64 == 4)
+                })
+                .unwrap();
+            assert!((last.x + last.advance - origins[&5]).abs() < 0.01);
+            let rects = range_rects(&list, 1, 5);
+            assert_eq!(rects.len(), 1);
+            assert!((rects[0].x - origins[&1]).abs() < 0.01);
+            assert!((rects[0].x + rects[0].width - origins[&5]).abs() < 0.01);
+        }
+    }
+}
+
+#[test]
+fn glyph_run_extent_uses_real_trailing_advance() {
+    // The trailing glyph's advance determines the run's right edge.
+    let store = store_with_liberation();
+    let text = "Hello world"; // 11 chars ⇒ doc span [1, 12)
+    let input = build_input(text, 80.0, None, false, Some(&[0]));
+    let dl: DisplayList =
+        serde_json::from_str(&build_display_list_json_with_fonts(&input, &store).unwrap()).unwrap();
+    let g = glyph_runs(&dl)[0];
+
+    // every glyph carries a positive pen advance, and `x + advance` chains to the
+    // next glyph's origin (the pen flows continuously across the run)
+    for w in g.glyphs.windows(2) {
+        assert!(w[0].advance > 0.0, "glyph advance is positive: {:?}", w[0]);
+        assert!(
+            (w[0].x + w[0].advance - w[1].x).abs() < 0.01,
+            "x+advance chains to the next origin: {} + {} vs {}",
+            w[0].x,
+            w[0].advance,
+            w[1].x
+        );
+    }
+
+    // expected extent = the shaped natural advance sum; reshape the same run in
+    // an isolated store to learn it
+    let mut probe = FontStore::new();
+    let id = probe.register(LIBERATION.to_vec()).unwrap();
+    let shaped = shape(&probe, id, text, 16.0, &[]).unwrap();
+    let shaped_width: f64 = shaped.iter().map(|gl| gl.x_advance as f64).sum();
+
+    let min_x = g.glyphs.iter().map(|gl| gl.x).fold(f64::INFINITY, f64::min);
+    let right = g
+        .glyphs
+        .iter()
+        .map(|gl| gl.x + gl.advance)
+        .fold(f64::MIN, f64::max);
+    let extent = right - min_x;
+    assert!(
+        (extent - shaped_width).abs() < 0.5,
+        "real glyph extent {extent} matches the shaped width {shaped_width}"
+    );
+
+    // a whole-run range rect exposes the same extent through the hit geometry
+    let rects = range_rects(&dl, 1, 12);
+    assert_eq!(rects.len(), 1);
+    let r = &rects[0];
+    assert!(
+        (r.x - min_x).abs() < 0.01,
+        "range rect left {} at the run's left edge {}",
+        r.x,
+        min_x
+    );
+    assert!(
+        (r.width - shaped_width).abs() < 0.5,
+        "range-rect width {} matches the shaped extent {}, including trailing advance",
+        r.width,
+        shaped_width
+    );
+
+    // and the discarded uniform estimate (span·n/(n-1)) was measurably off — the
+    // real extent is strictly closer to the shaped truth, which is what closed
+    // the ~3px right-edge drift
+    let max_origin = g.glyphs.iter().map(|gl| gl.x).fold(f64::MIN, f64::max);
+    let n = g.glyphs.len() as f64;
+    let old_estimate = (max_origin - min_x) * n / (n - 1.0);
+    assert!(
+        (r.width - shaped_width).abs() < (old_estimate - shaped_width).abs(),
+        "real extent {} is closer to shaped {} than the old estimate {}",
+        r.width,
+        shaped_width,
+        old_estimate
+    );
+}
+
+#[test]
+fn glyph_run_build_is_deterministic() {
+    let store = store_with_liberation();
+    let input = build_input("Hello world foo", 90.0, Some("justify"), true, Some(&[0]));
+    let a = build_display_list_json_with_fonts(&input, &store).unwrap();
+    let b = build_display_list_json_with_fonts(&input, &store).unwrap();
+    assert_eq!(a, b, "same input ⇒ identical JSON");
+}
+
+#[test]
+fn wasm_entry_threads_measure_fonts() {
+    // the production wasm export shapes from the module-global measurement store
+    docx_layout::clear_measure_fonts();
+    let id = docx_layout::register_measure_font(LIBERATION).expect("registers");
+    assert_eq!(id, 0);
+
+    let input = build_input("Hi", 20.0, None, false, Some(&[0]));
+    let json = docx_layout::build_display_list_json(&input).expect("builds");
+    assert!(
+        json.contains(r#""kind":"glyphRun""#),
+        "wasm entry shapes via MEASURE_FONTS: {json}"
+    );
+
+    docx_layout::clear_measure_fonts();
+}
+
+/// Glyph runs retain the resolved CSS font for outline fallback.
+#[test]
+fn glyph_runs_carry_the_resolved_fallback_font() {
+    let store = store_with_liberation();
+    let input = build_input("Hello world", 60.0, None, false, Some(&[0]));
+    let json = build_display_list_json_with_fonts(&input, &store).expect("builds");
+
+    let dl: DisplayList = serde_json::from_str(&json).unwrap();
+    let runs = glyph_runs(&dl);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].attrs.fallback_font.as_deref(),
+        Some("400 16px Liberation Sans, sans-serif"),
+        "fallbackFont must carry the resolved css shorthand: {json}"
+    );
+    assert!(json.contains(r#""fallbackFont":"400 16px Liberation Sans, sans-serif""#));
+}
+
+/// Painted glyph pens follow the same w:kern gate the measurement uses, so a
+/// run with no threshold draws at the plain hmtx advance.
+#[test]
+fn painted_pen_honors_the_kerning_threshold() {
+    /// Liberation Sans 'A' at 12pt/16px: 1366 units / 2048 upem.
+    const A_ADVANCE: f64 = 1366.0 * 16.0 / 2048.0;
+
+    fn pen(kerning_min_pt: Option<f64>) -> f64 {
+        let mut run = serde_json::json!({
+            "kind": "text",
+            "text": "AV",
+            "pmStart": 1,
+            "pmEnd": 3,
+            "fontFamily": "Liberation Sans",
+            "fontSize": 12.0
+        });
+        if let Some(threshold) = kerning_min_pt {
+            run["kerningMinPt"] = serde_json::json!(threshold);
+        }
+        let input = serde_json::json!({
+            "measured": [{
+                "block": {
+                    "kind": "paragraph", "id": 0, "runs": [run], "pmStart": 1, "pmEnd": 3
+                },
+                "measure": {
+                    "kind": "paragraph",
+                    "totalHeight": 20.0,
+                    "lines": [{
+                        "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 2,
+                        "width": 40.0, "ascent": 16.0, "descent": 4.0, "lineHeight": 20.0
+                    }]
+                }
+            }],
+            "fontChains": { "liberation sans|0|0": [0] },
+            "options": {},
+            "layout": {
+                "pages": [{
+                    "size": {"w": 816.0, "h": 1056.0},
+                    "margins": {"top": 96.0, "right": 96.0, "bottom": 96.0, "left": 96.0},
+                    "number": 1,
+                    "fragments": [{
+                        "kind": "paragraph", "blockId": 0,
+                        "x": FRAG_X, "y": 96.0, "width": FRAG_WIDTH, "height": 20.0,
+                        "fromLine": 0, "toLine": 1, "pmStart": 1, "pmEnd": 3
+                    }]
+                }]
+            }
+        })
+        .to_string();
+        let json =
+            build_display_list_json_with_fonts(&input, &store_with_liberation()).expect("builds");
+        let dl: DisplayList = serde_json::from_str(&json).unwrap();
+        let glyphs = &glyph_runs(&dl)[0].glyphs;
+        glyphs[1].x - glyphs[0].x
+    }
+
+    assert!(
+        (pen(None) - A_ADVANCE).abs() < 1e-3,
+        "no w:kern ⇒ plain advance: got {}",
+        pen(None)
+    );
+    assert!(
+        pen(Some(1.0)) < A_ADVANCE - 1e-3,
+        "w:kern at or below the font size tightens AV: got {}",
+        pen(Some(1.0))
+    );
+    assert!(
+        (pen(Some(14.0)) - A_ADVANCE).abs() < 1e-3,
+        "w:kern above the font size ⇒ plain advance: got {}",
+        pen(Some(14.0))
+    );
+}
+
+#[test]
+fn text_runs_carry_the_scripts_their_paragraph_resolves() {
+    let store = FontStore::new();
+    let cases: [(&str, Option<&str>, &[&str]); 5] = [
+        ("漢字", Some("ja-JP"), &["cjk-jp"]),
+        ("漢字", Some("zh-TW"), &["cjk-tc"]),
+        ("漢字", Some("en-US"), &["cjk-sc"]),
+        ("漢字", None, &["cjk-sc"]),
+        ("Latin", Some("ja-JP"), &[]),
+    ];
+    for (text, language, expected) in cases {
+        let mut input: serde_json::Value =
+            serde_json::from_str(&build_input(text, 40.0, None, false, None)).unwrap();
+        if let Some(language) = language {
+            input["measured"][0]["block"]["runs"][0]["language"] =
+                serde_json::json!({"latin": "en-US", "eastAsia": language});
+        }
+        let output = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+        let list: DisplayList = serde_json::from_str(&output).unwrap();
+        let run = list.pages[0]
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Text(run) if run.text == text => Some(run.clone()),
+                _ => None,
+            })
+            .expect("text run");
+        assert_eq!(
+            run.scripts
+                .as_deref()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            expected,
+            "{text} {language:?}"
+        );
+        let json = serde_json::to_value(&run).unwrap();
+        assert_eq!(json.get("scripts").is_some(), !expected.is_empty());
+    }
+}
+
+#[test]
+fn glyph_runs_draw_each_character_in_its_font_slot() {
+    // `w:ascii="Latin" w:eastAsia="East" w:hint="eastAsia"`: the ASCII letter
+    // takes the ascii face, the hinted "é" the East Asian one, as measurement
+    // does, rather than both falling back through the run's ascii family.
+    let mut store = FontStore::new();
+    let latin = store.register(LIBERATION.to_vec()).unwrap();
+    let mut east_bytes = LIBERATION.to_vec();
+    east_bytes.extend_from_slice(&[0; 64]);
+    let east = store.register(east_bytes).unwrap();
+    assert_ne!(latin, east);
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input("aé", 20.0, None, false, None)).unwrap();
+    let run = &mut input["measured"][0]["block"]["runs"][0];
+    run["fontFamily"] = serde_json::json!("Latin");
+    run["fontSlots"] = serde_json::json!({
+        "ascii": "Latin", "hAnsi": "Latin", "eastAsia": "East", "hint": "eastAsia"
+    });
+    input["fontChains"] = serde_json::json!({
+        "latin|0|0": [latin.to_u32()],
+        "east|0|0": [east.to_u32()],
+    });
+    let json = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&json).unwrap();
+    let fonts: Vec<(u32, usize)> = glyph_runs(&list)
+        .iter()
+        .map(|run| (run.font_id, run.glyphs.len()))
+        .collect();
+    assert_eq!(fonts, vec![(latin.to_u32(), 1), (east.to_u32(), 1)]);
+}
+
+#[test]
+fn glyph_runs_keep_the_run_family_when_a_slot_has_no_chain() {
+    let store = store_with_liberation();
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input("aé", 20.0, None, false, Some(&[0]))).unwrap();
+    input["measured"][0]["block"]["runs"][0]["fontSlots"] = serde_json::json!({
+        "ascii": "Liberation Sans", "hAnsi": "Liberation Sans", "eastAsia": "Missing", "hint": "eastAsia"
+    });
+    let json = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+    let list: DisplayList = serde_json::from_str(&json).unwrap();
+    let runs = glyph_runs(&list);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].font_id, 0);
+}
+
+#[test]
+fn inline_list_marker_fills_its_measured_slot_before_the_text() {
+    // `w:ind w:left="0"` with no hanging and `w:suff="space"`: measurement took
+    // the marker's width from the first line, so the text starts after it.
+    let mut input: serde_json::Value =
+        serde_json::from_str(&build_input("Body", 40.0, None, false, None)).unwrap();
+    input["measured"][0]["block"]["attrs"] = serde_json::json!({
+        "listMarker": "Ch 1", "listMarkerSuffix": "space"
+    });
+    input["measured"][0]["measure"]["lines"][0]["markerInlineWidth"] = serde_json::json!(30.0);
+    let list: DisplayList =
+        serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap()).unwrap();
+    let texts: Vec<&TextRunPrimitive> = list.pages[0]
+        .primitives
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Primitive::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    let marker = texts.iter().find(|text| text.text == "Ch 1").unwrap();
+    let body = texts.iter().find(|text| text.text != "Ch 1").unwrap();
+    assert_eq!(marker.x.as_f64(), Some(FRAG_X));
+    assert_eq!(marker.width.as_f64(), Some(30.0));
+    assert_eq!(body.x.as_f64(), Some(FRAG_X + 30.0));
+}
+
+/// With `compressPunctuation` the painter narrows each fullwidth pause mark
+/// and bracket as measurement did, and moves an opening bracket's glyph left
+/// into the blank half it gave up, so `（国），国` draws five glyphs in four ems.
+#[test]
+fn compressed_punctuation_paints_where_measurement_placed_it() {
+    let mut store = store_with_liberation();
+    store
+        .register(
+            nimbleoffice_fonts::decode(
+                include_bytes!("../../../packages/fonts-cjk/assets/NotoSansSC-Regular.otf.zst"),
+                None,
+                64 << 20,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let text = "（国），国";
+    let glyph_xs = |compress: bool| {
+        let mut input: serde_json::Value =
+            serde_json::from_str(&build_input(text, 0.0, None, false, Some(&[0, 1]))).unwrap();
+        if compress {
+            input["measured"][0]["block"]["attrs"] =
+                serde_json::json!({ "compressPunctuation": true });
+        }
+        let measure = ooxml_text::measure_paragraph_json(
+            &store,
+            &serde_json::json!({
+                "block": input["measured"][0]["block"],
+                "maxWidth": FRAG_WIDTH,
+                "fontChains": input["fontChains"],
+                "defaults": {"fontSize": 12.0, "fontFamily": "Liberation Sans"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        input["measured"][0]["measure"] = serde_json::from_str(&measure).unwrap();
+        let json = build_display_list_json_with_fonts(&input.to_string(), &store).unwrap();
+        let list: DisplayList = serde_json::from_str(&json).unwrap();
+        let line_width = input["measured"][0]["measure"]["lines"][0]["width"]
+            .as_f64()
+            .unwrap();
+        let xs: Vec<f64> = glyph_runs(&list)
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.x - FRAG_X))
+            .collect();
+        (xs, line_width)
+    };
+    let (full, full_width) = glyph_xs(false);
+    assert_eq!(full, [0.0, 16.0, 32.0, 48.0, 64.0]);
+    assert!((full_width - 80.0).abs() < 1e-3);
+    let (compressed, width) = glyph_xs(true);
+    // The line fits, so nothing is squeezed: Word keeps punctuation on its full em until a
+    // line is too long (a Word line with an adjacent "：（" measures 27 ems for 27 glyphs),
+    // and painting follows the measured advances.
+    assert_eq!(compressed, full);
+    assert!((width - full_width).abs() < 1e-3, "{width}");
+}

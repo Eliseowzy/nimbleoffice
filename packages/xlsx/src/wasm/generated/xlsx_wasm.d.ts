@@ -1,0 +1,352 @@
+/* tslint:disable */
+/* eslint-disable */
+export interface DecodedFontFace { font: Uint8Array; payload?: Uint8Array; }
+
+
+/**
+ * a workbook handle exposed to js; wraps the pure `Session`.
+ */
+export class XlsxDocument {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * accept a proposal as one agent transaction; returns the edit envelope
+     * plus `proposalId`, or a `{"code":"staleProposal",...}` error when the base moved.
+     */
+    acceptProposalJson(args: string): string;
+    adoptPeerVersion(version: string): void;
+    /**
+     * apply an edit batch all-or-nothing; volatile functions see only the request's clock.
+     */
+    applyEditsJson(request: string): string;
+    applyFormatJson(args: string): string;
+    /**
+     * apply a raw op list as one user transaction; returns `SheetInfo` json.
+     */
+    applyOpsJson(transaction_json: string): string;
+    applyOpsProfiledJson(transaction_json: string): string;
+    applyUpdateJson(update: Uint8Array): string;
+    beginPeerSnapshot(records: number, bytes: number): void;
+    calculationStatusJson(): string;
+    captureFormatJson(args: string): string;
+    /**
+     * the editable representation of one cell.
+     */
+    cellJson(args: string): string;
+    cellPositionJson(args: string): string;
+    cellRectJson(args: string): string;
+    /**
+     * the chart under a viewport-local point, or `null`.
+     */
+    chartAtPointJson(args: string): string;
+    chartsJson(sheet: number): string;
+    /**
+     * Stop observation and discard queued events.
+     */
+    clearUpdateObservation(): void;
+    conditionalFormatsJson(sheet: number): string;
+    /**
+     * @experimental
+     */
+    displayListForJson(sheet: number, viewport_json: string): string;
+    /**
+     * serialized `DisplayList` for a serialized `Viewport`.
+     */
+    displayListJson(viewport_json: string): string;
+    displayListProfiledJson(viewport_json: string): string;
+    /**
+     * The session-scoped version of the committed workbook state.
+     */
+    documentVersion(): string;
+    /**
+     * Poll one event: origin byte (`0` local, `1` remote), then update; empty means none.
+     */
+    drainUpdateEvent(): Uint8Array;
+    /**
+     * enter one cell edit; returns updated `SheetInfo` json.
+     */
+    editCellJson(args: string): string;
+    editCellProfiledJson(args: string): string;
+    /**
+     * enter a batch of cell edits as one undo step; returns `SheetInfo` json.
+     */
+    editCellsJson(args: string): string;
+    editChartsJson(edits: string): string;
+    encodeDiff(remote_state_vector: Uint8Array): Uint8Array;
+    encodeStateAsUpdate(): Uint8Array;
+    encodeStateVector(): Uint8Array;
+    endPeerSnapshot(): void;
+    exportMarkdownJson(options: string, markdown_options: string): string;
+    /**
+     * Export the committed workbook with the version it was read at; nothing recalculates.
+     */
+    exportStructuredJson(options: string): string;
+    findTextJson(request: string): string;
+    historyStateJson(): string;
+    listDefinedNamesJson(request: string): string;
+    /**
+     * the pending proposals: `{"proposals":[...]}`.
+     */
+    listProposalsJson(): string;
+    mergedRangesJson(args: string): string;
+    /**
+     * slide a chart by a pixel delta as one undo step.
+     */
+    moveChartJson(args: string): string;
+    moveRangeJson(args: string): string;
+    nextPeerSnapshotChunk(): Uint8Array | undefined;
+    /**
+     * Open a replica with a positive, safe-integer client ID.
+     */
+    static openCollaborative(bytes: Uint8Array, client_id: number): XlsxDocument;
+    /**
+     * Checkpoints are only restorable by the same engine version and codec.
+     */
+    static openRecoveryCheckpoint(bytes: Uint8Array, through_seq: number): XlsxDocument;
+    static openWithCalculationJson(bytes: Uint8Array, context: string): XlsxDocument;
+    static openWithPeerHydrationJson(bytes: Uint8Array, hydration: string): XlsxDocument;
+    /**
+     * open a workbook from raw `.xlsx` bytes.
+     */
+    static open(bytes: Uint8Array): XlsxDocument;
+    patchRangeStyleJson(args: string): string;
+    peerHydrationJson(): string;
+    pngDisplayListJson(viewport_json: string): string;
+    printDisplayListJson(args: string): string;
+    /**
+     * register an agent proposal (preview only); returns the stored `Proposal` json.
+     */
+    proposeJson(args: string): string;
+    /**
+     * a rectangular block of cells for clipboard copy.
+     */
+    rangeCellsJson(args: string): string;
+    rangePngDisplayListJson(args: string): string;
+    readCellsJson(request: string): string;
+    /**
+     * Recalculate every formula; the next save writes the recalculated values.
+     */
+    recalculateJson(): string;
+    /**
+     * Checkpoints are only restorable by the same engine version and codec.
+     */
+    recoveryCheckpoint(through_seq: number, preserve_history?: boolean | null): Uint8Array;
+    /**
+     * redo the last undone transaction; same shape as `undoJson`.
+     */
+    redoJson(): string;
+    /**
+     * reject a proposal by id; returns `{"removed":bool}`.
+     */
+    rejectProposalJson(args: string): string;
+    /**
+     * render the current sheet viewport to png bytes (raster feature only).
+     */
+    renderPng(viewport_json: string): Uint8Array;
+    /**
+     * render an a1 range (default: used range) at an optional scale to png.
+     */
+    renderRangePng(args: string): Uint8Array;
+    /**
+     * serialize the current workbook back to `.xlsx` bytes.
+     */
+    saveBytes(): Uint8Array;
+    searchTextJson(args: string): string;
+    selectionDataJson(args: string): string;
+    selectionFormattingJson(args: string): string;
+    /**
+     * switch the active sheet by index.
+     */
+    setActiveSheet(index: number): void;
+    setCalculationContextJson(context: string): void;
+    setRangeNumberFormatJson(args: string): string;
+    sheetCount(): number;
+    sheetInfoForJson(sheet: number): string;
+    /**
+     * serialized `SheetInfo`: stable IDs, names, active index, content extent.
+     */
+    sheetInfoJson(): string;
+    /**
+     * Start queuing origin-prefixed Yrs update events for polling.
+     */
+    startUpdateObservation(): void;
+    /**
+     * @internal
+     */
+    translateFormulasJson(args: string): string;
+    /**
+     * undo the last transaction; returns `{"applied":bool,"sheetInfo":{...}}`.
+     */
+    undoJson(): string;
+    validateEditsJson(request: string): string;
+    /**
+     * crate version string.
+     */
+    static version(): string;
+    visibleMergedRangesJson(sheet: number, viewport_json: string): string;
+    readonly clientId: number;
+}
+
+export class XlsxSnapshotBuilder {
+    free(): void;
+    [Symbol.dispose](): void;
+    advance(records: number, bytes: number): boolean;
+    finish(): XlsxDocument;
+    constructor();
+    push(chunk: Uint8Array): void;
+}
+
+/**
+ * bytes of the last allocation the engine could not get, or 0.
+ */
+export function allocationFailure(): number;
+
+/**
+ * Decodes one font pack face (codec "zstd" or "woff2t+zstd") with this engine's linked decoder.
+ * Returns owned bytes and an optional transformed payload. Non-zstd input passes through.
+ * The default output limit is 64 MiB; woff2t decoding is always capped at 64 MiB.
+ */
+export function decodeFontFace(bytes: Uint8Array, codec: string, dict?: Uint8Array | null, maxOutput?: number | null): DecodedFontFace;
+
+export function displayListCellLimit(): number;
+
+export function exportXlsxMarkdownJson(bytes: Uint8Array, options: string, markdown_options: string): string;
+
+/**
+ * Export `.xlsx` bytes as read: stored formula results, no clock.
+ */
+export function exportXlsxStructuredJson(bytes: Uint8Array, options: string): string;
+
+/**
+ * wasm panics abort, so a trap reaches JS as a bare `RuntimeError:
+ * unreachable executed`. Log the panic first so it stays diagnosable.
+ */
+export function install_panic_hook(): void;
+
+export function renderXlsxMarkdownJson(content: string, options: string): string;
+
+export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
+
+export interface InitOutput {
+    readonly __externref_table_alloc: () => number;
+    readonly __externref_table_dealloc: (a: number) => void;
+    readonly __wbg_xlsxdocument_free: (a: number, b: number) => void;
+    readonly __wbg_xlsxsnapshotbuilder_free: (a: number, b: number) => void;
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __wbindgen_externrefs: WebAssembly.Table;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_malloc: (a: number, b: number) => number;
+    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_start: () => void;
+    readonly allocationFailure: () => number;
+    readonly decodeFontFace: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
+    readonly displayListCellLimit: () => number;
+    readonly exportXlsxMarkdownJson: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly exportXlsxStructuredJson: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly install_panic_hook: () => void;
+    readonly memory: WebAssembly.Memory;
+    readonly renderXlsxMarkdownJson: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly xlsxdocument_acceptProposalJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_adoptPeerVersion: (a: number, b: number, c: number) => [number, number];
+    readonly xlsxdocument_applyEditsJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_applyFormatJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_applyOpsJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_applyOpsProfiledJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_applyUpdateJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_beginPeerSnapshot: (a: number, b: number, c: number) => [number, number];
+    readonly xlsxdocument_calculationStatusJson: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_captureFormatJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_cellJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_cellPositionJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_cellRectJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_chartAtPointJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_chartsJson: (a: number, b: number) => [number, number, number, number];
+    readonly xlsxdocument_clearUpdateObservation: (a: number) => void;
+    readonly xlsxdocument_clientId: (a: number) => number;
+    readonly xlsxdocument_conditionalFormatsJson: (a: number, b: number) => [number, number, number, number];
+    readonly xlsxdocument_displayListForJson: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly xlsxdocument_displayListJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_displayListProfiledJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_documentVersion: (a: number) => [number, number];
+    readonly xlsxdocument_drainUpdateEvent: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_editCellJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_editCellProfiledJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_editCellsJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_editChartsJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_encodeDiff: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_encodeStateAsUpdate: (a: number) => [number, number];
+    readonly xlsxdocument_encodeStateVector: (a: number) => [number, number];
+    readonly xlsxdocument_endPeerSnapshot: (a: number) => void;
+    readonly xlsxdocument_exportMarkdownJson: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly xlsxdocument_exportStructuredJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_findTextJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_historyStateJson: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_listDefinedNamesJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_listProposalsJson: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_mergedRangesJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_moveChartJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_moveRangeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_nextPeerSnapshotChunk: (a: number) => [number, number, number];
+    readonly xlsxdocument_open: (a: number, b: number) => [number, number, number];
+    readonly xlsxdocument_openCollaborative: (a: number, b: number, c: number) => [number, number, number];
+    readonly xlsxdocument_openRecoveryCheckpoint: (a: number, b: number, c: number) => [number, number, number];
+    readonly xlsxdocument_openWithCalculationJson: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly xlsxdocument_openWithPeerHydrationJson: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly xlsxdocument_patchRangeStyleJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_peerHydrationJson: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_pngDisplayListJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_printDisplayListJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_proposeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_rangeCellsJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_rangePngDisplayListJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_readCellsJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_recalculateJson: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_recoveryCheckpoint: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_redoJson: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_rejectProposalJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_renderPng: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_renderRangePng: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_saveBytes: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_searchTextJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_selectionDataJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_selectionFormattingJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_setActiveSheet: (a: number, b: number) => [number, number];
+    readonly xlsxdocument_setCalculationContextJson: (a: number, b: number, c: number) => [number, number];
+    readonly xlsxdocument_setRangeNumberFormatJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_sheetCount: (a: number) => number;
+    readonly xlsxdocument_sheetInfoForJson: (a: number, b: number) => [number, number, number, number];
+    readonly xlsxdocument_sheetInfoJson: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_startUpdateObservation: (a: number) => [number, number];
+    readonly xlsxdocument_translateFormulasJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_undoJson: (a: number) => [number, number, number, number];
+    readonly xlsxdocument_validateEditsJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly xlsxdocument_version: () => [number, number];
+    readonly xlsxdocument_visibleMergedRangesJson: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly xlsxsnapshotbuilder_advance: (a: number, b: number, c: number) => [number, number, number];
+    readonly xlsxsnapshotbuilder_finish: (a: number) => [number, number, number];
+    readonly xlsxsnapshotbuilder_new: () => number;
+    readonly xlsxsnapshotbuilder_push: (a: number, b: number, c: number) => [number, number];
+}
+
+export type SyncInitInput = BufferSource | WebAssembly.Module;
+
+/**
+ * Instantiates the given `module`, which can either be bytes or
+ * a precompiled `WebAssembly.Module`.
+ *
+ * @param {{ module: SyncInitInput }} module - Passing `SyncInitInput` directly is deprecated.
+ *
+ * @returns {InitOutput}
+ */
+export function initSync(module: { module: SyncInitInput } | SyncInitInput): InitOutput;
+
+/**
+ * If `module_or_path` is {RequestInfo} or {URL}, makes a request and
+ * for everything else, calls `WebAssembly.instantiate` directly.
+ *
+ * @param {{ module_or_path: InitInput | Promise<InitInput> }} module_or_path - Passing `InitInput` directly is deprecated.
+ *
+ * @returns {Promise<InitOutput>}
+ */
+export default function __wbg_init (module_or_path?: { module_or_path: InitInput | Promise<InitInput> } | InitInput | Promise<InitInput>): Promise<InitOutput>;

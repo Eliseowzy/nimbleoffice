@@ -1,0 +1,130 @@
+/**
+ * Loader for the docx-edit wasm (the Rust yrs editing core + resident layout
+ * engine). External-asset pattern — see ./loadWasmAsset.ts for the init
+ * contract and URL-geometry invariant.
+ *
+ * Reached only via the `src/yrs/` facade's dynamic `import()`, so the glue
+ * (and the wasm fetch) stay out of every non-editor bundle path. The facade's
+ * async `createYrsSession` awaits {@link preloadEditWasm} before constructing
+ * a session, which also covers the resident engine worker (it bootstraps
+ * through the same facade inside the worker context).
+ */
+
+import wasmInit, {
+  initSync,
+  engineKind,
+  EditSession,
+  decodeFontFace as decodePackedFontFace,
+  export_docx_markdown_json,
+  export_docx_structured_json,
+  find_docx_content_controls_json,
+  list_docx_content_controls_json,
+  render_docx_markdown_json,
+  render_docx_markdown_with_pages_json,
+  set_wasm_heap_limit,
+  wasm_failed_allocation_bytes,
+  wasm_heap_counted,
+  wasm_live_bytes,
+  wasm_peak_bytes,
+} from './engineEdit';
+import * as editGlue from './engineEdit';
+import { wasmAssetUrl } from './assetEdit';
+import { createWasmModuleState, type WasmAsyncInput } from './loadWasmAsset';
+import { registerResidentEngine } from './residentEngine';
+
+export const editWasmState = createWasmModuleState({
+  label: 'docx-edit',
+  preloadName: 'preloadEditWasm',
+  assetUrl: wasmAssetUrl,
+  engineKind,
+  initAsync: wasmInit,
+  initSync,
+  shareModule: true,
+  heap: () =>
+    wasm_heap_counted()
+      ? {
+          liveBytes: wasm_live_bytes(),
+          peakBytes: wasm_peak_bytes(),
+          failedAllocationBytes: wasm_failed_allocation_bytes(),
+        }
+      : undefined,
+});
+
+registerResidentEngine(editWasmState, editGlue);
+
+/** Load + instantiate the editing-core wasm (browser path). Idempotent. */
+export function preloadEditWasm(input?: WasmAsyncInput): Promise<void> {
+  return editWasmState.preload(input);
+}
+
+/** @internal */
+export function editWasmModule(): Promise<WebAssembly.Module | null> {
+  return editWasmState.sharedModule();
+}
+
+/** @internal */
+export function preloadEditWasmFrom(source: Promise<WebAssembly.Module | null>): Promise<void> {
+  return editWasmState.preloadFrom(source);
+}
+
+/**
+ * Caps the bytes the editing core in this thread may allocate at once; an
+ * allocation past the cap fails as if the memory were full. Undefined removes it.
+ */
+export function setEditWasmHeapLimit(bytes: number | undefined): void {
+  editWasmState.ensure();
+  set_wasm_heap_limit(bytes ?? Infinity);
+}
+
+/**
+ * Constructs a raw wasm `EditSession` replica after ensuring the module is
+ * initialized. The `src/yrs/` facade wraps this in the typed `YrsSession`
+ * surface — nothing else should call it.
+ */
+export function createEditSession(clientId: number): EditSession {
+  editWasmState.ensure();
+  return new EditSession(clientId);
+}
+
+/** Structured export of DOCX bytes: `{ok: true, content}` or `{ok: false, failure}` JSON. */
+export function exportDocxStructuredJson(bytes: Uint8Array, options: string): string {
+  editWasmState.ensure();
+  return export_docx_structured_json(bytes, options);
+}
+
+/** {@link exportDocxStructuredJson} rendered as Markdown. */
+export function exportDocxMarkdownJson(bytes: Uint8Array, options: string): string {
+  editWasmState.ensure();
+  return export_docx_markdown_json(bytes, options);
+}
+
+/** Markdown rendering of structured content JSON. */
+export function renderDocxMarkdownJson(content: string, options: string): string {
+  editWasmState.ensure();
+  return render_docx_markdown_json(content, options);
+}
+
+/** Content controls of DOCX bytes: `{ok: true, content}` or `{ok: false, failure}` JSON. */
+export function listDocxContentControlsJson(bytes: Uint8Array, options: string): string {
+  editWasmState.ensure();
+  return list_docx_content_controls_json(bytes, options);
+}
+
+/** The content controls of DOCX bytes matching a query, as {@link listDocxContentControlsJson}. */
+export function findDocxContentControlsJson(
+  bytes: Uint8Array,
+  query: string,
+  options: string
+): string {
+  editWasmState.ensure();
+  return find_docx_content_controls_json(bytes, query, options);
+}
+
+/** Markdown rendering of a paged export's JSON, with optional page markers. */
+export function renderDocxMarkdownWithPagesJson(content: string, options: string): string {
+  editWasmState.ensure();
+  return render_docx_markdown_with_pages_json(content, options);
+}
+
+export type { EditSession };
+export { decodePackedFontFace };

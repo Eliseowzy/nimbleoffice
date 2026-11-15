@@ -1,0 +1,42 @@
+[package]
+name = "nimbleoffice-pptx-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Rust-owned PPTX slide layout and display-list compiler."
+readme = "README.md"
+keywords = ["pptx", "powerpoint", "ooxml", "rendering"]
+categories = ["rendering", "graphics"]
+
+[lib]
+name = "pptx_render"
+
+[features]
+font-registration = []
+fuzzing = []
+
+[dependencies]
+ooxml-drawingml.workspace = true
+ooxml-metafile.workspace = true
+ooxml-text.workspace = true
+pptx-edit.workspace = true
+pptx-parse.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+unicode-properties = { version = "0.1.4", default-features = false, features = ["emoji"] }
+unicode-segmentation = "1.12"
+
+[dev-dependencies]
+nimbleoffice-fonts.workspace = true
+libm.workspace = true
+ooxml-opc.workspace = true
+pptx-edit = { workspace = true, features = ["metafile-svg"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libm.workspace = true

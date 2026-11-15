@@ -1,0 +1,119 @@
+{
+ "note": "Word 16.114 PDF export of script.docx (Arial)",
+ "sizes": [
+  {
+   "size": 8,
+   "raise": 3.12,
+   "scriptSize": 5.04,
+   "drop": null
+  },
+  {
+   "size": 9,
+   "raise": 3.12,
+   "scriptSize": 6.0,
+   "drop": 0.96
+  },
+  {
+   "size": 10,
+   "raise": 3.6,
+   "scriptSize": 6.48,
+   "drop": null
+  },
+  {
+   "size": 11,
+   "raise": 4.56,
+   "scriptSize": 6.96,
+   "drop": 0.96
+  },
+  {
+   "size": 12,
+   "raise": 4.08,
+   "scriptSize": 7.92,
+   "drop": 0.96
+  },
+  {
+   "size": 13,
+   "raise": 4.56,
+   "scriptSize": 8.4,
+   "drop": 0.96
+  },
+  {
+   "size": 14,
+   "raise": 5.04,
+   "scriptSize": 9.12,
+   "drop": 0.96
+  },
+  {
+   "size": 15,
+   "raise": 5.52,
+   "scriptSize": 9.6,
+   "drop": 0.96
+  },
+  {
+   "size": 16,
+   "raise": 5.52,
+   "scriptSize": 10.56,
+   "drop": 1.44
+  },
+  {
+   "size": 17,
+   "raise": 6.0,
+   "scriptSize": 11.04,
+   "drop": 0.96
+  },
+  {
+   "size": 18,
+   "raise": 6.48,
+   "scriptSize": 11.52,
+   "drop": 1.44
+  },
+  {
+   "size": 19,
+   "raise": 6.48,
+   "scriptSize": 12.48,
+   "drop": 1.44
+  },
+  {
+   "size": 20,
+   "raise": 6.48,
+   "scriptSize": 12.96,
+   "drop": 1.92
+  },
+  {
+   "size": 21,
+   "raise": 7.44,
+   "scriptSize": 13.44,
+   "drop": 1.44
+  },
+  {
+   "size": 22,
+   "raise": 7.92,
+   "scriptSize": 14.4,
+   "drop": 1.44
+  },
+  {
+   "size": 23,
+   "raise": 7.92,
+   "scriptSize": 15.12,
+   "drop": 1.92
+  },
+  {
+   "size": 24,
+   "raise": 8.4,
+   "scriptSize": 15.6,
+   "drop": 1.44
+  },
+  {
+   "size": 25,
+   "raise": 9.12,
+   "scriptSize": 16.08,
+   "drop": 1.92
+  },
+  {
+   "size": 26,
+   "raise": 8.4,
+   "scriptSize": 17.04,
+   "drop": 1.92
+  }
+ ]
+}

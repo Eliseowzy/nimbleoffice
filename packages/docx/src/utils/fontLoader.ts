@@ -1,0 +1,1807 @@
+/**
+ * Browser Font Loader
+ *
+ * Dynamically loads managed and app-configured fonts with:
+ * - Loading state tracking
+ * - Duplicate prevention
+ * - Callback notifications
+ * - Font availability detection
+ */
+
+import {
+  hasConfiguredFontSource,
+  hasDefaultFontSource,
+  hostedFontFamilies,
+  ImplicitFontAbsentError,
+  isImplicitFontProvider,
+  resolveDefaultFontProvider,
+} from '../layout/measure/defaultFontProvider';
+import type { BundledFontProvider } from '../layout/measure/fontRegistry';
+import { resolveFontFamily } from './fontResolver';
+
+// Track loaded fonts to avoid duplicate requests
+const loadedFonts = new Set<string>();
+
+// Track fonts currently being loaded
+const loadingFonts = new Map<string, Promise<boolean>>();
+
+// Track loaded faces (family|weight) for URL/buffer paths where one
+// family can have multiple weights registered independently.
+const loadedFaces = new Set<string>();
+const loadingFaces = new Map<string, Promise<boolean>>();
+
+// Callbacks to notify when fonts are loaded
+const loadCallbacks = new Set<(fonts: string[]) => void>();
+
+// Callbacks to notify when a font fails to load. Adapters subscribe and
+// forward to their `onError` prop so library consumers can route into their
+// own error tracker (Sentry, Datadog, etc.) instead of filtering the console.
+const errorCallbacks = new Set<(error: Error) => void>();
+
+/**
+ * The loads and notifications of one editor instance; see
+ * {@link createFontLoadScope}.
+ *
+ * @public
+ */
+export interface FontLoadScope {
+  /** Hears the loads this scope asked for and module-level loads, not other scopes' loads. */
+  onFontsLoaded(callback: (fonts: string[]) => void): () => void;
+  /** Hears the failures of this scope's loads and of module-level loads. */
+  onFontError(callback: (error: Error) => void): () => void;
+  /** {@link loadDocumentFonts} on behalf of this scope. */
+  loadDocumentFonts(document: unknown): Promise<void>;
+  /** {@link loadFontsWithMapping} on behalf of this scope. */
+  loadFontsWithMapping(families: string[]): Promise<void>;
+  /** {@link loadFontDefinitions} on behalf of this scope. */
+  loadFontDefinitions(defs: ReadonlyArray<FontDefinition> | undefined): Promise<void>;
+  /** Drops the listeners and releases the embedded faces this scope holds; a later listener revives it. */
+  dispose(): void;
+  /** Whether it is disposed and not revived since. */
+  readonly disposed: boolean;
+}
+
+/** Holds registered buffer faces; `scope` is null for a module-level registration, kept for the page's lifetime. */
+interface FaceOwner {
+  readonly scope: ScopeState | null;
+}
+
+interface ScopeState extends FontLoadScope {
+  readonly loadCallbacks: Set<(fonts: string[]) => void>;
+  readonly errorCallbacks: Set<(error: Error) => void>;
+  /** Owner of the embedded faces of the document this scope loaded last. */
+  embedded: FaceOwner;
+  /** Owners of its earlier documents, released once the last one's faces load. */
+  readonly retiring: Set<FaceOwner>;
+}
+
+/** Scopes that asked for one load; `null` is a module-level call, which every scope hears. */
+type Requesters = ReadonlySet<ScopeState | null>;
+
+const MODULE_LEVEL: Requesters = new Set([null]);
+const PERMANENT: FaceOwner = { scope: null };
+const moduleHostedFonts = {};
+const NO_OWNERS: ReadonlySet<FaceOwner> = new Set();
+// Scopes with at least one listener; a scope nobody listens to stays collectable.
+const liveScopes = new Set<ScopeState>();
+
+function syncListening(scope: ScopeState): void {
+  if (!scope.disposed && (scope.loadCallbacks.size > 0 || scope.errorCallbacks.size > 0)) {
+    liveScopes.add(scope);
+  } else {
+    liveScopes.delete(scope);
+  }
+}
+
+function scopesHearing(requesters: Requesters): Iterable<ScopeState> {
+  if (requesters.has(null)) return liveScopes;
+  return [...requesters].filter(
+    (scope): scope is ScopeState => scope !== null && liveScopes.has(scope)
+  );
+}
+
+// Requesters of in-flight loads, by the loadingFonts / loadingFaces key.
+const fontRequesters = new Map<string, Set<ScopeState | null>>();
+const faceRequesters = new Map<string, Set<ScopeState | null>>();
+
+function joinRequesters(
+  table: Map<string, Set<ScopeState | null>>,
+  key: string,
+  requester: ScopeState | null
+): Set<ScopeState | null> {
+  let requesters = table.get(key);
+  if (!requesters) {
+    requesters = new Set();
+    table.set(key, requesters);
+  }
+  requesters.add(requester);
+  return requesters;
+}
+
+// Track overall loading state
+let isLoadingAny = false;
+
+// When false, the automatic Google Fonts fetch path is disabled. Embedders
+// that must not egress (e.g. a CSP-locked review surface rendering privileged
+// content from embedded font blobs, or any offline host) call
+// setGoogleFontsEnabled(false) to suppress the redundant remote fetches at the
+// source. Embedded faces (loadFontFromBuffer) and consumer-hosted faces
+// (loadFontFromUrl / the `fonts` prop) are unaffected — only the implicit
+// Google Fonts lookup in loadFont / loadFontWithMapping is gated. With a
+// bundled font source configured (configureDefaultFonts), faces come from it
+// and the Google lookup is never made.
+let googleFontsEnabled = true;
+
+// Families registered through this module's face loaders — raw buffers
+// (DOCX-embedded fonts) and consumer URLs (the `fonts` prop). Both are
+// routinely subsetted, so "this family renders" does NOT imply full glyph
+// coverage. loadFontWithMapping keeps fetching the metric-compatible Google
+// equivalent for these families as a glyph-coverage safety net; genuine
+// system fonts skip it. Marked synchronously at registration start so an
+// in-flight registration already counts as provenance.
+const registeredFamilies = new Set<string>();
+
+// Families the canvas probe confirmed as system-satisfied. Kept SEPARATE from
+// loadedFonts on purpose: loadedFonts means "a fetch/registration happened"
+// and short-circuits loadFont before its options are even looked at, so
+// putting probe results there would make a later explicit-weights call a
+// silent no-op. Negative probes are NOT cached — a host page's own
+// @font-face can make a font appear at any time, and the re-probe is two
+// measureText calls on a shared canvas.
+const probeSatisfied = new Set<string>();
+
+// Google Fonts stylesheet URLs that failed, by when. A family Google does not
+// serve (Calibri, Cambria, Aptos, …) fails the same way every time; a network
+// error may not, so a failure is retried once it is this old.
+const failedGoogleStylesheets = new Map<string, number>();
+const GOOGLE_STYLESHEET_RETRY_MS = 5 * 60_000;
+
+function googleStylesheetFailed(url: string): boolean {
+  const failedAt = failedGoogleStylesheets.get(url);
+  if (failedAt === undefined) return false;
+  if (Date.now() - failedAt < GOOGLE_STYLESHEET_RETRY_MS) return true;
+  failedGoogleStylesheets.delete(url);
+  return false;
+}
+
+function reportFontError(
+  error: unknown,
+  context: string,
+  requesters: Requesters = MODULE_LEVEL
+): void {
+  // Wrap in a fresh Error rather than mutating the original — some Error
+  // subclasses (DOMException, frozen objects) have a non-writable .message
+  // and assigning to it throws, which would swallow the real load error.
+  // Carry the original via `cause` so consumers can still inspect it.
+  const origMessage = error instanceof Error ? error.message : String(error);
+  const err = new Error(`[font] ${context}: ${origMessage}`, {
+    cause: error,
+  });
+
+  const callbacks = [...errorCallbacks];
+  for (const scope of scopesHearing(requesters)) callbacks.push(...scope.errorCallbacks);
+  if (callbacks.length > 0) {
+    for (const callback of callbacks) {
+      try {
+        callback(err);
+      } catch (subscriberError) {
+        // A bad subscriber must not block the others — but don't silently eat
+        // the bug. Surface in dev via console.error so the consumer can fix it.
+        console.error('Font error subscriber threw:', subscriberError);
+      }
+    }
+  } else {
+    // No subscriber yet — fall back to console so the error is not silently
+    // dropped during pre-mount or in non-adapter (headless / SSR) usage.
+    console.warn(err.message);
+  }
+}
+
+function faceKey(
+  family: string,
+  weight: number | string = 'normal',
+  style: 'normal' | 'italic' = 'normal'
+): string {
+  return `${family.trim()}|${weight}|${style}`;
+}
+
+const DEFAULT_FACE_STYLES: Array<[boolean, boolean]> = [
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+];
+
+/** How long `loadFont` waits for a bundled family; the load continues and a later call reuses it. */
+const BUNDLED_FONT_DEADLINE_MS = 5000;
+/** Faces that finish while others are still loading are announced at least this often. */
+const BUNDLED_ANNOUNCE_BATCH_MS = 500;
+
+// Bundled faces by family|weight|style; a failed face is evicted so a later call retries it.
+const bundledFaces = new Map<string, Promise<boolean | undefined>>();
+// The requesters of every load that joined a bundled face still loading, which hear it fail.
+const bundledFaceRequesters = new Map<string, Set<Requesters>>();
+// Families with at least one bundled face registered; like registeredFamilies,
+// the system-font probe must not stand in for their missing faces.
+const bundledFamilies = new Set<string>();
+// Families whose bundled faces did not all register; a mapped original name
+// is not marked loaded from them, so its next pass retries.
+const partialBundledFamilies = new Set<string>();
+// Families the bundle had no face for on their last attempt.
+const bundledAbsentFamilies = new Set<string>();
+let bundledFacesInFlight = 0;
+let bundledFacesToAnnounce: FontFace[] = [];
+let announceTimer: ReturnType<typeof setTimeout> | null = null;
+
+// A face built from bytes can already be loaded when it joins the set
+// (Chromium parses it synchronously), so the set never fires `loadingdone`
+// for it. Announce such faces in batches, so the editor repaints text that
+// was drawn before they arrived.
+function announceBundledFaces(): void {
+  if (announceTimer !== null) {
+    clearTimeout(announceTimer);
+    announceTimer = null;
+  }
+  if (bundledFacesToAnnounce.length === 0) return;
+  const fontfaces = bundledFacesToAnnounce;
+  bundledFacesToAnnounce = [];
+  document.fonts.dispatchEvent(
+    typeof FontFaceSetLoadEvent === 'function'
+      ? new FontFaceSetLoadEvent('loadingdone', { fontfaces })
+      : new Event('loadingdone')
+  );
+}
+
+function settleBundledFace(): void {
+  bundledFacesInFlight -= 1;
+  if (bundledFacesToAnnounce.length === 0) return;
+  if (bundledFacesInFlight === 0) announceBundledFaces();
+  else announceTimer ??= setTimeout(announceBundledFaces, BUNDLED_ANNOUNCE_BATCH_MS);
+}
+
+// An older provider without resolveFamily hands back Regular bytes for a
+// style the family lacks, so only its Regular face is trusted.
+function bundledLoad(
+  provider: BundledFontProvider,
+  source: string,
+  bold: boolean,
+  italic: boolean
+): (() => Promise<ArrayBuffer>) | undefined {
+  if (provider.resolveFamily) return provider.resolveFamily(source, bold, italic);
+  return !bold && !italic ? provider.resolve(source, false, false) : undefined;
+}
+
+/** `undefined` when the provider has no face of exactly this weight and style. */
+function registerBundledFace(
+  provider: BundledFontProvider,
+  family: string,
+  source: string,
+  bold: boolean,
+  italic: boolean,
+  requesters: Requesters
+): Promise<boolean | undefined> | undefined {
+  const key = faceKey(family, bold ? 700 : 400, italic ? 'italic' : 'normal');
+  const existing = bundledFaces.get(key);
+  if (existing) {
+    bundledFaceRequesters.get(key)?.add(requesters);
+    return existing;
+  }
+  const load = bundledLoad(provider, source, bold, italic);
+  if (!load) return undefined;
+  bundledFacesInFlight += 1;
+  const joined = new Set([requesters]);
+  bundledFaceRequesters.set(key, joined);
+  const promise = (async () => {
+    let face: FontFace | undefined;
+    try {
+      face = new FontFace(family, await load(), {
+        weight: bold ? '700' : '400',
+        style: italic ? 'italic' : 'normal',
+      });
+      const loadedBeforeAdd = face.status === 'loaded';
+      document.fonts.add(face);
+      await face.load();
+      if (loadedBeforeAdd) bundledFacesToAnnounce.push(face);
+      return true;
+    } catch (error) {
+      if (face) document.fonts.delete(face);
+      if (error instanceof ImplicitFontAbsentError) return undefined;
+      reportFontError(
+        error,
+        `failed to register bundled "${family}"`,
+        new Set([...joined].flatMap((set) => [...set]))
+      );
+      return false;
+    } finally {
+      if (bundledFaceRequesters.get(key) === joined) bundledFaceRequesters.delete(key);
+      settleBundledFace();
+    }
+  })();
+  bundledFaces.set(key, promise);
+  void promise.then((registered) => {
+    if (!registered && bundledFaces.get(key) === promise) bundledFaces.delete(key);
+  });
+  return promise;
+}
+
+/** `absent`: the bundle has no face for the family at all, as opposed to faces that failed or are still loading. */
+type BundledRegistration = 'complete' | 'partial' | 'none' | 'absent';
+
+/**
+ * Registers the configured bundled faces for `family` under its own name,
+ * settling after at most {@link BUNDLED_FONT_DEADLINE_MS}. The faces come
+ * from the first of `sources` the bundle carries. A style the bundle does not
+ * ship is left to browser synthesis; a face that failed or is still loading
+ * makes the result `partial`, so a later call retries it.
+ */
+function registerBundledFamily(
+  family: string,
+  sources: string[],
+  weights: number[] | undefined,
+  styles: ('normal' | 'italic')[] | undefined,
+  deadlineMs: number,
+  requesters: Requesters,
+  requester: ScopeState | null
+): Promise<BundledRegistration> {
+  if (typeof FontFace === 'undefined' || document.fonts === undefined) {
+    return Promise.resolve('none');
+  }
+  const faces =
+    weights || styles
+      ? (weights ?? [400, 700]).flatMap((weight) =>
+          (styles ?? ['normal', 'italic']).map(
+            (style): [boolean, boolean] => [weight >= 600, style === 'italic']
+          )
+        )
+      : DEFAULT_FACE_STYLES;
+  const states: Array<'pending' | 'registered' | 'failed' | 'unsupported'> = faces.map(
+    () => 'pending'
+  );
+  let resolvedProvider = false;
+  const summarize = (): BundledRegistration => {
+    if (resolvedProvider && states.every((state) => state === 'unsupported')) return 'absent';
+    if (!states.includes('registered')) return 'none';
+    return resolvedProvider && states.every((state) => state === 'registered' || state === 'unsupported')
+      ? 'complete'
+      : 'partial';
+  };
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(summarize());
+    };
+    const timer = setTimeout(finish, deadlineMs);
+    void (async () => {
+      const provider = await resolveDefaultFontProvider();
+      if (!provider) return;
+      resolvedProvider = true;
+      if (isImplicitFontProvider(provider) && sources.some(source =>
+        hostedFontFamilies(requester ?? undefined)?.has(source.trim().toLowerCase()) ||
+        hostedFontFamilies(moduleHostedFonts)?.has(source.trim().toLowerCase())
+      )) {
+        states.fill('unsupported');
+        return;
+      }
+      const source =
+        sources.find((candidate) =>
+          faces.some(([bold, italic]) => bundledLoad(provider, candidate, bold, italic))
+        ) ?? family;
+      await Promise.all(
+        faces.map(async ([bold, italic], index) => {
+          const registration = registerBundledFace(
+            provider,
+            family,
+            source,
+            bold,
+            italic,
+            requesters
+          );
+          if (!registration) {
+            states[index] = 'unsupported';
+            return;
+          }
+          if (!isImplicitFontProvider(provider)) bundledFamilies.add(family);
+          const registered = await registration;
+          if (registered === undefined) {
+            states[index] = 'unsupported';
+            return;
+          }
+          bundledFamilies.add(family);
+          states[index] = registered ? 'registered' : 'failed';
+        })
+      );
+    })()
+      .catch(() => undefined)
+      .finally(finish);
+  });
+}
+
+// "A genuine system font satisfies this family" — the decision behind every
+// fetch skip. Self-excludes families registered through our face loaders
+// (subsetted/partial faces — see registeredFamilies); system fonts that
+// render are assumed weight-complete, since OS-bundled families ship full
+// sets. The first positive probe also fires onFontsLoaded (microtask,
+// matching the fetch path's async timing) — consumers gate ready-state UI
+// on that callback, and before the skip existed the fetch guaranteed it.
+function satisfiedBySystemFont(family: string, requesters: Requesters): boolean {
+  if (registeredFamilies.has(family) || bundledFamilies.has(family)) {
+    return false;
+  }
+  if (probeSatisfied.has(family)) {
+    return true;
+  }
+  if (canRenderFont(family)) {
+    probeSatisfied.add(family);
+    queueMicrotask(() => notifyCallbacks([family], requesters));
+    return true;
+  }
+  return false;
+}
+
+// In-flight buffer/URL registrations for a family (loadingFaces is keyed
+// `family|weight`), with the requesters each one notifies.
+function inFlightFaces(family: string): {
+  promises: Promise<boolean>[];
+  requesters: Requesters[];
+} {
+  const prefix = `${family.toLowerCase()}|`;
+  const promises: Promise<boolean>[] = [];
+  const requesters: Requesters[] = [];
+  for (const [key, promise] of loadingFaces) {
+    if (key.toLowerCase().startsWith(prefix)) {
+      promises.push(promise);
+      const notified = bufferFaces.get(key)?.requesters ?? faceRequesters.get(key);
+      if (notified) requesters.push(notified);
+    }
+  }
+  return { promises, requesters };
+}
+
+// Shared success bookkeeping for the buffer/URL face loaders. One place, so
+// the two loaders cannot drift (the next probeSatisfied-style cache line
+// added to one but not the other would skew buffer vs URL faces silently).
+function markFaceLoaded(key: string, family: string, requesters: Requesters): void {
+  loadedFaces.add(key);
+  loadedFonts.add(family);
+  notifyCallbacks([family], requesters);
+}
+
+/**
+ * Generate Google Fonts CSS URL for a font family
+ *
+ * @param fontFamily - The font family name (e.g., "Roboto", "Open Sans")
+ * @param weights - Font weights to load (default: 400, 700)
+ * @param styles - Font styles to load (default: normal, italic)
+ * @returns Google Fonts CSS URL
+ */
+function getGoogleFontsUrl(
+  fontFamily: string,
+  weights: number[] = [400, 700],
+  styles: ('normal' | 'italic')[] = ['normal', 'italic']
+): string {
+  // Encode font family name for URL
+  const encodedFamily = encodeURIComponent(fontFamily);
+
+  // Build weight/style combinations
+  // Format: ital,wght@0,400;0,700;1,400;1,700
+  const combinations: string[] = [];
+
+  for (const style of styles) {
+    const italVal = style === 'italic' ? 1 : 0;
+    for (const weight of weights) {
+      combinations.push(`${italVal},${weight}`);
+    }
+  }
+
+  // Sort and join
+  combinations.sort();
+  const spec = combinations.join(';');
+
+  return `https://fonts.googleapis.com/css2?family=${encodedFamily}:ital,wght@${spec}&display=swap`;
+}
+
+/**
+ * Load a font from the default font provider
+ *
+ * @param fontFamily - The font family name to load
+ * @param options - Optional configuration
+ * @returns Promise resolving to true if font loaded successfully, false otherwise
+ */
+export function loadFont(
+  fontFamily: string,
+  options?: {
+    weights?: number[];
+    styles?: ('normal' | 'italic')[];
+  }
+): Promise<boolean> {
+  return loadFontFrom(fontFamily, options, undefined, undefined, null);
+}
+
+/**
+ * {@link loadFont}, where a bundle lacking `fontFamily` may serve the faces of
+ * `bundledFallback` under the `fontFamily` name instead. `deadlineAt` carries
+ * a retry's original bundled deadline.
+ */
+async function loadFontFrom(
+  fontFamily: string,
+  options:
+    | {
+        weights?: number[];
+        styles?: ('normal' | 'italic')[];
+      }
+    | undefined,
+  bundledFallback: string | undefined,
+  deadlineAt: number | undefined,
+  requester: ScopeState | null
+): Promise<boolean> {
+  // Skip font loading in non-browser environments (Node.js, SSR)
+  if (typeof document === 'undefined') {
+    return false;
+  }
+
+  // Normalize font family name
+  const normalizedFamily = fontFamily.trim();
+
+  // Already loaded?
+  if (loadedFonts.has(normalizedFamily)) {
+    return true;
+  }
+
+  // Currently loading? Return existing promise
+  const existingLoad = loadingFonts.get(normalizedFamily);
+  if (existingLoad) {
+    joinRequesters(fontRequesters, normalizedFamily, requester);
+    // An in-flight load may lack this call's bundled fallback; retry with it
+    // only when the bundle had nothing under this name, not after a timeout,
+    // and within the deadline this call started with.
+    if (!bundledFallback) return existingLoad;
+    const retryDeadline = deadlineAt ?? Date.now() + BUNDLED_FONT_DEADLINE_MS;
+    return existingLoad.then((loaded) =>
+      loaded || !bundledAbsentFamilies.has(normalizedFamily)
+        ? loaded
+        : loadFontFrom(fontFamily, options, bundledFallback, retryDeadline, requester)
+    );
+  }
+
+  // Already satisfied by a system font — fetching the Google copy would be a
+  // redundant round-trip (and a CSP violation in no-egress embedders). Only
+  // taken for the default face set: explicit options.weights/options.styles
+  // always fetch, because the local probe can only see that *a* face renders,
+  // never that a specific weight exists (CSS font matching falls back to the
+  // nearest weight instead of failing). Deliberately NOT recorded in
+  // loadedFonts — the "Already loaded?" check above ignores options, so
+  // recording it there would turn a later explicit-weights call into a silent
+  // no-op. Synchronous on purpose: an await here would let concurrent
+  // loadFont calls slip past the loadingFonts dedupe above.
+  if (!options && satisfiedBySystemFont(normalizedFamily, new Set([requester]))) {
+    return true;
+  }
+
+  // A buffer/URL registration for this family may be mid-flight (its
+  // waitForFontAvailable can take up to 3s). Snapshot here, in the same
+  // synchronous frame as the dedupe checks above.
+  const pendingFaces = inFlightFaces(normalizedFamily);
+
+  // Remote disabled, not locally satisfied, and no in-flight registration
+  // that could change the answer — statically false. Skip the promise
+  // machinery instead of re-paying it on every loadDocumentFonts pass.
+  const bundled = hasDefaultFontSource();
+  if (!googleFontsEnabled && !bundled && pendingFaces.promises.length === 0) {
+    return false;
+  }
+  const googleUrl = getGoogleFontsUrl(normalizedFamily, options?.weights, options?.styles);
+  if (!bundled && pendingFaces.promises.length === 0 && googleStylesheetFailed(googleUrl)) {
+    return false;
+  }
+
+  const requesters = joinRequesters(fontRequesters, normalizedFamily, requester);
+  // Create load promise
+  const loadPromise = (async (): Promise<boolean> => {
+    isLoadingAny = true;
+
+    try {
+      // Settle in-flight registrations and re-check, so we neither issue the
+      // redundant fetch this path exists to skip nor report a spurious
+      // failure under googleFontsEnabled=false. Skipped when nothing was in
+      // flight — the synchronous checks above already gave the answer.
+      if (pendingFaces.promises.length > 0) {
+        await Promise.all(pendingFaces.promises);
+        if (loadedFonts.has(normalizedFamily)) {
+          notifyJoiners([normalizedFamily], requesters, pendingFaces.requesters);
+          return true;
+        }
+        if (!options && satisfiedBySystemFont(normalizedFamily, requesters)) {
+          return true;
+        }
+      }
+
+      if (bundled) {
+        const registration = await registerBundledFamily(
+          normalizedFamily,
+          bundledFallback ? [normalizedFamily, bundledFallback.trim()] : [normalizedFamily],
+          options?.weights,
+          options?.styles,
+          deadlineAt === undefined
+            ? BUNDLED_FONT_DEADLINE_MS
+            : Math.max(0, deadlineAt - Date.now()),
+          requesters,
+          requester
+        );
+        if (registration === 'absent') bundledAbsentFamilies.add(normalizedFamily);
+        else bundledAbsentFamilies.delete(normalizedFamily);
+        const remoteFallback = registration === 'absent' && !hasConfiguredFontSource();
+        if (registration === 'none' || (registration === 'absent' && !remoteFallback)) return false;
+        if (registration !== 'absent') {
+          if (registration === 'complete') {
+            partialBundledFamilies.delete(normalizedFamily);
+            markFamilyLoaded(normalizedFamily);
+          } else {
+            partialBundledFamilies.add(normalizedFamily);
+          }
+          notifyCallbacks([normalizedFamily], requesters);
+          return true;
+        }
+      }
+
+      // Remote fetch disabled (no-egress embedder). The font is not locally
+      // available, so don't inject a Google Fonts <link> — report failure and
+      // let the caller's CSS fallback stack render with what is available.
+      if (!googleFontsEnabled || googleStylesheetFailed(googleUrl)) {
+        return false;
+      }
+
+      // Create link element
+      const link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = googleUrl;
+
+      // Wait for load or error, with a 5s timeout. Clear the timer once
+      // settled so no handle dangles past the load (keeps test runners and
+      // watch cycles from waiting on dead timers).
+      let failed = false;
+      const loaded = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), 5000);
+        link.onload = () => {
+          clearTimeout(timer);
+          resolve(true);
+        };
+        link.onerror = () => {
+          clearTimeout(timer);
+          failed = true;
+          resolve(false);
+        };
+
+        // Append to head
+        document.head.appendChild(link);
+      });
+
+      if (loaded) {
+        // Wait a bit for the font to be available
+        await waitForFontAvailable(normalizedFamily, 3000);
+
+        markFamilyLoaded(normalizedFamily);
+
+        // Notify callbacks
+        notifyCallbacks([normalizedFamily], requesters);
+
+        return true;
+      }
+
+      // Remember a failure so the next mounts neither re-request it nor add a
+      // link until it may be retried. A timeout only drops the link, so a
+      // later call can try again.
+      link.onload = null;
+      link.onerror = null;
+      link.remove();
+      if (failed) failedGoogleStylesheets.set(googleUrl, Date.now());
+      return false;
+    } catch (error) {
+      reportFontError(error, `failed to load "${normalizedFamily}"`, requesters);
+      return false;
+    } finally {
+      loadingFonts.delete(normalizedFamily);
+      fontRequesters.delete(normalizedFamily);
+
+      // Check if still loading any fonts (Google or face-based)
+      if (loadingFonts.size === 0 && loadingFaces.size === 0) {
+        isLoadingAny = false;
+      }
+    }
+  })();
+
+  loadingFonts.set(normalizedFamily, loadPromise);
+  return loadPromise;
+}
+
+/**
+ * Load multiple fonts from the default font provider
+ *
+ * @param families - Array of font family names to load
+ * @param options - Optional configuration
+ * @returns Promise resolving when all fonts are loaded (or failed)
+ */
+export async function loadFonts(
+  families: string[],
+  options?: {
+    weights?: number[];
+    styles?: ('normal' | 'italic')[];
+  }
+): Promise<void> {
+  // Filter out already loaded fonts
+  const toLoad = families.filter((family) => !loadedFonts.has(family.trim()));
+
+  if (toLoad.length === 0) {
+    return;
+  }
+
+  // Load all fonts in parallel
+  await Promise.all(toLoad.map((family) => loadFont(family, options)));
+}
+
+/**
+ * Check if a font is loaded
+ *
+ * @param fontFamily - The font family name to check
+ * @returns true if the font is loaded, false otherwise
+ */
+export function isFontLoaded(fontFamily: string): boolean {
+  // Probe-satisfied system fonts count as available: onFontsLoaded announces
+  // them, so the read API must agree. (loadFont's internal dedupe reads
+  // loadedFonts directly — the split only matters there, where a
+  // probe-satisfied family must still honor explicit weight requests.)
+  const family = fontFamily.trim();
+  return loadedFonts.has(family) || probeSatisfied.has(family);
+}
+
+/**
+ * Enable or disable the editor's automatic Google Fonts lookup.
+ *
+ * Defaults to enabled. Set to `false` in no-egress embedders (strict CSP,
+ * offline) so `loadFont` / `loadFontWithMapping` never inject a
+ * `fonts.googleapis.com` stylesheet `<link>`. This gates ONLY the implicit
+ * Google Fonts lookup — font URLs you register yourself (the `fonts` prop /
+ * `loadFontFromUrl`) are still fetched by the browser, and embedded blobs
+ * (`loadFontFromBuffer`) and system fonts still resolve.
+ *
+ * The flag is page-global (module-level), not per-editor: with multiple
+ * editors on one page the last caller wins. Call it before loading documents;
+ * disabling does not cancel fetches already in flight. A document font that
+ * is neither local nor registered then resolves `loadFont` to `false`
+ * silently (no `onFontError`) and renders via its CSS fallback stack.
+ *
+ * @see isGoogleFontsEnabled
+ * @see loadFontFromBuffer
+ * @see loadFontFromUrl
+ *
+ * @public
+ */
+export function setGoogleFontsEnabled(enabled: boolean): void {
+  googleFontsEnabled = enabled;
+}
+
+/**
+ * Whether the automatic Google Fonts lookup is currently enabled.
+ *
+ * @see setGoogleFontsEnabled
+ *
+ * @public
+ */
+export function isGoogleFontsEnabled(): boolean {
+  return googleFontsEnabled;
+}
+
+/**
+ * Check if any fonts are currently loading
+ *
+ * @returns true if any fonts are loading, false otherwise
+ */
+export function isLoading(): boolean {
+  return isLoadingAny;
+}
+
+/**
+ * Get list of all loaded fonts
+ *
+ * @returns Array of loaded font family names
+ */
+export function getLoadedFonts(): string[] {
+  return Array.from(new Set([...loadedFonts, ...probeSatisfied]));
+}
+
+/**
+ * Register a callback to be notified when fonts are loaded
+ *
+ * @param callback - Function to call when fonts are loaded
+ * @returns Cleanup function to remove the callback
+ */
+export function onFontsLoaded(callback: (fonts: string[]) => void): () => void {
+  loadCallbacks.add(callback);
+
+  // Return cleanup function
+  return () => {
+    loadCallbacks.delete(callback);
+  };
+}
+
+/**
+ * Notify the module-level callbacks and the scopes that asked for the load
+ */
+function notifyCallbacks(fonts: string[], requesters: Requesters = MODULE_LEVEL): void {
+  const callbacks = [...loadCallbacks];
+  for (const scope of scopesHearing(requesters)) callbacks.push(...scope.loadCallbacks);
+  for (const callback of callbacks) {
+    try {
+      callback(fonts);
+    } catch (error) {
+      reportFontError(error, 'load callback threw', requesters);
+    }
+  }
+}
+
+/**
+ * Notify the scopes among `requesters` that no load in `notified` told;
+ * module-level callbacks heard those loads already.
+ */
+function notifyJoiners(fonts: string[], requesters: Requesters, notified: Requesters[]): void {
+  const told = new Set<ScopeState>();
+  for (const heard of notified) for (const scope of scopesHearing(heard)) told.add(scope);
+  for (const scope of scopesHearing(requesters)) {
+    if (told.has(scope)) continue;
+    for (const callback of [...scope.loadCallbacks]) {
+      try {
+        callback(fonts);
+      } catch (error) {
+        reportFontError(error, 'load callback threw', new Set([scope]));
+      }
+    }
+  }
+}
+
+/**
+ * Register a callback to be notified when a font fails to load.
+ *
+ * Adapters subscribe and forward to their `onError` prop. Returns the unsub.
+ *
+ * @public
+ */
+export function onFontError(callback: (error: Error) => void): () => void {
+  errorCallbacks.add(callback);
+  return () => {
+    errorCallbacks.delete(callback);
+  };
+}
+
+/**
+ * Wait for a font to be available using the CSS Font Loading API
+ *
+ * @param fontFamily - The font family to wait for
+ * @param timeout - Maximum time to wait in milliseconds
+ * @returns Promise resolving when font is available or timeout
+ */
+async function waitForFontAvailable(fontFamily: string, timeout: number): Promise<boolean> {
+  // Use CSS Font Loading API if available
+  if ('fonts' in document) {
+    try {
+      // Try to wait for the font
+      const fontFace = `400 16px "${fontFamily}"`;
+      await Promise.race([
+        document.fonts.load(fontFace),
+        new Promise((resolve) => setTimeout(resolve, timeout)),
+      ]);
+
+      return document.fonts.check(fontFace);
+    } catch {
+      // Fall through to fallback
+    }
+  }
+
+  // Fallback: just wait a bit
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  return true;
+}
+
+// Probe scratchpad. The probe runs once per family per document load, so a
+// fresh canvas per call is pure waste — one shared context suffices, and the
+// fallback-font widths ('72px sans-serif' over a fixed string) are session
+// constants worth memoizing.
+let probeContext: CanvasRenderingContext2D | null | undefined;
+const fallbackWidthCache = new Map<string, number>();
+const PROBE_TEXT = 'abcdefghijklmnopqrstuvwxyz0123456789';
+
+function getProbeContext(): CanvasRenderingContext2D | null {
+  if (probeContext === undefined) {
+    probeContext = document.createElement('canvas').getContext('2d');
+    if (probeContext) {
+      probeContext.textBaseline = 'top';
+    }
+  }
+  return probeContext;
+}
+
+/**
+ * Check if a font is available on the system using canvas measurement
+ *
+ * Compares text width with the target font vs a known fallback font (and the
+ * opposite fallback, for names that collide with the browser defaults). If
+ * the widths differ, the font is available. Reuses one shared canvas; the
+ * fallback widths are session constants and memoized.
+ *
+ * @param fontFamily - The font family name to check
+ * @param fallbackFont - Fallback font to compare against
+ * @returns true if font is available, false otherwise
+ */
+export function canRenderFont(fontFamily: string, fallbackFont: string = 'sans-serif'): boolean {
+  // Skip if we're not in a browser
+  if (typeof document === 'undefined') {
+    return false;
+  }
+
+  const ctx = getProbeContext();
+  if (!ctx) {
+    return false;
+  }
+
+  const measure = (font: string): number => {
+    ctx.font = font;
+    return ctx.measureText(PROBE_TEXT).width;
+  };
+
+  // If widths differ, the custom font (not the fallback) was used.
+  const differsFrom = (fallback: string): boolean => {
+    let fallbackWidth = fallbackWidthCache.get(fallback);
+    if (fallbackWidth === undefined) {
+      fallbackWidth = measure(`72px ${fallback}`);
+      fallbackWidthCache.set(fallback, fallbackWidth);
+    }
+    return measure(`72px "${fontFamily}", ${fallback}`) !== fallbackWidth;
+  };
+
+  // Check with the primary fallback, then the opposite one (handles the edge
+  // case where the font name matches the browser's default sans-serif/serif).
+  return (
+    differsFrom(fallbackFont) || differsFrom(fallbackFont === 'sans-serif' ? 'serif' : 'sans-serif')
+  );
+}
+
+// CSS hex escapes (with the mandatory trailing space) for characters that
+// either terminate a CSS string token (LF/CR/FF — bad-string-token per
+// css-syntax-3) or could close a serialized <style> block (< >).
+const CSS_HEX_ESCAPES: Record<string, string> = {
+  '<': '\\3c ',
+  '>': '\\3e ',
+  '\n': '\\a ',
+  '\r': '\\d ',
+  '\f': '\\c ',
+};
+const cssStringEscape = (s: string) =>
+  s.replace(/["\\]/g, '\\$&').replace(/[<>\n\r\f]/g, (c) => CSS_HEX_ESCAPES[c]);
+
+/**
+ * Load a font from a raw buffer (e.g., embedded in DOCX)
+ *
+ * Call before loading the document when possible: registration marks the
+ * family as ours, which keeps the managed coverage fallback
+ * in play for subsetted faces during the document's font resolution pass.
+ * Late registration still self-heals on the next pass.
+ *
+ * @param fontFamily - The font family name
+ * @param buffer - Font file buffer (TTF, OTF, WOFF, WOFF2)
+ * @param options - Font options
+ * @returns Promise resolving when font is loaded
+ */
+export async function loadFontFromBuffer(
+  fontFamily: string,
+  buffer: ArrayBuffer,
+  options?: {
+    weight?: number | string;
+    style?: 'normal' | 'italic';
+  }
+): Promise<boolean> {
+  if (typeof document === 'undefined') return false;
+  const face: BufferFaceInput = {
+    family: fontFamily,
+    data: buffer,
+    weight: options?.weight,
+    style: options?.style,
+  };
+  const family = fontFamily.trim();
+  return registerBufferFace(face, PERMANENT, cssFamilyFor(family, [face]));
+}
+
+/** One face of a font file's bytes, as {@link registerDocumentFaces} takes it. */
+export interface BufferFaceInput {
+  family: string;
+  data: ArrayBuffer;
+  weight?: number | string;
+  style?: 'normal' | 'italic';
+}
+
+/** One registered `@font-face` over one font file's bytes, held by its owners. */
+interface BufferFace {
+  readonly key: string;
+  /** `cssFamily|weight|style`, case-folded, with the weight in CSS numbers. */
+  readonly cssSlot: string;
+  readonly cssFamily: string;
+  /** Spellings of the family it registered under their own name, as `loadedFonts` holds them. */
+  readonly families: Set<string>;
+  /** Scopes to notify when it loads; emptied once it settles. */
+  requesters: Set<ScopeState | null>;
+  settled: boolean;
+  readonly bytes: Uint8Array<ArrayBuffer>;
+  readonly owners: Set<FaceOwner>;
+  promise: Promise<boolean>;
+  style: HTMLStyleElement | null;
+  url: string | null;
+}
+
+// Buffer faces by `cssFamily|weight|style|content`.
+const bufferFaces = new Map<string, BufferFace>();
+const bufferFacesBySlot = new Map<string, Set<BufferFace>>();
+const bufferFamilyCounts = new Map<string, number>();
+const MAX_DOCUMENT_FACES = 256;
+// Families loadedFonts holds only because buffer faces are registered.
+const bufferOnlyFamilies = new Set<string>();
+// Mapped originals loadedFonts holds only because their equivalent is such a family.
+const mappedOriginals = new Map<string, string>();
+
+function markFamilyLoaded(family: string): void {
+  loadedFonts.add(family);
+  bufferOnlyFamilies.delete(family);
+  mappedOriginals.delete(family);
+}
+
+function markBufferFamily(entry: BufferFace, family: string): void {
+  if (!loadedFonts.has(family)) bufferOnlyFamilies.add(family);
+  loadedFonts.add(family);
+  if (!entry.families.has(family)) {
+    entry.families.add(family);
+    bufferFamilyCounts.set(family, (bufferFamilyCounts.get(family) ?? 0) + 1);
+  }
+}
+
+function bytesOf(face: BufferFaceInput): Uint8Array<ArrayBuffer> {
+  return new Uint8Array(face.data);
+}
+
+/** FNV-1a of the bytes plus their length; equal fingerprints are compared byte for byte. */
+function fingerprint(bytes: Uint8Array): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < bytes.length; index += 1) {
+    hash = Math.imul(hash ^ bytes[index], 0x01000193);
+  }
+  return `${(hash >>> 0).toString(16).padStart(8, '0')}${bytes.length.toString(16)}`;
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function cssWeight(weight: number | string | undefined): string {
+  const value = String(weight ?? 'normal')
+    .trim()
+    .toLowerCase();
+  if (value === 'normal') return '400';
+  if (value === 'bold') return '700';
+  const numeric = Number(value);
+  return value !== '' && Number.isFinite(numeric) ? String(numeric) : value;
+}
+
+/** CSS matches family names case-insensitively and `bold` as 700, so keys and collisions do too. */
+function familySlot(family: string, weight: number | string | undefined, style: string): string {
+  return `${family.trim().toLowerCase()}|${cssWeight(weight)}|${style}`;
+}
+
+function bufferFaceKey(slot: string, bytes: Uint8Array): string {
+  const base = `${slot}|${fingerprint(bytes)}`;
+  for (let attempt = 0; ; attempt += 1) {
+    const key = attempt === 0 ? base : `${base}~${attempt}`;
+    const existing = bufferFaces.get(key);
+    if (!existing || sameBytes(existing.bytes, bytes)) return key;
+  }
+}
+
+/** Whether a live registration of an owner outside `replacing` holds different bytes for `face` under `cssFamily`. */
+function heldByOthers(
+  cssFamily: string,
+  face: BufferFaceInput,
+  replacing: ReadonlySet<FaceOwner>
+): boolean {
+  const slot = familySlot(cssFamily, face.weight, face.style ?? 'normal');
+  const bytes = bytesOf(face);
+  for (const entry of bufferFacesBySlot.get(slot) ?? []) {
+    if (
+      !sameBytes(entry.bytes, bytes) &&
+      [...entry.owners].some((owner) => !replacing.has(owner))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The CSS family `faces` of one family register under: the family's own name
+ * unless a live registration holds different bytes for one of its faces under
+ * that name, and then an alias unique to these faces' bytes. Faces only
+ * `replacing` hold, documents being replaced, are no collision.
+ */
+function cssFamilyFor(
+  family: string,
+  faces: readonly BufferFaceInput[],
+  replacing: ReadonlySet<FaceOwner> = NO_OWNERS
+): string {
+  if (!faces.some((face) => heldByOthers(family, face, replacing))) return family;
+  const base = `${family}#${fingerprint(new TextEncoder().encode(faces.map((face) => fingerprint(bytesOf(face))).join()))}`;
+  for (let attempt = 0; ; attempt += 1) {
+    const alias = attempt === 0 ? base : `${base}~${attempt}`;
+    if (!faces.some((face) => heldByOthers(alias, face, NO_OWNERS))) return alias;
+  }
+}
+
+function registerBufferFace(
+  input: BufferFaceInput,
+  owner: FaceOwner,
+  cssFamily: string
+): Promise<boolean> {
+  const family = input.family.trim();
+  const style = input.style ?? 'normal';
+  const cssSlot = familySlot(cssFamily, input.weight, style);
+  const key = bufferFaceKey(cssSlot, bytesOf(input));
+  const realName = cssFamily.toLowerCase() === family.toLowerCase();
+
+  // Provenance: mark before the async work so an in-flight registration
+  // already counts as registered (see loadFontWithMapping). Marking a family
+  // that then fails to load only means we keep fetching its Google
+  // equivalent — the safe direction.
+  registeredFamilies.add(family);
+
+  const existing = bufferFaces.get(key);
+  if (existing) {
+    existing.owners.add(owner);
+    if (!existing.settled) existing.requesters.add(owner.scope);
+    if (!realName) return existing.promise;
+    // The same face under another spelling of its name: CSS renders that spelling too.
+    return existing.promise.then((loaded) => {
+      if (loaded && bufferFaces.get(key) === existing) markBufferFamily(existing, family);
+      return loaded;
+    });
+  }
+
+  const bytes = bytesOf(input).slice();
+  const entry: BufferFace = {
+    key,
+    cssSlot,
+    cssFamily,
+    families: new Set(),
+    requesters: new Set([owner.scope]),
+    settled: false,
+    bytes,
+    owners: new Set([owner]),
+    promise: Promise.resolve(false),
+    style: null,
+    url: null,
+  };
+  bufferFaces.set(key, entry);
+  let slotFaces = bufferFacesBySlot.get(cssSlot);
+  if (!slotFaces) {
+    slotFaces = new Set();
+    bufferFacesBySlot.set(cssSlot, slotFaces);
+  }
+  slotFaces.add(entry);
+
+  entry.promise = (async (): Promise<boolean> => {
+    isLoadingAny = true;
+    try {
+      entry.url = URL.createObjectURL(new Blob([bytes], { type: 'font/ttf' }));
+      entry.style = document.createElement('style');
+      entry.style.textContent = `
+      @font-face {
+        font-family: "${cssStringEscape(cssFamily)}";
+        src: url(${entry.url}) format('truetype');
+        font-weight: ${input.weight ?? 'normal'};
+        font-style: ${style};
+        font-display: swap;
+      }
+    `;
+      document.head.appendChild(entry.style);
+
+      await waitForFontAvailable(cssFamily, 3000);
+
+      if (bufferFaces.get(key) !== entry) return false;
+      loadedFaces.add(key);
+      if (realName) markBufferFamily(entry, family);
+      notifyCallbacks([family], entry.requesters);
+
+      return true;
+    } catch (error) {
+      reportFontError(error, `failed to load "${family}" from buffer`, entry.requesters);
+      dropBufferFace(entry);
+      return false;
+    } finally {
+      entry.settled = true;
+      entry.requesters = new Set();
+      if (loadingFaces.get(key) === entry.promise) loadingFaces.delete(key);
+      if (loadingFonts.size === 0 && loadingFaces.size === 0) {
+        isLoadingAny = false;
+      }
+    }
+  })();
+
+  loadingFaces.set(key, entry.promise);
+  return entry.promise;
+}
+
+function dropBufferFace(entry: BufferFace): void {
+  if (bufferFaces.get(entry.key) !== entry) return;
+  bufferFaces.delete(entry.key);
+  const slotFaces = bufferFacesBySlot.get(entry.cssSlot);
+  slotFaces?.delete(entry);
+  if (slotFaces?.size === 0) bufferFacesBySlot.delete(entry.cssSlot);
+  loadedFaces.delete(entry.key);
+  entry.style?.remove();
+  if (entry.url) URL.revokeObjectURL(entry.url);
+  entry.style = null;
+  entry.url = null;
+  for (const family of entry.families) {
+    const count = (bufferFamilyCounts.get(family) ?? 0) - 1;
+    if (count > 0) bufferFamilyCounts.set(family, count);
+    else bufferFamilyCounts.delete(family);
+    if (!bufferOnlyFamilies.has(family) || count > 0) continue;
+    bufferOnlyFamilies.delete(family);
+    loadedFonts.delete(family);
+    for (const [original, source] of mappedOriginals) {
+      if (source !== family) continue;
+      mappedOriginals.delete(original);
+      loadedFonts.delete(original);
+    }
+  }
+}
+
+function releaseFaceOwner(owner: FaceOwner): void {
+  if (owner === PERMANENT) return;
+  for (const entry of [...bufferFaces.values()]) {
+    if (!entry.owners.delete(owner) || entry.owners.size > 0) continue;
+    dropBufferFace(entry);
+  }
+}
+
+/** Releases what a scope's document load replaced, once that load is the scope's last one. */
+function settleDocumentFaces(state: ScopeState | null, owner: FaceOwner): void {
+  if (!state) return;
+  if (state.disposed) {
+    releaseFaceOwner(owner);
+    return;
+  }
+  if (state.embedded !== owner) return;
+  for (const retired of state.retiring) releaseFaceOwner(retired);
+  state.retiring.clear();
+}
+
+/**
+ * Claims `scope` for a document's faces now, so that of two documents loading
+ * into one scope the later claim wins, whichever faces arrive first. The
+ * returned registration resolves to null when a later claim or disposal made
+ * it obsolete.
+ */
+export function claimDocumentFaces(
+  scope?: FontLoadScope
+): (
+  faces: readonly BufferFaceInput[] | PromiseLike<readonly BufferFaceInput[]>
+) => Promise<Map<string, string> | null> {
+  if (typeof document === 'undefined' || scope?.disposed) {
+    return async (faces) => {
+      await faces;
+      return null;
+    };
+  }
+  const state = scope ? (scope as ScopeState) : null;
+  const owner: FaceOwner = state ? { scope: state } : PERMANENT;
+  if (state) {
+    state.retiring.add(state.embedded);
+    state.embedded = owner;
+  }
+  const current = () => !state || (!state.disposed && state.embedded === owner);
+  const register = async (list: readonly BufferFaceInput[]) => {
+    if (!current()) {
+      settleDocumentFaces(state, owner);
+      return null;
+    }
+    const families = new Map<string, BufferFaceInput[]>();
+    for (const face of list.slice(0, MAX_DOCUMENT_FACES)) {
+      const family = face.family.trim();
+      let group = families.get(family);
+      if (!group) {
+        group = [];
+        families.set(family, group);
+      }
+      group.push(face);
+    }
+    const loads: Array<Promise<[string, string, boolean]>> = [];
+    for (const [family, group] of families) {
+      const cssFamily = cssFamilyFor(family, group, state?.retiring);
+      for (const face of group) {
+        loads.push(
+          registerBufferFace(face, owner, cssFamily).then((ok) => [family, cssFamily, ok])
+        );
+      }
+    }
+    const results = await Promise.all(loads);
+    settleDocumentFaces(state, owner);
+    if (!current()) return null;
+    const registered = new Map<string, string>();
+    for (const [family, cssFamily, ok] of results) {
+      if (ok) registered.set(family, cssFamily);
+    }
+    return registered;
+  };
+  // Faces in hand register at once, so a load of their family made right
+  // after this call finds them in flight.
+  return (faces) =>
+    'then' in faces
+      ? Promise.resolve(faces).then(register, (error: unknown) => {
+          settleDocumentFaces(state, owner);
+          throw error;
+        })
+      : register(faces);
+}
+
+/**
+ * Registers one document's font faces from their bytes. Each family takes its
+ * own name, as {@link loadFontFromBuffer} registers it, unless a live
+ * registration holds different bytes under that name; then all its faces take
+ * an alias, so both documents keep their own glyphs. Faces with the same bytes
+ * are registered once. With a scope, the faces are held until the scope loads
+ * its next document or is disposed; without one, for the page's lifetime.
+ * `faces` may be a promise: the scope's next document is the one whose call
+ * came last, whichever faces arrive first. Resolves to the CSS family each
+ * family was registered under, for the families with at least one face that
+ * loaded, or to an empty map once a later document or disposal replaced it.
+ *
+ * @public
+ */
+export async function registerDocumentFaces(
+  faces: readonly BufferFaceInput[] | PromiseLike<readonly BufferFaceInput[]>,
+  scope?: FontLoadScope
+): Promise<Map<string, string>> {
+  const register = claimDocumentFaces(scope);
+  return (await register(faces)) ?? new Map();
+}
+
+function guessFontFormat(src: string): string {
+  const url = src.split('?')[0].split('#')[0].toLowerCase();
+  if (url.endsWith('.woff2')) return 'woff2';
+  if (url.endsWith('.woff')) return 'woff';
+  if (url.endsWith('.otf')) return 'opentype';
+  return 'truetype';
+}
+
+/**
+ * Load a font face from a URL (woff2, woff, ttf, otf).
+ *
+ * Injects an `@font-face` rule pointing at the URL. Multiple weights of the
+ * same family can be registered independently. Families registered here are
+ * treated as potentially subsetted: the editor also loads their managed
+ * equivalent as a glyph-coverage fallback.
+ *
+ * @param fontFamily - CSS font-family name to expose
+ * @param src - URL to the font file
+ * @param options - Optional weight
+ * @returns Promise resolving to true if the face became available
+ *
+ * @public
+ */
+export function loadFontFromUrl(
+  fontFamily: string,
+  src: string,
+  options?: {
+    weight?: number | string;
+  }
+): Promise<boolean> {
+  return loadUrlFace(fontFamily, src, options, null);
+}
+
+async function loadUrlFace(
+  fontFamily: string,
+  src: string,
+  options: { weight?: number | string } | undefined,
+  requester: ScopeState | null
+): Promise<boolean> {
+  if (typeof document === 'undefined') return false;
+
+  // Reject URLs containing HTML-breaking characters. The loader writes src
+  // into a <style> element's textContent — safe for client rendering, but
+  // a serialized document.head (SSR, devtools snapshot) would terminate the
+  // style block early on </style>. < and > are never valid in a URL anyway.
+  if (/[<>]/.test(src)) {
+    reportFontError(
+      new Error(`invalid src URL for "${fontFamily}": contains '<' or '>'`),
+      'rejected src',
+      new Set([requester])
+    );
+    return false;
+  }
+
+  const normalizedFamily = fontFamily.trim();
+  const key = faceKey(normalizedFamily, options?.weight);
+
+  // Provenance: subsetted-face safety net — see registeredFamilies.
+  registeredFamilies.add(normalizedFamily);
+
+  if (loadedFaces.has(key)) return true;
+  const requesters = joinRequesters(faceRequesters, key, requester);
+  const existing = loadingFaces.get(key);
+  if (existing) return existing;
+
+  const loadPromise = (async (): Promise<boolean> => {
+    isLoadingAny = true;
+    try {
+      const style = document.createElement('style');
+      style.textContent = `
+      @font-face {
+        font-family: "${cssStringEscape(normalizedFamily)}";
+        src: url(${JSON.stringify(src)}) format('${guessFontFormat(src)}');
+        font-weight: ${options?.weight ?? 'normal'};
+        font-display: swap;
+      }
+    `;
+      document.head.appendChild(style);
+
+      await waitForFontAvailable(normalizedFamily, 3000);
+
+      markFamilyLoaded(normalizedFamily);
+      markFaceLoaded(key, normalizedFamily, requesters);
+
+      return true;
+    } catch (error) {
+      reportFontError(error, `failed to load "${normalizedFamily}" from ${src}`, requesters);
+      return false;
+    } finally {
+      loadingFaces.delete(key);
+      faceRequesters.delete(key);
+      if (loadingFonts.size === 0 && loadingFaces.size === 0) {
+        isLoadingAny = false;
+      }
+    }
+  })();
+
+  loadingFaces.set(key, loadPromise);
+  return loadPromise;
+}
+
+/**
+ * Declarative description of a single font face to register with the editor.
+ *
+ * Each entry injects one `@font-face` rule pointing at a URL. Multiple
+ * entries can share `family` to register distinct weights as separate faces.
+ *
+ * For managed fonts, call `loadFont(family)` directly; the `fonts` prop is
+ * for fonts the consumer hosts themselves. For raw bytes already in memory
+ * (DOCX-embedded fonts, user uploads), call `loadFontFromBuffer(family, buf)`.
+ *
+ * @public
+ */
+export interface FontDefinition {
+  /**
+   * CSS `font-family` name to expose. Match the family name your documents
+   * reference; the browser uses this to look up glyphs when text is rendered.
+   */
+  family: string;
+  /**
+   * URL to the font file (woff2, woff, ttf, or otf). The loader injects an
+   * `@font-face` rule and lets the browser fetch on demand.
+   */
+  src: string;
+  /**
+   * CSS `font-weight` for this face. Defaults to `'normal'` (≈400). Pass a
+   * number (`400`, `700`) or a CSS keyword (`'bold'`). Required when one
+   * `family` registers multiple weights as separate entries.
+   */
+  weight?: number | string;
+}
+
+/**
+ * Register a list of custom font faces. Used by the `fonts` prop on
+ * `<DocxEditor>` (React + Vue). Idempotent — safe to call on every render.
+ *
+ * @public
+ */
+export function loadFontDefinitions(
+  defs: ReadonlyArray<FontDefinition> | undefined
+): Promise<void> {
+  return loadDefinitionsFor(defs, null);
+}
+
+async function loadDefinitionsFor(
+  defs: ReadonlyArray<FontDefinition> | undefined,
+  requester: ScopeState | null
+): Promise<void> {
+  Object.assign(requester ?? moduleHostedFonts, {
+    [Symbol.for('@nimbleoffice/docx/hostedFontFamilies')]: new Set((defs ?? []).map(def => def.family.trim().toLowerCase())),
+  });
+  if (!defs || defs.length === 0) return;
+  await Promise.all(
+    defs.map((def) => loadUrlFace(def.family, def.src, { weight: def.weight }, requester))
+  );
+}
+
+/**
+ * Mapping from common Office/system fonts to Google Fonts equivalents
+ *
+ * Google Fonts doesn't have exact matches for many Microsoft fonts,
+ * but these are close alternatives that work well for document rendering.
+ */
+export const FONT_MAPPING: Record<string, string> = {
+  // Microsoft Office fonts → Google Fonts equivalents
+  Calibri: 'Carlito',
+  Cambria: 'Caladea',
+  Arial: 'Arimo',
+  'Times New Roman': 'Tinos',
+  'Courier New': 'Cousine',
+  Garamond: 'EB Garamond',
+  'Book Antiqua': 'EB Garamond',
+  Georgia: 'Tinos',
+  Verdana: 'Open Sans',
+  Tahoma: 'Open Sans',
+  'Trebuchet MS': 'Source Sans Pro',
+  'Century Gothic': 'Poppins',
+  'Franklin Gothic': 'Libre Franklin',
+  Palatino: 'EB Garamond',
+  'Palatino Linotype': 'EB Garamond',
+  'Lucida Sans': 'Open Sans',
+  'Segoe UI': 'Open Sans',
+  Impact: 'Anton',
+  'Comic Sans MS': 'Comic Neue',
+  Consolas: 'Inconsolata',
+  'Lucida Console': 'Inconsolata',
+  Monaco: 'Fira Code',
+};
+
+/**
+ * Get the Google Fonts equivalent for a font name
+ *
+ * @param fontName - The original font name from the document
+ * @returns The Google Fonts equivalent, or the original name if no mapping exists
+ */
+export function getGoogleFontEquivalent(fontName: string): string {
+  const trimmed = fontName.trim();
+  // FONT_MAPPING is the loader's small override table for a few Latin Office
+  // fonts. For everything else — notably CJK, and any-case spellings — defer to
+  // the single source of truth in fontResolver, whose lookup is case-insensitive
+  // and carries the full font→Noto mapping (so the family the loader fetches
+  // matches the one fontResolver puts in the CSS fallback stack). Falls back to
+  // the raw name when neither maps it.
+  return FONT_MAPPING[trimmed] || resolveFontFamily(trimmed).googleFont || trimmed;
+}
+
+/**
+ * Load a font, automatically mapping to Google Fonts equivalent if needed.
+ * If the font needs mapping, also creates a CSS alias so the original font
+ * name works in stylesheets.
+ *
+ * @param fontFamily - The font family name (may be an Office font)
+ * @returns Promise resolving to true if font loaded
+ */
+export function loadFontWithMapping(fontFamily: string): Promise<boolean> {
+  return loadWithMapping(fontFamily, null);
+}
+
+async function loadWithMapping(fontFamily: string, requester: ScopeState | null): Promise<boolean> {
+  const trimmed = fontFamily.trim();
+  const googleFont = getGoogleFontEquivalent(trimmed);
+
+  // Load the Google Font under its own name (no aliasing).
+  // The font resolver provides CSS fallback stacks that list both the
+  // original DOCX font and the Google equivalent, so the browser will
+  // use whichever is available without @font-face aliasing that would
+  // hijack Canvas measurements.
+  if (googleFont !== trimmed) {
+    // A genuine system-installed original has full glyph coverage, so the
+    // metric-approximate Google equivalent would never be consulted by the
+    // fallback stack — skip its fetch. Registered (subsetted) families keep
+    // it as the glyph-coverage safety net — see registeredFamilies. The
+    // isFontLoaded leg covers "equivalent already fetched on an earlier
+    // pass"; satisfiedBySystemFont self-excludes registered families.
+    if (
+      (!registeredFamilies.has(trimmed) && isFontLoaded(trimmed)) ||
+      satisfiedBySystemFont(trimmed, new Set([requester]))
+    ) {
+      return true;
+    }
+    const result = await loadFontFrom(googleFont, undefined, trimmed, undefined, requester);
+    // The equivalent may have been released while this call waited on it.
+    if (result && isFontLoaded(googleFont) && !partialBundledFamilies.has(googleFont)) {
+      if (!bufferOnlyFamilies.has(googleFont)) {
+        markFamilyLoaded(trimmed);
+      } else if (!loadedFonts.has(trimmed)) {
+        loadedFonts.add(trimmed);
+        mappedOriginals.set(trimmed, googleFont);
+      }
+    }
+    return result;
+  }
+
+  // No mapping needed, load directly
+  return loadFontFrom(googleFont, undefined, undefined, undefined, requester);
+}
+
+/**
+ * Load multiple fonts with automatic mapping to Google Fonts equivalents
+ *
+ * @param families - Array of font family names
+ * @returns Promise resolving when all fonts are loaded
+ */
+export function loadFontsWithMapping(families: string[]): Promise<void> {
+  return loadAllWithMapping(families, null);
+}
+
+async function loadAllWithMapping(
+  families: string[],
+  requester: ScopeState | null
+): Promise<void> {
+  // Remove duplicates
+  const uniqueFonts = [...new Set(families.map((f) => f.trim()))];
+  // Load each font with mapping (creates aliases for Office → Google font mappings)
+  await Promise.all(uniqueFonts.map((family) => loadWithMapping(family, requester)));
+}
+
+/**
+ * Preload a list of common document fonts
+ *
+ * This preloads fonts commonly used in DOCX documents that have
+ * Google Fonts equivalents.
+ */
+export async function preloadCommonFonts(): Promise<void> {
+  const commonFonts = [
+    'Carlito', // Calibri equivalent
+    'Caladea', // Cambria equivalent
+    'Arimo', // Arial equivalent
+    'Tinos', // Times New Roman equivalent
+    'Cousine', // Courier New equivalent
+    'EB Garamond', // Garamond equivalent
+  ];
+
+  await loadFonts(commonFonts);
+}
+
+/**
+ * Extract all font families used in a document
+ *
+ * Uses loose typing to handle any document-like structure.
+ *
+ * @param document - The parsed document
+ * @returns Set of unique font family names
+ */
+export function extractFontsFromDocument(document: unknown): Set<string> {
+  const fonts = new Set<string>();
+  if (typeof document !== 'object' || document === null) return fonts;
+
+  // Walk the parsed document/style/table containers, including nested tables,
+  // text boxes and header/footer content. Bound the traversal because every
+  // parsed DOCX value is attacker-controlled.
+  const stack: unknown[] = [document];
+  const seen = new WeakSet<object>();
+  let visited = 0;
+  const MAX_FONT_SCAN_NODES = 100_000;
+  while (stack.length > 0 && visited++ < MAX_FONT_SCAN_NODES) {
+    const value = stack.pop();
+    if (typeof value !== 'object' || value === null) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const child of value) stack.push(child);
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    const family = record.fontFamily;
+    if (typeof family === 'object' && family !== null) {
+      const slots = family as Record<string, unknown>;
+      for (const slot of ['ascii', 'hAnsi', 'eastAsia', 'cs']) {
+        const name = slots[slot];
+        if (typeof name === 'string' && name.trim()) fonts.add(name.trim());
+      }
+    }
+    // fontTable.xml names and altName aliases are both legitimate authored
+    // references; preload both so a run using either spelling resolves.
+    if (
+      typeof record.name === 'string' &&
+      ('altName' in record || 'panose1' in record || 'embedRegular' in record)
+    ) {
+      if (record.name.trim()) fonts.add(record.name.trim());
+      if (typeof record.altName === 'string' && record.altName.trim()) {
+        fonts.add(record.altName.trim());
+      }
+    }
+    for (const child of Object.values(record)) stack.push(child);
+  }
+
+  return fonts;
+}
+
+/**
+ * Extract fonts from a document and load them from Google Fonts
+ *
+ * @param document - The parsed document
+ * @returns Promise resolving when fonts are loaded
+ */
+export function loadDocumentFonts(document: unknown): Promise<void> {
+  return loadDocumentFontsFor(document, null);
+}
+
+async function loadDocumentFontsFor(
+  document: unknown,
+  requester: ScopeState | null
+): Promise<void> {
+  const fonts = extractFontsFromDocument(document);
+
+  if (fonts.size === 0) {
+    return;
+  }
+
+  // Loading document fonts
+  await loadAllWithMapping(Array.from(fonts), requester);
+}
+
+/**
+ * A scope for one editor instance's font loads. Loads made through it notify
+ * its own `onFontsLoaded` / `onFontError` listeners and the module-level ones,
+ * never another scope's; module-level loads still reach every scope, so a
+ * single editor hears what it heard before. Dedupe and caches stay shared.
+ *
+ * @public
+ */
+export function createFontLoadScope(): FontLoadScope {
+  const scope: ScopeState = {
+    loadCallbacks: new Set(),
+    errorCallbacks: new Set(),
+    embedded: PERMANENT,
+    retiring: new Set(),
+    disposed: false,
+    onFontsLoaded(callback) {
+      revive();
+      scope.loadCallbacks.add(callback);
+      syncListening(scope);
+      return () => {
+        scope.loadCallbacks.delete(callback);
+        syncListening(scope);
+      };
+    },
+    onFontError(callback) {
+      revive();
+      scope.errorCallbacks.add(callback);
+      syncListening(scope);
+      return () => {
+        scope.errorCallbacks.delete(callback);
+        syncListening(scope);
+      };
+    },
+    loadDocumentFonts: (document) => loadDocumentFontsFor(document, scope),
+    loadFontsWithMapping: (families) => loadAllWithMapping(families, scope),
+    loadFontDefinitions: (defs) => loadDefinitionsFor(defs, scope),
+    dispose() {
+      if (scope.disposed) return;
+      (scope as { disposed: boolean }).disposed = true;
+      liveScopes.delete(scope);
+      scope.loadCallbacks.clear();
+      scope.errorCallbacks.clear();
+      releaseFaceOwner(scope.embedded);
+      for (const retired of scope.retiring) releaseFaceOwner(retired);
+      scope.retiring.clear();
+      // A claim made before disposal stays obsolete after a revival.
+      scope.embedded = { scope };
+    },
+  };
+  // A remount (React StrictMode replays effects) subscribes again: the same
+  // scope serves it, holding new faces from then on.
+  const revive = (): void => {
+    (scope as { disposed: boolean }).disposed = false;
+  };
+  scope.embedded = { scope };
+  return scope;
+}

@@ -1,0 +1,62 @@
+import type {
+  ColorValue,
+  ParagraphFormatting,
+  TextFormatting,
+} from '@nimbleoffice/docx/types/document';
+import type {
+  CollaborationPresence,
+  CollaborationReplica,
+  CollaborationUser,
+} from '@nimbleoffice/docx/collaboration';
+import type { PointPosition } from '@nimbleoffice/docx/plugin-api';
+import type { DocxTextRange } from '@nimbleoffice/docx/yrs';
+
+/**
+ * The text under a client point in the rendered layout of `version`. `position`, `pageIndex`
+ * and `region` locate the hit in that layout. `target` is the collapsed accepted-view range at
+ * the point, keyed by session paragraph keys: an edit batch step can use it as its `target`
+ * (`insertText` at `'start'` inserts at the point) with `expectVersion: version`.
+ */
+export interface DocxPointPosition extends PointPosition {
+  version: string;
+  target: { kind: 'range' } & DocxTextRange;
+}
+
+export interface DocxEditorCollaborationOptions {
+  clientId?: number;
+  user?: CollaborationUser;
+  /** Shared Yrs state used instead of importing the source DOCX. */
+  initialUpdate?: Uint8Array;
+  onReplica?: (replica: CollaborationReplica | null) => void;
+  presence?: CollaborationPresence;
+}
+
+/**
+ * Framework-neutral selection state published by the Yrs-backed editor.
+ * In a viewer session formatting is empty and paragraph indices are -1; read the selection with the editor ref's `readSelectionInfo`.
+ */
+export interface SelectionState {
+  hasSelection: boolean;
+  isMultiParagraph: boolean;
+  textFormatting: TextFormatting;
+  paragraphFormatting: ParagraphFormatting;
+  styleId: string | null;
+  startParagraphIndex: number;
+  endParagraphIndex: number;
+}
+
+/** Yrs-derived table context consumed by the toolbar. */
+export interface TableContextInfo {
+  isInTable: boolean;
+  table?: { attrs?: { justification?: string } };
+  rowIndex?: number;
+  columnIndex?: number;
+  rowCount?: number;
+  columnCount?: number;
+  hasMultiCellSelection?: boolean;
+  canSplitCell?: boolean;
+  rowSpan?: number;
+  columnSpan?: number;
+  cellBorderColor?: ColorValue;
+  cellBackgroundColor?: string;
+}

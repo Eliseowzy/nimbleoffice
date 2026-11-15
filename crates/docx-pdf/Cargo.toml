@@ -1,0 +1,23 @@
+[package]
+name = "nimbleoffice-docx-pdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Vector PDF backend for DOCX display lists: selectable text with subset fonts, the raster backend's geometry. Never part of the wasm build."
+readme = "README.md"
+keywords = ["docx", "word", "pdf", "rendering"]
+categories = ["rendering"]
+
+[lib]
+name = "docx_pdf"
+
+[dependencies]
+docx-layout = { workspace = true, features = ["base-latin"] }
+docx-raster.workspace = true
+krilla = { version = "0.8.2", default-features = false, features = ["raster-images"] }
+ooxml-raster.workspace = true
+ooxml-text = { workspace = true, features = ["base-latin"] }
+serde_json = "1"
+tiny-skia = "0.12"

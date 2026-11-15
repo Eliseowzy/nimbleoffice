@@ -1,0 +1,13 @@
+[package]
+name = "nimbleoffice-python-common"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Eliseowzy/nimbleoffice"
+description = "PyO3 glue shared by the NimbleOffice Python bindings."
+publish = false
+
+[dependencies]
+nimbleoffice-fonts = { path = "../../crates/nimbleoffice-fonts", features = ["manager"] }
+getrandom = "0.4"
+pyo3 = { version = "0.29", features = ["abi3-py39"] }

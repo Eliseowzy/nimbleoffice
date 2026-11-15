@@ -1,0 +1,14864 @@
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use ooxml_drawingml::chart::{PlotFont, PlotRect, PlotTextAlign};
+use ooxml_drawingml::{
+    ColorValue, GeometryPathCommand, GradientFill, LineEnd, ResolvedCellStyle, ShapeEffects,
+    ShapeFill, ShapeOutline, ShapeStyle, StyleReference, TableCellBorder,
+    TableCellBorders as StyleCellBorders, TableCellPosition, TableCellStyle, TableStyle,
+    TableStyleFlags, Theme, ThemeFormatScheme, get_theme_color, normalize_table_column_widths,
+    preset_geometry_to_path, resolve_color_value_to_hex_with_theme,
+    resolve_color_value_to_rgba_hex, resolve_theme_east_asian_font, resolve_theme_font_ref,
+    style_effects, style_fill, style_outline, style_reference_color,
+};
+use ooxml_text::family_metrics::{
+    FamilyMetrics, family_advance, family_cluster_advance, family_composed_kana_advance,
+    family_metrics, runs_at_own_widths,
+};
+use ooxml_text::{
+    CompatFlags, FontId, FontStore, ShapeFeature, ShapedGlyph, WORD_SMALL_CAPS_ADVANCE_SCALE,
+    han_script_for_language, paragraph_scripts_with_languages,
+    presentation_break_opportunities_with, shape, single_line_box, uppercase_for_language,
+};
+use pptx_edit::paragraph::{
+    ListCounters, ParagraphCascade, SlideParents, find_placeholder, slide_number_insertions,
+    slide_number_run_texts, source_paragraph, table_style_text_body, table_text_levels,
+};
+use pptx_edit::{
+    DeckSnapshot, ShapeKind, ShapeSnapshot, SlideScope, SlideSnapshot, StorySnapshot, TextStyle,
+    style_from_run_properties,
+};
+use pptx_parse::{
+    BlipEffect, Bullet, BulletColor, BulletFont, BulletSize, ChartPart, ChartSpace,
+    CustomGeometryPath, GraphicFrameData, LineSpacing, MediaPart, ParagraphProperties, Picture,
+    PictureCrop, PictureFill, Placeholder, PptxPackage, RunProperties, ShapeNode, ShapeTransform,
+    Slide, SlideLayout, SlideMaster, Table, TableCell, TextAutofit, TextBody, TextCaps,
+    TextOverflow, builtin_table_style, effective_color_map,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use unicode_properties::{EmojiStatus, UnicodeEmoji};
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::chart::{ChartFrame, ChartText, chart_primitive};
+use crate::fmath;
+use crate::{
+    CONTRACT_VERSION, CaretStop, GradientStop, GradientType, ImageCrop, ImageEffect, ImageTile,
+    Paint, PositionedGlyph, PositionedTextLine, PositionedTextRun, Primitive, Shadow, Stroke,
+    StrokeEnd, SurfaceDisplayList, TextAlign, TextAnchor, TextParagraph, TextRun, Transform,
+};
+use ooxml_metafile::{MetafileDrawing, decode as decode_metafile, is_metafile};
+
+const EMU_PER_CSS_PIXEL: f32 = 9_525.0;
+const EMU_PER_POINT: f64 = 12_700.0;
+const CSS_PIXELS_PER_POINT: f64 = 96.0 / 72.0;
+const PICTURE_FILL: &str = "picture";
+const LINE_END_MIN_BASE_PX: f32 = 0.7 / 25.4 * 96.0;
+const ANGLE_UNITS_PER_DEGREE: f64 = 60_000.0;
+const DEFAULT_INSET_HORIZONTAL_EMU: i64 = 91_440;
+const DEFAULT_INSET_VERTICAL_EMU: i64 = 45_720;
+const DEFAULT_FONT_SIZE_PT: f32 = 18.0;
+/// Size a super/subscript run shapes at, relative to its own `sz`.
+const SCRIPT_SIZE_RATIO: f32 = 0.58;
+/// `p:bgRef/@idx` counts `a:bgFillStyleLst` entries from here.
+const BACKGROUND_FILL_BASE: u32 = 1_001;
+/// Measured on PowerPoint 16.113 exports: 1.2 em for every face.
+const SINGLE_LINE_PITCH_EM: f32 = 1.2;
+const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FONTS: usize = 256;
+const MAX_FONT_REGISTRATIONS: usize = 4_096;
+const BROWSER_FONT_ID: u32 = u32::MAX;
+pub(crate) const MAX_RENDER_SHAPES: usize = 20_000;
+const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TEXT_LINES: usize = 100_000;
+const MAX_TEXT_PARAGRAPHS: usize = 20_000;
+const MAX_TEXT_RUNS: usize = 100_000;
+/// Source paragraphs a joined story paragraph takes its languages from.
+const MAX_LANGUAGE_SOURCES: usize = 64;
+/// Larger edited shapes save unfitted, as when no fonts are registered.
+const MAX_FITTED_TEXT_UTF16: u32 = 65_536;
+/// Chart parts one slide may draw, shared across its charts.
+pub(crate) const MAX_CHART_PRIMITIVES: usize = 100_000;
+/// Metafile fills and strokes one slide may draw, shared across its pictures.
+const MAX_METAFILE_PRIMITIVES: usize = 4_000;
+
+#[derive(Debug, Error)]
+pub enum RenderError {
+    #[error("slide index {0} is outside the deck")]
+    SlideNotFound(usize),
+    #[error("no font has been registered for slide text")]
+    NoFont,
+    #[error("font error: {0}")]
+    Font(String),
+    #[error("render resource limit exceeded: {0}")]
+    ResourceLimit(String),
+}
+
+#[derive(Clone)]
+struct FontFace {
+    id: FontId,
+    family: String,
+    requested_family: String,
+    /// The named family's own advance widths, where this face stands in for a
+    /// family that does not already run at them.
+    widths: Option<&'static FamilyMetrics>,
+    /// The same family's `hhea` metrics, which decide where the line box sits.
+    line: Option<&'static FamilyMetrics>,
+    /// The face whose own metrics size the line when `line` names none: the
+    /// face itself, or for a coverage fallback the face of the run it stands in.
+    line_id: FontId,
+    /// The run's `a:ea` face, which draws its East Asian characters even where
+    /// this face has glyphs for them, as PowerPoint does.
+    east_asian: Option<Box<FontFace>>,
+    /// The run names an East Asian `lang`, so its full-width punctuation
+    /// belongs to the East Asian face too.
+    east_asian_language: bool,
+}
+
+fn needs_visible_glyph(character: char) -> bool {
+    !character.is_control()
+        && !character.is_whitespace()
+        && !matches!(
+            character as u32,
+            0x00AD
+                | 0x034F
+                | 0x061C
+                | 0x115F..=0x1160
+                | 0x17B4..=0x17B5
+                | 0x180B..=0x180F
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0x3164
+                | 0xFE00..=0xFE0F
+                | 0xFEFF
+                | 0xFFA0
+                | 0xFFF0..=0xFFF8
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0000..=0xE0FFF
+        )
+}
+
+fn emoji_presentation_cluster(cluster: &str) -> bool {
+    let text_presentation = cluster.contains('\u{FE0E}');
+    cluster.chars().any(|character| {
+        matches!(
+            character as u32,
+            0xFE0F | 0x20E3 | 0x1F1E6..=0x1F1FF | 0x1F3FB..=0x1F3FF
+        ) || (!text_presentation && default_emoji_presentation(character))
+    }) || cluster.split('\u{200D}').skip(1).any(|part| {
+        let Some(character) = part.chars().next() else {
+            return false;
+        };
+        // GB11 identifies pictographs; the ordinary prefix excludes extending marks.
+        let pictographic = format!("😀\u{200D}{character}");
+        let ordinary = format!("a\u{200D}{character}");
+        pictographic.graphemes(true).count() == 1 && ordinary.graphemes(true).count() == 2
+    })
+}
+
+fn default_emoji_presentation(character: char) -> bool {
+    matches!(
+        character.emoji_status(),
+        EmojiStatus::EmojiPresentation
+            | EmojiStatus::EmojiPresentationAndModifierBase
+            | EmojiStatus::EmojiPresentationAndEmojiComponent
+            | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+    )
+}
+
+/// A font family the deck asked for that is not registered, the family drawn
+/// instead, and the first shape that asked for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FontSubstitution {
+    pub requested_family: String,
+    pub selected_family: String,
+    pub shape_id: String,
+}
+
+/// Collects one `FontSubstitution` per requested family over a slide.
+#[derive(Default)]
+struct SubstitutionLog {
+    shape_id: String,
+    seen: HashSet<String>,
+    entries: Vec<FontSubstitution>,
+}
+
+impl SubstitutionLog {
+    fn enter_shape(&mut self, shape_id: &str) {
+        self.shape_id.clear();
+        self.shape_id.push_str(shape_id);
+    }
+
+    fn record(&mut self, requested: &str, normalized: &str, selected: &str) {
+        if normalized.is_empty() || self.seen.contains(normalized) {
+            return;
+        }
+        self.seen.insert(normalized.to_owned());
+        self.entries.push(FontSubstitution {
+            requested_family: requested.trim().to_owned(),
+            selected_family: selected.to_owned(),
+            shape_id: self.shape_id.clone(),
+        });
+    }
+}
+
+struct CachedBaselineStory {
+    body: TextBody,
+    theme: Theme,
+    story: StorySnapshot,
+}
+
+pub struct SlideRenderer {
+    fonts: FontStore,
+    faces: HashMap<(String, bool, bool), FontFace>,
+    /// Faces drawn only for characters a run's own face has no glyph for,
+    /// with the weight and slant each was registered for.
+    coverage_faces: Vec<(bool, bool, FontFace)>,
+    /// Coverage faces a requested family reaches before the shared ones.
+    #[cfg(any(not(target_arch = "wasm32"), feature = "font-registration"))]
+    family_coverage_faces: HashMap<String, Vec<(bool, bool, FontFace)>>,
+    fallback: Option<FontFace>,
+    /// Normalized fallback family.
+    fallback_family: Option<String>,
+    font_count: usize,
+    browser_coverage_fallback: bool,
+    /// The theme script (`Hans`, `Hant`, `Jpan`, `Hang`) whose supplemental font
+    /// draws East Asian text no language decides: PowerPoint's editing language.
+    east_asian_script: Option<String>,
+    /// Laid-out text reused across display-list builds and slides.
+    text_layouts: Mutex<TextLayoutCache>,
+    baseline_stories: Mutex<HashMap<String, CachedBaselineStory>>,
+}
+
+impl Default for SlideRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SlideRenderer {
+    pub fn new() -> Self {
+        Self {
+            fonts: FontStore::new(),
+            faces: HashMap::new(),
+            coverage_faces: Vec::new(),
+            #[cfg(any(not(target_arch = "wasm32"), feature = "font-registration"))]
+            family_coverage_faces: HashMap::new(),
+            fallback: None,
+            fallback_family: None,
+            font_count: 0,
+            browser_coverage_fallback: false,
+            east_asian_script: None,
+            text_layouts: Mutex::new(TextLayoutCache::default()),
+            baseline_stories: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Sets the language PowerPoint would edit in (`zh-CN`, `ja-JP`, ...): East
+    /// Asian text whose own language is unset takes the theme's supplemental
+    /// font for that language's script when the theme's `ea` face is empty.
+    /// Returns whether the setting changed.
+    pub fn set_default_east_asian_language(&mut self, language: Option<&str>) -> bool {
+        let script = language
+            .and_then(theme_script_for_language)
+            .map(str::to_owned);
+        if self.east_asian_script == script {
+            return false;
+        }
+        self.east_asian_script = script;
+        if let Ok(cache) = self.text_layouts.get_mut() {
+            cache.clear();
+        }
+        true
+    }
+
+    /// A face registered under `family` itself, nearest in weight and slant.
+    fn registered_face(&self, family: &str, bold: bool, italic: bool) -> Option<FontFace> {
+        let requested = normalize_family(family);
+        [
+            (bold, italic),
+            (bold, false),
+            (false, italic),
+            (false, false),
+        ]
+        .into_iter()
+        .find_map(|(face_bold, face_italic)| {
+            self.faces.get(&(requested.clone(), face_bold, face_italic))
+        })
+        .map(|face| FontFace {
+            east_asian: None,
+            east_asian_language: false,
+            ..face.clone()
+        })
+    }
+
+    pub fn set_browser_coverage_fallback(&mut self, enabled: bool) -> bool {
+        if self.browser_coverage_fallback == enabled {
+            return false;
+        }
+        self.browser_coverage_fallback = enabled;
+        if let Ok(cache) = self.text_layouts.get_mut() {
+            cache.clear();
+        }
+        true
+    }
+
+    pub fn register_font<'a>(
+        &mut self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+        bytes: impl Into<std::borrow::Cow<'a, [u8]>>,
+    ) -> Result<u32, RenderError> {
+        let bytes = bytes.into();
+        if bytes.len() > MAX_FONT_BYTES {
+            return Err(RenderError::ResourceLimit(format!(
+                "font exceeds {MAX_FONT_BYTES} bytes"
+            )));
+        }
+        self.check_font_budget(&bytes)?;
+        let family = family.trim();
+        if family.is_empty() {
+            return Err(RenderError::Font("font family is empty".to_owned()));
+        }
+        let id = self
+            .fonts
+            .register_cow(bytes)
+            .map_err(|error| RenderError::Font(error.to_string()))?;
+        let requested = normalize_family(family);
+        let metrics = family_metrics(&requested, bold, italic);
+        let face = FontFace {
+            id,
+            family: family.to_owned(),
+            requested_family: requested.clone(),
+            widths: metrics.filter(|metrics| !runs_at_own_widths(&self.fonts, id, metrics)),
+            line: metrics.filter(|metrics| !sits_on_own_baseline(&self.fonts, id, metrics)),
+            line_id: id,
+            east_asian: None,
+            east_asian_language: false,
+        };
+        self.faces.insert((requested, bold, italic), face.clone());
+        self.fallback.get_or_insert(face);
+        self.fallback_family
+            .get_or_insert_with(|| normalize_family(family));
+        self.font_count += 1;
+        if let Ok(cache) = self.text_layouts.get_mut() {
+            cache.clear();
+        }
+        Ok(id.to_u32())
+    }
+
+    /// Only distinct font bytes count against [`MAX_FONTS`]; the same bytes
+    /// under another family or style share the face already held.
+    fn check_font_budget(&self, bytes: &[u8]) -> Result<(), RenderError> {
+        if self.font_count >= MAX_FONT_REGISTRATIONS {
+            return Err(RenderError::ResourceLimit(format!(
+                "more than {MAX_FONT_REGISTRATIONS} font registrations"
+            )));
+        }
+        if self.fonts.face_count() >= MAX_FONTS && self.fonts.find_face(bytes).is_none() {
+            return Err(RenderError::ResourceLimit(format!(
+                "more than {MAX_FONTS} font faces"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Registers a face drawn only where a run's own face has no glyph, the way
+    /// PowerPoint reaches for a script's font when the named one cannot draw a
+    /// character. The first registered face that covers a character draws it.
+    pub fn register_fallback_font<'a>(
+        &mut self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+        bytes: impl Into<std::borrow::Cow<'a, [u8]>>,
+    ) -> Result<u32, RenderError> {
+        let bytes = bytes.into();
+        if bytes.len() > MAX_FONT_BYTES {
+            return Err(RenderError::ResourceLimit(format!(
+                "font exceeds {MAX_FONT_BYTES} bytes"
+            )));
+        }
+        self.check_font_budget(&bytes)?;
+        let family = family.trim();
+        if family.is_empty() {
+            return Err(RenderError::Font("font family is empty".to_owned()));
+        }
+        let id = self
+            .fonts
+            .register_cow(bytes)
+            .map_err(|error| RenderError::Font(error.to_string()))?;
+        self.coverage_faces.push((
+            bold,
+            italic,
+            FontFace {
+                id,
+                family: family.to_owned(),
+                requested_family: normalize_family(family),
+                widths: None,
+                line: None,
+                line_id: id,
+                east_asian: None,
+                east_asian_language: false,
+            },
+        ));
+        self.font_count += 1;
+        if let Ok(cache) = self.text_layouts.get_mut() {
+            cache.clear();
+        }
+        Ok(id.to_u32())
+    }
+
+    #[cfg(any(not(target_arch = "wasm32"), feature = "font-registration"))]
+    fn coverage_candidates<'a>(
+        &'a self,
+        face: &FontFace,
+    ) -> impl Iterator<Item = &'a (bool, bool, FontFace)> + Clone {
+        self.family_coverage_faces
+            .get(&face.requested_family)
+            .into_iter()
+            .flatten()
+            .chain(&self.coverage_faces)
+    }
+
+    #[cfg(not(any(not(target_arch = "wasm32"), feature = "font-registration")))]
+    fn coverage_candidates<'a>(
+        &'a self,
+        _face: &FontFace,
+    ) -> impl Iterator<Item = &'a (bool, bool, FontFace)> + Clone {
+        self.coverage_faces.iter()
+    }
+
+    /// The fallback face that draws `character` for a run in `face`: one of the
+    /// same weight and slant where there is one, sized on the run's own line.
+    fn coverage_face(
+        &self,
+        face: &FontFace,
+        character: char,
+        bold: bool,
+        italic: bool,
+    ) -> Option<FontFace> {
+        let covering = || {
+            self.coverage_candidates(face).filter(|(_, _, candidate)| {
+                self.fonts.covers(candidate.id, character).unwrap_or(false)
+            })
+        };
+        covering()
+            .find(|(face_bold, face_italic, _)| (*face_bold, *face_italic) == (bold, italic))
+            .or_else(|| covering().find(|(face_bold, _, _)| *face_bold == bold))
+            .or_else(|| covering().next())
+            .map(|(_, _, candidate)| FontFace {
+                line: face.line,
+                line_id: face.line_id,
+                ..candidate.clone()
+            })
+    }
+
+    /// Where `text` in `face` needs a fallback: each piece's byte start and the
+    /// face that draws it, `None` for `face` itself. Spaces and punctuation
+    /// stay with the fallback text around them.
+    fn coverage_pieces(
+        &self,
+        face: &FontFace,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Vec<(usize, Option<FontFace>)> {
+        let mut pieces: Vec<(usize, Option<FontFace>)> = Vec::new();
+        let east_asian = face
+            .east_asian
+            .as_deref()
+            .filter(|east_asian| east_asian.id != face.id);
+        let east_asian_drawn = |character: char| {
+            east_asian.filter(|east_asian| {
+                drawn_in_east_asian(character, face.east_asian_language)
+                    && self.fonts.covers(east_asian.id, character).unwrap_or(false)
+            })
+        };
+        if (self.coverage_candidates(face).next().is_none()
+            || text
+                .chars()
+                .all(|character| self.fonts.covers(face.id, character).unwrap_or(true)))
+            && !text
+                .chars()
+                .any(|character| east_asian_drawn(character).is_some())
+        {
+            return vec![(0, None)];
+        }
+        for (index, character) in text.char_indices() {
+            let current = pieces.last().and_then(|(_, face)| face.as_ref());
+            let own = self.fonts.covers(face.id, character).unwrap_or(true);
+            let neutral = character.is_whitespace() || character.is_ascii_punctuation();
+            // Spaces and ASCII punctuation stay with a fallback face around
+            // them, but not with the run's East Asian face: PowerPoint draws
+            // those in the Latin face wherever it has them.
+            let in_east_asian = current.is_some_and(|current| {
+                east_asian.is_some_and(|east_asian| east_asian.id == current.id)
+            });
+            let chosen = match current {
+                Some(current)
+                    if neutral
+                        && !(in_east_asian && own)
+                        && self.fonts.covers(current.id, character).unwrap_or(false) =>
+                {
+                    Some(current.clone())
+                }
+                _ if let Some(east_asian) = east_asian_drawn(character) => Some(FontFace {
+                    line: face.line,
+                    line_id: face.line_id,
+                    east_asian: None,
+                    east_asian_language: false,
+                    ..east_asian.clone()
+                }),
+                _ if own => None,
+                _ => self.coverage_face(face, character, bold, italic),
+            };
+            let same = pieces.last().is_some_and(|(_, last)| {
+                last.as_ref().map(|face| face.id) == chosen.as_ref().map(|face| face.id)
+            });
+            if !same {
+                pieces.push((index, chosen));
+            }
+        }
+        pieces
+    }
+
+    fn browser_coverage_face(
+        &self,
+        face: &FontFace,
+        cluster: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Option<FontFace> {
+        let covers = |candidate: &FontFace| {
+            cluster
+                .chars()
+                .filter(|character| needs_visible_glyph(*character))
+                .all(|character| self.fonts.covers(candidate.id, character).unwrap_or(false))
+        };
+        let covering = || {
+            self.coverage_candidates(face)
+                .filter(|(_, _, candidate)| covers(candidate))
+        };
+        let registered = || {
+            covering()
+                .find(|(face_bold, face_italic, _)| (*face_bold, *face_italic) == (bold, italic))
+                .or_else(|| covering().find(|(face_bold, _, _)| *face_bold == bold))
+                .or_else(|| covering().next())
+                .map(|(_, _, candidate)| candidate)
+        };
+        (!emoji_presentation_cluster(cluster))
+            .then(registered)
+            .flatten()
+            .map(|candidate| FontFace {
+                widths: None,
+                line: face.line,
+                line_id: face.line_id,
+                ..candidate.clone()
+            })
+            .or_else(|| {
+                cluster.chars().any(needs_visible_glyph).then(|| FontFace {
+                    id: FontId::from_u32(BROWSER_FONT_ID),
+                    ..face.clone()
+                })
+            })
+    }
+
+    fn browser_coverage_pieces(
+        &self,
+        face: &FontFace,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Vec<(usize, Option<FontFace>)> {
+        let promoted = self
+            .coverage_candidates(face)
+            .any(|(_, _, coverage)| coverage.id == face.id);
+        let mut pieces: Vec<(usize, Option<FontFace>)> = Vec::new();
+        if text
+            .chars()
+            .all(|character| self.fonts.covers(face.id, character).unwrap_or(true))
+            && !(promoted && text.graphemes(true).any(emoji_presentation_cluster))
+        {
+            return vec![(0, None)];
+        }
+        for (index, cluster) in text.grapheme_indices(true) {
+            let current = pieces.last().and_then(|(_, face)| face.as_ref());
+            let own = cluster
+                .chars()
+                .filter(|character| needs_visible_glyph(*character))
+                .all(|character| self.fonts.covers(face.id, character).unwrap_or(true))
+                && !(promoted && emoji_presentation_cluster(cluster));
+            let neutral = cluster
+                .chars()
+                .all(|character| character.is_whitespace() || character.is_ascii_punctuation());
+            let chosen = match current {
+                Some(current)
+                    if neutral
+                        && cluster.chars().all(|character| {
+                            self.fonts.covers(current.id, character).unwrap_or(false)
+                        }) =>
+                {
+                    Some(current.clone())
+                }
+                _ if own => None,
+                _ => self.browser_coverage_face(face, cluster, bold, italic),
+            };
+            let same = pieces.last().is_some_and(|(_, last)| {
+                last.as_ref().map(|face| face.id) == chosen.as_ref().map(|face| face.id)
+            });
+            if !same {
+                pieces.push((index, chosen));
+            }
+        }
+        pieces
+    }
+
+    /// Splits `run` where its face has no glyph and a fallback does, so each
+    /// part is shaped, measured and drawn in a face that can draw it.
+    fn split_by_coverage(&self, run: ResolvedRun, out: &mut Vec<ResolvedRun>) {
+        let pieces = if self.browser_coverage_fallback {
+            self.browser_coverage_pieces(
+                &run.style.face,
+                &run.text,
+                run.style.bold,
+                run.style.italic,
+            )
+        } else {
+            self.coverage_pieces(&run.style.face, &run.text, run.style.bold, run.style.italic)
+        };
+        split_coverage_pieces(run, pieces, out);
+    }
+
+    /// The store holding every registered face, so a raster backend can resolve
+    /// the `font_id`s the display list references.
+    pub fn fonts(&self) -> &FontStore {
+        &self.fonts
+    }
+
+    /// First registered face for placeholder labels.
+    pub fn fallback_font(&self) -> Option<FontId> {
+        self.fallback
+            .as_ref()
+            .or_else(|| self.coverage_faces.first().map(|(_, _, face)| face))
+            .map(|face| face.id)
+    }
+
+    pub fn layout_slide(
+        &self,
+        package: &PptxPackage,
+        deck: &DeckSnapshot,
+        slide_index: usize,
+    ) -> Result<RenderedSlide, RenderError> {
+        let deck_slide = deck
+            .slides
+            .get(slide_index)
+            .ok_or(RenderError::SlideNotFound(slide_index))?;
+        self.layout_resolved(
+            package,
+            deck_slide,
+            deck.width_emu,
+            deck.height_emu,
+            slide_index,
+            None,
+        )
+    }
+
+    /// Render one slide from a [`pptx_edit::DeckSession::slide_scope`] snapshot,
+    /// which materializes only that slide instead of the whole deck.
+    pub fn layout_scoped_slide(
+        &self,
+        package: &PptxPackage,
+        scope: &SlideScope,
+    ) -> Result<RenderedSlide, RenderError> {
+        self.layout_resolved(
+            package,
+            &scope.slide,
+            scope.width_emu,
+            scope.height_emu,
+            scope.index,
+            None,
+        )
+    }
+
+    /// returns a superset of layout's requested faces, including faces skipped by
+    /// shape or operation budgets or chart labels with no room.
+    #[doc(hidden)]
+    pub fn requested_font_faces(
+        &self,
+        package: &PptxPackage,
+        scopes: &[SlideScope],
+    ) -> Result<Vec<(String, bool, bool)>, RenderError> {
+        Ok(self
+            .requested_font_faces_with_scripts(package, scopes)?
+            .into_iter()
+            .map(|face| (face.family, face.bold, face.italic))
+            .collect())
+    }
+
+    #[doc(hidden)]
+    pub fn requested_font_faces_with_scripts(
+        &self,
+        package: &PptxPackage,
+        scopes: &[SlideScope],
+    ) -> Result<Vec<RequestedFontFace>, RenderError> {
+        let mut requests = FontRequests {
+            east_asian_script: self.east_asian_script.clone(),
+            ..FontRequests::default()
+        };
+        for scope in scopes {
+            let SlideParents {
+                slide: parsed_slide,
+                layout,
+                master,
+            } = SlideParents::resolve(
+                package,
+                scope.slide.source_part_path.as_deref(),
+                scope.slide.layout_part_path.as_deref(),
+            );
+            let theme = Theme {
+                color_map: effective_color_map(parsed_slide, layout, master),
+                ..slide_theme_part(package, master)
+                    .map(|part| part.theme.clone())
+                    .unwrap_or_default()
+            };
+            let mut walker = FontRequestWalker {
+                scope: TextScope {
+                    package,
+                    theme: &theme,
+                    parsed_slide,
+                    layout,
+                    master,
+                    slide_number: i64::from(package.presentation.first_slide_num)
+                        + scope.index as i64,
+                },
+                requests: &mut requests,
+                shape_count: 0,
+            };
+            for (shape, stable_id) in inherited_shapes(parsed_slide, layout, master) {
+                walker.parsed_shape(shape, &stable_id, Space::root())?;
+            }
+            for shape in &scope.slide.shapes {
+                walker.snapshot_shape(shape, Space::root())?;
+            }
+        }
+        Ok(requests.faces)
+    }
+
+    fn layout_resolved(
+        &self,
+        package: &PptxPackage,
+        deck_slide: &SlideSnapshot,
+        width_emu: i64,
+        height_emu: i64,
+        slide_index: usize,
+        shape_filter: Option<&HashSet<String>>,
+    ) -> Result<RenderedSlide, RenderError> {
+        let SlideParents {
+            slide: parsed_slide,
+            layout,
+            master,
+        } = SlideParents::resolve(
+            package,
+            deck_slide.source_part_path.as_deref(),
+            deck_slide.layout_part_path.as_deref(),
+        );
+        let theme_part = slide_theme_part(package, master);
+        let default_theme = Theme::default();
+        let base_theme = theme_part.map(|part| &part.theme).unwrap_or(&default_theme);
+        // The slot mapping is per slide, not per theme part.
+        let color_map = effective_color_map(parsed_slide, layout, master);
+        let mapped_theme;
+        let theme = if color_map.is_identity() {
+            base_theme
+        } else {
+            mapped_theme = Theme {
+                color_map,
+                ..base_theme.clone()
+            };
+            &mapped_theme
+        };
+        let default_format_scheme = ThemeFormatScheme::default();
+        let format_scheme = theme_part
+            .map(|part| &part.format_scheme)
+            .unwrap_or(&default_format_scheme);
+        let slide_background = if deck_slide.background_edited {
+            Some(BackgroundSource::from_edit(deck_slide.background.as_ref()))
+        } else {
+            parsed_slide.map(BackgroundSource::from_slide)
+        };
+        let background_source = if shape_filter.is_none() {
+            [
+                slide_background,
+                layout.map(BackgroundSource::from_layout),
+                master.map(BackgroundSource::from_master),
+            ]
+            .into_iter()
+            .flatten()
+            .find(BackgroundSource::is_declared)
+        } else {
+            None
+        };
+        let background_fill =
+            background_source
+                .as_ref()
+                .and_then(|source| match source.reference {
+                    Some(reference) => Some(style_fill(format_scheme, reference, theme)),
+                    None => source.fill.cloned(),
+                });
+        let background_picture = background_source.as_ref().and_then(|source| {
+            source.picture.or_else(|| {
+                let index = source.reference?.index.checked_sub(BACKGROUND_FILL_BASE)?;
+                theme_part?
+                    .background_pictures
+                    .get(index as usize)?
+                    .as_ref()
+            })
+        });
+        // A referenced picture style carries no colour of its own, so keep the
+        // reference's own colour for the fills we cannot paint, such as a tile.
+        let background = background_fill
+            .as_ref()
+            .and_then(|fill| paint(fill, theme))
+            .or_else(|| {
+                background_source
+                    .as_ref()
+                    .and_then(|source| source.fill)
+                    .and_then(|fill| paint(fill, theme))
+            })
+            .filter(|paint| !is_invisible(paint))
+            .or_else(|| {
+                shape_filter.is_none().then(|| Paint::Solid {
+                    color: "#ffffff".to_owned(),
+                })
+            });
+        let width = slide_extent_px(width_emu);
+        let height = slide_extent_px(height_emu);
+        let mut builder = LayoutBuilder {
+            renderer: self,
+            package,
+            theme,
+            format_scheme,
+            theme_part_path: theme_part.map(|part| part.part_path.as_str()),
+            master,
+            master_other_style_levels: None,
+            layout,
+            parsed_slide,
+            shape_filter,
+            primitives: Vec::new(),
+            hit_regions: Vec::new(),
+            autofit: HashMap::new(),
+            substitutions: SubstitutionLog::default(),
+            shape_count: 0,
+            line_count: 0,
+            chart_budget: MAX_CHART_PRIMITIVES,
+            metafile_budget: MAX_METAFILE_PRIMITIVES,
+            metafile_bytes: 32 * 1024 * 1024,
+            metafiles: HashMap::new(),
+            media_parts: None,
+            chart_parts: None,
+            slide_number: i64::from(package.presentation.first_slide_num) + slide_index as i64,
+            slide_width: width,
+            slide_height: height,
+            background_paint: background.clone(),
+            background_picture: background_picture.cloned(),
+        };
+        let root_space = Space::root();
+        if shape_filter.is_none()
+            && let Some(picture) = background_picture
+            && let Some(asset_id) = picture.media_part_path.clone()
+        {
+            let background_dpi = builder
+                .media_part(&asset_id)
+                .and_then(|part| image_dpi(&part.bytes));
+            let tile = picture_fill_tile(picture, background_dpi);
+            let (crop, destination) = picture_fill_crop(picture).placement(0.0, 0.0, width, height);
+            let destination = if tile.is_some() { None } else { destination };
+            builder.primitives.push(Primitive::Image {
+                geometry_fallback: false,
+                object_id: 0,
+                shape_id: None,
+                name: "Background".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                w: width,
+                h: height,
+                asset_id: Some(asset_id),
+                effects: image_effects_with_placeholder(
+                    &picture.effects,
+                    theme,
+                    background_source
+                        .as_ref()
+                        .and_then(|source| source.reference),
+                ),
+                crop,
+                destination,
+                tile,
+                path: None,
+                stroke: None,
+                shadow: None,
+                transform: Transform::default(),
+            });
+        }
+        if shape_filter.is_none() {
+            for (shape, stable_id) in inherited_shapes(parsed_slide, layout, master) {
+                builder.render_parsed_shape(shape, &stable_id, root_space, false)?;
+            }
+        }
+        for shape in &deck_slide.shapes {
+            builder.render_snapshot_shape(shape, root_space)?;
+        }
+        Ok(RenderedSlide {
+            display_list: SurfaceDisplayList {
+                contract_version: CONTRACT_VERSION,
+                width,
+                height,
+                background,
+                primitives: builder.primitives,
+            },
+            font_substitutions: builder.substitutions.entries,
+            hit_regions: builder.hit_regions,
+            autofit: builder.autofit,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn save(&self, session: &pptx_edit::DeckSession) -> pptx_edit::EditResult<Vec<u8>> {
+        if self.fallback_font().is_none() {
+            return session.save();
+        }
+        session.save_with_autofit_resolver(|snapshot, baseline| {
+            let mut autofit = HashMap::new();
+            for (index, slide) in snapshot.slides.iter().enumerate() {
+                let base = baseline.slides.iter().find(|base| base.id == slide.id);
+                let parents = SlideParents::resolve(
+                    session.package(),
+                    slide.source_part_path.as_deref(),
+                    slide.layout_part_path.as_deref(),
+                );
+                let shape_ids = autofit_edited_shapes(
+                    &slide.shapes,
+                    base.map_or(&[], |base| &base.shapes),
+                    &parents,
+                );
+                if shape_ids.is_empty() {
+                    continue;
+                }
+                let rendered = self
+                    .layout_resolved(
+                        session.package(),
+                        slide,
+                        snapshot.width_emu,
+                        snapshot.height_emu,
+                        index,
+                        Some(&shape_ids),
+                    )
+                    .map_err(|error| pptx_edit::EditError::Write(error.to_string()))?;
+                autofit.extend(rendered.autofit);
+            }
+            Ok(autofit)
+        })
+    }
+
+    fn story_edited(&self, story: &StorySnapshot, body: &TextBody, theme: &Theme) -> bool {
+        let Ok(mut cache) = self.baseline_stories.lock() else {
+            return pptx_edit::baseline_story(&story.id, body, Some(theme))
+                .is_ok_and(|baseline| baseline != *story);
+        };
+        if let Some(cached) = cache.get(&story.id)
+            && cached.body == *body
+            && cached.theme == *theme
+        {
+            return cached.story != *story;
+        }
+        let Ok(baseline) = pptx_edit::baseline_story(&story.id, body, Some(theme)) else {
+            return false;
+        };
+        let edited = baseline != *story;
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(
+            story.id.clone(),
+            CachedBaselineStory {
+                body: body.clone(),
+                theme: theme.clone(),
+                story: baseline,
+            },
+        );
+        edited
+    }
+
+    /// Whether a face was registered under `family` itself, rather than one
+    /// resolution would fall back to.
+    fn has_face_for(&self, family: &str) -> bool {
+        let requested = normalize_family(family);
+        self.faces.keys().any(|(name, _, _)| *name == requested)
+    }
+
+    fn resolve_face(
+        &self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+        substitutions: &mut SubstitutionLog,
+    ) -> Result<FontFace, RenderError> {
+        let requested = normalize_family(family);
+        if self.font_count == 0 {
+            let metrics = family_metrics(&requested, bold, italic)
+                .unwrap_or_else(|| family_metrics("aptos", bold, italic).unwrap());
+            substitutions.record(family, &requested, "sans-serif");
+            return Ok(FontFace {
+                id: FontId::from_u32(BROWSER_FONT_ID),
+                family: family.to_owned(),
+                requested_family: requested,
+                widths: Some(metrics),
+                line: Some(metrics),
+                line_id: FontId::from_u32(BROWSER_FONT_ID),
+                east_asian: None,
+                east_asian_language: false,
+            });
+        }
+        let styles = [
+            (bold, italic),
+            (bold, false),
+            (false, italic),
+            (false, false),
+        ];
+        for (face_bold, face_italic) in styles {
+            if let Some(face) = self.faces.get(&(requested.clone(), face_bold, face_italic)) {
+                return Ok(if (face_bold, face_italic) == (bold, italic) {
+                    face.clone()
+                } else {
+                    self.with_requested_metrics(face, &requested, bold, italic)
+                });
+            }
+        }
+        let face = self
+            .faces
+            .iter()
+            .filter(|((name, _, _), _)| Some(name) == self.fallback_family.as_ref())
+            .min_by_key(|((_, face_bold, face_italic), _)| {
+                (
+                    2 * u8::from(*face_bold != bold) + u8::from(*face_italic != italic),
+                    *face_bold,
+                    *face_italic,
+                )
+            })
+            .map(|(_, face)| self.with_requested_metrics(face, &requested, bold, italic))
+            .or_else(|| {
+                self.coverage_faces
+                    .iter()
+                    .min_by_key(|(face_bold, face_italic, _)| {
+                        2 * u8::from(*face_bold != bold) + u8::from(*face_italic != italic)
+                    })
+                    .map(|(_, _, face)| self.with_requested_metrics(face, &requested, bold, italic))
+            })
+            .ok_or(RenderError::NoFont)?;
+        if normalize_family(&face.family) != requested {
+            substitutions.record(family, &requested, &face.family);
+        }
+        Ok(face)
+    }
+
+    fn with_requested_metrics(
+        &self,
+        face: &FontFace,
+        requested: &str,
+        bold: bool,
+        italic: bool,
+    ) -> FontFace {
+        let metrics = family_metrics(requested, bold, italic);
+        FontFace {
+            requested_family: requested.to_owned(),
+            widths: metrics.filter(|metrics| !runs_at_own_widths(&self.fonts, face.id, metrics)),
+            line: metrics.filter(|metrics| !sits_on_own_baseline(&self.fonts, face.id, metrics)),
+            ..face.clone()
+        }
+    }
+}
+
+fn autofit_edited_shapes(
+    current: &[ShapeSnapshot],
+    baseline: &[ShapeSnapshot],
+    parents: &SlideParents<'_>,
+) -> HashSet<String> {
+    let mut edited = HashSet::new();
+    collect_autofit_edited_shapes(current, baseline, parents, &mut edited);
+    edited
+}
+
+fn collect_autofit_edited_shapes(
+    current: &[ShapeSnapshot],
+    baseline: &[ShapeSnapshot],
+    parents: &SlideParents<'_>,
+    edited: &mut HashSet<String>,
+) -> bool {
+    let mut has_edits = false;
+    let mut baseline_by_id = HashMap::with_capacity(baseline.len());
+    for shape in baseline {
+        baseline_by_id.entry(shape.id.as_str()).or_insert(shape);
+    }
+    for shape in current {
+        let base = baseline_by_id.get(shape.id.as_str()).copied();
+        let child_edited = collect_autofit_edited_shapes(
+            &shape.children,
+            base.map_or(&[], |base| &base.children),
+            parents,
+            edited,
+        );
+        if child_edited && shape.kind == ShapeKind::Group {
+            edited.insert(shape.id.clone());
+        }
+        has_edits |= child_edited;
+        if base.is_some_and(|base| base.text_stories == shape.text_stories) {
+            continue;
+        }
+        let text_utf16 = shape.text_stories.iter().fold(0_u32, |length, story| {
+            length.saturating_add(story.length.saturating_sub(1))
+        });
+        if text_utf16 > MAX_FITTED_TEXT_UTF16 {
+            continue;
+        }
+        let original = parents
+            .slide
+            .and_then(|slide| find_node(&slide.shapes, shape.source_id));
+        let layout = shape.placeholder.as_ref().and_then(|placeholder| {
+            parents
+                .layout
+                .and_then(|layout| find_placeholder(&layout.shapes, placeholder))
+        });
+        let master = shape.placeholder.as_ref().and_then(|placeholder| {
+            parents
+                .master
+                .and_then(|master| find_placeholder(&master.shapes, placeholder))
+        });
+        if matches!(
+            [original, layout, master]
+                .into_iter()
+                .flatten()
+                .find_map(|node| node_text(node)?.autofit.as_ref()),
+            Some(TextAutofit::Normal { .. })
+        ) {
+            edited.insert(shape.id.clone());
+            has_edits = true;
+        }
+    }
+    has_edits
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum HitTestResult {
+    Shape {
+        shape_id: String,
+    },
+    Text {
+        shape_id: String,
+        story_id: String,
+        position: u32,
+    },
+}
+
+/// The first of slide, layout and master that declares `p:bg`.
+struct BackgroundSource<'a> {
+    fill: Option<&'a ShapeFill>,
+    picture: Option<&'a PictureFill>,
+    reference: Option<&'a StyleReference>,
+}
+
+impl<'a> BackgroundSource<'a> {
+    /// An edited slide background, which replaces the part's `p:bg` whole.
+    fn from_edit(fill: Option<&'a ShapeFill>) -> Self {
+        Self {
+            fill,
+            picture: None,
+            reference: None,
+        }
+    }
+
+    fn from_slide(slide: &'a Slide) -> Self {
+        Self {
+            fill: slide.background.as_ref(),
+            picture: slide.background_picture.as_deref(),
+            reference: slide.background_reference.as_ref(),
+        }
+    }
+
+    fn from_layout(layout: &'a SlideLayout) -> Self {
+        Self {
+            fill: layout.background.as_ref(),
+            picture: layout.background_picture.as_deref(),
+            reference: layout.background_reference.as_ref(),
+        }
+    }
+
+    fn from_master(master: &'a SlideMaster) -> Self {
+        Self {
+            fill: master.background.as_ref(),
+            picture: master.background_picture.as_deref(),
+            reference: master.background_reference.as_ref(),
+        }
+    }
+
+    fn is_declared(&self) -> bool {
+        self.fill.is_some() || self.picture.is_some() || self.reference.is_some()
+    }
+}
+
+pub struct RenderedSlide {
+    pub display_list: SurfaceDisplayList,
+    /// Families the slide asked for that no registered face matched.
+    pub font_substitutions: Vec<FontSubstitution>,
+    hit_regions: Vec<HitRegion>,
+    autofit: HashMap<String, TextAutofit>,
+}
+
+impl RenderedSlide {
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<HitTestResult> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        for region in self.hit_regions.iter().rev() {
+            let (shape_x, shape_y) = region.local_point(x, y);
+            let inside_shape = region.rect.contains(shape_x, shape_y);
+            if let Some(text) = &region.text {
+                let (text_x, text_y) = text.local_point(x, y);
+                if !inside_shape && !(text.overflow && region.hit_rect.contains(text_x, text_y)) {
+                    continue;
+                }
+                if let Some(line) = nearest_line(&text.lines, text_x, text_y)
+                    && let Some(caret) = line.caret_stops.iter().min_by(|left, right| {
+                        (left.x - text_x).abs().total_cmp(&(right.x - text_x).abs())
+                    })
+                {
+                    return Some(HitTestResult::Text {
+                        shape_id: region.shape_id.clone(),
+                        story_id: text.story_id.clone(),
+                        position: caret.position,
+                    });
+                }
+            } else if !inside_shape {
+                continue;
+            }
+            return Some(HitTestResult::Shape {
+                shape_id: region.shape_id.clone(),
+            });
+        }
+        None
+    }
+}
+
+fn slide_theme_part<'a>(
+    package: &'a PptxPackage,
+    master: Option<&SlideMaster>,
+) -> Option<&'a pptx_parse::ThemePart> {
+    master
+        .and_then(|master| master.theme_part_path.as_deref())
+        .and_then(|path| package.themes.iter().find(|theme| theme.part_path == path))
+        .or_else(|| package.themes.first())
+}
+
+fn inherited_shapes<'a>(
+    slide: Option<&Slide>,
+    layout: Option<&'a SlideLayout>,
+    master: Option<&'a SlideMaster>,
+) -> impl Iterator<Item = (&'a ShapeNode, String)> {
+    let show_layout = slide.is_none_or(|slide| slide.show_master_shapes);
+    let show_master = show_layout && layout.is_none_or(|layout| layout.show_master_shapes);
+    let master_shapes = master
+        .filter(|_| show_master)
+        .into_iter()
+        .flat_map(|master| {
+            master
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, shape)| node_placeholder(shape).is_none())
+                .map(move |(index, shape)| (shape, format!("master:{}:{index}", master.part_path)))
+        });
+    let layout_shapes = layout
+        .filter(|_| show_layout)
+        .into_iter()
+        .flat_map(|layout| {
+            layout
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, shape)| node_placeholder(shape).is_none())
+                .map(move |(index, shape)| (shape, format!("layout:{}:{index}", layout.part_path)))
+        });
+    master_shapes.chain(layout_shapes)
+}
+
+#[derive(Clone, Copy)]
+struct TextScope<'a> {
+    package: &'a PptxPackage,
+    theme: &'a Theme,
+    parsed_slide: Option<&'a Slide>,
+    layout: Option<&'a SlideLayout>,
+    master: Option<&'a SlideMaster>,
+    slide_number: i64,
+}
+
+impl<'a> TextScope<'a> {
+    fn snapshot_nodes(&self, shape: &ShapeSnapshot) -> [Option<&'a ShapeNode>; 3] {
+        let original = (shape.source_id != 0)
+            .then(|| {
+                self.parsed_slide
+                    .and_then(|slide| find_node(&slide.shapes, shape.source_id))
+            })
+            .flatten();
+        let layout = shape.placeholder.as_ref().and_then(|placeholder| {
+            self.layout
+                .and_then(|layout| find_placeholder(&layout.shapes, placeholder))
+        });
+        let master = shape.placeholder.as_ref().and_then(|placeholder| {
+            self.master
+                .and_then(|master| find_placeholder(&master.shapes, placeholder))
+        });
+        [original, layout, master]
+    }
+
+    fn cascade<'b>(
+        &self,
+        nodes: [Option<&'b ShapeNode>; 3],
+        placeholder: Option<&'b Placeholder>,
+        fit_to_box: bool,
+    ) -> BodyCascade<'b>
+    where
+        'a: 'b,
+    {
+        BodyCascade {
+            fit_to_box,
+            primary: nodes[0].and_then(node_text),
+            layout: nodes[1].and_then(node_text),
+            master: nodes[2].and_then(node_text),
+            master_slide: self.master,
+            default_style: &self.package.presentation.default_text_style,
+            default_paragraph: self.package.presentation.default_text_paragraph.as_deref(),
+            placeholder,
+            style_color: shape_style_color(nodes[0]),
+        }
+    }
+}
+
+struct TableStyleScope<'a> {
+    style: Option<&'a TableStyle>,
+    flags: TableStyleFlags,
+}
+
+impl<'a> TableStyleScope<'a> {
+    fn new(package: &'a PptxPackage, table: &Table) -> Self {
+        Self {
+            style: table.properties.style_id.as_deref().and_then(|id| {
+                package
+                    .table_styles
+                    .style(Some(id))
+                    .or_else(|| builtin_table_style(id))
+            }),
+            flags: TableStyleFlags {
+                first_row: table.properties.first_row,
+                last_row: table.properties.last_row,
+                first_column: table.properties.first_col,
+                last_column: table.properties.last_col,
+                band_row: table.properties.band_row,
+            },
+        }
+    }
+
+    fn cell(
+        &self,
+        position: TableCellPosition,
+        cell: &TableCell,
+        span: usize,
+        row_span: usize,
+    ) -> ResolvedCellStyle {
+        let resolve = |position| {
+            self.style
+                .map(|style| style.resolve_cell(self.flags, position))
+                .unwrap_or_default()
+        };
+        let mut style = resolve(position);
+        if span > 1 || row_span > 1 {
+            let far = resolve(TableCellPosition {
+                row: position.row + row_span - 1,
+                column: position.column + span - 1,
+                ..position
+            });
+            style.right = far.right;
+            style.bottom = far.bottom;
+        }
+        style.apply_cell_style(&direct_cell_style(cell));
+        style
+    }
+}
+
+#[derive(Default)]
+struct FontRequests {
+    seen: HashMap<(String, bool, bool), usize>,
+    faces: Vec<RequestedFontFace>,
+    east_asian_script: Option<String>,
+}
+
+impl FontRequests {
+    fn record(&mut self, mut request: RequestedFontFace, scripts: &[String]) {
+        let normalized = normalize_family(&request.family);
+        if normalized.is_empty() {
+            return;
+        }
+        let index = *self
+            .seen
+            .entry((normalized, request.bold, request.italic))
+            .or_insert_with(|| {
+                request.family = request.family.trim().to_owned();
+                self.faces.push(request);
+                self.faces.len() - 1
+            });
+        for script in scripts {
+            if !self.faces[index].scripts.contains(script) {
+                self.faces[index].scripts.push(script.clone());
+            }
+        }
+    }
+
+    fn content(
+        &mut self,
+        theme: &Theme,
+        content: &TextContent,
+        cascade: BodyCascade<'_>,
+    ) -> Result<(), RenderError> {
+        let mut numbering = ListCounters::default();
+        for source in paragraph_sources(content, cascade)? {
+            let fallback = source.properties.default_run.as_ref();
+            let first = match source.paragraph.runs.first() {
+                Some(run) => resolve_font_request(theme, &run.style, fallback),
+                None => {
+                    let end_style = source
+                        .end_properties
+                        .map(|end| style_from_properties(end, theme))
+                        .unwrap_or_default();
+                    resolve_font_request(theme, &end_style, fallback)
+                }
+            };
+            let end_language = source.paragraph.end_language.as_deref().or_else(|| {
+                source
+                    .end_properties
+                    .and_then(|properties| properties.language.as_deref())
+            });
+            let style_language = source
+                .properties
+                .default_run
+                .as_ref()
+                .and_then(|properties| properties.language.as_deref());
+            let mut pieces: Vec<(&str, Option<&str>)> = Vec::new();
+            let mut spans = Vec::with_capacity(source.paragraph.runs.len());
+            for run in &source.paragraph.runs {
+                let start = pieces.len();
+                push_language_pieces(&mut pieces, run, end_language, style_language);
+                spans.push(start..pieces.len());
+            }
+            let paragraph_scripts = paragraph_scripts_with_languages(pieces.iter().copied(), false);
+            let text_context: Vec<String> = paragraph_scripts_with_languages(
+                pieces.iter().map(|&(text, _)| (text, None)),
+                false,
+            )
+            .into_iter()
+            .filter(|script| matches!(script.as_str(), "cjk-jp" | "cjk-kr"))
+            .collect();
+            self.record(first.clone(), &[]);
+            let mut decided: Vec<(&str, Option<&str>)> = Vec::new();
+            let mut undecided: Vec<(&str, Option<&str>)> = Vec::new();
+            for (run, span) in source.paragraph.runs.iter().zip(spans) {
+                decided.clear();
+                undecided.clear();
+                for &piece in &pieces[span] {
+                    if piece.1.is_some() {
+                        decided.push(piece);
+                    } else {
+                        undecided.push(piece);
+                    }
+                }
+                let mut scripts =
+                    paragraph_scripts_with_languages(undecided.iter().copied(), false);
+                if !text_context.is_empty() && scripts.iter().any(|script| script == "cjk-sc") {
+                    scripts.retain(|script| script != "cjk-sc");
+                    for script in &text_context {
+                        if !scripts.contains(script) {
+                            scripts.push(script.clone());
+                        }
+                    }
+                }
+                for script in paragraph_scripts_with_languages(decided.iter().copied(), false) {
+                    if !scripts.contains(&script) {
+                        scripts.push(script);
+                    }
+                }
+                let request = resolve_font_request(theme, &run.style, fallback);
+                let mut directs: Vec<Option<&str>> = run
+                    .east_asian
+                    .iter()
+                    .map(|(_, face)| face.as_deref())
+                    .collect();
+                if directs.is_empty()
+                    || run
+                        .east_asian
+                        .iter()
+                        .map(|(range, _)| range.len())
+                        .sum::<usize>()
+                        < run.text.len()
+                {
+                    directs.push(None);
+                }
+                directs.dedup();
+                for direct in directs {
+                    if let Some(family) = east_asian_family(
+                        theme,
+                        direct,
+                        fallback,
+                        self.east_asian_script.as_deref(),
+                    ) {
+                        self.record(
+                            RequestedFontFace {
+                                family,
+                                ..request.clone()
+                            },
+                            &scripts,
+                        );
+                    }
+                }
+                self.record(request, &scripts);
+            }
+            if paragraph_marker(source.paragraph, &source.properties, &mut numbering).is_some()
+                && let Some(family) = bullet_font_request(theme, &source.properties)
+            {
+                self.record(RequestedFontFace { family, ..first }, &paragraph_scripts);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The language deciding Han glyphs: the first East Asian one of the source text, the
+/// paragraph mark and the paragraph's style default.
+fn decide_language<'a>(
+    language: Option<&'a str>,
+    end_language: Option<&'a str>,
+    style_language: Option<&'a str>,
+) -> Option<&'a str> {
+    [language, end_language, style_language]
+        .into_iter()
+        .flatten()
+        .find(|tag| han_script_for_language(tag).is_some())
+}
+
+/// Appends a run's text pieces with the language deciding their Han glyphs.
+fn push_language_pieces<'a>(
+    out: &mut Vec<(&'a str, Option<&'a str>)>,
+    run: &'a ContentRun,
+    end_language: Option<&'a str>,
+    style_language: Option<&'a str>,
+) {
+    if run.languages.is_empty() {
+        out.push((
+            run.text.as_str(),
+            decide_language(None, end_language, style_language),
+        ));
+    }
+    for (range, language) in &run.languages {
+        out.push((
+            run.text.get(range.clone()).unwrap_or(""),
+            decide_language(language.as_deref(), end_language, style_language),
+        ));
+    }
+}
+
+/// One language per CJK bucket, or one undecided entry when no language decides Han glyphs.
+fn east_asian_languages(
+    languages: &mut dyn Iterator<Item = Option<&String>>,
+) -> Vec<Option<String>> {
+    let mut buckets: [Option<&String>; 4] = [None; 4];
+    let mut undecided = false;
+    for tag in languages {
+        let slot = match tag.and_then(|tag| han_script_for_language(tag)) {
+            Some("cjk-jp") => 0,
+            Some("cjk-kr") => 1,
+            Some("cjk-tc") => 2,
+            Some(_) => 3,
+            None => {
+                undecided = true;
+                continue;
+            }
+        };
+        buckets[slot] = buckets[slot].or(tag);
+    }
+    let mut found: Vec<Option<String>> = buckets
+        .iter()
+        .flatten()
+        .map(|tag| Some((*tag).clone()))
+        .collect();
+    if undecided || found.is_empty() {
+        found.push(None);
+    }
+    found
+}
+
+/// Every live run carries each effective source language: a run's own East Asian language,
+/// else its paragraph mark's, else an undecided entry that the paragraph's fallbacks resolve.
+fn union_languages(
+    sources: &[&pptx_parse::TextParagraph],
+    live: &[&str],
+) -> Vec<Vec<(std::ops::Range<usize>, Option<String>)>> {
+    let languages = east_asian_languages(&mut sources.iter().flat_map(|source| {
+        let mark = source
+            .end_properties
+            .as_ref()
+            .and_then(|properties| properties.language.as_ref())
+            .filter(|tag| han_script_for_language(tag).is_some());
+        source.runs.iter().map(move |run| {
+            run.properties
+                .language
+                .as_ref()
+                .filter(|tag| han_script_for_language(tag).is_some())
+                .or(mark)
+        })
+    }));
+    let mut out = Vec::with_capacity(live.len());
+    for text in live {
+        let mut spans = Vec::with_capacity(languages.len());
+        for language in &languages {
+            spans.push((0..text.len(), language.clone()));
+        }
+        out.push(spans);
+    }
+    out
+}
+
+/// Whether the live run texts concatenate to exactly the source run texts.
+fn same_text(live: &[&str], runs: &[pptx_parse::TextRun]) -> bool {
+    let mut next = 0;
+    let mut pending: &[u8] = &[];
+    for text in live {
+        let mut rest = text.as_bytes();
+        while !rest.is_empty() {
+            while pending.is_empty() {
+                let Some(run) = runs.get(next) else {
+                    return false;
+                };
+                pending = run.text.as_bytes();
+                next += 1;
+            }
+            let shared = pending.len().min(rest.len());
+            if pending[..shared] != rest[..shared] {
+                return false;
+            }
+            pending = &pending[shared..];
+            rest = &rest[shared..];
+        }
+    }
+    pending.is_empty()
+        && runs[next.min(runs.len())..]
+            .iter()
+            .all(|run| run.text.is_empty())
+}
+
+/// Source languages for each live run of a story paragraph: where the live text still equals
+/// its one source paragraph, each run is cut at the source run boundaries; otherwise (edited,
+/// joined or new paragraphs) every run carries each East Asian language of its sources.
+fn live_run_languages(
+    sources: &[&pptx_parse::TextParagraph],
+    live: &[&str],
+) -> Vec<Vec<(std::ops::Range<usize>, Option<String>)>> {
+    let [source] = sources else {
+        return union_languages(sources, live);
+    };
+    if !same_text(live, &source.runs) {
+        return union_languages(sources, live);
+    }
+    let mut index = 0;
+    let mut source_start = 0;
+    let mut start = 0;
+    let mut out = Vec::with_capacity(live.len());
+    for text in live {
+        let end = start + text.len();
+        let mut spans = Vec::new();
+        while let Some(run) = source.runs.get(index) {
+            let source_end = source_start + run.text.len();
+            let from = source_start.max(start);
+            let to = source_end.min(end);
+            if from < to {
+                spans.push((from - start..to - start, run.properties.language.clone()));
+            }
+            if source_end <= end {
+                source_start = source_end;
+                index += 1;
+            } else {
+                break;
+            }
+        }
+        if spans.is_empty() {
+            spans.push((0..text.len(), None));
+        }
+        out.push(spans);
+        start = end;
+    }
+    out
+}
+
+/// The direct `a:ea` face over each live run, as byte ranges cut at the source
+/// run boundaries; empty where the live text no longer equals its one source
+/// paragraph.
+fn live_run_east_asian(
+    sources: &[&pptx_parse::TextParagraph],
+    live: &[&str],
+) -> Vec<Vec<(std::ops::Range<usize>, Option<String>)>> {
+    let [source] = sources else {
+        return vec![Vec::new(); live.len()];
+    };
+    if !same_text(live, &source.runs)
+        || source
+            .runs
+            .iter()
+            .all(|run| run.properties.east_asian_family.is_none())
+    {
+        return vec![Vec::new(); live.len()];
+    }
+    let mut out = Vec::with_capacity(live.len());
+    let mut index = 0;
+    let mut source_start = 0;
+    let mut start = 0;
+    for text in live {
+        let end = start + text.len();
+        let mut spans: Vec<(std::ops::Range<usize>, Option<String>)> = Vec::new();
+        while let Some(run) = source.runs.get(index) {
+            let source_end = source_start + run.text.len();
+            let from = source_start.max(start);
+            let to = source_end.min(end);
+            if from < to {
+                let face = &run.properties.east_asian_family;
+                match spans.last_mut() {
+                    Some((range, last)) if last == face => range.end = to - start,
+                    _ => spans.push((from - start..to - start, face.clone())),
+                }
+            }
+            if source_end <= end {
+                source_start = source_end;
+                index += 1;
+            } else {
+                break;
+            }
+        }
+        out.push(spans);
+        start = end;
+    }
+    out
+}
+
+/// A run's text cut where its direct `a:ea` face changes, each piece with
+/// that face; the whole run with none when no face is written on it.
+fn east_asian_pieces(run: &ContentRun) -> Vec<(&str, Option<&str>)> {
+    let mut pieces = Vec::new();
+    let mut cursor = 0;
+    for (range, face) in &run.east_asian {
+        let (Some(_), Some(text)) = (range.start.checked_sub(cursor), run.text.get(range.clone()))
+        else {
+            continue;
+        };
+        if range.start > cursor {
+            pieces.push((&run.text[cursor..range.start], None));
+        }
+        pieces.push((text, face.as_deref()));
+        cursor = range.end;
+    }
+    if cursor < run.text.len() || pieces.is_empty() {
+        pieces.push((run.text.get(cursor..).unwrap_or(""), None));
+    }
+    pieces
+}
+
+fn whole_run_east_asian(
+    text: &str,
+    properties: &RunProperties,
+) -> Vec<(std::ops::Range<usize>, Option<String>)> {
+    properties
+        .east_asian_family
+        .clone()
+        .map(|face| vec![(0..text.len(), Some(face))])
+        .unwrap_or_default()
+}
+
+struct FontRequestWalker<'a, 'b> {
+    scope: TextScope<'a>,
+    requests: &'b mut FontRequests,
+    shape_count: usize,
+}
+
+impl FontRequestWalker<'_, '_> {
+    fn charge_shape(&mut self) -> Result<(), RenderError> {
+        self.shape_count += 1;
+        if self.shape_count > MAX_RENDER_SHAPES {
+            return Err(RenderError::ResourceLimit(format!(
+                "more than {MAX_RENDER_SHAPES} shapes"
+            )));
+        }
+        Ok(())
+    }
+
+    fn snapshot_shape(&mut self, shape: &ShapeSnapshot, space: Space) -> Result<(), RenderError> {
+        self.charge_shape()?;
+        if shape.hidden {
+            return Ok(());
+        }
+        let scope = self.scope;
+        let nodes @ [original, layout, master] = scope.snapshot_nodes(shape);
+        let resolved = resolved_transform_value(shape, original, layout, master);
+        let rect = space.map_transform(&resolved);
+        if shape.kind == ShapeKind::Group {
+            let group = nodes.into_iter().flatten().find_map(node_group_transform);
+            let child_space = group
+                .map(|transform| space.for_group(rect, transform))
+                .unwrap_or(space);
+            for child in &shape.children {
+                self.snapshot_shape(child, child_space)?;
+            }
+        } else if shape.kind == ShapeKind::GraphicFrame {
+            self.graphic(
+                &shape.id,
+                shape.graphic.as_ref(),
+                &shape.text_stories,
+                rect,
+                space,
+            )?;
+        } else if let Some(story) = shape.text_stories.first() {
+            let cascade = scope.cascade(nodes, shape.placeholder.as_ref(), false);
+            let content = content_from_story(
+                story,
+                cascade.primary,
+                scope.slide_number,
+                scope.theme,
+                true,
+            );
+            self.requests.content(scope.theme, &content, cascade)?;
+        }
+        Ok(())
+    }
+
+    fn parsed_shape(
+        &mut self,
+        shape: &ShapeNode,
+        stable_id: &str,
+        space: Space,
+    ) -> Result<(), RenderError> {
+        self.charge_shape()?;
+        if node_base(shape).hidden {
+            return Ok(());
+        }
+        if let ShapeNode::Group(group) = shape {
+            let rect = space.map_transform(&group.base.transform);
+            let child_space = space.for_group(rect, &group.base.transform);
+            for (index, child) in group.children.iter().enumerate() {
+                self.parsed_shape(child, &format!("{stable_id}:{index}"), child_space)?;
+            }
+            return Ok(());
+        }
+        if let ShapeNode::GraphicFrame(frame) = shape {
+            self.graphic(
+                stable_id,
+                Some(&frame.data),
+                &[],
+                space.map_transform(&frame.base.transform),
+                space,
+            )?;
+        }
+        if let Some(body) = node_text(shape) {
+            let scope = self.scope;
+            let content = content_from_body(stable_id, body, scope.theme, scope.slide_number);
+            self.requests.content(
+                scope.theme,
+                &content,
+                scope.cascade([Some(shape), None, None], node_placeholder(shape), false),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn graphic(
+        &mut self,
+        shape_id: &str,
+        graphic: Option<&GraphicFrameData>,
+        stories: &[StorySnapshot],
+        rect: PxRect,
+        space: Space,
+    ) -> Result<(), RenderError> {
+        let scope = self.scope;
+        match graphic {
+            Some(GraphicFrameData::Table(table)) => {
+                let row_count = table.rows.len();
+                let column_count = table.grid.len().max(
+                    table
+                        .rows
+                        .iter()
+                        .map(|row| row.cells.len())
+                        .max()
+                        .unwrap_or_default(),
+                );
+                if row_count == 0 || column_count == 0 {
+                    return Ok(());
+                }
+                let levels = scope
+                    .master
+                    .map(|master| scope.package.master_other_style_levels(master))
+                    .unwrap_or([false; 9]);
+                let text_levels =
+                    table_text_levels(scope.master, &levels, &scope.package.presentation);
+                let table_style = TableStyleScope::new(scope.package, table);
+                let mut story_index = 0;
+                for (row_index, row) in table.rows.iter().enumerate() {
+                    for (column, cell) in row.cells.iter().enumerate() {
+                        let story = stories.get(story_index);
+                        story_index += 1;
+                        self.charge_shape()?;
+                        if cell.merged {
+                            continue;
+                        }
+                        let content = match story {
+                            Some(story) => content_from_story(
+                                story,
+                                Some(&cell.text),
+                                scope.slide_number,
+                                scope.theme,
+                                true,
+                            ),
+                            None => content_from_body(
+                                &format!("{shape_id}:table:{row_index}:{column}"),
+                                &cell.text,
+                                scope.theme,
+                                scope.slide_number,
+                            ),
+                        };
+                        let style = table_style.cell(
+                            TableCellPosition {
+                                row: row_index,
+                                column,
+                                row_count,
+                                column_count,
+                            },
+                            cell,
+                            (cell.grid_span as usize).clamp(1, column_count - column),
+                            (cell.row_span as usize).clamp(1, row_count - row_index),
+                        );
+                        let inherited = table_style_text_body(&style, &text_levels);
+                        self.requests.content(
+                            scope.theme,
+                            &content,
+                            cell_cascade(&cell.text, &inherited),
+                        )?;
+                    }
+                }
+            }
+            Some(GraphicFrameData::Diagram {
+                drawing_part_path: Some(path),
+                ..
+            }) => {
+                if let Some(drawing) = scope
+                    .package
+                    .diagram_drawings
+                    .iter()
+                    .find(|drawing| drawing.part_path == *path)
+                {
+                    let (scale_x, scale_y) = drawing
+                        .synthesis_extent
+                        .filter(|[width, height]| *width > 0 && *height > 0)
+                        .map(|[width, height]| (rect.w / width as f32, rect.h / height as f32))
+                        .unwrap_or((space.scale_x, space.scale_y));
+                    let space = Space {
+                        origin_x: rect.x,
+                        origin_y: rect.y,
+                        scale_x,
+                        scale_y,
+                    };
+                    for (index, child) in drawing.shapes.iter().enumerate() {
+                        self.parsed_shape(child, &format!("{shape_id}:{index}"), space)?;
+                    }
+                }
+            }
+            Some(GraphicFrameData::Chart {
+                part_path: Some(path),
+                ..
+            }) => {
+                let theme_path = slide_theme_part(scope.package, scope.master)
+                    .map(|part| part.part_path.as_str());
+                if let Some(part) = scope.package.charts.iter().find(|part| {
+                    part.part_path == *path && part.theme_part_path.as_deref() == theme_path
+                }) {
+                    let default_font = resolve_theme_font_ref(Some(scope.theme), "+mn-lt");
+                    let east_asian = chart_east_asian_family(
+                        scope.theme,
+                        self.requests.east_asian_script.as_deref(),
+                    );
+                    crate::chart::visit_chart_fonts(
+                        &part.chart,
+                        &default_font,
+                        &mut |family, bold, italic, scripts| {
+                            let request = RequestedFontFace {
+                                family: resolve_font_family(scope.theme, family),
+                                bold,
+                                italic,
+                                scripts: Vec::new(),
+                            };
+                            if let Some(family) = east_asian.clone() {
+                                self.requests.record(
+                                    RequestedFontFace {
+                                        family,
+                                        ..request.clone()
+                                    },
+                                    scripts,
+                                );
+                            }
+                            self.requests.record(request, scripts);
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+struct LayoutBuilder<'a> {
+    renderer: &'a SlideRenderer,
+    package: &'a PptxPackage,
+    theme: &'a Theme,
+    format_scheme: &'a ThemeFormatScheme,
+    theme_part_path: Option<&'a str>,
+    master: Option<&'a SlideMaster>,
+    master_other_style_levels: Option<[bool; 9]>,
+    layout: Option<&'a SlideLayout>,
+    parsed_slide: Option<&'a Slide>,
+    shape_filter: Option<&'a HashSet<String>>,
+    primitives: Vec<Primitive>,
+    hit_regions: Vec<HitRegion>,
+    autofit: HashMap<String, TextAutofit>,
+    substitutions: SubstitutionLog,
+    shape_count: usize,
+    line_count: usize,
+    chart_budget: usize,
+    metafile_budget: usize,
+    metafile_bytes: usize,
+    metafiles: HashMap<&'a str, Option<Arc<MetafileDrawing>>>,
+    /// Package media keyed by part path, built on first picture lookup so
+    /// per-shape work stays independent of the deck's part count.
+    media_parts: Option<HashMap<&'a str, &'a MediaPart>>,
+    /// Package charts keyed by (part path, theme part path); same rationale.
+    chart_parts: Option<HashMap<(&'a str, Option<&'a str>), &'a ChartPart>>,
+    /// The number a `slidenum` field resolves to on this slide.
+    slide_number: i64,
+    slide_width: f32,
+    slide_height: f32,
+    background_paint: Option<Paint>,
+    background_picture: Option<PictureFill>,
+}
+
+impl<'a> LayoutBuilder<'a> {
+    fn text_scope(&self) -> TextScope<'a> {
+        TextScope {
+            package: self.package,
+            theme: self.theme,
+            parsed_slide: self.parsed_slide,
+            layout: self.layout,
+            master: self.master,
+            slide_number: self.slide_number,
+        }
+    }
+
+    fn resolved_effects(&self, nodes: &[Option<&ShapeNode>]) -> Option<ShapeEffects> {
+        nodes
+            .iter()
+            .flatten()
+            .find_map(|node| node_effects(node))
+            .cloned()
+            .or_else(|| {
+                let reference = nodes
+                    .iter()
+                    .flatten()
+                    .find_map(|node| node_style(node)?.effect.as_ref())?;
+                style_effects(self.format_scheme, reference, self.theme)
+            })
+    }
+
+    fn resolved_fill(&self, nodes: &[Option<&ShapeNode>]) -> Option<ShapeFill> {
+        nodes
+            .iter()
+            .flatten()
+            .find_map(|node| {
+                if node_style(node).is_some_and(|style| style.fill_disabled) {
+                    Some(ShapeFill::named("none"))
+                } else {
+                    node_fill(node).cloned()
+                }
+            })
+            .or_else(|| {
+                let reference = nodes
+                    .iter()
+                    .flatten()
+                    .find_map(|node| node_style(node)?.fill.as_ref())?;
+                Some(style_fill(self.format_scheme, reference, self.theme))
+            })
+    }
+
+    fn resolved_outline(&self, nodes: &[Option<&ShapeNode>]) -> Option<ShapeOutline> {
+        let mut outline = nodes.iter().flatten().find_map(|node| {
+            let reference = node_style(node)?.line.as_ref()?;
+            Some(style_outline(self.format_scheme, reference, self.theme).unwrap_or_default())
+        });
+        for node in nodes.iter().rev().flatten() {
+            if node_style(node).is_some_and(|style| style.line_disabled) {
+                outline = Some(ShapeOutline::default());
+            }
+            if let Some(direct) = node_outline(node) {
+                outline = Some(merge_outline(direct, outline.as_ref()));
+            }
+        }
+        outline
+    }
+
+    fn charge_shape(&mut self) -> Result<(), RenderError> {
+        self.shape_count += 1;
+        if self.shape_count > MAX_RENDER_SHAPES {
+            return Err(RenderError::ResourceLimit(format!(
+                "more than {MAX_RENDER_SHAPES} shapes"
+            )));
+        }
+        Ok(())
+    }
+
+    fn render_snapshot_shape(
+        &mut self,
+        shape: &ShapeSnapshot,
+        space: Space,
+    ) -> Result<(), RenderError> {
+        if self
+            .shape_filter
+            .is_some_and(|shape_ids| !shape_ids.contains(&shape.id))
+        {
+            return Ok(());
+        }
+        self.charge_shape()?;
+        if shape.hidden {
+            return Ok(());
+        }
+        let text_scope = self.text_scope();
+        let [original, layout_node, master_node] = text_scope.snapshot_nodes(shape);
+        let resolved = resolved_transform_value(shape, original, layout_node, master_node);
+        let rect = space.map_transform(&resolved);
+        if shape.kind == ShapeKind::Group {
+            let group_transform = original
+                .and_then(node_group_transform)
+                .or_else(|| layout_node.and_then(node_group_transform))
+                .or_else(|| master_node.and_then(node_group_transform));
+            let child_space = group_transform
+                .map(|transform| space.for_group(rect, transform))
+                .unwrap_or(space);
+            for child in &shape.children {
+                self.render_snapshot_shape(child, child_space)?;
+            }
+            return Ok(());
+        }
+        let stable_id = shape.id.clone();
+        let transform = Transform {
+            rotation_deg: resolved.rotation_deg as f32,
+            flip_h: resolved.flip_h,
+            flip_v: resolved.flip_v,
+        };
+        if self.shape_filter.is_none() {
+            let inherited = [original, layout_node, master_node];
+            let inherited_fill = self.resolved_fill(&inherited);
+            let inherited_outline = self.resolved_outline(&inherited);
+            let effective_fill = shape.fill.as_ref().or(inherited_fill.as_ref());
+            let picture = effective_fill
+                .filter(|fill| fill.fill_type == PICTURE_FILL)
+                .and_then(|_| picture_fill(&inherited));
+            let use_bg_fill = shape.kind == ShapeKind::Shape && node_use_bg_fill(original);
+            let background_picture = use_bg_fill
+                .then(|| self.background_picture.clone())
+                .flatten();
+            let picture = if use_bg_fill {
+                background_picture.as_ref()
+            } else {
+                picture
+            };
+            let fill = if use_bg_fill {
+                self.background_paint.clone()
+            } else {
+                effective_fill.and_then(|fill| paint(fill, self.theme))
+            };
+            let outline = if shape.outline.as_ref() == original.and_then(node_outline) {
+                inherited_outline
+            } else {
+                shape
+                    .outline
+                    .as_ref()
+                    .map(|edited| {
+                        if *edited == ShapeOutline::default() {
+                            edited.clone()
+                        } else {
+                            merge_outline(edited, inherited_outline.as_ref())
+                        }
+                    })
+                    .or(inherited_outline)
+            }
+            .and_then(|outline| stroke(&outline, self.theme));
+            let node_effects = self.resolved_effects(&[original, layout_node, master_node]);
+            let shadow = node_effects
+                .as_ref()
+                .filter(|_| match shape.kind {
+                    ShapeKind::Shape => fill.is_some() || outline.is_some() || picture.is_some(),
+                    ShapeKind::Picture => true,
+                    ShapeKind::GraphicFrame | ShapeKind::Group => false,
+                })
+                .and_then(|effects| {
+                    shadow(
+                        effects,
+                        self.theme,
+                        space,
+                        rect,
+                        resolved.rotation_deg as f32,
+                        resolved.flip_h,
+                        resolved.flip_v,
+                    )
+                });
+            match shape.kind {
+                ShapeKind::Shape => {
+                    let paths = custom_paths(original);
+                    let (path, mut geometry_fallback) = geometry_path_with_fallback(
+                        &shape.geometry,
+                        &shape.adjust_values,
+                        f64::from(rect.w) / f64::from(rect.h),
+                    );
+                    if shape.geometry == "custom" && !paths.is_empty() {
+                        geometry_fallback = false;
+                    }
+                    let primitive = Primitive::Shape {
+                        clip: None,
+                        even_odd: false,
+                        object_id: shape.source_id,
+                        shape_id: Some(stable_id.clone()),
+                        name: shape.name.clone(),
+                        x: rect.x,
+                        y: rect.y,
+                        w: rect.w,
+                        h: rect.h,
+                        geometry: shape.geometry.clone(),
+                        path,
+                        geometry_fallback,
+                        adjust_values: shape
+                            .adjust_values
+                            .iter()
+                            .map(|(name, value)| (name.clone(), *value as f32))
+                            .collect(),
+                        fill,
+                        stroke: outline,
+                        shadow,
+                        transform,
+                    };
+                    if use_bg_fill {
+                        self.push_background_shape(primitive, paths, picture)?;
+                    } else {
+                        self.push_shape(primitive, paths, picture)?;
+                    }
+                }
+                ShapeKind::Picture => {
+                    let source = picture_source(original);
+                    let asset_id = picture_asset_id(shape);
+                    self.render_picture(
+                        shape.source_id,
+                        &stable_id,
+                        &shape.name,
+                        rect,
+                        transform,
+                        asset_id.as_deref(),
+                        &shape.blip_effects,
+                        source.map(|picture| &picture.crop),
+                        source
+                            .map(|picture| picture_mask(picture, rect))
+                            .unwrap_or_default(),
+                        outline,
+                        shadow,
+                    );
+                }
+                ShapeKind::GraphicFrame => {
+                    self.render_graphic_frame(
+                        shape.source_id,
+                        &stable_id,
+                        &shape.name,
+                        rect,
+                        transform,
+                        space,
+                        shape.graphic.as_ref(),
+                        &shape.text_stories,
+                    )?;
+                }
+                ShapeKind::Group => unreachable!(),
+            }
+        }
+        let body_cascade = text_scope.cascade(
+            [original, layout_node, master_node],
+            shape.placeholder.as_ref(),
+            false,
+        );
+        let text = match shape.kind {
+            ShapeKind::GraphicFrame => None,
+            ShapeKind::Shape | ShapeKind::Picture | ShapeKind::Group => {
+                shape.text_stories.first().map(|story| {
+                    let mut content = content_from_story(
+                        story,
+                        body_cascade.primary,
+                        self.slide_number,
+                        self.theme,
+                        false,
+                    );
+                    content.refit_autofit =
+                        matches!(body_cascade.autofit(), Some(TextAutofit::Normal { .. }))
+                            && body_cascade.primary.is_some_and(|body| {
+                                self.renderer.story_edited(story, body, self.theme)
+                            });
+                    content
+                })
+            }
+        };
+        let text_hit = if let Some(content) = text {
+            self.render_text_box(
+                shape.source_id,
+                &stable_id,
+                rect,
+                transform,
+                space,
+                geometry_text_inset(original, rect),
+                content,
+                body_cascade,
+            )?
+        } else {
+            None
+        };
+        if self.shape_filter.is_none() {
+            self.hit_regions.push(HitRegion {
+                shape_id: stable_id,
+                rect,
+                hit_rect: rect_covering_text(rect, text_hit.as_ref()),
+                transform,
+                text: text_hit,
+            });
+        }
+        Ok(())
+    }
+
+    fn render_parsed_shape(
+        &mut self,
+        shape: &ShapeNode,
+        stable_id: &str,
+        space: Space,
+        fit_text: bool,
+    ) -> Result<(), RenderError> {
+        self.charge_shape()?;
+        if node_base(shape).hidden {
+            return Ok(());
+        }
+        if let ShapeNode::Group(group) = shape {
+            let rect = space.map_transform(&group.base.transform);
+            let child_space = space.for_group(rect, &group.base.transform);
+            for (index, child) in group.children.iter().enumerate() {
+                self.render_parsed_shape(
+                    child,
+                    &format!("{stable_id}:{index}"),
+                    child_space,
+                    fit_text,
+                )?;
+            }
+            return Ok(());
+        }
+        let base = node_base(shape);
+        let rect = space.map_transform(&base.transform);
+        let transform = Transform {
+            rotation_deg: base.transform.rotation_deg as f32,
+            flip_h: base.transform.flip_h,
+            flip_v: base.transform.flip_v,
+        };
+        match shape {
+            ShapeNode::Shape(value) => {
+                let resolved_fill = self.resolved_fill(&[Some(shape)]);
+                let use_bg_fill = value.use_bg_fill;
+                let background_picture = use_bg_fill
+                    .then(|| self.background_picture.clone())
+                    .flatten();
+                let fill = if use_bg_fill {
+                    self.background_paint.clone()
+                } else {
+                    resolved_fill
+                        .as_ref()
+                        .and_then(|fill| paint(fill, self.theme))
+                };
+                let outline = self
+                    .resolved_outline(&[Some(shape)])
+                    .and_then(|outline| stroke(&outline, self.theme));
+                let picture = if use_bg_fill {
+                    background_picture.as_ref()
+                } else {
+                    resolved_fill
+                        .as_ref()
+                        .filter(|fill| fill.fill_type == PICTURE_FILL)
+                        .and(value.picture_fill.as_deref())
+                };
+                let resolved_effects = self.resolved_effects(&[Some(shape)]);
+                let shadow = resolved_effects
+                    .as_ref()
+                    .filter(|_| fill.is_some() || outline.is_some() || picture.is_some())
+                    .and_then(|effects| {
+                        shadow(
+                            effects,
+                            self.theme,
+                            space,
+                            rect,
+                            transform.rotation_deg,
+                            transform.flip_h,
+                            transform.flip_v,
+                        )
+                    });
+                let (path, mut geometry_fallback) = geometry_path_with_fallback(
+                    &value.geometry,
+                    &value.adjust_values,
+                    f64::from(rect.w) / f64::from(rect.h),
+                );
+                if value.geometry == "custom" && !value.paths.is_empty() {
+                    geometry_fallback = false;
+                }
+                let primitive = Primitive::Shape {
+                    clip: None,
+                    even_odd: false,
+                    object_id: base.id,
+                    shape_id: Some(stable_id.to_owned()),
+                    name: base.name.clone(),
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                    geometry: value.geometry.clone(),
+                    path,
+                    geometry_fallback,
+                    adjust_values: value
+                        .adjust_values
+                        .iter()
+                        .map(|(name, value)| (name.clone(), *value as f32))
+                        .collect(),
+                    fill,
+                    stroke: outline,
+                    shadow,
+                    transform,
+                };
+                if use_bg_fill {
+                    self.push_background_shape(primitive, &value.paths, picture)?;
+                } else {
+                    self.push_shape(primitive, &value.paths, picture)?;
+                }
+            }
+            ShapeNode::Picture(value) => {
+                let outline = self
+                    .resolved_outline(&[Some(shape)])
+                    .and_then(|outline| stroke(&outline, self.theme));
+                self.render_picture(
+                    base.id,
+                    stable_id,
+                    &base.name,
+                    rect,
+                    transform,
+                    value.media_part_path.as_deref(),
+                    &value.effects,
+                    Some(&value.crop),
+                    picture_mask(value, rect),
+                    outline,
+                    self.resolved_effects(&[Some(shape)])
+                        .as_ref()
+                        .and_then(|effects| {
+                            shadow(
+                                effects,
+                                self.theme,
+                                space,
+                                rect,
+                                transform.rotation_deg,
+                                transform.flip_h,
+                                transform.flip_v,
+                            )
+                        }),
+                );
+            }
+            ShapeNode::GraphicFrame(value) => {
+                self.render_graphic_frame(
+                    base.id,
+                    stable_id,
+                    &base.name,
+                    rect,
+                    transform,
+                    space,
+                    Some(&value.data),
+                    &[],
+                )?;
+            }
+            ShapeNode::Group(_) => unreachable!(),
+        }
+        let text_hit = if let Some(body) = node_text(shape) {
+            let content = content_from_body(stable_id, body, self.theme, self.slide_number);
+            self.render_text_box(
+                base.id,
+                stable_id,
+                rect,
+                transform,
+                space,
+                geometry_text_inset(Some(shape), rect),
+                content,
+                BodyCascade {
+                    fit_to_box: fit_text,
+                    primary: Some(body),
+                    layout: None,
+                    master: None,
+                    master_slide: self.master,
+                    default_style: &self.package.presentation.default_text_style,
+                    default_paragraph: self.package.presentation.default_text_paragraph.as_deref(),
+                    placeholder: base.placeholder.as_ref(),
+                    style_color: shape_style_color(Some(shape)),
+                },
+            )?
+        } else {
+            None
+        };
+        self.hit_regions.push(HitRegion {
+            shape_id: stable_id.to_owned(),
+            rect,
+            hit_rect: rect_covering_text(rect, text_hit.as_ref()),
+            transform,
+            text: text_hit,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_picture(
+        &mut self,
+        object_id: u32,
+        shape_id: &str,
+        name: &str,
+        rect: PxRect,
+        transform: Transform,
+        media_part_path: Option<&str>,
+        effects: &[BlipEffect],
+        crop: Option<&PictureCrop>,
+        mut mask: PictureMask,
+        mut outline: Option<Stroke>,
+        shadow: Option<Shadow>,
+    ) {
+        let separate_outline = mask.outline_path.is_some();
+        let metafile = !mask.empty
+            && effects.is_empty()
+            && self.push_metafile(
+                object_id,
+                name,
+                rect,
+                transform,
+                media_part_path,
+                crop,
+                &mask,
+            );
+        if !mask.empty && !metafile {
+            let (crop, destination) = crop
+                .map(image_crop)
+                .unwrap_or_default()
+                .placement(rect.x, rect.y, rect.w, rect.h);
+            self.primitives.push(Primitive::Image {
+                object_id,
+                shape_id: Some(shape_id.to_owned()),
+                name: name.to_owned(),
+                x: rect.x,
+                y: rect.y,
+                w: rect.w,
+                h: rect.h,
+                asset_id: media_part_path.map(str::to_owned),
+                effects: image_effects(effects, self.theme),
+                crop,
+                destination,
+                tile: None,
+                path: mask.path.take(),
+                geometry_fallback: mask.geometry_fallback,
+                stroke: if separate_outline {
+                    None
+                } else {
+                    outline.take()
+                },
+                shadow,
+                transform,
+            });
+        }
+        if (metafile || separate_outline)
+            && let Some(outline) = outline
+        {
+            let path = mask
+                .outline_path
+                .or(mask.path)
+                .unwrap_or_else(|| geometry_path("rect", &BTreeMap::new(), 1.0));
+            if path.is_empty() {
+                return;
+            }
+            self.primitives.push(Primitive::Shape {
+                clip: None,
+                even_odd: false,
+                object_id,
+                shape_id: Some(shape_id.to_owned()),
+                name: name.to_owned(),
+                x: rect.x,
+                y: rect.y,
+                w: rect.w,
+                h: rect.h,
+                geometry: if separate_outline { "custom" } else { "rect" }.to_owned(),
+                path,
+                geometry_fallback: mask.geometry_fallback,
+                adjust_values: BTreeMap::new(),
+                fill: None,
+                stroke: Some(outline),
+                shadow: None,
+                transform,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_metafile(
+        &mut self,
+        object_id: u32,
+        name: &str,
+        rect: PxRect,
+        transform: Transform,
+        media_part_path: Option<&str>,
+        crop: Option<&PictureCrop>,
+        mask: &PictureMask,
+    ) -> bool {
+        if self.metafile_budget == 0 {
+            return false;
+        }
+        let Some(drawing) = self.metafile(media_part_path) else {
+            return false;
+        };
+        if drawing.ops.len() > self.metafile_budget {
+            return false;
+        }
+        self.metafile_budget -= drawing.ops.len();
+        let Some(crop) = source_rect(crop) else {
+            return true;
+        };
+        let masked = mask.path.is_some();
+        let clip = mask
+            .path
+            .clone()
+            .unwrap_or_else(|| geometry_path("rect", &BTreeMap::new(), 1.0));
+        for mut op in drawing.ops.iter().cloned() {
+            place_in_source_rect(&mut op.path, crop);
+            // one clip per primitive, so a picture mask and the metafile's own
+            // clip cannot both be carried: draw under the mask only where the
+            // metafile clip would remove nothing, and drop the op otherwise
+            // rather than paint what either region hides.
+            let op_clip = match (op.clip, masked) {
+                (Some(rect), false) => match metafile_clip_path(rect, crop) {
+                    Some(path) => path,
+                    None => continue,
+                },
+                (Some(rect), true) => match clipped_away(&op.path, rect, crop) {
+                    true => continue,
+                    false => clip.clone(),
+                },
+                (None, _) => clip.clone(),
+            };
+            self.primitives.push(Primitive::Shape {
+                clip: Some(op_clip),
+                even_odd: op.even_odd,
+                object_id,
+                shape_id: None,
+                name: name.to_owned(),
+                x: rect.x,
+                y: rect.y,
+                w: rect.w,
+                h: rect.h,
+                geometry: "custom".to_owned(),
+                path: op.path,
+                geometry_fallback: mask.geometry_fallback,
+                adjust_values: BTreeMap::new(),
+                fill: op.fill.map(|color| Paint::Solid { color }),
+                stroke: op.stroke.map(|stroke| Stroke {
+                    join: None,
+                    color: stroke.color,
+                    paint: None,
+                    width: ((stroke.width * crop.2 * f64::from(rect.w)) as f32).max(1.0),
+                    dashed: false,
+                    head_end: None,
+                    tail_end: None,
+                }),
+                shadow: None,
+                transform,
+            });
+        }
+        true
+    }
+
+    fn media_part(&mut self, part_path: &str) -> Option<&'a MediaPart> {
+        self.media_parts
+            .get_or_insert_with(|| {
+                let mut index = HashMap::new();
+                for part in &self.package.media {
+                    index.entry(part.part_path.as_str()).or_insert(part);
+                }
+                index
+            })
+            .get(part_path)
+            .copied()
+    }
+
+    fn metafile(&mut self, media_part_path: Option<&str>) -> Option<Arc<MetafileDrawing>> {
+        let part_path = media_part_path?;
+        if let Some(drawing) = self.metafiles.get(part_path) {
+            return drawing.clone();
+        }
+        let part = self.media_part(part_path)?;
+        if !is_metafile(&part.bytes) || part.bytes.len() > self.metafile_bytes {
+            self.metafiles.insert(part.part_path.as_str(), None);
+            return None;
+        }
+        self.metafile_bytes -= part.bytes.len();
+        let drawing = decode_metafile(&part.bytes).map(Arc::new);
+        self.metafiles
+            .insert(part.part_path.as_str(), drawing.clone());
+        drawing
+    }
+
+    fn push_shape(
+        &mut self,
+        primitive: Primitive,
+        paths: &[CustomGeometryPath],
+        picture: Option<&PictureFill>,
+    ) -> Result<(), RenderError> {
+        if paths.is_empty()
+            || !matches!(&primitive, Primitive::Shape { geometry, .. } if geometry == "custom")
+        {
+            for (index, (primitive, has_fill)) in crate::geometry::preset_primitives(primitive)
+                .into_iter()
+                .enumerate()
+            {
+                if index > 0 {
+                    self.charge_shape()?;
+                }
+                let picture = picture.filter(|_| has_fill);
+                let dpi = picture
+                    .and_then(|fill| fill.media_part_path.as_deref())
+                    .and_then(|path| self.media_part(path))
+                    .and_then(|part| image_dpi(&part.bytes));
+                self.primitives
+                    .push(picture_filled(primitive, picture, dpi, self.theme));
+            }
+            return Ok(());
+        }
+        for (index, custom) in paths.iter().enumerate() {
+            if index > 0 {
+                self.charge_shape()?;
+            }
+            let mut primitive = primitive.clone();
+            if let Primitive::Shape {
+                path,
+                fill,
+                stroke,
+                shadow,
+                ..
+            } = &mut primitive
+            {
+                *path = custom.commands.clone();
+                if custom.no_fill {
+                    *fill = None;
+                }
+                if custom.no_stroke {
+                    *stroke = None;
+                }
+                if fill.is_none() && stroke.is_none() {
+                    *shadow = None;
+                }
+            }
+            let picture = picture.filter(|_| !custom.no_fill);
+            let dpi = picture
+                .and_then(|fill| fill.media_part_path.as_deref())
+                .and_then(|path| self.media_part(path))
+                .and_then(|part| image_dpi(&part.bytes));
+            self.primitives
+                .push(picture_filled(primitive, picture, dpi, self.theme));
+        }
+        Ok(())
+    }
+
+    fn push_background_shape(
+        &mut self,
+        primitive: Primitive,
+        paths: &[CustomGeometryPath],
+        picture: Option<&PictureFill>,
+    ) -> Result<(), RenderError> {
+        let start = self.primitives.len();
+        self.push_shape(primitive, paths, None)?;
+        let parts = self.primitives.split_off(start);
+        let picture = picture.filter(|fill| fill.media_part_path.is_some());
+        let dpi = picture
+            .and_then(|fill| fill.media_part_path.as_deref())
+            .and_then(|path| self.media_part(path))
+            .and_then(|part| image_dpi(&part.bytes));
+        for mut part in parts {
+            if self.slide_width > 0.0
+                && self.slide_height > 0.0
+                && matches!(&part, Primitive::Shape { fill, shadow, .. } if fill.is_some() || shadow.is_some())
+            {
+                self.charge_shape()?;
+                let slide = self.slide_background_primitive(part.clone(), picture, dpi);
+                self.primitives.push(slide);
+            }
+            if let Primitive::Shape { fill, shadow, .. } = &mut part {
+                *fill = None;
+                *shadow = None;
+            }
+            self.primitives.push(part);
+        }
+        Ok(())
+    }
+
+    fn slide_background_primitive(
+        &self,
+        primitive: Primitive,
+        picture: Option<&PictureFill>,
+        dpi: Option<f32>,
+    ) -> Primitive {
+        let Primitive::Shape {
+            object_id,
+            name,
+            geometry,
+            path,
+            geometry_fallback,
+            adjust_values,
+            fill,
+            stroke,
+            shadow,
+            even_odd,
+            x,
+            y,
+            w,
+            h,
+            transform,
+            ..
+        } = primitive
+        else {
+            return primitive;
+        };
+        let placement = BackgroundTransform::for_shape(PxRect { x, y, w, h }, transform);
+        let shadow = shadow.map(|mut shadow| {
+            if shadow.paths.is_empty() {
+                shadow.paths.push(crate::ShadowPath {
+                    path: path.clone(),
+                    fill: fill.is_some(),
+                    stroke,
+                });
+            }
+            for part in &mut shadow.paths {
+                part.path = slide_background_path(
+                    &part.path,
+                    placement,
+                    self.slide_width,
+                    self.slide_height,
+                );
+            }
+            shadow
+        });
+        let path = slide_background_path(&path, placement, self.slide_width, self.slide_height);
+        if let Some(picture) = picture.filter(|_| fill.is_some()) {
+            let tile = picture_fill_tile(picture, dpi);
+            let (crop, destination) =
+                picture_fill_crop(picture).placement(0.0, 0.0, self.slide_width, self.slide_height);
+            let destination = if tile.is_some() { None } else { destination };
+            return Primitive::Image {
+                object_id,
+                shape_id: None,
+                name,
+                x: 0.0,
+                y: 0.0,
+                w: self.slide_width,
+                h: self.slide_height,
+                asset_id: picture.media_part_path.clone(),
+                effects: Vec::new(),
+                crop,
+                destination,
+                tile,
+                path: Some(path),
+                geometry_fallback,
+                stroke: None,
+                shadow,
+                transform: Transform::default(),
+            };
+        }
+        Primitive::Shape {
+            clip: None,
+            even_odd,
+            object_id,
+            shape_id: None,
+            name,
+            x: 0.0,
+            y: 0.0,
+            w: self.slide_width,
+            h: self.slide_height,
+            geometry,
+            path,
+            geometry_fallback,
+            adjust_values,
+            fill,
+            stroke: None,
+            shadow,
+            transform: Transform::default(),
+        }
+    }
+
+    /// Plots a chart or table frame, or keeps the placeholder for graphics
+    /// that carry no drawable data.
+    #[allow(clippy::too_many_arguments)]
+    fn render_graphic_frame(
+        &mut self,
+        object_id: u32,
+        shape_id: &str,
+        name: &str,
+        rect: PxRect,
+        transform: Transform,
+        frame_space: Space,
+        graphic: Option<&GraphicFrameData>,
+        stories: &[StorySnapshot],
+    ) -> Result<(), RenderError> {
+        if let Some(space) = self.chart_space(graphic) {
+            let frame = ChartFrame {
+                object_id,
+                shape_id: Some(shape_id),
+                name,
+                rect: PlotRect {
+                    x: f64::from(rect.x),
+                    y: f64::from(rect.y),
+                    w: f64::from(rect.w),
+                    h: f64::from(rect.h),
+                },
+                transform,
+            };
+            let (renderer, theme) = (self.renderer, self.theme);
+            let default_font = resolve_theme_font_ref(Some(theme), "+mn-lt");
+            self.substitutions.enter_shape(shape_id);
+            let substitutions = &mut self.substitutions;
+            let chart = chart_primitive(
+                frame,
+                space,
+                &default_font,
+                self.chart_budget,
+                &mut |text| chart_text_primitive(renderer, theme, shape_id, text, substitutions),
+            )?;
+            if let Primitive::Chart { primitives, .. } = &chart {
+                self.chart_budget -= primitives.len();
+            }
+            self.primitives.push(chart);
+            return Ok(());
+        }
+        if let Some(GraphicFrameData::Unknown {
+            picture: Some(picture),
+            ..
+        }) = graphic
+        {
+            let outline = picture
+                .outline
+                .as_ref()
+                .and_then(|outline| stroke(outline, self.theme));
+            self.render_picture(
+                object_id,
+                shape_id,
+                name,
+                rect,
+                transform,
+                picture.media_part_path.as_deref(),
+                &picture.effects,
+                Some(&picture.crop),
+                picture_mask(picture, rect),
+                outline,
+                picture.shape_effects.as_ref().and_then(|effects| {
+                    shadow(
+                        effects,
+                        self.theme,
+                        frame_space,
+                        rect,
+                        transform.rotation_deg,
+                        transform.flip_h,
+                        transform.flip_v,
+                    )
+                }),
+            );
+            return Ok(());
+        }
+        if let Some(GraphicFrameData::Table(table)) = graphic {
+            return self.render_table(
+                object_id,
+                shape_id,
+                name,
+                rect,
+                transform,
+                frame_space,
+                table,
+                stories,
+            );
+        }
+        if let Some(GraphicFrameData::Diagram {
+            drawing_part_path: Some(part_path),
+            ..
+        }) = graphic
+            && let Some(drawing) = self
+                .package
+                .diagram_drawings
+                .iter()
+                .find(|drawing| drawing.part_path == *part_path)
+        {
+            let (scale_x, scale_y) = drawing
+                .synthesis_extent
+                .filter(|[width, height]| *width > 0 && *height > 0)
+                .map(|[width, height]| (rect.w / width as f32, rect.h / height as f32))
+                .unwrap_or((frame_space.scale_x, frame_space.scale_y));
+            let space = Space {
+                origin_x: rect.x,
+                origin_y: rect.y,
+                scale_x,
+                scale_y,
+            };
+            for (index, shape) in drawing.shapes.iter().enumerate() {
+                self.render_parsed_shape(
+                    shape,
+                    &format!("{shape_id}:{index}"),
+                    space,
+                    drawing.synthesis_extent.is_some(),
+                )?;
+            }
+            return Ok(());
+        }
+        self.primitives.push(Primitive::Placeholder {
+            object_id,
+            shape_id: Some(shape_id.to_owned()),
+            name: name.to_owned(),
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+            label: graphic_label(graphic),
+            transform,
+        });
+        Ok(())
+    }
+
+    /// Lays a table out into one container primitive. Every fill paints before
+    /// every border, or a shared edge is overpainted.
+    #[allow(clippy::too_many_arguments)]
+    fn render_table(
+        &mut self,
+        object_id: u32,
+        shape_id: &str,
+        name: &str,
+        rect: PxRect,
+        transform: Transform,
+        space: Space,
+        table: &Table,
+        stories: &[StorySnapshot],
+    ) -> Result<(), RenderError> {
+        let row_count = table.rows.len();
+        let column_count = table.grid.len().max(
+            table
+                .rows
+                .iter()
+                .map(|row| row.cells.len())
+                .max()
+                .unwrap_or_default(),
+        );
+        if row_count == 0 || column_count == 0 {
+            return Ok(());
+        }
+        let columns = column_edges(&table.grid, column_count, rect);
+        let package = self.package;
+        let master = self.master;
+        let master_levels = self.master_other_style_levels.get_or_insert_with(|| {
+            master
+                .map(|master| package.master_other_style_levels(master))
+                .unwrap_or([false; 9])
+        });
+        let text_levels = table_text_levels(master, master_levels, &package.presentation);
+        let table_style = TableStyleScope::new(package, table);
+        let mut heights: Vec<f32> = table.rows.iter().map(|row| emu_to_px(row.height)).collect();
+        let mut spans = Vec::new();
+        let mut plans = Vec::new();
+        let mut story_index = 0;
+        for (row_index, row) in table.rows.iter().enumerate() {
+            for (column, cell) in row.cells.iter().enumerate() {
+                let story = stories.get(story_index);
+                story_index += 1;
+                if column >= column_count {
+                    continue;
+                }
+                self.charge_shape()?;
+                if cell.merged {
+                    continue;
+                }
+                let span = (cell.grid_span as usize).clamp(1, column_count - column);
+                let row_span = (cell.row_span as usize).clamp(1, row_count - row_index);
+                let content = match story {
+                    Some(story) => content_from_story(
+                        story,
+                        Some(&cell.text),
+                        self.slide_number,
+                        self.theme,
+                        false,
+                    ),
+                    None => content_from_body(
+                        &format!("{shape_id}:table:{row_index}:{column}"),
+                        &cell.text,
+                        self.theme,
+                        self.slide_number,
+                    ),
+                };
+                let position = TableCellPosition {
+                    row: row_index,
+                    column,
+                    row_count,
+                    column_count,
+                };
+                let style = table_style.cell(position, cell, span, row_span);
+                let inherited = table_style_text_body(&style, &text_levels);
+                let height = self.cell_text_height(
+                    &content,
+                    cell_cascade(&cell.text, &inherited),
+                    columns[column + span] - columns[column],
+                    heights[row_index..row_index + row_span].iter().sum(),
+                )?;
+                if row_span == 1 {
+                    heights[row_index] = heights[row_index].max(height);
+                } else {
+                    spans.push((row_index, row_span, height));
+                }
+                plans.push(CellPlan {
+                    text: &cell.text,
+                    picture_fill: cell.picture_fill.as_ref(),
+                    inherited,
+                    content,
+                    style,
+                    row: row_index,
+                    column,
+                    span,
+                    row_span,
+                });
+            }
+        }
+        for (row_index, row_span, height) in spans {
+            let covered: f32 = heights[row_index..row_index + row_span].iter().sum();
+            if height > covered {
+                heights[row_index + row_span - 1] += height - covered;
+            }
+        }
+        let mut rows = Vec::with_capacity(row_count + 1);
+        let mut bottom = rect.y;
+        rows.push(bottom);
+        for height in &heights {
+            bottom += height;
+            rows.push(bottom);
+        }
+        let start = self.primitives.len();
+        for plan in &plans {
+            let cell = plan.rect(&columns, &rows);
+            let paint = plan
+                .style
+                .fill
+                .as_ref()
+                .and_then(|fill| paint(fill, self.theme));
+            if plan.picture_fill.is_some() || paint.is_some() {
+                let dpi = plan
+                    .picture_fill
+                    .and_then(|fill| fill.media_part_path.as_deref())
+                    .and_then(|path| self.media_part(path))
+                    .and_then(|part| image_dpi(&part.bytes));
+                self.primitives.push(cell_picture_filled(
+                    cell_fill(object_id, cell, paint),
+                    plan.picture_fill,
+                    dpi,
+                    self.theme,
+                ));
+            }
+        }
+        for plan in &plans {
+            let cell = plan.rect(&columns, &rows);
+            let right = cell.x + cell.w;
+            let foot = cell.y + cell.h;
+            let edges = [
+                (&plan.style.top, (cell.x, cell.y), (right, cell.y)),
+                (&plan.style.bottom, (cell.x, foot), (right, foot)),
+                (&plan.style.left, (cell.x, cell.y), (cell.x, foot)),
+                (&plan.style.right, (right, cell.y), (right, foot)),
+            ];
+            for (outline, from, to) in edges {
+                if let Some(stroke) = outline.as_ref().and_then(|line| stroke(line, self.theme)) {
+                    self.primitives
+                        .push(cell_border(object_id, from, to, stroke));
+                }
+            }
+        }
+        for plan in &plans {
+            let _ = self.render_text_box(
+                object_id,
+                shape_id,
+                plan.rect(&columns, &rows),
+                Transform::default(),
+                space,
+                [0.0; 4],
+                plan.content.clone(),
+                cell_cascade(plan.text, &plan.inherited),
+            )?;
+        }
+        let primitives = self.primitives.split_off(start);
+        self.primitives.push(Primitive::Table {
+            object_id,
+            shape_id: Some(shape_id.to_owned()),
+            name: name.to_owned(),
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            // The pivot for a rotation or flip is the centre of these bounds, so a
+            // turned table keeps the frame's height and clips instead of moving.
+            h: if transform.is_identity() {
+                (bottom - rect.y).max(rect.h)
+            } else {
+                rect.h
+            },
+            label: format!("Table, {row_count} rows, {column_count} columns"),
+            primitives,
+            transform,
+        });
+        Ok(())
+    }
+
+    /// The height a cell's text needs at `width`, insets included. Vertical
+    /// writing runs along the height it would be growing, so it keeps `a:tr/@h`
+    /// rather than being measured across the cell.
+    fn cell_text_height(
+        &self,
+        content: &TextContent,
+        cascade: BodyCascade<'_>,
+        width: f32,
+        height: f32,
+    ) -> Result<f32, RenderError> {
+        if TextFlow::from_body_vert(cascade.vertical()) != TextFlow::Horizontal {
+            return Ok(0.0);
+        }
+        let resolved = resolve_content(
+            self.renderer,
+            self.theme,
+            content,
+            cascade,
+            &mut SubstitutionLog::default(),
+        )?;
+        let left = cascade.inset_left().unwrap_or(DEFAULT_INSET_HORIZONTAL_EMU);
+        let right = cascade
+            .inset_right()
+            .unwrap_or(DEFAULT_INSET_HORIZONTAL_EMU);
+        let top = cascade.inset_top().unwrap_or(DEFAULT_INSET_VERTICAL_EMU);
+        let bottom = cascade.inset_bottom().unwrap_or(DEFAULT_INSET_VERTICAL_EMU);
+        let rect = PxRect {
+            x: 0.0,
+            y: 0.0,
+            w: (width - emu_to_px(left + right)).max(1.0),
+            h: (height - emu_to_px(top + bottom)).max(1.0),
+        };
+        let text = if cascade.num_col() > 1 {
+            self.layout_text_columns(
+                &resolved,
+                rect,
+                cascade,
+                autofit_font_scale(cascade.autofit()),
+            )?
+        } else {
+            self.layout_text(&resolved, rect, 1.0, false, true)?
+        };
+        Ok(text.total_height + emu_to_px(top + bottom))
+    }
+
+    fn chart_space(&mut self, graphic: Option<&GraphicFrameData>) -> Option<&'a ChartSpace> {
+        let GraphicFrameData::Chart {
+            part_path: Some(part_path),
+            ..
+        } = graphic?
+        else {
+            return None;
+        };
+        let theme_part_path = self.theme_part_path;
+        self.chart_parts
+            .get_or_insert_with(|| {
+                let mut index = HashMap::new();
+                for part in &self.package.charts {
+                    index
+                        .entry((part.part_path.as_str(), part.theme_part_path.as_deref()))
+                        .or_insert(part);
+                }
+                index
+            })
+            .get(&(part_path.as_str(), theme_part_path))
+            .map(|part| &part.chart)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_text_box(
+        &mut self,
+        object_id: u32,
+        shape_id: &str,
+        rect: PxRect,
+        transform: Transform,
+        space: Space,
+        preset_inset: [f32; 4],
+        content: TextContent,
+        cascade: BodyCascade<'_>,
+    ) -> Result<Option<TextHit>, RenderError> {
+        self.substitutions.enter_shape(shape_id);
+        let mut resolved = resolve_content(
+            self.renderer,
+            self.theme,
+            &content,
+            cascade,
+            &mut self.substitutions,
+        )?;
+        let flow = TextFlow::from_body_vert(cascade.vertical());
+        let text_transform = text_transform(transform, flow);
+        let text_rect = flow.layout_rect(rect);
+        let left = cascade.inset_left().unwrap_or(DEFAULT_INSET_HORIZONTAL_EMU);
+        let right = cascade
+            .inset_right()
+            .unwrap_or(DEFAULT_INSET_HORIZONTAL_EMU);
+        let top = cascade.inset_top().unwrap_or(DEFAULT_INSET_VERTICAL_EMU);
+        let bottom = cascade.inset_bottom().unwrap_or(DEFAULT_INSET_VERTICAL_EMU);
+        let [left, top, right, bottom] = flow.layout_insets([left, top, right, bottom]);
+        let [preset_l, preset_t, preset_r, preset_b] = flow.layout_insets(preset_inset);
+        let content_rect = PxRect {
+            x: text_rect.x + emu_to_px(left) + preset_l,
+            y: text_rect.y + emu_to_px(top) + preset_t,
+            w: (text_rect.w - emu_to_px(left + right) - preset_l - preset_r).max(1.0),
+            h: (text_rect.h - emu_to_px(top + bottom) - preset_t - preset_b).max(1.0),
+        };
+        let mut scale = if content.refit_autofit {
+            let steps = [
+                (100_000, 0),
+                (100_000, 10_000),
+                (100_000, 20_000),
+                (92_500, 20_000),
+                (85_000, 20_000),
+                (77_500, 20_000),
+                (70_000, 20_000),
+                (62_500, 20_000),
+                (55_000, 20_000),
+                (47_500, 20_000),
+                (40_000, 20_000),
+                (32_500, 20_000),
+                (25_000, 20_000),
+            ];
+            let mut low = 0;
+            let mut high = steps.len() - 1;
+            while low < high {
+                let mid = (low + high) / 2;
+                let (scale, reduction) = steps[mid];
+                for paragraph in &mut resolved.paragraphs {
+                    paragraph.line_space_reduction = reduction as f32 / 100_000.0;
+                }
+                let text = self.layout_text_columns(
+                    &resolved,
+                    content_rect,
+                    cascade,
+                    scale as f32 / 100_000.0,
+                )?;
+                if text.total_height <= content_rect.h
+                    && text.lines.iter().all(|line| {
+                        line.x >= content_rect.x
+                            && visible_right(line)
+                                <= content_rect.x + content_rect.w + FIT_EPSILON_PX
+                    })
+                {
+                    high = mid;
+                } else {
+                    low = mid + 1;
+                }
+            }
+            let (scale, reduction) = steps[low];
+            for paragraph in &mut resolved.paragraphs {
+                paragraph.line_space_reduction = reduction as f32 / 100_000.0;
+            }
+            self.autofit.insert(
+                content.story_id.clone(),
+                TextAutofit::Normal {
+                    font_scale: Some(f64::from(scale) / 100_000.0),
+                    line_space_reduction: Some(f64::from(reduction) / 100_000.0),
+                },
+            );
+            scale as f32 / 100_000.0
+        } else {
+            autofit_font_scale(cascade.autofit())
+        };
+        if self.shape_filter.is_some() {
+            return Ok(None);
+        }
+        let mut laid_out = self.layout_text_columns(&resolved, content_rect, cascade, scale)?;
+        if cascade.fit_to_box {
+            let largest_font = resolved
+                .paragraphs
+                .iter()
+                .flat_map(|paragraph| &paragraph.runs)
+                .map(|run| run.style.font_size_pt)
+                .fold(1.0_f32, f32::max);
+            let minimum_scale = 1.0 / largest_font;
+            while laid_out.total_height > content_rect.h
+                || laid_out
+                    .lines
+                    .iter()
+                    .any(|line| line.x + line.width > content_rect.x + content_rect.w)
+            {
+                let next_scale = (scale * 0.8).max(minimum_scale);
+                if next_scale >= scale {
+                    break;
+                }
+                scale = next_scale;
+                laid_out = self.layout_text_columns(&resolved, content_rect, cascade, scale)?;
+            }
+        }
+        self.line_count += laid_out.lines.len();
+        if self.line_count > MAX_TEXT_LINES {
+            return Err(RenderError::ResourceLimit(format!(
+                "more than {MAX_TEXT_LINES} text lines"
+            )));
+        }
+        let anchor = match cascade.anchor() {
+            Some("ctr") => TextAnchor::Center,
+            Some("b") => TextAnchor::Bottom,
+            _ => TextAnchor::Top,
+        };
+        let spare_height = content_rect.h - laid_out.total_height;
+        let spare_height = if cascade.clips_overflow() {
+            spare_height.max(0.0)
+        } else {
+            spare_height
+        };
+        let vertical_shift = match anchor {
+            TextAnchor::Top => 0.0,
+            TextAnchor::Center => spare_height / 2.0,
+            TextAnchor::Bottom => spare_height,
+        };
+        for line in &mut laid_out.lines {
+            shift_line(line, 0.0, vertical_shift);
+        }
+        if flow == TextFlow::VertLeftToRight {
+            reverse_line_order(&mut laid_out.lines);
+        }
+        let display_paragraphs = resolved
+            .paragraphs
+            .iter()
+            .map(|paragraph| TextParagraph {
+                align: Some(paragraph.align),
+                level: paragraph.level,
+                runs: paragraph
+                    .runs
+                    .iter()
+                    .map(|run| TextRun {
+                        text: run.text.clone(),
+                        font_family: run.style.family.clone(),
+                        font_size_pt: autofit_size_pt(run.style.font_size_pt, scale),
+                        bold: run.style.bold,
+                        italic: run.style.italic,
+                        underline: run.style.underline,
+                        color: run.style.color.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let (left, right) = (text_rect.x - 0.5, text_rect.x + text_rect.w + 0.5);
+        let horizontal_overflow = laid_out.lines.iter().any(|line| {
+            line.runs
+                .iter()
+                .filter(|run| !run.text.trim().is_empty())
+                .any(|run| run.x < left || run.x + run.width > right)
+        });
+        let overflow = !cascade.clips_overflow()
+            && (laid_out.total_height > content_rect.h || horizontal_overflow);
+        let text_shadow = cascade.text_shadow().and_then(|effects| {
+            shadow(
+                effects,
+                self.theme,
+                space,
+                text_rect,
+                text_transform.rotation_deg,
+                text_transform.flip_h,
+                text_transform.flip_v,
+            )
+        });
+        let story_id = content.story_id;
+        let lines = laid_out.lines;
+        self.primitives.push(Primitive::TextBox {
+            text_shadow,
+            object_id,
+            shape_id: Some(shape_id.to_owned()),
+            story_id: Some(story_id.clone()),
+            x: text_rect.x,
+            y: text_rect.y,
+            w: text_rect.w,
+            h: text_rect.h,
+            anchor,
+            paragraphs: display_paragraphs,
+            lines: lines.clone(),
+            overflow,
+            transform: text_transform,
+        });
+        Ok(Some(TextHit {
+            overflow,
+            story_id,
+            rect: text_rect,
+            transform: text_transform,
+            lines,
+        }))
+    }
+
+    fn layout_text_columns(
+        &self,
+        resolved: &ResolvedContent,
+        rect: PxRect,
+        cascade: BodyCascade<'_>,
+        scale: f32,
+    ) -> Result<LayoutText, RenderError> {
+        let flow = TextFlow::from_body_vert(cascade.vertical());
+        let stacked = flow == TextFlow::Stacked;
+        let columns = if flow == TextFlow::Horizontal {
+            cascade.num_col()
+        } else {
+            1
+        };
+        let gap = emu_to_px(cascade.spc_col()).min(
+            (rect.w - f32::from(columns)).max(0.0) / f32::from(columns.saturating_sub(1).max(1)),
+        );
+        let column_rect = PxRect {
+            w: ((rect.w - f32::from(columns - 1) * gap) / f32::from(columns)).max(1.0),
+            ..rect
+        };
+        let mut laid_out =
+            self.layout_text(resolved, column_rect, scale, stacked, cascade.wraps())?;
+        if columns > 1 {
+            flow_text_columns(&mut laid_out, column_rect, columns, gap, cascade.rtl_col());
+        }
+        Ok(laid_out)
+    }
+
+    /// `layout_content` behind the renderer cache.
+    fn layout_text(
+        &self,
+        content: &ResolvedContent,
+        rect: PxRect,
+        scale: f32,
+        stacked: bool,
+        wraps: bool,
+    ) -> Result<LayoutText, RenderError> {
+        let key = text_layout_key(content, rect, scale, stacked, wraps);
+        if let Some(text) = self
+            .renderer
+            .text_layouts
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key))
+        {
+            return Ok(text);
+        }
+        let laid_out = layout_content(&self.renderer.fonts, content, rect, scale, stacked, wraps)?;
+        if let Ok(mut cache) = self.renderer.text_layouts.lock() {
+            cache.insert(key, &laid_out);
+        }
+        Ok(laid_out)
+    }
+}
+
+/// One cell of a table, measured and ready to paint.
+struct CellPlan<'a> {
+    text: &'a TextBody,
+    picture_fill: Option<&'a PictureFill>,
+    inherited: TextBody,
+    content: TextContent,
+    style: ResolvedCellStyle,
+    row: usize,
+    column: usize,
+    span: usize,
+    row_span: usize,
+}
+
+impl CellPlan<'_> {
+    fn rect(&self, columns: &[f32], rows: &[f32]) -> PxRect {
+        let x = columns[self.column];
+        let y = rows[self.row];
+        PxRect {
+            x,
+            y,
+            w: columns[self.column + self.span] - x,
+            h: rows[self.row + self.row_span] - y,
+        }
+    }
+}
+
+/// Column edges across the frame, scaling a declared grid that disagrees with
+/// the frame's own width.
+fn column_edges(grid: &[i64], column_count: usize, rect: PxRect) -> Vec<f32> {
+    let declared: Vec<f64> = grid
+        .iter()
+        .map(|width| f64::from(emu_to_px(*width)))
+        .collect();
+    let widths = normalize_table_column_widths(&declared, column_count, f64::from(rect.w));
+    let total: f64 = widths.iter().sum();
+    let scale = if total > 0.0 {
+        f64::from(rect.w) / total
+    } else {
+        0.0
+    };
+    let mut edges = Vec::with_capacity(column_count + 1);
+    let mut offset = 0.0;
+    edges.push(rect.x);
+    for width in widths {
+        offset += width * scale;
+        edges.push(rect.x + safe_geometry(offset as f32));
+    }
+    edges
+}
+
+/// A cell's own `a:tcPr`, as the top of the style cascade.
+fn direct_cell_style(cell: &TableCell) -> TableCellStyle {
+    let edge = |outline: &Option<ShapeOutline>| {
+        outline
+            .clone()
+            .map(|outline| TableCellBorder::Line(Box::new(outline)))
+    };
+    TableCellStyle {
+        fill: cell.fill.clone(),
+        borders: StyleCellBorders {
+            left: edge(&cell.borders.left),
+            right: edge(&cell.borders.right),
+            top: edge(&cell.borders.top),
+            bottom: edge(&cell.borders.bottom),
+            inside_horizontal: None,
+            inside_vertical: None,
+        },
+    }
+}
+
+fn cell_cascade<'a>(text: &'a TextBody, inherited: &'a TextBody) -> BodyCascade<'a> {
+    BodyCascade {
+        fit_to_box: false,
+        primary: Some(text),
+        layout: None,
+        master: Some(inherited),
+        master_slide: None,
+        default_style: &[],
+        default_paragraph: None,
+        placeholder: None,
+        style_color: None,
+    }
+}
+
+fn cell_fill(object_id: u32, rect: PxRect, fill: Option<Paint>) -> Primitive {
+    Primitive::Shape {
+        clip: None,
+        even_odd: false,
+        object_id,
+        shape_id: None,
+        name: String::new(),
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        geometry: "rect".to_owned(),
+        path: geometry_path(
+            "rect",
+            &BTreeMap::new(),
+            f64::from(rect.w) / f64::from(rect.h),
+        ),
+        geometry_fallback: false,
+        adjust_values: BTreeMap::new(),
+        fill,
+        stroke: None,
+        shadow: None,
+        transform: Transform::default(),
+    }
+}
+
+fn cell_border(object_id: u32, from: (f32, f32), to: (f32, f32), stroke: Stroke) -> Primitive {
+    Primitive::Shape {
+        clip: None,
+        even_odd: false,
+        object_id,
+        shape_id: None,
+        name: String::new(),
+        x: from.0,
+        y: from.1,
+        w: to.0 - from.0,
+        h: to.1 - from.1,
+        geometry: "line".to_owned(),
+        path: vec![
+            GeometryPathCommand::Move { x: 0.0, y: 0.0 },
+            GeometryPathCommand::Line { x: 1.0, y: 1.0 },
+        ],
+        geometry_fallback: false,
+        adjust_values: BTreeMap::new(),
+        fill: None,
+        stroke: Some(stroke),
+        shadow: None,
+        transform: Transform::default(),
+    }
+}
+
+/// Text flow relative to the shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextFlow {
+    Horizontal,
+    Vert,
+    Vert270,
+    VertLeftToRight,
+    Stacked,
+}
+
+impl TextFlow {
+    fn from_body_vert(vertical: Option<&str>) -> Self {
+        match vertical {
+            Some("vert" | "eaVert") => Self::Vert,
+            Some("vert270") => Self::Vert270,
+            Some("mongolianVert") => Self::VertLeftToRight,
+            Some("wordArtVert" | "wordArtVertRtl") => Self::Stacked,
+            _ => Self::Horizontal,
+        }
+    }
+
+    fn rotation_deg(self) -> f32 {
+        match self {
+            Self::Horizontal | Self::Stacked => 0.0,
+            Self::Vert | Self::VertLeftToRight => 90.0,
+            Self::Vert270 => -90.0,
+        }
+    }
+
+    fn layout_rect(self, rect: PxRect) -> PxRect {
+        match self {
+            Self::Horizontal | Self::Stacked => rect,
+            Self::Vert | Self::Vert270 | Self::VertLeftToRight => PxRect {
+                x: rect.x + (rect.w - rect.h) / 2.0,
+                y: rect.y + (rect.h - rect.w) / 2.0,
+                w: rect.h,
+                h: rect.w,
+            },
+        }
+    }
+
+    fn layout_insets<T: Copy>(self, [left, top, right, bottom]: [T; 4]) -> [T; 4] {
+        match self {
+            Self::Horizontal | Self::Stacked => [left, top, right, bottom],
+            Self::Vert | Self::VertLeftToRight => [top, right, bottom, left],
+            Self::Vert270 => [bottom, left, top, right],
+        }
+    }
+}
+
+/// Mirrors the lines within the block they occupy, keeping the block in place.
+/// The right edge of a line's ink: blanks that hang past the end of a wrapped
+/// line, or that were just typed, do not count, as in `aligned_slice`.
+fn visible_right(line: &PositionedTextLine) -> f32 {
+    let last = line.runs.iter().rev().find_map(|run| {
+        let visible = run.text.trim_end_matches(char::is_whitespace);
+        (!visible.is_empty()).then(|| {
+            (
+                run.end - utf16_len(&run.text[visible.len()..]),
+                run.letter_spacing_px,
+            )
+        })
+    });
+    let Some((end, tracking)) = last else {
+        return line.x;
+    };
+    let right = line
+        .caret_stops
+        .iter()
+        .filter(|stop| stop.position <= end)
+        .map(|stop| stop.x)
+        .fold(line.x, f32::max);
+    let ends_at_right = line
+        .caret_stops
+        .iter()
+        .any(|stop| stop.position == end && stop.x >= right);
+    if ends_at_right {
+        right - tracking
+    } else {
+        right
+    }
+}
+
+fn reverse_line_order(lines: &mut [PositionedTextLine]) {
+    let Some(top) = lines.iter().map(|line| line.y).reduce(f32::min) else {
+        return;
+    };
+    let bottom = lines
+        .iter()
+        .map(|line| line.y + line.height)
+        .fold(f32::MIN, f32::max);
+    for line in lines {
+        shift_line(line, 0.0, top + bottom - line.height - 2.0 * line.y);
+    }
+}
+
+/// Removes glyph reflections and applies vertical flow.
+fn text_transform(shape: Transform, flow: TextFlow) -> Transform {
+    if flow == TextFlow::Horizontal && !shape.flip_v {
+        return Transform {
+            flip_h: false,
+            ..shape
+        };
+    }
+    let rotation_deg =
+        shape.rotation_deg + if shape.flip_v { 180.0 } else { 0.0 } + flow.rotation_deg();
+    Transform {
+        rotation_deg: rotation_deg.rem_euclid(360.0),
+        flip_h: false,
+        flip_v: false,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BodyCascade<'a> {
+    fit_to_box: bool,
+    primary: Option<&'a TextBody>,
+    layout: Option<&'a TextBody>,
+    master: Option<&'a TextBody>,
+    master_slide: Option<&'a SlideMaster>,
+    /// `p:defaultTextStyle`, which outranks the master's `otherStyle` for
+    /// text outside placeholders.
+    default_style: &'a [ParagraphProperties],
+    /// `p:defaultTextStyle/a:defPPr`, under every level of `default_style`.
+    default_paragraph: Option<&'a ParagraphProperties>,
+    placeholder: Option<&'a Placeholder>,
+    style_color: Option<&'a ColorValue>,
+}
+
+impl<'a> BodyCascade<'a> {
+    /// The shadow the body's text is drawn with. PowerPoint keeps one per run;
+    /// the first any level declares stands for the whole box, because a body
+    /// that shadows one run shadows them all.
+    fn text_shadow(&self) -> Option<&ShapeEffects> {
+        [self.primary, self.layout, self.master]
+            .into_iter()
+            .flatten()
+            .find_map(body_text_effects)
+    }
+
+    fn clips_overflow(&self) -> bool {
+        let vertical = cascade_value(self.primary, self.layout, self.master, |body| {
+            body.vertical_overflow
+        });
+        let horizontal = cascade_value(self.primary, self.layout, self.master, |body| {
+            body.horizontal_overflow
+        });
+        [vertical, horizontal]
+            .into_iter()
+            .flatten()
+            .any(|value| value != TextOverflow::Overflow)
+    }
+
+    fn anchor(&self) -> Option<&str> {
+        self.primary
+            .and_then(|body| body.anchor.as_deref())
+            .or_else(|| self.layout.and_then(|body| body.anchor.as_deref()))
+            .or_else(|| self.master.and_then(|body| body.anchor.as_deref()))
+    }
+
+    fn vertical(&self) -> Option<&str> {
+        self.primary
+            .and_then(|body| body.vertical.as_deref())
+            .or_else(|| self.layout.and_then(|body| body.vertical.as_deref()))
+            .or_else(|| self.master.and_then(|body| body.vertical.as_deref()))
+    }
+
+    fn num_col(&self) -> u8 {
+        cascade_value(self.primary, self.layout, self.master, |body| body.num_col)
+            .unwrap_or(1)
+            .clamp(1, 16)
+    }
+
+    fn spc_col(&self) -> i64 {
+        cascade_value(self.primary, self.layout, self.master, |body| body.spc_col)
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    fn rtl_col(&self) -> bool {
+        cascade_value(self.primary, self.layout, self.master, |body| body.rtl_col).unwrap_or(false)
+    }
+
+    fn space_first_last_para(&self) -> bool {
+        cascade_value(self.primary, self.layout, self.master, |body| {
+            body.space_first_last_para
+        })
+        .unwrap_or(false)
+    }
+
+    /// `a:bodyPr/@wrap="none"`: every paragraph is one line, however far it
+    /// runs past the shape.
+    fn wraps(&self) -> bool {
+        cascade_value(self.primary, self.layout, self.master, |body| body.wrap).unwrap_or(true)
+    }
+
+    fn autofit(&self) -> Option<&TextAutofit> {
+        self.primary
+            .and_then(|body| body.autofit.as_ref())
+            .or_else(|| self.layout.and_then(|body| body.autofit.as_ref()))
+            .or_else(|| self.master.and_then(|body| body.autofit.as_ref()))
+    }
+
+    fn inset_left(&self) -> Option<i64> {
+        cascade_value(self.primary, self.layout, self.master, |body| {
+            body.inset_left
+        })
+    }
+
+    fn inset_top(&self) -> Option<i64> {
+        cascade_value(self.primary, self.layout, self.master, |body| {
+            body.inset_top
+        })
+    }
+
+    fn inset_right(&self) -> Option<i64> {
+        cascade_value(self.primary, self.layout, self.master, |body| {
+            body.inset_right
+        })
+    }
+
+    fn inset_bottom(&self) -> Option<i64> {
+        cascade_value(self.primary, self.layout, self.master, |body| {
+            body.inset_bottom
+        })
+    }
+
+    /// `a:endParaRPr`: what PowerPoint sizes a paragraph by when it carries no
+    /// runs of its own.
+    fn end_run_properties(&self, index: usize) -> Option<&'a RunProperties> {
+        [self.primary, self.layout, self.master]
+            .into_iter()
+            .flatten()
+            .find_map(|body| {
+                body.paragraphs
+                    .get(index)
+                    .and_then(|paragraph| paragraph.end_properties.as_ref())
+            })
+    }
+
+    fn paragraph_properties(
+        &self,
+        index: usize,
+        level: u32,
+        authored: Option<&Bullet>,
+    ) -> ParagraphProperties {
+        ParagraphCascade {
+            primary: self.primary,
+            layout: self.layout,
+            master: self.master,
+            master_slide: self.master_slide,
+            default_style: self.default_style,
+            default_paragraph: self.default_paragraph,
+            placeholder: self.placeholder,
+            style_color: self.style_color,
+        }
+        .properties(index, level, authored)
+    }
+}
+
+fn cascade_value<T: Copy>(
+    primary: Option<&TextBody>,
+    layout: Option<&TextBody>,
+    master: Option<&TextBody>,
+    get: impl Fn(&TextBody) -> Option<T>,
+) -> Option<T> {
+    primary
+        .and_then(&get)
+        .or_else(|| layout.and_then(&get))
+        .or_else(|| master.and_then(get))
+}
+
+#[derive(Clone)]
+struct TextContent {
+    story_id: String,
+    refit_autofit: bool,
+    paragraphs: Vec<ContentParagraph>,
+}
+
+#[derive(Clone)]
+struct ContentParagraph {
+    alignment: Option<String>,
+    level: u32,
+    bullet: Option<Bullet>,
+    runs: Vec<ContentRun>,
+    /// `a:endParaRPr/@lang` of the source paragraph.
+    end_language: Option<String>,
+}
+
+#[derive(Clone)]
+struct ContentRun {
+    text: String,
+    style: TextStyle,
+    /// Byte ranges of `text` with the `a:rPr/@lang` of the source text they come from;
+    /// ranges overlap when an edited paragraph can no longer be mapped to its source runs.
+    languages: Vec<(std::ops::Range<usize>, Option<String>)>,
+    /// Byte ranges of `text` with the `a:ea/@typeface` written on the source
+    /// run itself; empty where none is known.
+    east_asian: Vec<(std::ops::Range<usize>, Option<String>)>,
+}
+
+/// For each story paragraph without a source paragraph (new or split off), the nearest
+/// preceding and following paragraphs that have one; their languages stand in for its own.
+fn sourced_neighbours<'a>(
+    resolved: &[Option<&'a pptx_parse::TextParagraph>],
+) -> Vec<[Option<&'a pptx_parse::TextParagraph>; 2]> {
+    let mut out = vec![[None, None]; resolved.len()];
+    let mut previous = None;
+    for (index, source) in resolved.iter().enumerate() {
+        out[index][0] = previous;
+        if source.is_some() {
+            previous = *source;
+        }
+    }
+    let mut next = None;
+    for (index, source) in resolved.iter().enumerate().rev() {
+        out[index][1] = next;
+        if source.is_some() {
+            next = *source;
+        }
+    }
+    out
+}
+
+/// Live story content; `with_languages` attaches the source languages that only font
+/// requests read, so layout skips that work.
+fn content_from_story(
+    story: &StorySnapshot,
+    source: Option<&TextBody>,
+    slide_number: i64,
+    theme: &Theme,
+    with_languages: bool,
+) -> TextContent {
+    TextContent {
+        story_id: story.id.clone(),
+        refit_autofit: false,
+        paragraphs: {
+            let resolved: Vec<Option<&pptx_parse::TextParagraph>> = story
+                .paragraphs
+                .iter()
+                .map(|paragraph| {
+                    source.and_then(|body| source_paragraph(body, &story.id, &paragraph.id))
+                })
+                .collect();
+            let neighbours = if with_languages {
+                sourced_neighbours(&resolved)
+            } else {
+                Vec::new()
+            };
+            story
+                .paragraphs
+                .iter()
+                .enumerate()
+                .map(|(index, paragraph)| {
+                    let source_para = resolved[index];
+                    let live: Vec<&str> =
+                        paragraph.runs.iter().map(|run| run.text.as_str()).collect();
+                    let replacements = source_para
+                        .map(|source| slide_number_run_texts(source, &live, slide_number));
+                    let insertions = source_para
+                        .map(|source| slide_number_insertions(source, &live))
+                        .unwrap_or_default();
+                    let sources: Vec<&pptx_parse::TextParagraph> = if !with_languages {
+                        Vec::new()
+                    } else if paragraph.source_paragraphs.len() > 1 {
+                        paragraph
+                            .source_paragraphs
+                            .iter()
+                            .take(MAX_LANGUAGE_SOURCES)
+                            .filter_map(|joined| {
+                                source
+                                    .and_then(|body| source_paragraph(body, &story.id, &joined.id))
+                            })
+                            .collect()
+                    } else if source_para.is_some() {
+                        source_para.into_iter().collect()
+                    } else {
+                        neighbours[index].iter().flatten().copied().collect()
+                    };
+                    let mut live_languages = if with_languages {
+                        live_run_languages(&sources, &live)
+                    } else {
+                        Vec::new()
+                    }
+                    .into_iter();
+                    let mut live_east_asian =
+                        live_run_east_asian(source_para.as_slice(), &live).into_iter();
+                    let mut runs = Vec::with_capacity(paragraph.runs.len() + insertions.len());
+                    let mut insertion_index = 0;
+                    let mut offset = 0;
+                    for (run_index, run) in paragraph.runs.iter().enumerate() {
+                        while insertion_index < insertions.len()
+                            && insertions[insertion_index].0 == offset
+                        {
+                            let source_run = insertions[insertion_index].1;
+                            let text = slide_number.to_string();
+                            runs.push(ContentRun {
+                                languages: if with_languages {
+                                    vec![(0..text.len(), source_run.properties.language.clone())]
+                                } else {
+                                    Vec::new()
+                                },
+                                text,
+                                style: style_from_run_properties(
+                                    &source_run.properties,
+                                    Some(theme),
+                                ),
+                                east_asian: whole_run_east_asian(
+                                    &slide_number.to_string(),
+                                    &source_run.properties,
+                                ),
+                            });
+                            insertion_index += 1;
+                        }
+                        offset += run.text.len();
+                        let languages = live_languages.next().unwrap_or_default();
+                        let replaced = replacements
+                            .as_ref()
+                            .and_then(|values| values.get(run_index))
+                            .and_then(|value| value.clone());
+                        let languages = match &replaced {
+                            Some(text) if with_languages => east_asian_languages(
+                                &mut languages.iter().map(|(_, tag)| tag.as_ref()),
+                            )
+                            .into_iter()
+                            .map(|tag| (0..text.len(), tag))
+                            .collect(),
+                            _ => languages,
+                        };
+                        runs.push(ContentRun {
+                            languages,
+                            text: replaced.unwrap_or_else(|| run.text.clone()),
+                            style: run.style.clone(),
+                            east_asian: live_east_asian.next().unwrap_or_default(),
+                        });
+                    }
+                    while insertion_index < insertions.len() {
+                        let source_run = insertions[insertion_index].1;
+                        let text = slide_number.to_string();
+                        runs.push(ContentRun {
+                            languages: if with_languages {
+                                vec![(0..text.len(), source_run.properties.language.clone())]
+                            } else {
+                                Vec::new()
+                            },
+                            text,
+                            style: style_from_run_properties(&source_run.properties, Some(theme)),
+                            east_asian: whole_run_east_asian(
+                                &slide_number.to_string(),
+                                &source_run.properties,
+                            ),
+                        });
+                        insertion_index += 1;
+                    }
+                    ContentParagraph {
+                        alignment: paragraph.alignment.clone(),
+                        level: paragraph.level,
+                        bullet: paragraph
+                            .bullet_json
+                            .as_deref()
+                            .and_then(|json| serde_json::from_str(json).ok()),
+                        runs,
+                        end_language: source_para
+                            .and_then(|source| source.end_properties.as_ref())
+                            .and_then(|properties| properties.language.clone()),
+                    }
+                })
+                .collect()
+        },
+    }
+}
+
+/// Resolves inherited slide-number fields.
+fn field_text(run: &pptx_parse::TextRun, slide_number: i64) -> String {
+    match run.field_type.as_deref() {
+        Some("slidenum") => slide_number.to_string(),
+        _ => run.text.clone(),
+    }
+}
+
+fn content_from_body(
+    story_id: &str,
+    body: &TextBody,
+    theme: &Theme,
+    slide_number: i64,
+) -> TextContent {
+    TextContent {
+        story_id: format!("inherited:{story_id}"),
+        refit_autofit: false,
+        paragraphs: body
+            .paragraphs
+            .iter()
+            .map(|paragraph| ContentParagraph {
+                alignment: paragraph.properties.alignment.clone(),
+                level: paragraph.properties.level,
+                bullet: paragraph.properties.bullet.clone(),
+                runs: paragraph
+                    .runs
+                    .iter()
+                    .map(|run| {
+                        let text = field_text(run, slide_number);
+                        ContentRun {
+                            languages: vec![(0..text.len(), run.properties.language.clone())],
+                            text,
+                            style: style_from_properties(&run.properties, theme),
+                            east_asian: whole_run_east_asian(
+                                &field_text(run, slide_number),
+                                &run.properties,
+                            ),
+                        }
+                    })
+                    .collect(),
+                end_language: paragraph
+                    .end_properties
+                    .as_ref()
+                    .and_then(|properties| properties.language.clone()),
+            })
+            .collect(),
+    }
+}
+
+struct ResolvedContent {
+    paragraphs: Vec<ResolvedParagraph>,
+    /// `a:bodyPr/@spcFirstLastPara`: the outer paragraphs keep their spacing.
+    space_first_last_para: bool,
+}
+
+struct ResolvedParagraph {
+    align: TextAlign,
+    justify: bool,
+    level: u32,
+    margin_left_px: f32,
+    margin_right_px: f32,
+    line_spacing: Option<LineSpacing>,
+    space_before: Option<LineSpacing>,
+    space_after: Option<LineSpacing>,
+    line_space_reduction: f32,
+    indent_px: f32,
+    /// `a:tabLst` stops in pixels from the text area's left edge, ascending.
+    tab_stops: Vec<f32>,
+    /// Pitch of the implicit stops past the last declared one.
+    default_tab_px: f32,
+    marker: Option<String>,
+    bullet_style: Option<ResolvedStyle>,
+    /// `a:pPr/@rtl`: margins, indent, bullet and run order mirror.
+    rtl: bool,
+    runs: Vec<ResolvedRun>,
+}
+
+struct ResolvedRun {
+    text: String,
+    start: u32,
+    style: ResolvedStyle,
+}
+
+#[derive(Clone)]
+struct ResolvedStyle {
+    face: FontFace,
+    family: String,
+    font_size_pt: f32,
+    /// Size the line box and percentage line spacing read. Small caps shape
+    /// smaller than the run was authored at without shortening its line.
+    line_font_size_pt: f32,
+    /// `spc`: tracking added after every cluster, in points.
+    spacing_pt: f32,
+    /// `kern`: the smallest size, in points, the run is kerned at.
+    kern_pt: Option<f32>,
+    baseline_shift_px: f32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strike: Option<String>,
+    color: String,
+    caps: TextCaps,
+}
+
+struct ParagraphSource<'a> {
+    paragraph: &'a ContentParagraph,
+    properties: ParagraphProperties,
+    end_properties: Option<&'a RunProperties>,
+}
+
+fn paragraph_sources<'a>(
+    content: &'a TextContent,
+    cascade: BodyCascade<'a>,
+) -> Result<impl Iterator<Item = ParagraphSource<'a>> + 'a, RenderError> {
+    let total_bytes = content
+        .paragraphs
+        .iter()
+        .flat_map(|paragraph| &paragraph.runs)
+        .map(|run| run.text.len())
+        .sum::<usize>();
+    let total_runs = content
+        .paragraphs
+        .iter()
+        .map(|paragraph| paragraph.runs.len())
+        .sum::<usize>();
+    if total_bytes > MAX_TEXT_BYTES {
+        return Err(RenderError::ResourceLimit(format!(
+            "text exceeds {MAX_TEXT_BYTES} bytes"
+        )));
+    }
+    if content.paragraphs.len() > MAX_TEXT_PARAGRAPHS {
+        return Err(RenderError::ResourceLimit(format!(
+            "more than {MAX_TEXT_PARAGRAPHS} text paragraphs"
+        )));
+    }
+    if total_runs > MAX_TEXT_RUNS {
+        return Err(RenderError::ResourceLimit(format!(
+            "more than {MAX_TEXT_RUNS} text runs"
+        )));
+    }
+    Ok(content
+        .paragraphs
+        .iter()
+        .enumerate()
+        .map(move |(index, paragraph)| {
+            let properties =
+                cascade.paragraph_properties(index, paragraph.level, paragraph.bullet.as_ref());
+            let end_properties = if paragraph.runs.is_empty() {
+                cascade.end_run_properties(index)
+            } else {
+                None
+            };
+            ParagraphSource {
+                paragraph,
+                properties,
+                end_properties,
+            }
+        }))
+}
+
+fn paragraph_marker(
+    paragraph: &ContentParagraph,
+    properties: &ParagraphProperties,
+    numbering: &mut ListCounters,
+) -> Option<String> {
+    numbering
+        .next(
+            properties.bullet.as_ref(),
+            paragraph.level,
+            paragraph.runs.iter().any(|run| !run.text.is_empty()),
+        )
+        .map(|marker| marker.text())
+}
+
+fn resolve_content(
+    renderer: &SlideRenderer,
+    theme: &Theme,
+    content: &TextContent,
+    cascade: BodyCascade<'_>,
+    substitutions: &mut SubstitutionLog,
+) -> Result<ResolvedContent, RenderError> {
+    let sources = paragraph_sources(content, cascade)?;
+    let line_space_reduction = autofit_line_space_reduction(cascade.autofit());
+    let mut story_offset = 0_u32;
+    let mut paragraphs = Vec::with_capacity(content.paragraphs.len());
+    let mut numbering = ListCounters::default();
+    for source in sources {
+        let ParagraphSource {
+            paragraph,
+            properties,
+            end_properties,
+        } = source;
+        let language = properties
+            .default_run
+            .as_ref()
+            .and_then(|value| value.language.as_deref());
+        let mut runs = Vec::with_capacity(paragraph.runs.len().max(1));
+        for run in &paragraph.runs {
+            for (text, direct_east_asian) in east_asian_pieces(run) {
+                let style = resolve_style(
+                    renderer,
+                    theme,
+                    &run.style,
+                    direct_east_asian,
+                    properties.default_run.as_ref(),
+                    substitutions,
+                )?;
+                let start = story_offset;
+                story_offset = story_offset.saturating_add(utf16_len(text));
+                let mut cased = Vec::new();
+                push_cased_runs(&mut cased, text, start, language, style);
+                if properties.rtl == Some(true) {
+                    let mut directed = Vec::new();
+                    for run in cased {
+                        split_by_direction(run, &mut directed);
+                    }
+                    cased = directed;
+                }
+                for run in cased {
+                    renderer.split_by_coverage(run, &mut runs);
+                }
+            }
+        }
+        if runs.is_empty() {
+            let end_style = end_properties
+                .map(|end| style_from_properties(end, theme))
+                .unwrap_or_default();
+            runs.push(ResolvedRun {
+                text: String::new(),
+                start: story_offset,
+                style: resolve_style(
+                    renderer,
+                    theme,
+                    &end_style,
+                    None,
+                    properties.default_run.as_ref(),
+                    substitutions,
+                )?,
+            });
+        }
+        let alignment = paragraph
+            .alignment
+            .as_deref()
+            .or(properties.alignment.as_deref());
+        let written_marker = paragraph_marker(paragraph, &properties, &mut numbering);
+        let marker = written_marker
+            .as_deref()
+            .map(|marker| symbol_bullet(marker, properties.bullet_font.as_ref(), theme));
+        let bullet_style = written_marker
+            .as_deref()
+            .zip(marker.as_deref())
+            .map(|(written, marker)| {
+                let mut style = resolve_bullet_style(
+                    renderer,
+                    theme,
+                    &properties,
+                    &runs[0].style,
+                    written,
+                    substitutions,
+                )?;
+                let font = properties.bullet_font.as_ref();
+                if !bullet_font_draws(renderer, theme, font, style.face.id, marker) {
+                    style.color = TRANSPARENT.to_owned();
+                }
+                Ok::<_, RenderError>(style)
+            })
+            .transpose()?;
+        paragraphs.push(ResolvedParagraph {
+            align: parse_align(alignment),
+            justify: is_full_justification(alignment),
+            level: paragraph.level,
+            margin_left_px: emu_to_px(properties.margin_left.unwrap_or_default()),
+            margin_right_px: emu_to_px(properties.margin_right.unwrap_or_default()),
+            line_spacing: properties.line_spacing,
+            space_before: properties.space_before,
+            space_after: properties.space_after,
+            line_space_reduction,
+            indent_px: emu_to_px(properties.indent.unwrap_or_default()),
+            tab_stops: resolve_tab_stops(
+                properties.tab_stops.as_deref(),
+                properties.margin_left.unwrap_or_default(),
+                properties.indent.unwrap_or_default(),
+            ),
+            default_tab_px: resolve_default_tab(properties.default_tab_size),
+            bullet_style,
+            marker,
+            rtl: properties.rtl.unwrap_or(false),
+            runs,
+        });
+        story_offset = story_offset.saturating_add(1);
+    }
+    Ok(ResolvedContent {
+        paragraphs,
+        space_first_last_para: cascade.space_first_last_para(),
+    })
+}
+
+/// Cases one run for drawing. `a:rPr/@cap` is a display property: the stored
+/// run text keeps the author's casing, so only the runs handed to the shaper
+/// change and the save projection is untouched.
+fn push_cased_runs(
+    out: &mut Vec<ResolvedRun>,
+    text: &str,
+    start: u32,
+    language: Option<&str>,
+    style: ResolvedStyle,
+) {
+    if text.is_empty() || style.caps == TextCaps::None {
+        out.push(ResolvedRun {
+            text: text.to_owned(),
+            start,
+            style,
+        });
+        return;
+    }
+    if style.caps == TextCaps::All {
+        out.push(ResolvedRun {
+            text: display_uppercase(text, language),
+            start,
+            style,
+        });
+        return;
+    }
+    let mut small = style.clone();
+    small.font_size_pt = style.font_size_pt * WORD_SMALL_CAPS_ADVANCE_SCALE;
+    let mut offset = start;
+    for (lowercase, segment) in case_segments(text) {
+        let cased = display_uppercase(segment, language);
+        let length = utf16_len(&cased);
+        out.push(ResolvedRun {
+            text: cased,
+            start: offset,
+            style: if lowercase {
+                small.clone()
+            } else {
+                style.clone()
+            },
+        });
+        offset = offset.saturating_add(length);
+    }
+}
+
+/// Uppercases for drawing only, keeping every character's UTF-16 width so the
+/// display list still reports the authored story offsets. A character whose
+/// uppercase form is wider (ß → SS) stays as authored.
+fn display_uppercase(text: &str, language: Option<&str>) -> String {
+    text.chars()
+        .map(|character| {
+            let mut upper = uppercase_for_language(character, language).into_iter();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) if single.len_utf16() == character.len_utf16() => single,
+                _ => character,
+            }
+        })
+        .collect()
+}
+
+/// Splits `text` where its characters stop being lowercase, so small caps can
+/// draw the lowercase stretches at a reduced size.
+fn case_segments(text: &str) -> Vec<(bool, &str)> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut current = None;
+    for (index, character) in text.char_indices() {
+        let lowercase = character.is_lowercase();
+        if current != Some(lowercase) {
+            if let Some(previous) = current {
+                segments.push((previous, &text[start..index]));
+            }
+            start = index;
+            current = Some(lowercase);
+        }
+    }
+    if let Some(previous) = current {
+        segments.push((previous, &text[start..]));
+    }
+    segments
+}
+
+#[derive(Clone, Serialize)]
+#[doc(hidden)]
+pub struct RequestedFontFace {
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scripts: Vec<String>,
+}
+
+/// The theme script whose supplemental font PowerPoint uses for East Asian
+/// text in `language`.
+fn theme_script_for_language(language: &str) -> Option<&'static str> {
+    match han_script_for_language(language)? {
+        "cjk-tc" => Some("Hant"),
+        "cjk-jp" => Some("Jpan"),
+        "cjk-kr" => Some("Hang"),
+        _ => Some("Hans"),
+    }
+}
+
+/// The family a run's East Asian text is drawn in: its cascaded `a:ea`
+/// typeface, a theme reference resolved for the run's language or else the
+/// renderer's default script.
+fn east_asian_family(
+    theme: &Theme,
+    direct: Option<&str>,
+    fallback: Option<&RunProperties>,
+    default_script: Option<&str>,
+) -> Option<String> {
+    let reference = direct.or_else(|| fallback?.east_asian_family.as_deref())?;
+    let script = fallback
+        .and_then(|properties| properties.language.as_deref())
+        .and_then(theme_script_for_language)
+        .or(default_script);
+    resolve_theme_east_asian_font(Some(theme), reference, script)
+        .filter(|family| family.len() <= 256)
+}
+
+/// Characters PowerPoint draws in a run's East Asian face: CJK ideographs,
+/// kana, hangul, CJK symbols and full-width forms. Punctuation East Asian text
+/// shares with Latin (curly quotes, the middle dot) stays in the Latin face,
+/// which is what PowerPoint's export shows.
+fn is_east_asian(character: char) -> bool {
+    matches!(character as u32,
+        0x1100..=0x11FF
+        | 0x2E80..=0x2FDF
+        | 0x3000..=0x303F
+        | 0x3040..=0x30FF
+        | 0x3100..=0x318F
+        | 0x31A0..=0x31FF
+        | 0x3200..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA960..=0xA97F
+        | 0xAC00..=0xD7FF
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFFEF
+        | 0x2_0000..=0x3_FFFF)
+}
+
+/// Full-width forms of ASCII punctuation. PowerPoint draws them in the Latin
+/// face unless the run's `lang` is East Asian: its export of a deck with no
+/// `lang` shows `，` and `（` in the Latin face's fallback, centred in the em.
+fn is_full_width_symbol(character: char) -> bool {
+    matches!(character as u32,
+        0xFF01..=0xFF0F | 0xFF1A..=0xFF20 | 0xFF3B..=0xFF40 | 0xFF5B..=0xFF60)
+}
+
+fn drawn_in_east_asian(character: char, east_asian_language: bool) -> bool {
+    is_east_asian(character) && (east_asian_language || !is_full_width_symbol(character))
+}
+
+fn resolve_font_request(
+    theme: &Theme,
+    direct: &TextStyle,
+    fallback: Option<&RunProperties>,
+) -> RequestedFontFace {
+    let bold = direct
+        .bold
+        .or_else(|| fallback.and_then(|value| value.bold))
+        .unwrap_or(false);
+    let italic = direct
+        .italic
+        .or_else(|| fallback.and_then(|value| value.italic))
+        .unwrap_or(false);
+    let family = direct
+        .font_family
+        .as_deref()
+        .filter(|family| family.len() <= 256)
+        .or_else(|| {
+            fallback
+                .and_then(|value| value.font_family.as_deref())
+                .filter(|family| family.len() <= 256)
+        })
+        .map(|family| resolve_font_family(theme, family))
+        .unwrap_or_else(|| resolve_theme_font_ref(Some(theme), "+mn-lt"));
+    RequestedFontFace {
+        family,
+        bold,
+        italic,
+        scripts: Vec::new(),
+    }
+}
+
+fn bullet_font_request(theme: &Theme, properties: &ParagraphProperties) -> Option<String> {
+    let BulletFont::Typeface(family) = properties.bullet_font.as_ref()? else {
+        return None;
+    };
+    Some(resolve_font_family(theme, family))
+}
+
+fn resolve_font_family(theme: &Theme, family: &str) -> String {
+    if family.starts_with('+') {
+        resolve_theme_font_ref(Some(theme), family)
+    } else {
+        family.to_owned()
+    }
+}
+
+fn chart_font_request(theme: &Theme, font: &PlotFont) -> RequestedFontFace {
+    RequestedFontFace {
+        family: resolve_font_family(theme, &font.family),
+        bold: font.weight >= 600,
+        italic: font.italic,
+        scripts: Vec::new(),
+    }
+}
+
+fn resolve_bullet_style(
+    renderer: &SlideRenderer,
+    theme: &Theme,
+    properties: &ParagraphProperties,
+    text: &ResolvedStyle,
+    written_marker: &str,
+    substitutions: &mut SubstitutionLog,
+) -> Result<ResolvedStyle, RenderError> {
+    let mut style = text.clone();
+    if let Some(family) = bullet_font_request(theme, properties) {
+        let emulated = ooxml_text::SymbolFont::named(&family).is_some_and(|font| {
+            written_marker
+                .chars()
+                .all(|character| font.substitute(character).is_some())
+        });
+        let mut ignored = SubstitutionLog::default();
+        let log = if emulated {
+            &mut ignored
+        } else {
+            substitutions
+        };
+        style.face = renderer.resolve_face(&family, style.bold, style.italic, log)?;
+        style.family = style.face.family.clone();
+    }
+    if let Some(BulletColor::Color(color)) = &properties.bullet_color
+        && let Some(color) = resolve_color_value_to_hex_with_theme(Some(color), Some(theme))
+    {
+        style.color = color;
+    }
+    style.font_size_pt = match properties.bullet_size {
+        Some(BulletSize::Percent(size)) => text.font_size_pt * size as f32,
+        Some(BulletSize::Points(size)) => size as f32,
+        _ => text.font_size_pt,
+    }
+    .clamp(1.0, 4_096.0);
+    Ok(style)
+}
+
+fn resolve_style(
+    renderer: &SlideRenderer,
+    theme: &Theme,
+    direct: &TextStyle,
+    direct_east_asian: Option<&str>,
+    fallback: Option<&RunProperties>,
+    substitutions: &mut SubstitutionLog,
+) -> Result<ResolvedStyle, RenderError> {
+    let RequestedFontFace {
+        family,
+        bold,
+        italic,
+        ..
+    } = resolve_font_request(theme, direct, fallback);
+    let mut face = renderer.resolve_face(&family, bold, italic, substitutions)?;
+    let east_asian = east_asian_family(
+        theme,
+        direct_east_asian,
+        fallback,
+        renderer.east_asian_script.as_deref(),
+    );
+    attach_east_asian_face(
+        renderer,
+        &mut face,
+        east_asian,
+        (&family, bold, italic),
+        substitutions,
+    );
+    face.east_asian_language = fallback
+        .and_then(|properties| properties.language.as_deref())
+        .is_some_and(|language| han_script_for_language(language).is_some());
+    let color = direct
+        .color
+        .as_deref()
+        .filter(|color| valid_color(color))
+        .map(str::to_owned)
+        .or_else(|| fallback.and_then(|value| resolve_paint_color(value.color.as_ref(), theme)))
+        .unwrap_or_else(|| "#000000".to_owned());
+    let font_size_pt = direct
+        .font_size_pt
+        .map(|value| value as f32)
+        .or_else(|| fallback.and_then(|value| value.font_size_pt.map(|value| value as f32)))
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_FONT_SIZE_PT)
+        .min(4_096.0);
+    let spacing_pt = direct
+        .spacing_pt
+        .or_else(|| fallback.and_then(|value| value.spacing_pt))
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .clamp(-4_096.0, 4_096.0);
+    let baseline_pct = direct
+        .baseline_pct
+        .or_else(|| fallback.and_then(|value| value.baseline_pct))
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let kern_pt = direct
+        .kern_pt
+        .or_else(|| fallback.and_then(|value| value.kern_pt))
+        .map(|value| value as f32);
+    let baseline_shift_px = points_to_px(font_size_pt) * baseline_pct / 100.0;
+    let font_size_pt = if baseline_pct == 0.0 {
+        font_size_pt
+    } else {
+        font_size_pt * SCRIPT_SIZE_RATIO
+    };
+    Ok(ResolvedStyle {
+        family: face.family.clone(),
+        face,
+        font_size_pt,
+        line_font_size_pt: font_size_pt,
+        spacing_pt,
+        kern_pt,
+        baseline_shift_px,
+        bold,
+        italic,
+        underline: direct
+            .underline
+            .as_deref()
+            .or_else(|| fallback.and_then(|value| value.underline.as_deref()))
+            .is_some_and(|value| value != "none"),
+        strike: direct
+            .strike
+            .clone()
+            .or_else(|| fallback.and_then(|value| value.strike.clone()))
+            .filter(|strike| matches!(strike.as_str(), "sngStrike" | "dblStrike")),
+        color,
+        caps: direct
+            .caps
+            .or_else(|| fallback.and_then(|value| value.caps))
+            .unwrap_or(TextCaps::None),
+    })
+}
+
+/// Whether `id` already stacks its lines the way `metrics` does.
+fn sits_on_own_baseline(fonts: &FontStore, id: FontId, metrics: &FamilyMetrics) -> bool {
+    let Ok(own) = fonts.metrics(id) else {
+        return true;
+    };
+    let units = f32::from(own.units_per_em);
+    if units <= 0.0 {
+        return true;
+    }
+    let same =
+        |theirs: i32, ours: i16| (theirs as f32 / 1000.0 - f32::from(ours) / units).abs() <= 0.002;
+    same(metrics.ascent, own.hhea_ascender)
+        && same(metrics.descent, own.hhea_descender)
+        && same(metrics.line_gap, own.hhea_line_gap)
+}
+
+/// The line box the named family measures at `size_px`, in the shape
+/// [`single_line_box`] gives a registered face.
+fn family_line_box(metrics: &FamilyMetrics, size_px: f32) -> ooxml_text::LineBox {
+    let em = size_px / 1000.0;
+    ooxml_text::LineBox {
+        ascent: (metrics.ascent + metrics.line_gap).max(0) as f32 * em,
+        descent: (-metrics.descent).max(0) as f32 * em,
+        leading: 0.0,
+    }
+}
+
+/// How wide the family a run names draws `text`, when that family is one we
+/// have widths but no face for. `None` for anything the table cannot measure,
+/// which keeps the substitute's own advance.
+fn named_cluster_width(style: &ResolvedStyle, text: &str, size_px: f32) -> Option<f32> {
+    family_cluster_advance(style.face.widths?, text).map(|advance| advance * size_px)
+}
+
+/// Optional ligatures are off once glyphs are tracked apart or advanced by the
+/// named family's widths: either way every character needs its own cluster, or
+/// the browser draws the substitute's narrower ligature into a wider slot.
+fn ligature_features(separate: bool) -> &'static [ShapeFeature] {
+    run_features(separate, true)
+}
+
+/// The features a run shapes with: ligatures off when its characters must
+/// keep their own clusters, and kerning off below its `kern` threshold.
+/// PowerPoint kerns only at or above `kern`, and not at all at `0`; with no
+/// threshold anywhere in the cascade every size is kerned.
+fn kerned(kern_pt: Option<f32>, size_pt: f32) -> bool {
+    kern_pt.is_none_or(|threshold| threshold > 0.0 && size_pt >= threshold)
+}
+
+fn run_features(separate: bool, kerned: bool) -> &'static [ShapeFeature] {
+    const LIGA: ShapeFeature = ShapeFeature {
+        tag: *b"liga",
+        value: 0,
+    };
+    const CLIG: ShapeFeature = ShapeFeature {
+        tag: *b"clig",
+        value: 0,
+    };
+    const KERN: ShapeFeature = ShapeFeature {
+        tag: *b"kern",
+        value: 0,
+    };
+    match (separate, kerned) {
+        (false, true) => &[],
+        (true, true) => &[LIGA, CLIG],
+        (false, false) => &[KERN],
+        (true, false) => &[LIGA, CLIG, KERN],
+    }
+}
+
+/// One shaped line of chart text, in the family, weight, slant and pixel size
+/// the plot geometry asked for.
+/// Gives `face` the registered `east_asian` face, logging the family as
+/// substituted by `face` when none is registered.
+fn attach_east_asian_face(
+    renderer: &SlideRenderer,
+    face: &mut FontFace,
+    east_asian: Option<String>,
+    (family, bold, italic): (&str, bool, bool),
+    substitutions: &mut SubstitutionLog,
+) {
+    let Some(east_asian) =
+        east_asian.filter(|east_asian| normalize_family(east_asian) != normalize_family(family))
+    else {
+        return;
+    };
+    face.east_asian = renderer
+        .registered_face(&east_asian, bold, italic)
+        .map(Box::new);
+    if face.east_asian.is_none() {
+        substitutions.record(&east_asian, &normalize_family(&east_asian), &face.family);
+    }
+}
+
+/// Chart text carries no `a:ea` of its own here, so its East Asian characters
+/// take the theme's minor East Asian font, as PowerPoint draws them.
+fn chart_east_asian_family(theme: &Theme, default_script: Option<&str>) -> Option<String> {
+    east_asian_family(theme, Some("+mn-ea"), None, default_script)
+}
+
+fn chart_text_primitive(
+    renderer: &SlideRenderer,
+    theme: &Theme,
+    shape_id: &str,
+    text: ChartText<'_>,
+    substitutions: &mut SubstitutionLog,
+) -> Result<Primitive, RenderError> {
+    let RequestedFontFace {
+        family,
+        bold,
+        italic,
+        ..
+    } = chart_font_request(theme, &text.font);
+    let mut face = renderer.resolve_face(&family, bold, italic, substitutions)?;
+    let east_asian = chart_east_asian_family(theme, renderer.east_asian_script.as_deref());
+    attach_east_asian_face(
+        renderer,
+        &mut face,
+        east_asian,
+        (&family, bold, italic),
+        substitutions,
+    );
+    let size_px = safe_geometry(text.font.size_px as f32).clamp(1.0, 4_096.0);
+    let tracking = safe_geometry(text.font.letter_spacing_px as f32);
+    let browser_metrics = face.line.filter(|_| face.id.to_u32() == BROWSER_FONT_ID);
+    let line_box = if let Some(metrics) = browser_metrics {
+        family_line_box(metrics, size_px)
+    } else {
+        let metrics = renderer
+            .fonts
+            .metrics(face.id)
+            .map_err(|error| RenderError::Font(error.to_string()))?;
+        single_line_box(metrics, size_px, &CompatFlags::default())
+    };
+    let pieces = if renderer.browser_coverage_fallback {
+        renderer.browser_coverage_pieces(&face, text.text, bold, italic)
+    } else {
+        renderer.coverage_pieces(&face, text.text, bold, italic)
+    };
+    let mut shaped_pieces = Vec::with_capacity(pieces.len());
+    let mut cursor = 0.0_f32;
+    let mut cluster_advance = 0.0_f32;
+    let mut started = false;
+    for (index, (start, piece_face)) in pieces.iter().enumerate() {
+        let end = pieces
+            .get(index + 1)
+            .map_or(text.text.len(), |(next, _)| *next);
+        let piece_face = piece_face.clone().unwrap_or_else(|| face.clone());
+        let shaped = shape_face(
+            &renderer.fonts,
+            &piece_face,
+            &text.text[*start..end],
+            size_px,
+            ligature_features(tracking != 0.0),
+        )
+        .map_err(|error| RenderError::Font(error.to_string()))?;
+        let piece_x = cursor;
+        let mut offsets = Vec::with_capacity(shaped.len());
+        let mut cluster = None;
+        for glyph in &shaped {
+            if started && cluster != Some(glyph.cluster) {
+                cursor += tracking.max(-cluster_advance);
+                cluster_advance = 0.0;
+            }
+            offsets.push(cursor);
+            cursor += glyph.x_advance;
+            cluster_advance += glyph.x_advance;
+            cluster = Some(glyph.cluster);
+            started = true;
+        }
+        let piece_x = offsets.first().copied().unwrap_or(piece_x);
+        shaped_pieces.push((*start, end, piece_face, shaped, offsets, piece_x, cursor));
+    }
+    let advance = cursor;
+    let mut utf16_offsets = vec![0; text.text.len() + 1];
+    let mut utf16_end = 0;
+    for (index, character) in text.text.char_indices() {
+        utf16_offsets[index] = utf16_end;
+        utf16_end += character.len_utf16() as u32;
+    }
+    utf16_offsets[text.text.len()] = utf16_end;
+    let box_x = safe_geometry(text.x as f32);
+    let box_w = safe_geometry(text.width as f32);
+    let align = match text.align {
+        PlotTextAlign::Center => TextAlign::Center,
+        PlotTextAlign::Start => TextAlign::Left,
+    };
+    let x = match align {
+        TextAlign::Center => box_x + ((box_w - advance) / 2.0).max(0.0),
+        _ => box_x,
+    };
+    let baseline = safe_geometry(text.baseline_y as f32);
+    let runs: Vec<PositionedTextRun> = shaped_pieces
+        .into_iter()
+        .map(
+            |(start, end, piece_face, shaped, offsets, piece_x, piece_end)| {
+                let glyphs = shaped
+                    .iter()
+                    .zip(&offsets)
+                    .map(|(glyph, offset)| PositionedGlyph {
+                        glyph_id: glyph.glyph_id,
+                        cluster: utf16_offsets[start + glyph.cluster as usize],
+                        x: x + offset,
+                        advance: glyph.x_advance,
+                        x_offset: glyph.x_offset,
+                        y_offset: baseline + glyph.y_offset,
+                    })
+                    .collect();
+                PositionedTextRun {
+                    text: text.text[start..end].to_owned(),
+                    start: utf16_offsets[start],
+                    end: utf16_offsets[end],
+                    x: x + piece_x,
+                    width: (piece_end - piece_x).max(0.0),
+                    font_id: piece_face.id.to_u32(),
+                    font_family: piece_face.family.clone(),
+                    font_size_px: size_px,
+                    bold,
+                    italic,
+                    underline: false,
+                    strike: None,
+                    color: text.color.to_owned(),
+                    letter_spacing_px: tracking,
+                    baseline_offset_px: 0.0,
+                    glyphs,
+                }
+            },
+        )
+        .collect();
+    let width = advance.max(0.0);
+    let end = utf16_end;
+    Ok(Primitive::TextBox {
+        text_shadow: None,
+        object_id: text.object_id,
+        shape_id: Some(shape_id.to_owned()),
+        story_id: None,
+        x: box_x,
+        y: baseline - line_box.ascent,
+        w: box_w.max(x - box_x + width),
+        h: line_box.height(),
+        anchor: TextAnchor::Top,
+        paragraphs: vec![TextParagraph {
+            align: Some(align),
+            level: 0,
+            runs: vec![TextRun {
+                text: text.text.to_owned(),
+                font_family: face.family.clone(),
+                font_size_pt: size_px * 72.0 / 96.0,
+                bold,
+                italic,
+                underline: false,
+                color: text.color.to_owned(),
+            }],
+        }],
+        lines: vec![PositionedTextLine {
+            column_offset: 0.0,
+            x,
+            y: baseline - line_box.ascent,
+            width,
+            height: line_box.height(),
+            baseline,
+            start: 0,
+            end,
+            runs,
+            caret_stops: Vec::new(),
+        }],
+        overflow: false,
+        transform: Transform {
+            rotation_deg: safe_geometry(text.rotation_deg as f32),
+            ..Transform::default()
+        },
+    })
+}
+
+struct LayoutText {
+    lines: Vec<PositionedTextLine>,
+    total_height: f32,
+}
+
+/// Byte cap on retained text layouts; oldest entry evicts first.
+const MAX_TEXT_LAYOUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Laid-out text keyed by every `layout_content` input.
+#[derive(Default)]
+struct TextLayoutCache {
+    entries: HashMap<Vec<u8>, CachedTextLayout>,
+    order: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+struct CachedTextLayout {
+    lines: Vec<PositionedTextLine>,
+    total_height: f32,
+    bytes: usize,
+}
+
+impl TextLayoutCache {
+    fn get(&self, key: &[u8]) -> Option<LayoutText> {
+        self.entries.get(key).map(|entry| LayoutText {
+            lines: entry.lines.clone(),
+            total_height: entry.total_height,
+        })
+    }
+
+    fn insert(&mut self, key: Vec<u8>, text: &LayoutText) {
+        let bytes = key.len() * 2 + text_layout_bytes(&text.lines);
+        if bytes > MAX_TEXT_LAYOUT_BYTES || self.entries.contains_key(&key) {
+            return;
+        }
+        self.bytes += bytes;
+        self.order.push_back(key.clone());
+        self.entries.insert(
+            key,
+            CachedTextLayout {
+                lines: text.lines.clone(),
+                total_height: text.total_height,
+                bytes,
+            },
+        );
+        while self.bytes > MAX_TEXT_LAYOUT_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.bytes -= entry.bytes;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+}
+
+fn text_layout_bytes(lines: &[PositionedTextLine]) -> usize {
+    lines
+        .iter()
+        .map(|line| {
+            size_of::<PositionedTextLine>()
+                + line.caret_stops.capacity() * size_of::<CaretStop>()
+                + line
+                    .runs
+                    .iter()
+                    .map(|run| {
+                        size_of::<PositionedTextRun>()
+                            + run.text.capacity()
+                            + run.font_family.capacity()
+                            + run.color.capacity()
+                            + run.glyphs.capacity() * size_of::<PositionedGlyph>()
+                    })
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Encodes every argument `layout_content` reads.
+fn text_layout_key(
+    content: &ResolvedContent,
+    rect: PxRect,
+    scale: f32,
+    stacked: bool,
+    wraps: bool,
+) -> Vec<u8> {
+    let ResolvedContent {
+        paragraphs,
+        space_first_last_para,
+    } = content;
+    let text_len: usize = paragraphs
+        .iter()
+        .flat_map(|paragraph| &paragraph.runs)
+        .map(|run| run.text.len())
+        .sum();
+    let mut key = Vec::with_capacity(64 + text_len);
+    key_f32(&mut key, rect.x);
+    key_f32(&mut key, rect.y);
+    key_f32(&mut key, rect.w);
+    key_f32(&mut key, scale);
+    key.push(u8::from(stacked));
+    key.push(u8::from(wraps));
+    key.push(u8::from(*space_first_last_para));
+    key_u32(&mut key, paragraphs.len() as u32);
+    for paragraph in paragraphs {
+        let ResolvedParagraph {
+            align,
+            justify,
+            level,
+            margin_left_px,
+            margin_right_px,
+            line_spacing,
+            space_before,
+            space_after,
+            line_space_reduction,
+            indent_px,
+            tab_stops,
+            default_tab_px,
+            marker,
+            bullet_style,
+            rtl,
+            runs,
+        } = paragraph;
+        key.push(match align {
+            TextAlign::Left => 0,
+            TextAlign::Center => 1,
+            TextAlign::Right => 2,
+            TextAlign::Justify => 3,
+        });
+        key.push(u8::from(*justify));
+        key_u32(&mut key, *level);
+        key_f32(&mut key, *margin_left_px);
+        key_f32(&mut key, *margin_right_px);
+        key_f32(&mut key, *indent_px);
+        key_f32(&mut key, *line_space_reduction);
+        key_spacing(&mut key, line_spacing);
+        key_spacing(&mut key, space_before);
+        key_spacing(&mut key, space_after);
+        key_u32(&mut key, tab_stops.len() as u32);
+        for stop in tab_stops {
+            key_f32(&mut key, *stop);
+        }
+        key_f32(&mut key, *default_tab_px);
+        key.push(u8::from(*rtl));
+        key_opt_str(&mut key, marker);
+        match bullet_style {
+            Some(style) => {
+                key.push(1);
+                key_style(&mut key, style);
+            }
+            None => key.push(0),
+        }
+        key_u32(&mut key, runs.len() as u32);
+        for ResolvedRun { text, start, style } in runs {
+            key_u32(&mut key, *start);
+            key_str(&mut key, text);
+            key_style(&mut key, style);
+        }
+    }
+    key
+}
+
+fn key_u32(key: &mut Vec<u8>, value: u32) {
+    key.extend_from_slice(&value.to_le_bytes());
+}
+
+fn key_f32(key: &mut Vec<u8>, value: f32) {
+    key_u32(key, value.to_bits());
+}
+
+fn key_f64(key: &mut Vec<u8>, value: f64) {
+    key.extend_from_slice(&value.to_bits().to_le_bytes());
+}
+
+fn key_str(key: &mut Vec<u8>, value: &str) {
+    key_u32(key, value.len() as u32);
+    key.extend_from_slice(value.as_bytes());
+}
+
+fn key_opt_str(key: &mut Vec<u8>, value: &Option<String>) {
+    match value {
+        Some(value) => {
+            key.push(1);
+            key_str(key, value);
+        }
+        None => key.push(0),
+    }
+}
+
+fn key_spacing(key: &mut Vec<u8>, spacing: &Option<LineSpacing>) {
+    match spacing {
+        Some(LineSpacing::Percent { value }) => {
+            key.push(1);
+            key_f64(key, *value);
+        }
+        Some(LineSpacing::Points { value }) => {
+            key.push(2);
+            key_f64(key, *value);
+        }
+        None => key.push(0),
+    }
+}
+
+fn key_style(key: &mut Vec<u8>, style: &ResolvedStyle) {
+    let ResolvedStyle {
+        face:
+            FontFace {
+                id,
+                family: face_family,
+                requested_family,
+                widths,
+                line,
+                line_id,
+                east_asian,
+                east_asian_language,
+            },
+        family,
+        font_size_pt,
+        line_font_size_pt,
+        spacing_pt,
+        kern_pt,
+        baseline_shift_px,
+        bold,
+        italic,
+        underline,
+        strike,
+        color,
+        caps,
+    } = style;
+    key_u32(key, id.to_u32());
+    key_u32(key, line_id.to_u32());
+    key_u32(
+        key,
+        east_asian
+            .as_ref()
+            .map_or(u32::MAX, |face| face.id.to_u32()),
+    );
+    key_str(key, face_family);
+    key_str(key, requested_family);
+    key.push(u8::from(widths.is_some()));
+    key.push(u8::from(line.is_some()));
+    key.push(u8::from(*east_asian_language));
+    key_str(key, family);
+    key_f32(key, *font_size_pt);
+    key_f32(key, *line_font_size_pt);
+    key_f32(key, *spacing_pt);
+    key.push(u8::from(kern_pt.is_some()));
+    key_f32(key, kern_pt.unwrap_or(0.0));
+    key_f32(key, *baseline_shift_px);
+    key.push(u8::from(*bold));
+    key.push(u8::from(*italic));
+    key.push(u8::from(*underline));
+    key_opt_str(key, strike);
+    key_str(key, color);
+    key.push(match caps {
+        TextCaps::None => 0,
+        TextCaps::Small => 1,
+        TextCaps::All => 2,
+    });
+}
+
+fn layout_content(
+    fonts: &FontStore,
+    content: &ResolvedContent,
+    rect: PxRect,
+    scale: f32,
+    stacked: bool,
+    wraps: bool,
+) -> Result<LayoutText, RenderError> {
+    let mut lines = Vec::new();
+    let mut y = rect.y;
+    let mut previous: Option<&ResolvedParagraph> = None;
+    for paragraph in &content.paragraphs {
+        if let Some(previous) = previous {
+            y += spacing_px(previous.space_after, previous, scale)
+                + spacing_px(paragraph.space_before, paragraph, scale);
+        } else if content.space_first_last_para {
+            y += spacing_px(paragraph.space_before, paragraph, scale);
+        }
+        previous = Some(paragraph);
+        let start_margin = if paragraph.rtl {
+            paragraph.margin_right_px
+        } else {
+            paragraph.margin_left_px
+        };
+        let paragraph_x = rect.x + start_margin.max(0.0);
+        let paragraph_width =
+            (rect.w - paragraph.margin_left_px.max(0.0) - paragraph.margin_right_px.max(0.0))
+                .max(1.0);
+        let mut paragraph_lines = layout_paragraph(
+            fonts,
+            paragraph,
+            paragraph_x,
+            y,
+            paragraph_width,
+            scale,
+            stacked,
+            wraps,
+        )?;
+        if let Some(last) = paragraph_lines.last() {
+            y = last.y + last.height;
+        }
+        lines.append(&mut paragraph_lines);
+    }
+    if content.space_first_last_para
+        && let Some(last) = previous
+    {
+        y += spacing_px(last.space_after, last, scale);
+    }
+    Ok(LayoutText {
+        total_height: (y - rect.y).max(0.0),
+        lines,
+    })
+}
+
+fn flow_text_columns(text: &mut LayoutText, rect: PxRect, columns: u8, gap: f32, rtl: bool) {
+    let trailing_space = text.lines.last().map_or(0.0, |line| {
+        text.total_height - (line.y + line.height - rect.y)
+    });
+    let mut column = 0;
+    let mut column_start = rect.y;
+    let mut has_lines = false;
+    let mut total_height = 0.0_f32;
+    for line in &mut text.lines {
+        let mut y = line.y - column_start;
+        if has_lines && y + line.height > rect.h && column + 1 < columns {
+            column += 1;
+            column_start = line.y;
+            y = 0.0;
+        }
+        let visual_column = if rtl { columns - 1 - column } else { column };
+        line.column_offset = f32::from(visual_column) * (rect.w + gap);
+        shift_line(line, line.column_offset, rect.y + y - line.y);
+        total_height = total_height.max(y + line.height);
+        has_lines = true;
+    }
+    if let Some(last) = text.lines.last() {
+        total_height = total_height.max(last.y + last.height - rect.y + trailing_space);
+    }
+    text.total_height = total_height;
+}
+
+/// Height of a `spcBef` or `spcAft`, whose percentages measure a single line.
+fn spacing_px(spacing: Option<LineSpacing>, paragraph: &ResolvedParagraph, scale: f32) -> f32 {
+    let height = match spacing {
+        Some(LineSpacing::Percent { value }) => {
+            let size_pt = paragraph
+                .runs
+                .iter()
+                .map(|run| run.style.font_size_pt)
+                .fold(0.0_f32, f32::max);
+            value as f32 * SINGLE_LINE_PITCH_EM * points_to_px(autofit_size_pt(size_pt, scale))
+        }
+        // An autofit font scale shrinks the text, never a spacing written in
+        // points: PowerPoint keeps `a:spcBef`/`a:spcAft` at their stated size.
+        Some(LineSpacing::Points { value }) => points_to_px(value as f32),
+        None => 0.0,
+    };
+    if height.is_finite() {
+        height.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// `a:pPr/@defTabSz` when the cascade declares none: one inch.
+const DEFAULT_TAB_EMU: i64 = 914_400;
+
+/// Pitch of the implicit tab stops, in pixels.
+fn resolve_default_tab(size: Option<i64>) -> f32 {
+    let pitch = emu_to_px(size.unwrap_or(DEFAULT_TAB_EMU));
+    if pitch.is_finite() && pitch >= 1.0 {
+        pitch
+    } else {
+        emu_to_px(DEFAULT_TAB_EMU)
+    }
+}
+
+/// Declared `a:tabLst` stops, plus the implicit stop a hanging indent
+/// puts at the paragraph's left margin — the one a leading tab lands on.
+fn resolve_tab_stops(stops: Option<&[i64]>, margin_left: i64, indent: i64) -> Vec<f32> {
+    let mut resolved = stops
+        .unwrap_or_default()
+        .iter()
+        .map(|position| emu_to_px(*position))
+        .filter(|position| position.is_finite() && *position > 0.0)
+        .collect::<Vec<_>>();
+    if indent < 0 {
+        let hanging = emu_to_px(margin_left);
+        if hanging.is_finite() && hanging > 0.0 {
+            resolved.push(hanging);
+        }
+    }
+    resolved.sort_by(f32::total_cmp);
+    resolved.dedup();
+    resolved
+}
+
+/// `a:pPr/@indent` as the first line's own offset from the paragraph's left
+/// margin. A marker takes the indent instead — it is drawn there and the text
+/// still starts at the margin — so only an unmarked paragraph moves, and never
+/// past the left edge of the text box.
+fn first_line_indent(paragraph: &ResolvedParagraph) -> f32 {
+    if paragraph.marker.is_some() || !paragraph.indent_px.is_finite() {
+        return 0.0;
+    }
+    paragraph.indent_px.max(-paragraph.margin_left_px.max(0.0))
+}
+
+/// The width a `wrap="none"` body lays its lines against: wide enough that no
+/// paragraph in a slide-sized shape reaches it, so each one stays on one line.
+const NO_WRAP_WIDTH_PX: f32 = 1.0e6;
+
+/// A stop the pen already sits on does not hold the tab.
+const TAB_EPSILON_PX: f32 = 0.01;
+/// Slack for a right-aligned line, whose summed advances can land a rounding
+/// step past the edge it was placed against.
+const FIT_EPSILON_PX: f32 = 0.01;
+
+/// Width one tab takes. The stop is chosen from `offset` — where PowerPoint's
+/// pen would be — and the width is measured from `pen`, where ours is; the two
+/// differ only for the tab that stands in a hanging indent. The first declared
+/// stop past `offset` wins, otherwise the next multiple of the default pitch,
+/// and a tab never moves backwards or reaches past the line.
+fn tab_advance(offset: f32, pen: f32, stops: &[f32], default_px: f32, limit: f32) -> f32 {
+    let limit = if limit.is_finite() {
+        limit.max(0.0)
+    } else {
+        0.0
+    };
+    if !offset.is_finite() || !pen.is_finite() {
+        return 0.0;
+    }
+    let next = stops
+        .iter()
+        .copied()
+        .find(|stop| *stop > offset + TAB_EPSILON_PX)
+        .unwrap_or_else(|| {
+            let steps = (offset / default_px).floor() + 1.0;
+            if steps.is_finite() {
+                steps * default_px
+            } else {
+                offset + default_px
+            }
+        });
+    (next - pen).clamp(0.0, limit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_paragraph(
+    fonts: &FontStore,
+    paragraph: &ResolvedParagraph,
+    x: f32,
+    y: f32,
+    width: f32,
+    scale: f32,
+    stacked: bool,
+    wraps: bool,
+) -> Result<Vec<PositionedTextLine>, RenderError> {
+    let mut clusters = shape_paragraph(fonts, paragraph, scale)?;
+    if clusters.is_empty() {
+        let style = &paragraph.runs[0].style;
+        let line_box = spaced_line_box(
+            style_line_box(fonts, style, scale)?,
+            paragraph,
+            points_to_px(autofit_size_pt(style.font_size_pt, scale)),
+        );
+        return Ok(vec![PositionedTextLine {
+            column_offset: 0.0,
+            x,
+            y,
+            width: 0.0,
+            height: line_box.height(),
+            baseline: y + line_box.ascent,
+            start: paragraph.runs[0].start,
+            end: paragraph.runs[0].start,
+            runs: Vec::new(),
+            caret_stops: vec![CaretStop {
+                position: paragraph.runs[0].start,
+                x,
+            }],
+        }]);
+    }
+    let ranges = if stacked {
+        // A hard break shapes to no glyph, so stacking it would leave a blank cell.
+        (0..clusters.len())
+            .filter(|index| !clusters[*index].glyphs.is_empty())
+            .map(|index| (index, index + 1))
+            .collect()
+    } else {
+        wrap_clusters(
+            &mut clusters,
+            if wraps { width } else { NO_WRAP_WIDTH_PX },
+            paragraph.margin_left_px.max(0.0),
+            first_line_indent(paragraph),
+            &paragraph.tab_stops,
+            paragraph.default_tab_px,
+        )
+    };
+    let line_count = ranges.len();
+    let mut output = Vec::with_capacity(line_count);
+    let mut line_y = y;
+    for (line_index, (start, end)) in ranges.into_iter().enumerate() {
+        let slice = &clusters[start..end];
+        let natural_width = line_advance(aligned_slice(slice));
+        let stretchable = paragraph.justify
+            && line_index + 1 < line_count
+            && !slice.last().is_some_and(|cluster| cluster.mandatory);
+        let padding = if stretchable {
+            justification_padding(&justify_clusters(slice), width)
+        } else {
+            vec![0.0; slice.len()]
+        };
+        let stretched = padding.iter().any(|value| *value > 0.0);
+        let trailing = if stretched {
+            slice
+                .iter()
+                .rev()
+                .take_while(|cluster| cluster_is_blank(cluster))
+                .count()
+        } else {
+            0
+        };
+        let visible = slice.len() - trailing;
+        let advances = slice
+            .iter()
+            .enumerate()
+            .map(|(index, cluster)| {
+                if index < visible {
+                    cluster.width + padding[index]
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let line_width = advances.iter().sum::<f32>() - trailing_tracking(&slice[..visible]);
+        let indent = if line_index == 0 {
+            first_line_indent(paragraph)
+        } else {
+            0.0
+        };
+        let line_start = if paragraph.rtl { x } else { x + indent };
+        let line_room = width - indent;
+        let line_x = match paragraph.align {
+            TextAlign::Center => line_start + ((line_room - natural_width) / 2.0).max(0.0),
+            TextAlign::Right => line_start + (line_room - natural_width).max(0.0),
+            TextAlign::Left | TextAlign::Justify => line_start,
+        };
+        let (natural, extents) = clusters_line_box(fonts, slice, scale)?;
+        let line_box = shifted_line_box(
+            spaced_line_box(natural, paragraph, line_font_size_px(slice, scale)),
+            extents,
+        );
+        let mut caret_stops = vec![CaretStop {
+            position: slice[0].start,
+            x: line_x,
+        }];
+        let mut cursor_x = line_x;
+        for (cluster, advance) in slice.iter().zip(&advances) {
+            cursor_x += advance;
+            caret_stops.push(CaretStop {
+                position: cluster.end,
+                x: cursor_x,
+            });
+        }
+        caret_stops.dedup_by(|left, right| {
+            left.position == right.position && left.x.to_bits() == right.x.to_bits()
+        });
+        let mut runs = positioned_runs(slice, &advances, line_x, line_y + line_box.ascent, scale);
+        if paragraph.rtl {
+            mirror_line(&mut runs, &mut caret_stops, line_x, line_width);
+        }
+        output.push(PositionedTextLine {
+            column_offset: 0.0,
+            x: line_x,
+            y: line_y,
+            width: line_width,
+            height: line_box.height(),
+            baseline: line_y + line_box.ascent,
+            start: slice[0].start,
+            end: slice
+                .last()
+                .map(|cluster| cluster.end)
+                .unwrap_or(slice[0].start),
+            runs,
+            caret_stops,
+        });
+        line_y += line_box.height();
+    }
+    prepend_bullet(fonts, paragraph, (x, width), &mut output, scale)?;
+    Ok(output)
+}
+
+/// Lays a right-to-left line out from its right edge, in bidi visual order:
+/// the runs reverse, except that a stretch of consecutive left-to-right runs
+/// keeps its own order. A run of spaces or punctuation reads the way its
+/// strong neighbours agree on, else right to left. A right-to-left run mirrors
+/// glyph by glyph so it paints in reading order; a left-to-right run keeps its
+/// glyphs and moves as a block. Each caret stop sits at the leading edge of
+/// the character after it, or at the trailing edge of the line's last run.
+fn mirror_line(
+    runs: &mut [PositionedTextRun],
+    caret_stops: &mut [CaretStop],
+    line_x: f32,
+    line_width: f32,
+) {
+    let mirror = 2.0 * line_x + line_width;
+    let strong: Vec<Option<bool>> = runs.iter().map(|run| direction(&run.text)).collect();
+    let ltr: Vec<bool> = (0..runs.len())
+        .map(|position| match strong[position] {
+            Some(rtl) => !rtl,
+            None => {
+                let before = strong[..position].iter().rev().find_map(|value| *value);
+                let after = strong[position + 1..].iter().find_map(|value| *value);
+                before == Some(false) && after == Some(false)
+            }
+        })
+        .collect();
+    let old: Vec<f32> = runs.iter().map(|run| run.x).collect();
+    let mut placed: Vec<f32> = runs.iter().map(|run| mirror - run.width - run.x).collect();
+    let mut index = 0;
+    while index < runs.len() {
+        if !ltr[index] {
+            index += 1;
+            continue;
+        }
+        let end = (index..runs.len())
+            .find(|position| !ltr[*position])
+            .unwrap_or(runs.len());
+        let mut x = placed[index..end].iter().copied().fold(f32::MAX, f32::min);
+        for position in index..end {
+            placed[position] = x;
+            x += runs[position].width;
+        }
+        index = end;
+    }
+    let last = runs.len().checked_sub(1);
+    for stop in caret_stops.iter_mut() {
+        let home = (0..runs.len()).find(|&position| {
+            let run = &runs[position];
+            (run.start..run.end).contains(&stop.position)
+                || Some(position) == last && stop.position == run.end
+        });
+        stop.x = match home {
+            Some(position) if ltr[position] => placed[position] + (stop.x - old[position]),
+            _ => mirror - stop.x,
+        };
+    }
+    for (position, run) in runs.iter_mut().enumerate() {
+        if ltr[position] {
+            for glyph in &mut run.glyphs {
+                glyph.x += placed[position] - old[position];
+            }
+        } else {
+            for glyph in &mut run.glyphs {
+                glyph.x = mirror - glyph.x - glyph.advance;
+            }
+        }
+        run.x = placed[position];
+    }
+}
+
+/// The strong direction of `text`: `Some(true)` for right-to-left script,
+/// `Some(false)` for letters and digits of any other, `None` for neither.
+fn direction(text: &str) -> Option<bool> {
+    text.chars().find_map(char_direction)
+}
+
+fn char_direction(character: char) -> Option<bool> {
+    if matches!(
+        character as u32,
+        0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF
+    ) {
+        Some(true)
+    } else if character.is_alphanumeric() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Splits a right-to-left paragraph's run where its strong direction turns, so
+/// each part reads one way. Spaces and punctuation stay with the text before.
+fn split_by_direction(run: ResolvedRun, out: &mut Vec<ResolvedRun>) {
+    let mut cuts = vec![0];
+    let mut current = None;
+    for (index, character) in run.text.char_indices() {
+        if let Some(next) = char_direction(character) {
+            if current.is_some_and(|current| current != next) {
+                cuts.push(index);
+            }
+            current = Some(next);
+        }
+    }
+    if cuts.len() == 1 {
+        out.push(run);
+        return;
+    }
+    let mut offset = run.start;
+    for (position, start) in cuts.iter().enumerate() {
+        let end = cuts.get(position + 1).copied().unwrap_or(run.text.len());
+        let text = &run.text[*start..end];
+        out.push(ResolvedRun {
+            text: text.to_owned(),
+            start: offset,
+            style: run.style.clone(),
+        });
+        offset += utf16_len(text);
+    }
+}
+
+/// Prepends a marker outside the story's character space.
+fn prepend_bullet(
+    fonts: &FontStore,
+    paragraph: &ResolvedParagraph,
+    (x, width): (f32, f32),
+    lines: &mut [PositionedTextLine],
+    scale: f32,
+) -> Result<(), RenderError> {
+    let Some(value) = &paragraph.marker else {
+        return Ok(());
+    };
+    let (Some(first), Some(style)) = (lines.first_mut(), paragraph.bullet_style.as_ref()) else {
+        return Ok(());
+    };
+    if value.trim().is_empty() || first.runs.is_empty() {
+        return Ok(());
+    }
+    let bullet_x = (x + paragraph.indent_px).max(x - paragraph.margin_left_px.max(0.0));
+    let marker = ResolvedParagraph {
+        align: paragraph.align,
+        justify: false,
+        level: paragraph.level,
+        margin_left_px: 0.0,
+        margin_right_px: 0.0,
+        line_spacing: None,
+        space_before: None,
+        space_after: None,
+        line_space_reduction: 0.0,
+        indent_px: 0.0,
+        tab_stops: Vec::new(),
+        default_tab_px: resolve_default_tab(None),
+        marker: None,
+        bullet_style: None,
+        rtl: false,
+        runs: vec![ResolvedRun {
+            text: value.clone(),
+            start: paragraph.runs[0].start,
+            style: style.clone(),
+        }],
+    };
+    let clusters = shape_paragraph(fonts, &marker, scale)?;
+    if clusters.is_empty() {
+        return Ok(());
+    }
+    let advances = clusters
+        .iter()
+        .map(|cluster| cluster.width)
+        .collect::<Vec<_>>();
+    // A right-to-left marker hangs off the right edge the way a left-to-right
+    // one hangs off the left.
+    let bullet_x = if paragraph.rtl {
+        let right =
+            (x + width - paragraph.indent_px).min(x + width + paragraph.margin_left_px.max(0.0));
+        right - advances.iter().sum::<f32>()
+    } else {
+        bullet_x
+    };
+    let mut runs = positioned_runs(&clusters, &advances, bullet_x, first.baseline, scale);
+    for run in &mut runs {
+        run.start = paragraph.runs[0].start;
+        run.end = run.start;
+        for glyph in &mut run.glyphs {
+            glyph.cluster = run.start;
+        }
+    }
+    runs.append(&mut first.runs);
+    first.runs = runs;
+    Ok(())
+}
+
+struct ShapedCluster {
+    text: String,
+    start: u32,
+    end: u32,
+    /// Glyph advances plus `tracking`.
+    width: f32,
+    /// Part of `width` that is the gap after the cluster, dropped at a line's end.
+    tracking: f32,
+    run_index: usize,
+    style: ResolvedStyle,
+    glyphs: Vec<ClusterGlyph>,
+    break_after: bool,
+    mandatory: bool,
+    /// A `U+0009` cluster, whose width the tab stops decide per line.
+    tab: bool,
+}
+
+struct ClusterGlyph {
+    glyph_id: u32,
+    cluster: u32,
+    x: f32,
+    advance: f32,
+    x_offset: f32,
+    y_offset: f32,
+}
+
+fn shape_paragraph(
+    fonts: &FontStore,
+    paragraph: &ResolvedParagraph,
+    scale: f32,
+) -> Result<Vec<ShapedCluster>, RenderError> {
+    let full_text = paragraph
+        .runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect::<String>();
+    let east_asian = paragraph
+        .runs
+        .iter()
+        .any(|run| run.style.face.east_asian_language);
+    let breaks = presentation_break_opportunities_with(&full_text, east_asian)
+        .into_iter()
+        .map(|value| (value.byte_index, value.mandatory))
+        .collect::<HashMap<_, _>>();
+    let mut clusters = Vec::new();
+    let mut global_byte = 0_usize;
+    for (run_index, run) in paragraph.runs.iter().enumerate() {
+        let mut segment_start = 0_usize;
+        let mut source_start = run.start;
+        for (byte_index, character) in run.text.char_indices() {
+            if character != '\n' && character != '\t' {
+                continue;
+            }
+            add_shaped_segment(
+                SegmentShape {
+                    fonts,
+                    run,
+                    run_index,
+                    text: &run.text[segment_start..byte_index],
+                    run_byte_start: segment_start,
+                    source_start,
+                    global_run_byte: global_byte,
+                    scale,
+                    breaks: &breaks,
+                },
+                &mut clusters,
+            )?;
+            let start = source_start + utf16_len(&run.text[segment_start..byte_index]);
+            let hard = character == '\n';
+            clusters.push(ShapedCluster {
+                text: character.to_string(),
+                start,
+                end: start + 1,
+                width: 0.0,
+                tracking: 0.0,
+                run_index,
+                style: run.style.clone(),
+                glyphs: Vec::new(),
+                break_after: true,
+                mandatory: hard,
+                tab: !hard,
+            });
+            segment_start = byte_index + character.len_utf8();
+            source_start = start + 1;
+        }
+        add_shaped_segment(
+            SegmentShape {
+                fonts,
+                run,
+                run_index,
+                text: &run.text[segment_start..],
+                run_byte_start: segment_start,
+                source_start,
+                global_run_byte: global_byte,
+                scale,
+                breaks: &breaks,
+            },
+            &mut clusters,
+        )?;
+        global_byte += run.text.len();
+    }
+    Ok(clusters)
+}
+
+struct SegmentShape<'a> {
+    fonts: &'a FontStore,
+    run: &'a ResolvedRun,
+    run_index: usize,
+    text: &'a str,
+    run_byte_start: usize,
+    source_start: u32,
+    global_run_byte: usize,
+    scale: f32,
+    breaks: &'a HashMap<usize, bool>,
+}
+
+/// The em advance of a character the browser draws for a family without a
+/// width table: an East Asian full-width character fills its em box, anything
+/// else, halfwidth forms and kana voicing marks included, takes half of it.
+fn browser_default_advance(character: char) -> f32 {
+    if matches!(character as u32,
+        0x1100..=0x115f | 0x2e80..=0x303e | 0x3041..=0x3098 | 0x309b..=0x33ff | 0x3400..=0x4dbf |
+        0x4e00..=0x9fff | 0xa000..=0xa4cf | 0xa960..=0xa97f | 0xac00..=0xd7a3 |
+        0xf900..=0xfaff | 0xfe30..=0xfe4f | 0xff00..=0xff60 | 0xffe0..=0xffe6 |
+        0x20000..=0x3fffd)
+    {
+        1.0
+    } else {
+        0.5
+    }
+}
+
+fn shape_face(
+    fonts: &FontStore,
+    face: &FontFace,
+    text: &str,
+    size_px: f32,
+    features: &[ShapeFeature],
+) -> Result<Vec<ShapedGlyph>, ooxml_text::FontError> {
+    if face.id.to_u32() != BROWSER_FONT_ID {
+        return shape(fonts, face.id, text, size_px, features);
+    }
+    let mut glyphs = Vec::new();
+    let mut characters = text.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        let first = glyphs.len();
+        glyphs.push(ShapedGlyph {
+            glyph_id: 0,
+            cluster: index as u32,
+            x_advance: face.widths.map_or_else(
+                || browser_default_advance(character),
+                |metrics| family_advance(metrics, character).unwrap_or(0.5),
+            ) * size_px,
+            x_offset: 0.0,
+            y_offset: 0.0,
+        });
+        if let Some(&(_, mark)) = characters.peek()
+            && let Some(advance) = match face.widths {
+                Some(metrics) => family_composed_kana_advance(metrics, character, mark),
+                None => (matches!(mark, '\u{3099}' | '\u{309a}')
+                    && browser_default_advance(character) == 1.0)
+                    .then_some(1.0),
+            }
+        {
+            characters.next();
+            glyphs.push(ShapedGlyph {
+                glyph_id: 0,
+                cluster: index as u32,
+                x_advance: 0.0,
+                x_offset: 0.0,
+                y_offset: 0.0,
+            });
+            glyphs[first].x_advance = advance * size_px;
+        }
+    }
+    Ok(glyphs)
+}
+
+fn add_shaped_segment(
+    request: SegmentShape<'_>,
+    output: &mut Vec<ShapedCluster>,
+) -> Result<(), RenderError> {
+    let SegmentShape {
+        fonts,
+        run,
+        run_index,
+        text,
+        run_byte_start,
+        mut source_start,
+        global_run_byte,
+        scale,
+        breaks,
+    } = request;
+    if text.is_empty() {
+        return Ok(());
+    }
+    let size_pt = autofit_size_pt(run.style.font_size_pt, scale);
+    let size_px = points_to_px(size_pt);
+    let tracking = points_to_px(run.style.spacing_pt * scale);
+    let shaped = shape_face(
+        fonts,
+        &run.style.face,
+        text,
+        size_px,
+        run_features(
+            tracking != 0.0 || run.style.face.widths.is_some(),
+            kerned(run.style.kern_pt, size_pt),
+        ),
+    )
+    .map_err(|error| RenderError::Font(error.to_string()))?;
+    let mut glyphs_by_cluster: HashMap<usize, Vec<ShapedGlyph>> = HashMap::new();
+    for glyph in shaped {
+        let start = glyph.cluster as usize;
+        if start < text.len() && text.is_char_boundary(start) {
+            glyphs_by_cluster.entry(start).or_default().push(glyph);
+        }
+    }
+    let mut starts = text
+        .char_indices()
+        .filter(|(start, _)| *start == 0 || glyphs_by_cluster.contains_key(start))
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    starts.push(text.len());
+    for pair in starts.windows(2) {
+        let start_byte = pair[0];
+        let end_byte = pair[1];
+        if start_byte == end_byte {
+            continue;
+        }
+        let text_slice = &text[start_byte..end_byte];
+        let source_end = source_start + utf16_len(text_slice);
+        let mut glyph_x = 0.0;
+        let mut glyphs = Vec::new();
+        for glyph in glyphs_by_cluster.remove(&start_byte).unwrap_or_default() {
+            glyphs.push(ClusterGlyph {
+                glyph_id: glyph.glyph_id,
+                cluster: source_start,
+                x: glyph_x,
+                advance: glyph.x_advance,
+                x_offset: glyph.x_offset,
+                y_offset: glyph.y_offset,
+            });
+            glyph_x += glyph.x_advance;
+        }
+        // The glyphs keep the advances of the face that draws them, so a
+        // backend laying the run out itself still sees where each one ends and
+        // places the next cluster at the x this width put it.
+        let cluster_width = named_cluster_width(&run.style, text_slice, size_px).unwrap_or(glyph_x);
+        let global_end = global_run_byte + run_byte_start + end_byte;
+        let tracking = tracking.max(-cluster_width);
+        output.push(ShapedCluster {
+            text: text_slice.to_owned(),
+            start: source_start,
+            end: source_end,
+            width: cluster_width + tracking,
+            tracking,
+            run_index,
+            style: run.style.clone(),
+            glyphs,
+            break_after: breaks.contains_key(&global_end),
+            mandatory: breaks.get(&global_end).copied().unwrap_or(false),
+            tab: false,
+        });
+        source_start = source_end;
+    }
+    Ok(())
+}
+
+/// The part of a line that centring and right alignment measure: a space at
+/// the end of a wrapped line hangs past the margin, so PowerPoint does not
+/// count it when it places the line.
+fn aligned_slice(clusters: &[ShapedCluster]) -> &[ShapedCluster] {
+    let end = clusters
+        .iter()
+        .rposition(|cluster| !cluster.text.chars().all(char::is_whitespace))
+        .map_or(0, |index| index + 1);
+    &clusters[..end]
+}
+
+/// Measures a line without its trailing tracking gap.
+fn line_advance(clusters: &[ShapedCluster]) -> f32 {
+    clusters.iter().map(|cluster| cluster.width).sum::<f32>() - trailing_tracking(clusters)
+}
+
+fn trailing_tracking(clusters: &[ShapedCluster]) -> f32 {
+    clusters
+        .iter()
+        .rev()
+        .find(|cluster| cluster.text != "\n")
+        .map_or(0.0, |cluster| cluster.tracking)
+}
+
+/// Greedy line fill. Tab clusters take their width here, from the pen's offset
+/// in the text area, so the wrap and the painted line agree on where a tab
+/// lands: the greedy walk reaches a cluster in its final line's position last.
+fn wrap_clusters(
+    clusters: &mut [ShapedCluster],
+    width: f32,
+    left_offset: f32,
+    first_line_indent: f32,
+    stops: &[f32],
+    default_tab_px: f32,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut line_index = 0;
+    while start < clusters.len() {
+        let indent = if line_index == 0 {
+            first_line_indent
+        } else {
+            0.0
+        };
+        let width = (width - indent).max(1.0);
+        let left_offset = left_offset + indent;
+        let mut cursor = start;
+        let mut line_width = 0.0;
+        let mut last_break = None;
+        let mut end = clusters.len();
+        while cursor < clusters.len() {
+            if clusters[cursor].tab {
+                let pen = left_offset + line_width;
+                clusters[cursor].width =
+                    tab_advance(pen, pen, stops, default_tab_px, width - line_width);
+            }
+            let cluster = &clusters[cursor];
+            // A space that lands at the end of a line hangs past the edge
+            // instead of pushing the word before it down, which is what lets
+            // PowerPoint fit a word we were breaking one early (#797).
+            if cluster.text != "\n"
+                && !cluster.tab
+                && !cluster.text.chars().all(char::is_whitespace)
+                && line_width + cluster.width - cluster.tracking > width + FIT_EPSILON_PX
+                && cursor > start
+            {
+                end = last_break
+                    .filter(|candidate| *candidate > start)
+                    .unwrap_or(cursor);
+                break;
+            }
+            line_width += cluster.width;
+            cursor += 1;
+            if cluster.break_after {
+                last_break = Some(cursor);
+            }
+            if cluster.mandatory {
+                end = cursor;
+                break;
+            }
+        }
+        if cursor == clusters.len() {
+            end = clusters.len();
+        }
+        if end <= start {
+            end = start + 1;
+        }
+        ranges.push((start, end));
+        start = end;
+        line_index += 1;
+    }
+    // A paragraph ending in `a:br` keeps the empty line the break opened, the
+    // way PowerPoint does; a centred or bottom-anchored body is half a line
+    // out without it (#797).
+    if clusters.last().is_some_and(|cluster| cluster.text == "\n")
+        && let Some(last) = ranges.last_mut()
+        && last.1 - last.0 > 1
+    {
+        last.1 -= 1;
+        ranges.push((clusters.len() - 1, clusters.len()));
+    }
+    ranges
+}
+
+fn positioned_runs(
+    clusters: &[ShapedCluster],
+    advances: &[f32],
+    line_x: f32,
+    baseline: f32,
+    scale: f32,
+) -> Vec<PositionedTextRun> {
+    let mut output: Vec<PositionedTextRun> = Vec::new();
+    let mut cursor_x = line_x;
+    let mut trailing_tracking = 0.0_f32;
+    let mut run_direction = None;
+    for (index, cluster) in clusters.iter().enumerate() {
+        if cluster.text == "\n" {
+            continue;
+        }
+        let baseline_offset_px = cluster.style.baseline_shift_px * scale;
+        let turns = matches!(
+            (run_direction, direction(&cluster.text)),
+            (Some(current), Some(next)) if current != next
+        );
+        let append = !turns
+            && output.last().is_some_and(|run| {
+                run.end == cluster.start
+                    && run.font_id == cluster.style.face.id.to_u32()
+                    && run.letter_spacing_px == cluster.tracking
+                    && run.baseline_offset_px == baseline_offset_px
+                    && run.font_family == cluster.style.family
+                    && run.font_size_px
+                        == points_to_px(autofit_size_pt(cluster.style.font_size_pt, scale))
+                    && run.bold == cluster.style.bold
+                    && run.italic == cluster.style.italic
+                    && run.underline == cluster.style.underline
+                    && run.strike == cluster.style.strike
+                    && run.color == cluster.style.color
+            });
+        if !append {
+            run_direction = None;
+            if let Some(previous) = output.last_mut() {
+                previous.width -= trailing_tracking;
+            }
+            output.push(PositionedTextRun {
+                text: String::new(),
+                start: cluster.start,
+                end: cluster.start,
+                x: cursor_x,
+                width: 0.0,
+                font_id: cluster.style.face.id.to_u32(),
+                font_family: cluster.style.family.clone(),
+                font_size_px: points_to_px(autofit_size_pt(cluster.style.font_size_pt, scale)),
+                bold: cluster.style.bold,
+                italic: cluster.style.italic,
+                underline: cluster.style.underline,
+                strike: cluster.style.strike.clone(),
+                color: cluster.style.color.clone(),
+                letter_spacing_px: cluster.tracking,
+                baseline_offset_px,
+                glyphs: Vec::new(),
+            });
+        }
+        run_direction = run_direction.or_else(|| direction(&cluster.text));
+        let Some(run) = output.last_mut() else {
+            continue;
+        };
+        run.text.push_str(&cluster.text);
+        run.end = cluster.end;
+        for glyph in &cluster.glyphs {
+            run.glyphs.push(PositionedGlyph {
+                glyph_id: glyph.glyph_id,
+                cluster: glyph.cluster,
+                x: cursor_x + glyph.x,
+                advance: glyph.advance,
+                x_offset: glyph.x_offset,
+                y_offset: baseline - baseline_offset_px + glyph.y_offset,
+            });
+        }
+        let advance = advances.get(index).copied().unwrap_or(cluster.width);
+        run.width += advance;
+        cursor_x += advance;
+        trailing_tracking = cluster.tracking;
+    }
+    if let Some(last) = output.last_mut() {
+        last.width -= trailing_tracking;
+    }
+    output
+}
+
+/// What justification needs to know about one cluster.
+struct JustifyCluster {
+    width: f32,
+    break_after: bool,
+    blank: bool,
+}
+
+fn justify_clusters(clusters: &[ShapedCluster]) -> Vec<JustifyCluster> {
+    let last_visible = clusters
+        .iter()
+        .rposition(|cluster| !cluster_is_blank(cluster));
+    clusters
+        .iter()
+        .enumerate()
+        .map(|(index, cluster)| JustifyCluster {
+            width: cluster.width
+                - if Some(index) == last_visible {
+                    cluster.tracking
+                } else {
+                    0.0
+                },
+            break_after: cluster.break_after,
+            blank: cluster_is_blank(cluster),
+        })
+        .collect()
+}
+
+fn cluster_is_blank(cluster: &ShapedCluster) -> bool {
+    !cluster.text.is_empty() && cluster.text.chars().all(char::is_whitespace)
+}
+
+/// Extra width to add after each cluster so the line fills `available`. Only
+/// the break opportunities inside the line stretch, so the glyphs spread while
+/// the words stay whole; trailing blanks are excluded from both the measurement
+/// and the stretch, which lands the last glyph on the far edge.
+fn justification_padding(clusters: &[JustifyCluster], available: f32) -> Vec<f32> {
+    let mut padding = vec![0.0; clusters.len()];
+    let trailing = clusters
+        .iter()
+        .rev()
+        .take_while(|cluster| cluster.blank)
+        .count();
+    let visible = clusters.len() - trailing;
+    let width: f32 = clusters[..visible]
+        .iter()
+        .map(|cluster| cluster.width)
+        .sum();
+    let extra = available - width;
+    if !extra.is_finite() || extra <= 0.0 || visible == 0 {
+        return padding;
+    }
+    let gaps: Vec<usize> = clusters[..visible]
+        .iter()
+        .enumerate()
+        .take(visible.saturating_sub(1))
+        .filter(|(_, cluster)| cluster.break_after)
+        .map(|(index, _)| index)
+        .collect();
+    if gaps.is_empty() {
+        return padding;
+    }
+    let share = extra / gaps.len() as f32;
+    for index in gaps {
+        padding[index] = share;
+    }
+    padding
+}
+
+fn clusters_line_box(
+    fonts: &FontStore,
+    clusters: &[ShapedCluster],
+    scale: f32,
+) -> Result<(ooxml_text::LineBox, ShiftExtents), RenderError> {
+    let mut ascent: f32 = 0.0;
+    let mut descent: f32 = 0.0;
+    let mut leading: f32 = 0.0;
+    let mut shifted_ascent: f32 = 0.0;
+    let mut shifted_descent: f32 = 0.0;
+    let mut seen = HashSet::new();
+    for cluster in clusters {
+        if !seen.insert(cluster.run_index) {
+            continue;
+        }
+        let line = style_line_box(fonts, &cluster.style, scale)?;
+        let shift = cluster.style.baseline_shift_px * scale;
+        ascent = ascent.max(line.ascent);
+        descent = descent.max(line.descent);
+        leading = leading.max(line.leading);
+        shifted_ascent = shifted_ascent.max((line.ascent + shift).max(0.0));
+        shifted_descent = shifted_descent.max((line.descent - shift).max(0.0));
+    }
+    Ok((
+        ooxml_text::LineBox {
+            ascent,
+            descent,
+            leading,
+        },
+        ShiftExtents {
+            ascent: (shifted_ascent - ascent).max(0.0),
+            descent: (shifted_descent - descent).max(0.0),
+        },
+    ))
+}
+
+/// How far super/subscript ink reaches past the unshifted line box.
+#[derive(Clone, Copy, Default)]
+struct ShiftExtents {
+    ascent: f32,
+    descent: f32,
+}
+
+/// Spacing sets the pitch of the unshifted box; shifted ink then pushes the
+/// edges back out so a raised or lowered run is never clipped.
+fn shifted_line_box(line: ooxml_text::LineBox, extents: ShiftExtents) -> ooxml_text::LineBox {
+    ooxml_text::LineBox {
+        ascent: line.ascent + extents.ascent,
+        descent: line.descent + extents.descent,
+        leading: line.leading,
+    }
+}
+
+fn style_line_box(
+    fonts: &FontStore,
+    style: &ResolvedStyle,
+    scale: f32,
+) -> Result<ooxml_text::LineBox, RenderError> {
+    let size_px = points_to_px(autofit_size_pt(style.line_font_size_pt, scale));
+    if let Some(named) = style.face.line {
+        return Ok(family_line_box(named, size_px));
+    }
+    let metrics = fonts
+        .metrics(style.face.line_id)
+        .map_err(|error| RenderError::Font(error.to_string()))?;
+    Ok(single_line_box(metrics, size_px, &CompatFlags::default()))
+}
+
+/// Largest font size on this line.
+fn line_font_size_px(clusters: &[ShapedCluster], scale: f32) -> f32 {
+    clusters
+        .iter()
+        .map(|cluster| points_to_px(autofit_size_pt(cluster.style.line_font_size_pt, scale)))
+        .fold(0.0_f32, f32::max)
+}
+
+/// Round normal-autofit sizes to whole points, preserving authored sizes otherwise.
+fn autofit_size_pt(size_pt: f32, scale: f32) -> f32 {
+    if scale >= 1.0 {
+        return size_pt;
+    }
+    (size_pt * scale).round().max(1.0)
+}
+
+/// `a:normAutofit/@fontScale`, applied verbatim: PowerPoint stores the scale it
+/// computed when the text last changed and re-fits only on edit, never on render.
+fn autofit_font_scale(autofit: Option<&TextAutofit>) -> f32 {
+    match autofit {
+        Some(TextAutofit::Normal { font_scale, .. }) => {
+            font_scale.unwrap_or(1.0).clamp(0.1, 1.0) as f32
+        }
+        _ => 1.0,
+    }
+}
+
+/// `a:normAutofit/@lnSpcReduction`, subtracted from percentage line spacing.
+fn autofit_line_space_reduction(autofit: Option<&TextAutofit>) -> f32 {
+    match autofit {
+        Some(TextAutofit::Normal {
+            line_space_reduction,
+            ..
+        }) => line_space_reduction.unwrap_or(0.0).clamp(0.0, 0.9) as f32,
+        _ => 0.0,
+    }
+}
+
+/// Apply paragraph spacing to a measured line box.
+fn spaced_line_box(
+    content: ooxml_text::LineBox,
+    paragraph: &ResolvedParagraph,
+    size_px: f32,
+) -> ooxml_text::LineBox {
+    if content.height() <= 0.0 {
+        return content;
+    }
+    let reduction = paragraph.line_space_reduction;
+    let single = SINGLE_LINE_PITCH_EM * size_px;
+    let target = match paragraph.line_spacing {
+        // An exact line spacing is a measurement, not a font size, so the
+        // autofit scale leaves it alone.
+        Some(LineSpacing::Points { value }) => points_to_px(value as f32),
+        Some(LineSpacing::Percent { value }) => (value as f32 - reduction).max(0.0) * single,
+        None => (1.0 - reduction) * single,
+    };
+    if !target.is_finite() || target < 0.0 {
+        return content;
+    }
+    // PowerPoint splits the room a line box does not fill evenly above and
+    // below it, so a paragraph whose spacing asks for more than its face
+    // measures starts that much lower.
+    if target >= content.height() {
+        let slack = (target - content.ascent - content.descent) / 2.0;
+        return ooxml_text::LineBox {
+            ascent: content.ascent + slack,
+            leading: slack,
+            ..content
+        };
+    }
+    scale_line_box(content, target / content.height())
+}
+
+fn scale_line_box(line: ooxml_text::LineBox, factor: f32) -> ooxml_text::LineBox {
+    ooxml_text::LineBox {
+        ascent: line.ascent * factor,
+        descent: line.descent * factor,
+        leading: line.leading * factor,
+    }
+}
+
+fn shift_line(line: &mut PositionedTextLine, x: f32, y: f32) {
+    line.x += x;
+    line.y += y;
+    line.baseline += y;
+    for stop in &mut line.caret_stops {
+        stop.x += x;
+    }
+    for run in &mut line.runs {
+        run.x += x;
+        for glyph in &mut run.glyphs {
+            glyph.x += x;
+            glyph.y_offset += y;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PxRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl PxRect {
+    fn contains(self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BackgroundTransform {
+    xx: f64,
+    xy: f64,
+    yx: f64,
+    yy: f64,
+    tx: f64,
+    ty: f64,
+}
+
+impl BackgroundTransform {
+    fn for_shape(rect: PxRect, transform: Transform) -> Self {
+        let (sin, cos) = fmath::sin_cos(f64::from(transform.rotation_deg).to_radians());
+        let width = f64::from(rect.w);
+        let height = f64::from(rect.h);
+        let flipped_width = if transform.flip_h { -width } else { width };
+        let flipped_height = if transform.flip_v { -height } else { height };
+        let (xx, xy) = (cos * flipped_width, -sin * flipped_height);
+        let (yx, yy) = (sin * flipped_width, cos * flipped_height);
+        Self {
+            xx,
+            xy,
+            yx,
+            yy,
+            tx: f64::from(rect.x) + width / 2.0 - (xx + xy) / 2.0,
+            ty: f64::from(rect.y) + height / 2.0 - (yx + yy) / 2.0,
+        }
+    }
+
+    fn point(self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.xx * x + self.xy * y + self.tx,
+            self.yx * x + self.yy * y + self.ty,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Space {
+    origin_x: f32,
+    origin_y: f32,
+    scale_x: f32,
+    scale_y: f32,
+}
+
+impl Space {
+    fn root() -> Self {
+        Self {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            scale_x: 1.0 / EMU_PER_CSS_PIXEL,
+            scale_y: 1.0 / EMU_PER_CSS_PIXEL,
+        }
+    }
+
+    fn map_transform(self, transform: &ShapeTransform) -> PxRect {
+        PxRect {
+            x: safe_geometry(self.origin_x + transform.x as f32 * self.scale_x),
+            y: safe_geometry(self.origin_y + transform.y as f32 * self.scale_y),
+            w: safe_geometry(transform.width as f32 * self.scale_x).abs(),
+            h: safe_geometry(transform.height as f32 * self.scale_y).abs(),
+        }
+    }
+
+    fn for_group(self, rect: PxRect, transform: &ShapeTransform) -> Self {
+        let child_width = transform.child_width.unwrap_or(transform.width);
+        let child_height = transform.child_height.unwrap_or(transform.height);
+        if child_width == 0 || child_height == 0 {
+            return Self::root();
+        }
+        let scale_x = safe_geometry(rect.w / child_width as f32);
+        let scale_y = safe_geometry(rect.h / child_height as f32);
+        let child_x = transform.child_x.unwrap_or_default() as f32;
+        let child_y = transform.child_y.unwrap_or_default() as f32;
+        let origin_x = safe_geometry(rect.x - child_x * scale_x);
+        let origin_y = safe_geometry(rect.y - child_y * scale_y);
+        Self {
+            origin_x,
+            origin_y,
+            scale_x,
+            scale_y,
+        }
+    }
+}
+
+struct HitRegion {
+    shape_id: String,
+    rect: PxRect,
+    hit_rect: PxRect,
+    transform: Transform,
+    text: Option<TextHit>,
+}
+
+impl HitRegion {
+    /// Maps slide coordinates into the shape frame.
+    fn local_point(&self, x: f32, y: f32) -> (f32, f32) {
+        local_point(self.rect, self.transform, x, y)
+    }
+}
+
+struct TextHit {
+    overflow: bool,
+    story_id: String,
+    rect: PxRect,
+    transform: Transform,
+    lines: Vec<PositionedTextLine>,
+}
+
+impl TextHit {
+    /// Maps slide coordinates into the text frame.
+    fn local_point(&self, x: f32, y: f32) -> (f32, f32) {
+        local_point(self.rect, self.transform, x, y)
+    }
+}
+
+/// Maps a slide point back into the unrotated frame `rect` was laid out in.
+fn local_point(rect: PxRect, transform: Transform, x: f32, y: f32) -> (f32, f32) {
+    if transform.is_identity() {
+        return (x, y);
+    }
+    let center_x = rect.x + rect.w / 2.0;
+    let center_y = rect.y + rect.h / 2.0;
+    let (sin, cos) = fmath::sin_cosf(transform.rotation_deg.to_radians());
+    let dx = x - center_x;
+    let dy = y - center_y;
+    let mut local_x = dx * cos + dy * sin;
+    let mut local_y = dy * cos - dx * sin;
+    if transform.flip_h {
+        local_x = -local_x;
+    }
+    if transform.flip_v {
+        local_y = -local_y;
+    }
+    (center_x + local_x, center_y + local_y)
+}
+
+fn nearest_line(lines: &[PositionedTextLine], x: f32, y: f32) -> Option<&PositionedTextLine> {
+    let columns = lines
+        .windows(2)
+        .any(|pair| pair[1].column_offset != pair[0].column_offset);
+    let distance = |line: &PositionedTextLine| {
+        let dx = distance_to_interval(x, line.x, line.x + line.width);
+        let dy = distance_to_interval(y, line.y, line.y + line.height);
+        if columns { dx * dx + dy * dy } else { dy }
+    };
+    lines
+        .iter()
+        .min_by(|left, right| distance(left).total_cmp(&distance(right)))
+}
+
+fn distance_to_interval(value: f32, start: f32, end: f32) -> f32 {
+    if value < start {
+        start - value
+    } else if value > end {
+        value - end
+    } else {
+        0.0
+    }
+}
+
+fn find_node(nodes: &[ShapeNode], id: u32) -> Option<&ShapeNode> {
+    for node in nodes {
+        if node.id() == id {
+            return Some(node);
+        }
+        if let ShapeNode::Group(group) = node
+            && let Some(found) = find_node(&group.children, id)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn node_base(node: &ShapeNode) -> &pptx_parse::ShapeBase {
+    match node {
+        ShapeNode::Shape(shape) => &shape.base,
+        ShapeNode::Picture(shape) => &shape.base,
+        ShapeNode::GraphicFrame(shape) => &shape.base,
+        ShapeNode::Group(shape) => &shape.base,
+    }
+}
+
+fn node_placeholder(node: &ShapeNode) -> Option<&Placeholder> {
+    node_base(node).placeholder.as_ref()
+}
+
+fn node_fill(node: &ShapeNode) -> Option<&ShapeFill> {
+    match node {
+        ShapeNode::Shape(shape) => shape.fill.as_ref(),
+        ShapeNode::Picture(shape) => shape.fill.as_ref(),
+        ShapeNode::GraphicFrame(_) | ShapeNode::Group(_) => None,
+    }
+}
+
+fn node_style(node: &ShapeNode) -> Option<&ShapeStyle> {
+    match node {
+        ShapeNode::Shape(shape) => shape.style.as_deref(),
+        ShapeNode::Picture(picture) => picture.style.as_deref(),
+        _ => None,
+    }
+}
+
+fn merge_outline(direct: &ShapeOutline, fallback: Option<&ShapeOutline>) -> ShapeOutline {
+    let Some(fallback) = fallback else {
+        return direct.clone();
+    };
+    ShapeOutline {
+        width: direct.width.or(fallback.width),
+        color: direct.color.clone().or_else(|| {
+            direct
+                .gradient
+                .is_none()
+                .then(|| fallback.color.clone())
+                .flatten()
+        }),
+        gradient: direct.gradient.clone().or_else(|| {
+            direct
+                .color
+                .is_none()
+                .then(|| fallback.gradient.clone())
+                .flatten()
+        }),
+        style: direct.style.clone().or_else(|| fallback.style.clone()),
+        cap: direct.cap.clone().or_else(|| fallback.cap.clone()),
+        join: direct.join.clone().or_else(|| fallback.join.clone()),
+        head_end: direct
+            .head_end
+            .clone()
+            .or_else(|| fallback.head_end.clone()),
+        tail_end: direct
+            .tail_end
+            .clone()
+            .or_else(|| fallback.tail_end.clone()),
+    }
+}
+
+fn node_outline(node: &ShapeNode) -> Option<&ShapeOutline> {
+    match node {
+        ShapeNode::Shape(shape) => shape.outline.as_ref(),
+        ShapeNode::Picture(shape) => shape.outline.as_ref(),
+        ShapeNode::GraphicFrame(_) | ShapeNode::Group(_) => None,
+    }
+}
+
+fn source_rect(crop: Option<&PictureCrop>) -> Option<(f64, f64, f64, f64)> {
+    let Some(crop) = crop else {
+        return Some((0.0, 0.0, 1.0, 1.0));
+    };
+    let fraction = |value: i32| f64::from(value) / 100_000.0;
+    let (left, top) = (fraction(crop.left), fraction(crop.top));
+    let (width, height) = (
+        1.0 - left - fraction(crop.right),
+        1.0 - top - fraction(crop.bottom),
+    );
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some((-left / width, -top / height, 1.0 / width, 1.0 / height))
+}
+
+/// Maps a metafile clip rectangle into the picture box, or `None` when the clip
+/// leaves nothing of the box visible.
+/// whether a metafile clip would hide any of `path`, in the normalised space
+/// `metafile_clip_path` works in.
+fn clipped_away(path: &[GeometryPathCommand], clip: [f64; 4], rect: (f64, f64, f64, f64)) -> bool {
+    let Some(bounds) = metafile_clip_path(clip, rect) else {
+        return true;
+    };
+    let (mut left, mut top, mut right, mut bottom) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for command in &bounds {
+        if let GeometryPathCommand::Move { x, y } | GeometryPathCommand::Line { x, y } = command {
+            left = left.min(*x);
+            top = top.min(*y);
+            right = right.max(*x);
+            bottom = bottom.max(*y);
+        }
+    }
+    let outside = |x: &f64, y: &f64| *x < left || *x > right || *y < top || *y > bottom;
+    path.iter().any(|command| match command {
+        GeometryPathCommand::Move { x, y } | GeometryPathCommand::Line { x, y } => outside(x, y),
+        GeometryPathCommand::Quad { cpx, cpy, x, y } => outside(cpx, cpy) || outside(x, y),
+        GeometryPathCommand::Cubic {
+            cp1x,
+            cp1y,
+            cp2x,
+            cp2y,
+            x,
+            y,
+        } => outside(cp1x, cp1y) || outside(cp2x, cp2y) || outside(x, y),
+        GeometryPathCommand::Close => false,
+    })
+}
+
+fn metafile_clip_path(
+    clip: [f64; 4],
+    rect: (f64, f64, f64, f64),
+) -> Option<Vec<GeometryPathCommand>> {
+    let (x0, y0, w, h) = rect;
+    let left = (x0 + clip[0] * w).max(0.0);
+    let top = (y0 + clip[1] * h).max(0.0);
+    let right = (x0 + clip[2] * w).min(1.0);
+    let bottom = (y0 + clip[3] * h).min(1.0);
+    if !(left < right && top < bottom) {
+        return None;
+    }
+    Some(vec![
+        GeometryPathCommand::Move { x: left, y: top },
+        GeometryPathCommand::Line { x: right, y: top },
+        GeometryPathCommand::Line {
+            x: right,
+            y: bottom,
+        },
+        GeometryPathCommand::Line { x: left, y: bottom },
+        GeometryPathCommand::Close,
+    ])
+}
+
+/// Maps a path measured in the metafile's frame into the picture box.
+fn place_in_source_rect(path: &mut [GeometryPathCommand], rect: (f64, f64, f64, f64)) {
+    if rect == (0.0, 0.0, 1.0, 1.0) {
+        return;
+    }
+    let (x0, y0, w, h) = rect;
+    let place = |x: &mut f64, y: &mut f64| {
+        *x = x0 + *x * w;
+        *y = y0 + *y * h;
+    };
+    for command in path {
+        match command {
+            GeometryPathCommand::Move { x, y } | GeometryPathCommand::Line { x, y } => place(x, y),
+            GeometryPathCommand::Quad { cpx, cpy, x, y } => {
+                place(cpx, cpy);
+                place(x, y);
+            }
+            GeometryPathCommand::Cubic {
+                cp1x,
+                cp1y,
+                cp2x,
+                cp2y,
+                x,
+                y,
+            } => {
+                place(cp1x, cp1y);
+                place(cp2x, cp2y);
+                place(x, y);
+            }
+            GeometryPathCommand::Close => {}
+        }
+    }
+}
+
+fn node_effects(node: &ShapeNode) -> Option<&ShapeEffects> {
+    match node {
+        ShapeNode::Shape(shape) => shape.effects.as_ref(),
+        ShapeNode::Picture(shape) => shape.shape_effects.as_ref(),
+        ShapeNode::GraphicFrame(_) | ShapeNode::Group(_) => None,
+    }
+}
+
+fn node_text(node: &ShapeNode) -> Option<&TextBody> {
+    match node {
+        ShapeNode::Shape(shape) => shape.text.as_ref(),
+        _ => None,
+    }
+}
+
+fn node_group_transform(node: &ShapeNode) -> Option<&ShapeTransform> {
+    match node {
+        ShapeNode::Group(group) => Some(&group.base.transform),
+        _ => None,
+    }
+}
+
+/// The first `a:effectLst` any of a body's runs or level defaults declares.
+fn body_text_effects(body: &TextBody) -> Option<&ShapeEffects> {
+    let paragraph_runs = body.paragraphs.iter().flat_map(|paragraph| {
+        paragraph
+            .runs
+            .iter()
+            .map(|run| &run.properties)
+            .chain(paragraph.properties.default_run.as_ref())
+    });
+    let level_defaults = body
+        .list_style
+        .iter()
+        .chain(body.default_list_style.as_deref())
+        .filter_map(|properties| properties.default_run.as_ref());
+    paragraph_runs
+        .chain(level_defaults)
+        .find_map(|properties| properties.effects.as_ref())
+        .filter(|effects| effects.outer_shadow.is_some())
+}
+
+/// A run that carries an `a:hlinkClick` is drawn in the theme's `hlink` colour
+/// and underlined, over whatever the placeholder would otherwise give it.
+fn style_from_properties(properties: &RunProperties, theme: &Theme) -> TextStyle {
+    let linked = properties.hyperlink_relationship_id.is_some();
+    TextStyle {
+        bold: properties.bold,
+        italic: properties.italic,
+        font_size_pt: properties.font_size_pt,
+        color: resolve_paint_color(properties.color.as_ref(), theme)
+            .or_else(|| linked.then(|| format!("#{}", get_theme_color(Some(theme), "hlink")))),
+        font_family: properties.font_family.clone(),
+        underline: properties
+            .underline
+            .clone()
+            .or_else(|| linked.then(|| "sng".to_owned())),
+        strike: properties.strike.clone(),
+        spacing_pt: properties.spacing_pt,
+        baseline_pct: properties.baseline_pct,
+        kern_pt: properties.kern_pt,
+        caps: properties.caps,
+    }
+}
+
+/// The transform a shape draws at. Without an extent it takes the inherited
+/// one, keeping its own orientation when its node spells out a transform.
+fn resolved_transform_value(
+    shape: &ShapeSnapshot,
+    original: Option<&ShapeNode>,
+    layout: Option<&ShapeNode>,
+    master: Option<&ShapeNode>,
+) -> ShapeTransform {
+    let own = ShapeTransform {
+        x: shape.x,
+        y: shape.y,
+        width: shape.width,
+        height: shape.height,
+        rotation_deg: shape.rotation_deg,
+        flip_h: shape.flip_h,
+        flip_v: shape.flip_v,
+        ..ShapeTransform::default()
+    };
+    if shape.width > 0 && shape.height > 0 {
+        return own;
+    }
+    let Some(inherited) = [original, layout, master]
+        .into_iter()
+        .flatten()
+        .map(|node| &node_base(node).transform)
+        .find(|transform| transform.width > 0 && transform.height > 0)
+    else {
+        return own;
+    };
+    if original.is_some_and(|node| node_base(node).transform != ShapeTransform::default()) {
+        ShapeTransform {
+            rotation_deg: own.rotation_deg,
+            flip_h: own.flip_h,
+            flip_v: own.flip_v,
+            ..inherited.clone()
+        }
+    } else {
+        inherited.clone()
+    }
+}
+
+/// Resolves bitmap effect colours against the theme.
+fn image_effects(effects: &[BlipEffect], theme: &Theme) -> Vec<ImageEffect> {
+    image_effects_with_placeholder(effects, theme, None)
+}
+
+fn image_effects_with_placeholder(
+    effects: &[BlipEffect],
+    theme: &Theme,
+    reference: Option<&StyleReference>,
+) -> Vec<ImageEffect> {
+    let rgba = |color: Option<&ColorValue>| {
+        let color = color?;
+        let substituted =
+            reference.and_then(|reference| style_reference_color(color, reference, theme));
+        resolve_color_value_to_rgba_hex(Some(substituted.as_ref().unwrap_or(color)), Some(theme))
+    };
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            BlipEffect::BiLevel { threshold } => Some(ImageEffect::BiLevel {
+                threshold: (*threshold as f32).clamp(0.0, 1.0),
+            }),
+            BlipEffect::Grayscale => Some(ImageEffect::Grayscale),
+            BlipEffect::Alpha { amount } => Some(ImageEffect::Alpha {
+                amount: *amount as f32,
+            }),
+            BlipEffect::Luminance {
+                brightness,
+                contrast,
+            } => Some(ImageEffect::Luminance {
+                brightness: (*brightness as f32).clamp(-1.0, 1.0),
+                contrast: (*contrast as f32).clamp(-1.0, 1.0),
+            }),
+            BlipEffect::Duotone { shadow, highlight } => Some(ImageEffect::Duotone {
+                shadow: rgba(shadow.as_ref())?,
+                highlight: rgba(highlight.as_ref())?,
+            }),
+            BlipEffect::ColorChange {
+                from,
+                to,
+                use_alpha,
+            } => Some(ImageEffect::ColorChange {
+                from: rgba(from.as_ref())?,
+                to: rgba(to.as_ref())?,
+                use_alpha: *use_alpha,
+            }),
+        })
+        .collect()
+}
+
+/// A fill or stroke colour, widened to `#RRGGBBAA` only when it is actually translucent.
+fn resolve_paint_color(color: Option<&ColorValue>, theme: &Theme) -> Option<String> {
+    let rgba = resolve_color_value_to_rgba_hex(color, Some(theme))?;
+    match rgba.strip_suffix("FF") {
+        Some(opaque) if rgba.len() == 9 => Some(opaque.to_owned()),
+        _ => Some(rgba),
+    }
+}
+
+fn paint(fill: &ShapeFill, theme: &Theme) -> Option<Paint> {
+    if fill.fill_type == "none" {
+        return None;
+    }
+    if let Some(paint) = fill
+        .gradient
+        .as_ref()
+        .and_then(|gradient| gradient_paint(gradient, theme))
+    {
+        return Some(paint);
+    }
+    resolve_paint_color(fill.color.as_ref(), theme).map(|color| Paint::Solid { color })
+}
+
+fn shape_style_color(shape: Option<&ShapeNode>) -> Option<&ColorValue> {
+    match shape? {
+        ShapeNode::Shape(shape) => shape.style.as_ref()?.font_color.as_ref(),
+        _ => None,
+    }
+}
+
+fn line_end(end: Option<&LineEnd>, stroke_width: f32) -> Option<StrokeEnd> {
+    let end = end.filter(|end| end.end_type != "none")?;
+    let base = stroke_width.max(LINE_END_MIN_BASE_PX);
+    Some(StrokeEnd {
+        kind: end.end_type.clone(),
+        width: base * line_end_scale(end.width.as_deref()),
+        length: base * line_end_scale(end.length.as_deref()),
+    })
+}
+
+fn line_end_scale(size: Option<&str>) -> f32 {
+    match size {
+        Some("sm") => 2.0,
+        Some("lg") => 5.0,
+        _ => 3.0,
+    }
+}
+
+/// `a:outerShdw` in surface pixels, or `None` when it would paint nothing.
+fn shadow(
+    effects: &ShapeEffects,
+    theme: &Theme,
+    space: Space,
+    rect: PxRect,
+    rotation_deg: f32,
+    flip_h: bool,
+    flip_v: bool,
+) -> Option<Shadow> {
+    let outer = effects.outer_shadow.as_ref()?;
+    let color = resolve_paint_color(outer.color.as_ref(), theme)?;
+    if color.len() == 9 && color.ends_with("00") {
+        return None;
+    }
+    let direction = (outer.direction as f64 / ANGLE_UNITS_PER_DEGREE).to_radians();
+    let distance = outer.distance as f64;
+    let mut dx = (distance * fmath::cos(direction)) as f32 * space.scale_x;
+    let mut dy = (distance * fmath::sin(direction)) as f32 * space.scale_y;
+    if outer.rotate_with_shape {
+        dx *= if flip_h { -1.0 } else { 1.0 };
+        dy *= if flip_v { -1.0 } else { 1.0 };
+        let (sin, cos) = fmath::sin_cosf(rotation_deg.to_radians());
+        (dx, dy) = (cos * dx - sin * dy, sin * dx + cos * dy);
+    }
+    // Scaling happens about the surface origin, so the anchor `algn` names travels in the
+    // offset: a point scaled about A lands at s * p + A * (1 - s).
+    let scale_x = safe_scale(outer.scale_x as f32);
+    let scale_y = safe_scale(outer.scale_y as f32);
+    if scale_x == 0.0 || scale_y == 0.0 {
+        return None;
+    }
+    let (anchor_x, anchor_y) = shadow_anchor(&outer.alignment, rect);
+    Some(Shadow {
+        paths: Vec::new(),
+        color,
+        blur: safe_geometry(outer.blur_radius as f32 * (space.scale_x + space.scale_y) / 2.0),
+        dx: safe_geometry(dx + anchor_x * (1.0 - scale_x)),
+        dy: safe_geometry(dy + anchor_y * (1.0 - scale_y)),
+        scale_x,
+        scale_y,
+    })
+}
+
+fn safe_scale(value: f32) -> f32 {
+    if value.is_finite() { value } else { 1.0 }
+}
+
+/// The point of `rect` that `a:algn` keeps fixed when the shadow is scaled.
+fn shadow_anchor(alignment: &str, rect: PxRect) -> (f32, f32) {
+    let x = match alignment {
+        "tl" | "l" | "bl" => rect.x,
+        "tr" | "r" | "br" => rect.x + rect.w,
+        _ => rect.x + rect.w / 2.0,
+    };
+    let y = match alignment {
+        "tl" | "t" | "tr" => rect.y,
+        "l" | "ctr" | "r" => rect.y + rect.h / 2.0,
+        _ => rect.y + rect.h,
+    };
+    (x, y)
+}
+
+fn gradient_paint(gradient: &GradientFill, theme: &Theme) -> Option<Paint> {
+    let gradient_type = match gradient.gradient_type.as_str() {
+        "radial" => GradientType::Radial,
+        "rectangular" => GradientType::Rectangular,
+        "path" => GradientType::Path,
+        _ => GradientType::Linear,
+    };
+    let mut stops = gradient
+        .stops
+        .iter()
+        .filter_map(|stop| {
+            Some(GradientStop {
+                position: (stop.position as f32 / 100_000.0).clamp(0.0, 1.0),
+                color: resolve_paint_color(Some(&stop.color), theme)?,
+            })
+        })
+        .collect::<Vec<_>>();
+    stops.sort_by(|left, right| {
+        left.position
+            .partial_cmp(&right.position)
+            .unwrap_or_else(|| left.position.total_cmp(&right.position))
+    });
+    if stops.is_empty() {
+        return None;
+    }
+    Some(Paint::Gradient {
+        gradient_type,
+        angle_deg: gradient.angle.map(|value| value as f32),
+        stops,
+    })
+}
+
+fn stroke(outline: &ShapeOutline, theme: &Theme) -> Option<Stroke> {
+    let solid = resolve_paint_color(outline.color.as_ref(), theme);
+    let paint = match &solid {
+        Some(_) => None,
+        None => outline
+            .gradient
+            .as_ref()
+            .and_then(|gradient| gradient_paint(gradient, theme)),
+    };
+    let color = match (&solid, &paint) {
+        (Some(color), _) => color.clone(),
+        (None, Some(Paint::Gradient { stops, .. })) => stops.first()?.color.clone(),
+        (None, Some(Paint::Solid { color })) => color.clone(),
+        (None, None) => return None,
+    };
+    let width = outline
+        .width
+        .filter(|width| width.is_finite() && *width >= 0.0)
+        .map(|width| width as f32 / EMU_PER_CSS_PIXEL)
+        .unwrap_or(1.0);
+    Some(Stroke {
+        join: outline.join.clone(),
+        color,
+        width,
+        dashed: outline
+            .style
+            .as_deref()
+            .is_some_and(|style| style != "solid"),
+        paint,
+        head_end: line_end(outline.head_end.as_ref(), width),
+        tail_end: line_end(outline.tail_end.as_ref(), width),
+    })
+}
+
+/// Looks up a snapshot picture's parsed source.
+fn picture_source(shape: Option<&ShapeNode>) -> Option<&Picture> {
+    match shape? {
+        ShapeNode::Picture(picture) => Some(picture),
+        _ => None,
+    }
+}
+
+/// A picture's part path, or a marker resolving to its unsaved pending bytes.
+fn picture_asset_id(shape: &ShapeSnapshot) -> Option<String> {
+    shape.media_part_path.clone().or_else(|| {
+        shape
+            .pending_media
+            .as_ref()
+            .map(|_| format!("pending-media:{}", shape.id))
+    })
+}
+
+/// Discards empty source rectangles.
+fn image_crop(crop: &PictureCrop) -> ImageCrop {
+    let fraction = |value: i32| (value as f32 / 100_000.0).min(1.0);
+    let cropped = ImageCrop {
+        left: fraction(crop.left),
+        top: fraction(crop.top),
+        right: fraction(crop.right),
+        bottom: fraction(crop.bottom),
+    };
+    let (kept_x, kept_y) = cropped.kept();
+    if kept_x <= 0.0 || kept_y <= 0.0 {
+        ImageCrop::default()
+    } else {
+        cropped
+    }
+}
+
+#[derive(Default)]
+struct PictureMask {
+    path: Option<Vec<GeometryPathCommand>>,
+    outline_path: Option<Vec<GeometryPathCommand>>,
+    empty: bool,
+    geometry_fallback: bool,
+}
+
+fn picture_mask(picture: &Picture, rect: PxRect) -> PictureMask {
+    if picture.geometry.is_empty() || picture.geometry == "rect" || rect.h <= 0.0 {
+        return PictureMask::default();
+    }
+    if picture.geometry == "custom" && !picture.paths.is_empty() {
+        let path: Vec<_> = picture
+            .paths
+            .iter()
+            .filter(|path| !path.no_fill)
+            .flat_map(|path| path.commands.iter().cloned())
+            .collect();
+        let outline_path = picture
+            .paths
+            .iter()
+            .any(|path| path.no_fill || path.no_stroke)
+            .then(|| {
+                picture
+                    .paths
+                    .iter()
+                    .filter(|path| !path.no_stroke)
+                    .flat_map(|path| path.commands.iter().cloned())
+                    .collect()
+            });
+        return PictureMask {
+            empty: path.is_empty(),
+            path: (!path.is_empty()).then_some(path),
+            outline_path,
+            geometry_fallback: false,
+        };
+    }
+    let (path, geometry_fallback) = geometry_path_with_fallback(
+        &picture.geometry,
+        &picture.adjust_values,
+        f64::from(rect.w) / f64::from(rect.h),
+    );
+    PictureMask {
+        path: (!path.is_empty()).then_some(path),
+        geometry_fallback,
+        ..PictureMask::default()
+    }
+}
+
+fn node_use_bg_fill(node: Option<&ShapeNode>) -> bool {
+    matches!(node, Some(ShapeNode::Shape(shape)) if shape.use_bg_fill)
+}
+
+fn slide_background_path(
+    path: &[GeometryPathCommand],
+    placement: BackgroundTransform,
+    slide_width: f32,
+    slide_height: f32,
+) -> Vec<GeometryPathCommand> {
+    if slide_width <= 0.0 || slide_height <= 0.0 {
+        return path.to_vec();
+    }
+    let map = |x: f64, y: f64| {
+        let (x, y) = placement.point(x, y);
+        (x / f64::from(slide_width), y / f64::from(slide_height))
+    };
+    path.iter()
+        .map(|command| match *command {
+            GeometryPathCommand::Move { x, y } => {
+                let (x, y) = map(x, y);
+                GeometryPathCommand::Move { x, y }
+            }
+            GeometryPathCommand::Line { x, y } => {
+                let (x, y) = map(x, y);
+                GeometryPathCommand::Line { x, y }
+            }
+            GeometryPathCommand::Quad { cpx, cpy, x, y } => {
+                let (cpx, cpy) = map(cpx, cpy);
+                let (x, y) = map(x, y);
+                GeometryPathCommand::Quad { cpx, cpy, x, y }
+            }
+            GeometryPathCommand::Cubic {
+                cp1x,
+                cp1y,
+                cp2x,
+                cp2y,
+                x,
+                y,
+            } => {
+                let (cp1x, cp1y) = map(cp1x, cp1y);
+                let (cp2x, cp2y) = map(cp2x, cp2y);
+                let (x, y) = map(x, y);
+                GeometryPathCommand::Cubic {
+                    cp1x,
+                    cp1y,
+                    cp2x,
+                    cp2y,
+                    x,
+                    y,
+                }
+            }
+            GeometryPathCommand::Close => GeometryPathCommand::Close,
+        })
+        .collect()
+}
+
+fn custom_paths(shape: Option<&ShapeNode>) -> &[CustomGeometryPath] {
+    match shape {
+        Some(ShapeNode::Shape(shape)) => &shape.paths,
+        _ => &[],
+    }
+}
+
+/// Looks up the blip behind a snapshot shape's picture fill.
+fn picture_fill<'a>(nodes: &[Option<&'a ShapeNode>]) -> Option<&'a PictureFill> {
+    match nodes
+        .iter()
+        .flatten()
+        .find(|node| node_fill(node).is_some())?
+    {
+        ShapeNode::Shape(shape) => shape.picture_fill.as_deref(),
+        _ => None,
+    }
+}
+
+/// Redraws a picture-filled shape as an image masked by the shape's own outline.
+fn picture_filled(
+    primitive: Primitive,
+    picture: Option<&PictureFill>,
+    dpi: Option<f32>,
+    theme: &Theme,
+) -> Primitive {
+    let Some(picture) = picture else {
+        return primitive;
+    };
+    match primitive {
+        Primitive::Shape {
+            object_id,
+            shape_id,
+            name,
+            x,
+            y,
+            w,
+            h,
+            geometry,
+            path,
+            geometry_fallback,
+            stroke,
+            shadow,
+            transform,
+            ..
+        } => {
+            let tile = picture_fill_tile(picture, dpi);
+            let (crop, destination) = picture_fill_crop(picture).placement(x, y, w, h);
+            let destination = if tile.is_some() { None } else { destination };
+            Primitive::Image {
+                object_id,
+                shape_id,
+                name,
+                x,
+                y,
+                w,
+                h,
+                asset_id: picture.media_part_path.clone(),
+                effects: image_effects(&picture.effects, theme),
+                crop,
+                destination,
+                tile,
+                path: (geometry != "rect").then_some(path),
+                geometry_fallback,
+                stroke,
+                shadow,
+                transform,
+            }
+        }
+        other => other,
+    }
+}
+
+fn cell_picture_filled(
+    mut primitive: Primitive,
+    picture: Option<&PictureFill>,
+    dpi: Option<f32>,
+    theme: &Theme,
+) -> Primitive {
+    if let Some(picture) = picture.filter(|picture| picture.tile.is_none())
+        && let Primitive::Shape { x, y, w, h, .. } = &mut primitive
+    {
+        let inset = |value: i32| value.max(0) as f32 / 100_000.0;
+        let left = inset(picture.fill_rect.left);
+        let top = inset(picture.fill_rect.top);
+        let right = inset(picture.fill_rect.right);
+        let bottom = inset(picture.fill_rect.bottom);
+        *x += *w * left;
+        *y += *h * top;
+        *w *= (1.0 - left - right).max(0.0);
+        *h *= (1.0 - top - bottom).max(0.0);
+    }
+    picture_filled(primitive, picture, dpi, theme)
+}
+
+/// Folds `a:srcRect` and the `a:stretch/a:fillRect` band into source fractions.
+/// Insets that letterbox the image rather than crop it stretch to the box instead.
+fn picture_fill_crop(picture: &PictureFill) -> ImageCrop {
+    let source = image_crop(&picture.crop);
+    let (kept_x, kept_y) = source.kept();
+    let band = |near: i32, far: i32| {
+        let (near, far) = (near as f32 / 100_000.0, far as f32 / 100_000.0);
+        let span = 1.0 - near - far;
+        if span <= 0.0 {
+            return (0.0, 0.0);
+        }
+        ((-near).max(0.0) / span, (-far).max(0.0) / span)
+    };
+    let (left, right) = band(picture.fill_rect.left, picture.fill_rect.right);
+    let (top, bottom) = band(picture.fill_rect.top, picture.fill_rect.bottom);
+    let cropped = ImageCrop {
+        left: source.left + left * kept_x,
+        top: source.top + top * kept_y,
+        right: source.right + right * kept_x,
+        bottom: source.bottom + bottom * kept_y,
+    };
+    let (kept_x, kept_y) = cropped.kept();
+    if kept_x <= 0.0 || kept_y <= 0.0 {
+        source
+    } else {
+        cropped
+    }
+}
+
+fn geometry_path(
+    geometry: &str,
+    adjustments: &BTreeMap<String, f64>,
+    aspect_ratio: f64,
+) -> Vec<ooxml_drawingml::GeometryPathCommand> {
+    geometry_path_with_fallback(geometry, adjustments, aspect_ratio).0
+}
+
+fn geometry_path_with_fallback(
+    geometry: &str,
+    adjustments: &BTreeMap<String, f64>,
+    aspect_ratio: f64,
+) -> (Vec<ooxml_drawingml::GeometryPathCommand>, bool) {
+    let adjustments = adjustments
+        .iter()
+        .map(|(name, value)| (name.clone(), *value))
+        .collect();
+    match preset_geometry_to_path(geometry, &adjustments, aspect_ratio) {
+        Some(path) => (path, false),
+        None => (
+            preset_geometry_to_path("rect", &HashMap::new(), aspect_ratio).unwrap_or_default(),
+            true,
+        ),
+    }
+}
+
+fn graphic_label(graphic: Option<&GraphicFrameData>) -> Option<String> {
+    match graphic {
+        Some(GraphicFrameData::Table { .. }) => Some("Table".to_owned()),
+        Some(GraphicFrameData::Chart { .. }) => Some("Chart".to_owned()),
+        Some(GraphicFrameData::Diagram { .. }) => Some("Diagram".to_owned()),
+        Some(GraphicFrameData::Unknown { .. }) | None => None,
+    }
+}
+
+/// A tile repeats at the picture's own printed size, which is its pixels over
+/// its own resolution — PowerPoint reads the density the file declares, so a
+/// 75 dpi bitmap tiles 28% larger than the 96 dpi the canvas assumes.
+fn picture_fill_tile(picture: &PictureFill, dpi: Option<f32>) -> Option<ImageTile> {
+    let density = dpi
+        .filter(|value| value.is_finite() && *value > 1.0)
+        .map_or(1.0, |value| 96.0 / value);
+    picture.tile.map(|tile| ImageTile {
+        scale_x: tile.scale_x as f32 * density,
+        scale_y: tile.scale_y as f32 * density,
+    })
+}
+
+/// The resolution a PNG or JPEG declares, in dots per inch. `None` where the
+/// file names none, which reads as the 96 dpi a canvas assumes.
+fn image_dpi(bytes: &[u8]) -> Option<f32> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        let mut offset = 8;
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as usize;
+            let kind = &bytes[offset + 4..offset + 8];
+            if kind == b"pHYs" && length >= 9 && offset + 8 + 9 <= bytes.len() {
+                let body = &bytes[offset + 8..offset + 17];
+                if body[8] != 1 {
+                    return None;
+                }
+                let per_metre = u32::from_be_bytes(body[0..4].try_into().ok()?);
+                return (per_metre > 0).then_some(per_metre as f32 * 0.0254);
+            }
+            offset = offset.checked_add(length)?.checked_add(12)?;
+        }
+        return None;
+    }
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset] != 0xFF {
+            return None;
+        }
+        let marker = bytes[offset + 1];
+        let length = u16::from_be_bytes(bytes[offset + 2..offset + 4].try_into().ok()?) as usize;
+        if marker == 0xE0 && length >= 14 && offset + 2 + length <= bytes.len() {
+            let body = &bytes[offset + 4..offset + 2 + length];
+            let units = body[7];
+            let x = u16::from_be_bytes(body[8..10].try_into().ok()?);
+            return match (units, x) {
+                (1, density) if density > 0 => Some(f32::from(density)),
+                (2, density) if density > 0 => Some(f32::from(density) * 2.54),
+                _ => None,
+            };
+        }
+        offset = offset.checked_add(2)?.checked_add(length)?;
+    }
+    None
+}
+
+/// The rectangle a preset holds its text in. Most presets use the whole frame;
+/// the ones below declare a smaller `a:rect` in ECMA-376 `presetShapeDefinitions`
+/// (a rounded box and an ellipse clear their curve, a chevron keeps its text in
+/// the band between its notches), and PowerPoint wraps the text to that rect.
+/// Returned as `[left, top, right, bottom]` insets from the frame, in px.
+fn geometry_text_inset(shape: Option<&ShapeNode>, rect: PxRect) -> [f32; 4] {
+    let Some(ShapeNode::Shape(shape)) = shape else {
+        return [0.0; 4];
+    };
+    preset_text_inset(&shape.geometry, &shape.adjust_values, rect.w, rect.h).unwrap_or([0.0; 4])
+}
+
+fn preset_text_inset(
+    geometry: &str,
+    adjust: &BTreeMap<String, f64>,
+    width: f32,
+    height: f32,
+) -> Option<[f32; 4]> {
+    const DIAGONAL: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let (w, h) = (width, height);
+    let ss = w.min(h);
+    if ss <= 0.0 {
+        return None;
+    }
+    // An adjust value in 1/100,000ths, clamped like the preset's `pin` guide.
+    let adj = |name: &str, default: f32, max: f32| {
+        (adjust
+            .get(name)
+            .map(|value| *value as f32)
+            .unwrap_or(default))
+        .clamp(0.0, max)
+    };
+    let width_max = 100_000.0 * w / ss;
+    match geometry {
+        "roundRect" | "round1Rect" | "round2SameRect" | "round2DiagRect" => {
+            let a = adj("adj", 16_667.0, 50_000.0) / 100_000.0;
+            let inset = ss * a * (1.0 - DIAGONAL);
+            Some([inset; 4])
+        }
+        "ellipse" => {
+            let (x, y) = (w * (1.0 - DIAGONAL) / 2.0, h * (1.0 - DIAGONAL) / 2.0);
+            Some([x, y, x, y])
+        }
+        "chevron" => {
+            let x1 = ss * adj("adj", 50_000.0, width_max) / 100_000.0;
+            let x2 = w - x1;
+            // `il`/`ir`: the band between the notches, or the whole frame once
+            // the notches meet.
+            if x2 > x1 {
+                Some([x1, 0.0, w - x2, 0.0])
+            } else {
+                Some([0.0; 4])
+            }
+        }
+        "homePlate" => {
+            let x1 = w - ss * adj("adj", 50_000.0, width_max) / 100_000.0;
+            Some([0.0, 0.0, w - (x1 + w) / 2.0, 0.0])
+        }
+        "rightArrow" | "leftArrow" => {
+            let a1 = adj("adj1", 50_000.0, 100_000.0);
+            let head = ss * adj("adj2", 50_000.0, width_max) / 100_000.0;
+            let half = h / 2.0;
+            let y1 = half - h * a1 / 200_000.0;
+            let into_head = if half > 0.0 { y1 * head / half } else { 0.0 };
+            let shaft_end = (w - head + into_head).min(w);
+            if geometry == "rightArrow" {
+                Some([0.0, y1, w - shaft_end, y1])
+            } else {
+                Some([(head - into_head).max(0.0), y1, 0.0, y1])
+            }
+        }
+        "triangle" => {
+            let a = adj("adj", 50_000.0, 100_000.0);
+            let x1 = w * a / 200_000.0;
+            let x2 = w * (a + 100_000.0) / 200_000.0;
+            Some([x1, h / 2.0, w - x2, 0.0])
+        }
+        "diamond" => Some([w / 4.0, h / 4.0, w / 4.0, h / 4.0]),
+        "parallelogram" => {
+            let a = adj("adj", 25_000.0, width_max);
+            let q2 = (1.0 + 5.0 * a / width_max) / 12.0;
+            let (x, y) = (q2 * w, q2 * h);
+            Some([x, y, x, y])
+        }
+        _ => None,
+    }
+}
+
+fn parse_align(value: Option<&str>) -> TextAlign {
+    match value {
+        Some("ctr") => TextAlign::Center,
+        Some("r") => TextAlign::Right,
+        Some("just") | Some("justLow") | Some("dist") | Some("thaiDist") => TextAlign::Justify,
+        _ => TextAlign::Left,
+    }
+}
+
+fn is_full_justification(value: Option<&str>) -> bool {
+    value == Some("just")
+}
+
+fn rect_covering_text(rect: PxRect, text: Option<&TextHit>) -> PxRect {
+    let Some(text) = text.filter(|text| text.overflow) else {
+        return rect;
+    };
+    let rect = text.rect;
+    let (mut left, mut right) = (rect.x, rect.x + rect.w);
+    let (mut top, mut bottom) = (rect.y, rect.y + rect.h);
+    for line in &text.lines {
+        left = left.min(line.x);
+        right = right.max(line.x + line.width);
+        top = top.min(line.y);
+        bottom = bottom.max(line.y + line.height);
+        for run in &line.runs {
+            left = left.min(run.x);
+            right = right.max(run.x + run.width);
+        }
+    }
+    PxRect {
+        x: left,
+        y: top,
+        w: (right - left).max(rect.w),
+        h: (bottom - top).max(rect.h),
+    }
+}
+
+const TRANSPARENT: &str = "#00000000";
+
+/// Whether the `buFont` a deck names can draw `marker`. PowerPoint paints no
+/// marker when that font lacks the character, where a browser would borrow
+/// another font's glyph; it is judged only when the host registered a face for
+/// that family, and never for a symbol font, whose slots are translated first.
+fn bullet_font_draws(
+    renderer: &SlideRenderer,
+    theme: &Theme,
+    font: Option<&BulletFont>,
+    face: FontId,
+    marker: &str,
+) -> bool {
+    let Some(BulletFont::Typeface(typeface)) = font else {
+        return true;
+    };
+    let family = if typeface.starts_with('+') {
+        resolve_theme_font_ref(Some(theme), typeface)
+    } else {
+        typeface.clone()
+    };
+    if ooxml_text::SymbolFont::named(&family).is_some() || !renderer.has_face_for(&family) {
+        return true;
+    }
+    let requested = normalize_family(&family);
+    let substitute = renderer
+        .fonts
+        .declared_families(face)
+        .is_ok_and(|declared| {
+            !declared.is_empty()
+                && declared
+                    .iter()
+                    .all(|name| normalize_family(name) != requested)
+        });
+    marker
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .filter(|character| !substitute || is_private_use(*character))
+        .all(|character| renderer.fonts.covers(face, character).unwrap_or(true))
+}
+
+fn is_private_use(character: char) -> bool {
+    matches!(character as u32, 0xe000..=0xf8ff | 0xf_0000..=0x10_ffff)
+}
+
+/// A `buFont` symbol face reaches its glyphs by font position, so `buChar`
+/// names a slot rather than the character to draw. Checked against
+/// PowerPoint's own render of the corpus: Wingdings `§` draws a small filled
+/// square, Wingdings 3's `U+F075` a solid right-pointing triangle.
+fn symbol_bullet(marker: &str, font: Option<&BulletFont>, theme: &Theme) -> String {
+    let Some(BulletFont::Typeface(typeface)) = font else {
+        return marker.to_owned();
+    };
+    let typeface = if typeface.starts_with('+') {
+        resolve_theme_font_ref(Some(theme), typeface)
+    } else {
+        typeface.clone()
+    };
+    let Some(font) = ooxml_text::SymbolFont::named(&typeface) else {
+        return marker.to_owned();
+    };
+    marker
+        .chars()
+        .map(|character| font.substitute(character).unwrap_or(character))
+        .collect()
+}
+
+fn normalize_family(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn valid_color(value: &str) -> bool {
+    let value = value.strip_prefix('#').unwrap_or(value);
+    matches!(value.len(), 6 | 8) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn points_to_px(value: f32) -> f32 {
+    value * 96.0 / 72.0
+}
+
+fn emu_to_px(value: i64) -> f32 {
+    safe_geometry(value as f32 / EMU_PER_CSS_PIXEL)
+}
+
+/// A slide's page box is a whole number of points, the unit PowerPoint
+/// exports and prints it in, so the extent snaps there before the px scale.
+/// a slide is white paper, so a background the deck made fully transparent is
+/// not a hole onto whatever is behind it.
+fn is_invisible(paint: &Paint) -> bool {
+    fn clear(color: &str) -> bool {
+        color.len() == 9 && color.as_bytes()[7..] == *b"00"
+    }
+    match paint {
+        Paint::Solid { color } => clear(color),
+        Paint::Gradient { stops, .. } => !stops.is_empty() && stops.iter().all(|s| clear(&s.color)),
+    }
+}
+
+fn slide_extent_px(value: i64) -> f32 {
+    safe_geometry(((value as f64 / EMU_PER_POINT).round() * CSS_PIXELS_PER_POINT) as f32)
+}
+
+fn safe_geometry(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0e12, 1.0e12)
+    } else {
+        0.0
+    }
+}
+
+fn utf16_len(value: &str) -> u32 {
+    value.encode_utf16().count() as u32
+}
+
+fn split_coverage_pieces(
+    run: ResolvedRun,
+    pieces: Vec<(usize, Option<FontFace>)>,
+    out: &mut Vec<ResolvedRun>,
+) {
+    if let [(0, None)] = pieces.as_slice() {
+        out.push(run);
+        return;
+    }
+    let mut offset = run.start;
+    for (position, (start, face)) in pieces.iter().enumerate() {
+        let end = pieces
+            .get(position + 1)
+            .map_or(run.text.len(), |(next, _)| *next);
+        let text = &run.text[*start..end];
+        let mut style = run.style.clone();
+        if let Some(face) = face {
+            style.family = face.family.clone();
+            style.face = face.clone();
+        }
+        out.push(ResolvedRun {
+            text: text.to_owned(),
+            start: offset,
+            style,
+        });
+        offset += utf16_len(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    include!("layout_coverage_tests.rs");
+
+    use ooxml_drawingml::ThemeColorScheme;
+    use std::collections::BTreeSet;
+
+    use pptx_edit::{DeckSession, EditCtx, TextStylePatch};
+    use pptx_parse::ShapeBase;
+
+    use super::*;
+
+    const FIXTURE: &[u8] = include_bytes!("../../../fixtures/demo/nimbleoffice-demo.pptx");
+    const CHART_FIXTURE: &[u8] = include_bytes!("../../pptx-parse/tests/fixtures/chart-deck.pptx");
+    const GRADIENT_OUTLINE_FIXTURE: &[u8] =
+        include_bytes!("../../pptx-parse/tests/fixtures/gradient-outline.pptx");
+    const NUMBERED_FIXTURE: &[u8] =
+        include_bytes!("../../pptx-parse/tests/fixtures/slide-number-fields.pptx");
+    const STYLE_FIXTURE: &[u8] = include_bytes!("../../pptx-parse/tests/fixtures/shape-style.pptx");
+    const STYLE_MATRIX_FIXTURE: &[u8] =
+        include_bytes!("../../pptx-parse/tests/fixtures/style-matrix-deck.pptx");
+    const HIDDEN_FIXTURE: &[u8] =
+        include_bytes!("../../pptx-edit/tests/fixtures/hidden-shapes.pptx");
+    const V2_UPDATE: &[u8] =
+        include_bytes!("../../pptx-edit/tests/fixtures/deck-schema-v2-hidden.update.bin");
+    const FONT: &[u8] = include_bytes!("../../ooxml-text/tests/fonts/LiberationSans-Regular.ttf");
+    const BOLD_FONT: &[u8] =
+        include_bytes!("../../../packages/fonts/assets/LiberationSans-Bold.ttf");
+    const ITALIC_FONT: &[u8] =
+        include_bytes!("../../../packages/fonts/assets/LiberationSans-Italic.ttf");
+    const BOLD_ITALIC_FONT: &[u8] =
+        include_bytes!("../../../packages/fonts/assets/LiberationSans-BoldItalic.ttf");
+
+    #[test]
+    fn a_slide_extent_matches_the_page_powerpoint_exports() {
+        let page_px = |emu| (f64::from(slide_extent_px(emu)) * 150.0 / 96.0).ceil() as u32;
+        for (emu, px, dots) in [
+            (12_192_000, 1280.0, 2000),
+            (6_858_000, 720.0, 1125),
+            (10_691_813, 1122.6666, 1755),
+            (7_559_675, 793.3333, 1240),
+            (7_556_500, 793.3333, 1240),
+            (10_693_400, 1122.6666, 1755),
+        ] {
+            assert!((slide_extent_px(emu) - px).abs() < 0.001, "{emu}");
+            assert_eq!(page_px(emu), dots, "{emu}");
+        }
+    }
+
+    #[test]
+    fn a_source_crop_converts_to_fractions_and_refuses_what_cannot_be_drawn() {
+        assert_eq!(
+            image_crop(&PictureCrop {
+                left: 0,
+                top: 251,
+                right: 0,
+                bottom: 16_720,
+            }),
+            ImageCrop {
+                left: 0.0,
+                top: 0.002_51,
+                right: 0.0,
+                bottom: 0.167_2,
+            }
+        );
+        assert_eq!(
+            image_crop(&PictureCrop {
+                left: -5_000,
+                right: 20_000,
+                ..PictureCrop::default()
+            }),
+            ImageCrop {
+                left: -0.05,
+                right: 0.2,
+                ..ImageCrop::default()
+            }
+        );
+        assert_eq!(
+            image_crop(&PictureCrop {
+                left: 60_000,
+                right: 60_000,
+                ..PictureCrop::default()
+            }),
+            ImageCrop::default()
+        );
+    }
+
+    #[test]
+    fn only_a_picture_with_its_own_geometry_gets_a_mask() {
+        let mut picture = Picture {
+            aspect_ratio_locked: false,
+            base: ShapeBase {
+                id: 1,
+                name: "Photo".to_owned(),
+                title: None,
+                description: None,
+                decorative: false,
+                hidden: false,
+                placeholder: None,
+                transform: ShapeTransform::default(),
+            },
+            relationship_id: None,
+            media_part_path: None,
+            effects: Vec::new(),
+            crop: PictureCrop::default(),
+            geometry: "rect".to_owned(),
+            paths: Vec::new(),
+            adjust_values: BTreeMap::new(),
+            fill: None,
+            outline: None,
+            shape_effects: None,
+            style: None,
+        };
+        let rect = PxRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 50.0,
+        };
+        assert!(picture_mask(&picture, rect).path.is_none());
+        picture.geometry = "ellipse".to_owned();
+        let path = picture_mask(&picture, rect).path.unwrap();
+        assert_eq!(path.len(), 6);
+        assert_eq!(
+            path[0],
+            ooxml_drawingml::GeometryPathCommand::Move { x: 1.0, y: 0.5 }
+        );
+        assert!(
+            path[1..5].iter().all(|command| matches!(
+                command,
+                ooxml_drawingml::GeometryPathCommand::Cubic { .. }
+            ))
+        );
+        assert_eq!(path[5], ooxml_drawingml::GeometryPathCommand::Close);
+    }
+
+    #[test]
+    fn an_east_asian_face_written_on_a_run_is_requested() {
+        let mut source = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let part = "ppt/slides/slide1.xml";
+        let shape = r#"<p:sp><p:nvSpPr><p:cNvPr id="4343" name="Direct ea"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="457200"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US"><a:ea typeface="Direct EA Face"/></a:rPr><a:t>直接</a:t></a:r><a:r><a:rPr lang="en-US"/><a:t>继承</a:t></a:r></a:p></p:txBody></p:sp>"#;
+        let xml = std::str::from_utf8(source.part_bytes(part).unwrap())
+            .unwrap()
+            .replace("</p:spTree>", &format!("{shape}</p:spTree>"));
+        assert!(source.replace_part(part, xml.into_bytes()));
+        let bytes = pptx_parse::write_pptx(&source).unwrap();
+        let session = DeckSession::open(&bytes, 291).unwrap();
+        let scope = session.slide_scope(0).unwrap();
+        let faces = renderer()
+            .requested_font_faces(session.package(), std::slice::from_ref(&scope))
+            .unwrap();
+        assert!(
+            faces.iter().any(|(family, ..)| family == "Direct EA Face"),
+            "{faces:?}"
+        );
+    }
+
+    #[test]
+    fn custom_geometry_picture_is_clipped_through_layout_and_save() {
+        let mut source = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let part = "ppt/slides/slide1.xml";
+        let picture = r#"<p:pic><p:nvPicPr><p:cNvPr id="4242" name="Triangle"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill/><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:custGeom><a:pathLst><a:path w="100" h="100"><a:moveTo><a:pt x="50" y="0"/></a:moveTo><a:lnTo><a:pt x="100" y="100"/></a:lnTo><a:lnTo><a:pt x="0" y="100"/></a:lnTo><a:close/></a:path></a:pathLst></a:custGeom><a:ln w="9525"><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></a:ln></p:spPr></p:pic>"#;
+        let xml = std::str::from_utf8(source.part_bytes(part).unwrap())
+            .unwrap()
+            .replace("</p:spTree>", &format!("{picture}</p:spTree>"));
+        assert!(source.replace_part(part, xml.clone().into_bytes()));
+        let bytes = pptx_parse::write_pptx(&source).unwrap();
+        let session = DeckSession::open(&bytes, 289).unwrap();
+        let rendered = renderer()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap();
+        let image = rendered
+            .display_list
+            .primitives
+            .iter()
+            .find(|primitive| {
+                matches!(
+                    primitive,
+                    Primitive::Image {
+                        object_id: 4242,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let Primitive::Image {
+            path,
+            geometry_fallback,
+            stroke,
+            ..
+        } = image
+        else {
+            unreachable!()
+        };
+        assert!(!geometry_fallback);
+        assert_eq!(
+            path.as_ref().unwrap(),
+            &vec![
+                GeometryPathCommand::Move { x: 0.5, y: 0.0 },
+                GeometryPathCommand::Line { x: 1.0, y: 1.0 },
+                GeometryPathCommand::Line { x: 0.0, y: 1.0 },
+                GeometryPathCommand::Close,
+            ]
+        );
+        assert_eq!(stroke.as_ref().unwrap().color, "#0000FF");
+        let saved = session.save().unwrap();
+        let reopened = pptx_parse::parse_pptx(&saved).unwrap();
+        assert_eq!(reopened.part_bytes(part).unwrap(), xml.as_bytes());
+    }
+
+    fn layout_custom_geometry_picture(path_a_fill: &str, path_b_stroke: &str) -> RenderedSlide {
+        let mut source = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let part = "ppt/slides/slide1.xml";
+        let picture = format!(
+            r#"<p:pic><p:nvPicPr><p:cNvPr id="4242" name="Custom picture"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill/><p:spPr><a:xfrm rot="5400000" flipH="1"><a:off x="914400" y="457200"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:custGeom><a:pathLst><a:path w="100" h="100" fill="{path_a_fill}" stroke="0"><a:moveTo><a:pt x="50" y="0"/></a:moveTo><a:lnTo><a:pt x="100" y="100"/></a:lnTo><a:lnTo><a:pt x="0" y="100"/></a:lnTo><a:close/></a:path><a:path w="100" h="100" fill="none" stroke="{path_b_stroke}"><a:moveTo><a:pt x="25" y="25"/></a:moveTo><a:lnTo><a:pt x="75" y="25"/></a:lnTo></a:path></a:pathLst></a:custGeom><a:ln w="9525"><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></a:ln></p:spPr></p:pic>"#
+        );
+        let xml = std::str::from_utf8(source.part_bytes(part).unwrap())
+            .unwrap()
+            .replace("</p:spTree>", &format!("{picture}</p:spTree>"));
+        assert!(source.replace_part(part, xml.into_bytes()));
+        let bytes = pptx_parse::write_pptx(&source).unwrap();
+        let session = DeckSession::open(&bytes, 290).unwrap();
+        renderer()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn custom_geometry_picture_path_flags_control_mask_and_outline() {
+        let rendered = layout_custom_geometry_picture("norm", "1");
+        let primitives = &rendered.display_list.primitives;
+        let index = primitives
+            .iter()
+            .position(|primitive| {
+                matches!(
+                    primitive,
+                    Primitive::Image {
+                        object_id: 4242,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let Primitive::Image {
+            path,
+            stroke,
+            shape_id,
+            transform,
+            x,
+            y,
+            w,
+            h,
+            ..
+        } = &primitives[index]
+        else {
+            panic!("expected image");
+        };
+        assert_eq!(
+            path.as_ref().unwrap(),
+            &vec![
+                GeometryPathCommand::Move { x: 0.5, y: 0.0 },
+                GeometryPathCommand::Line { x: 1.0, y: 1.0 },
+                GeometryPathCommand::Line { x: 0.0, y: 1.0 },
+                GeometryPathCommand::Close,
+            ]
+        );
+        assert!(stroke.is_none());
+        let Primitive::Shape {
+            object_id: 4242,
+            path,
+            fill: None,
+            stroke: Some(stroke),
+            shape_id: outline_id,
+            transform: outline_transform,
+            x: outline_x,
+            y: outline_y,
+            w: outline_w,
+            h: outline_h,
+            ..
+        } = &primitives[index + 1]
+        else {
+            panic!("expected stroke-only outline immediately after image");
+        };
+        assert_eq!(shape_id, outline_id);
+        assert_eq!(transform, outline_transform);
+        assert_eq!((x, y, w, h), (outline_x, outline_y, outline_w, outline_h));
+        assert_eq!(
+            path,
+            &vec![
+                GeometryPathCommand::Move { x: 0.25, y: 0.25 },
+                GeometryPathCommand::Line { x: 0.75, y: 0.25 },
+            ]
+        );
+        assert_eq!(stroke.color, "#0000FF");
+        assert_eq!(
+            primitives
+                .iter()
+                .filter(|p| matches!(
+                    p,
+                    Primitive::Image {
+                        object_id: 4242,
+                        ..
+                    } | Primitive::Shape {
+                        object_id: 4242,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn custom_geometry_picture_without_filled_paths_emits_only_its_outline() {
+        for stroked in [true, false] {
+            let rendered = layout_custom_geometry_picture("none", if stroked { "1" } else { "0" });
+            let primitives: Vec<_> = rendered
+                .display_list
+                .primitives
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        Primitive::Image {
+                            object_id: 4242,
+                            ..
+                        } | Primitive::Shape {
+                            object_id: 4242,
+                            ..
+                        }
+                    )
+                })
+                .collect();
+            assert!(
+                primitives
+                    .iter()
+                    .all(|p| !matches!(p, Primitive::Image { .. }))
+            );
+            assert_eq!(primitives.len(), usize::from(stroked));
+            if stroked {
+                let Primitive::Shape {
+                    path,
+                    fill: None,
+                    stroke: Some(stroke),
+                    ..
+                } = primitives[0]
+                else {
+                    panic!("expected stroke-only outline");
+                };
+                assert_eq!(
+                    path,
+                    &vec![
+                        GeometryPathCommand::Move { x: 0.25, y: 0.25 },
+                        GeometryPathCommand::Line { x: 0.75, y: 0.25 },
+                    ]
+                );
+                assert_eq!(stroke.color, "#0000FF");
+            }
+        }
+    }
+
+    #[test]
+    fn a_negative_picture_crop_offsets_the_image_inside_its_frame() {
+        assert_picture_outset(
+            PictureCrop {
+                top: -36_890,
+                bottom: 36_890,
+                ..PictureCrop::default()
+            },
+            (100.0, 86.89, 200.0, 63.11),
+            ImageCrop {
+                bottom: 0.3689,
+                ..ImageCrop::default()
+            },
+        );
+    }
+
+    #[test]
+    fn mixed_picture_crops_keep_insets_and_outsets_on_both_axes() {
+        assert_picture_outset(
+            PictureCrop {
+                left: 7_795,
+                top: -36_890,
+                right: -5_518,
+                bottom: 36_890,
+            },
+            (100.0, 86.89, 200.0 * 0.92205 / 0.97723, 63.11),
+            ImageCrop {
+                left: 0.07795,
+                bottom: 0.3689,
+                ..ImageCrop::default()
+            },
+        );
+        assert_picture_outset(
+            PictureCrop {
+                left: -25_000,
+                top: 20_000,
+                right: 50_000,
+                bottom: -20_000,
+            },
+            (100.0 + 200.0 / 3.0, 50.0, 400.0 / 3.0, 80.0),
+            ImageCrop {
+                top: 0.2,
+                right: 0.5,
+                ..ImageCrop::default()
+            },
+        );
+    }
+
+    fn assert_picture_outset(crop: PictureCrop, dest: (f32, f32, f32, f32), kept: ImageCrop) {
+        let fixture = include_bytes!("../tests/fixtures/picture-crop-mask.pptx");
+        let mut package = pptx_parse::parse_pptx(fixture).unwrap();
+        let picture = package.slides[0]
+            .shapes
+            .iter_mut()
+            .find_map(|node| match node {
+                ShapeNode::Picture(picture) if picture.base.id == 90 => Some(picture),
+                _ => None,
+            })
+            .unwrap();
+        picture.crop = crop;
+        let session = DeckSession::from_package_with_source(package, fixture, 289).unwrap();
+        let rendered = renderer()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap();
+        let image = rendered
+            .display_list
+            .primitives
+            .iter()
+            .find(|primitive| matches!(primitive, Primitive::Image { object_id: 90, .. }))
+            .unwrap();
+        let Primitive::Image {
+            x,
+            y,
+            w,
+            h,
+            crop,
+            destination,
+            path,
+            ..
+        } = image
+        else {
+            unreachable!()
+        };
+        assert_eq!((*x, *y, *w, *h), (100.0, 50.0, 200.0, 100.0));
+        let destination = destination.unwrap();
+        for (actual, expected) in [
+            (destination.x, dest.0),
+            (destination.y, dest.1),
+            (destination.w, dest.2),
+            (destination.h, dest.3),
+        ] {
+            assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+        }
+        assert_eq!(*crop, kept);
+        assert_eq!(
+            path.as_ref().unwrap()[0],
+            GeometryPathCommand::Move { x: 1.0, y: 0.5 }
+        );
+    }
+
+    #[test]
+    fn a_fixture_picture_keeps_its_crop_mask_and_outline_through_layout() {
+        let session = DeckSession::open(
+            include_bytes!("../tests/fixtures/picture-crop-mask.pptx"),
+            288,
+        )
+        .unwrap();
+        let rendered = renderer()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap();
+        let image = rendered
+            .display_list
+            .primitives
+            .iter()
+            .find(|primitive| matches!(primitive, Primitive::Image { object_id: 90, .. }))
+            .unwrap();
+        assert!(
+            serde_json::to_value(image)
+                .unwrap()
+                .get("destination")
+                .is_none()
+        );
+        let Primitive::Image {
+            x,
+            y,
+            w,
+            h,
+            crop,
+            path,
+            stroke,
+            ..
+        } = image
+        else {
+            unreachable!()
+        };
+        assert_eq!((*x, *y, *w, *h), (100.0, 50.0, 200.0, 100.0));
+        assert_eq!(
+            *crop,
+            ImageCrop {
+                left: 0.1,
+                top: 0.2,
+                right: 0.3,
+                bottom: 0.1
+            }
+        );
+        let path = path.as_ref().unwrap();
+        assert_eq!(path.len(), 6);
+        assert_eq!(
+            path[0],
+            ooxml_drawingml::GeometryPathCommand::Move { x: 1.0, y: 0.5 }
+        );
+        assert!(
+            path[1..5].iter().all(|command| matches!(
+                command,
+                ooxml_drawingml::GeometryPathCommand::Cubic { .. }
+            ))
+        );
+        let stroke = stroke.as_ref().unwrap();
+        assert_eq!(stroke.width, 2.0);
+        assert_eq!(stroke.color, "#FF00FF");
+    }
+
+    #[test]
+    fn overflowing_text_grows_the_hit_region_so_a_visible_glyph_stays_clickable() {
+        let rect = PxRect {
+            x: 10.0,
+            y: 100.0,
+            w: 200.0,
+            h: 20.0,
+        };
+        let line = |y: f32, height: f32| PositionedTextLine {
+            column_offset: 0.0,
+            x: 10.0,
+            y,
+            width: 200.0,
+            height,
+            baseline: y + height,
+            start: 0,
+            end: 0,
+            runs: Vec::new(),
+            caret_stops: Vec::new(),
+        };
+        let text = TextHit {
+            rect,
+            transform: Transform::default(),
+            overflow: true,
+            story_id: "story".to_owned(),
+            lines: vec![line(80.0, 40.0), line(120.0, 40.0)],
+        };
+        let grown = rect_covering_text(rect, Some(&text));
+        assert_eq!(grown.y, 80.0);
+        assert_eq!(grown.y + grown.h, 160.0);
+        assert_eq!(grown.x, rect.x);
+        assert_eq!(grown.w, rect.w);
+        let fitting = TextHit {
+            rect,
+            transform: Transform::default(),
+            overflow: false,
+            story_id: "story".to_owned(),
+            lines: vec![line(104.0, 12.0)],
+        };
+        let same = rect_covering_text(rect, Some(&fitting));
+        assert_eq!((same.y, same.h), (rect.y, rect.h));
+        assert_eq!(
+            (
+                rect_covering_text(rect, None).y,
+                rect_covering_text(rect, None).h
+            ),
+            (rect.y, rect.h)
+        );
+    }
+
+    #[test]
+    fn browser_coverage_keeps_controls_and_ignorables_in_the_original_face() {
+        for registered_fallback in [false, true] {
+            let mut renderer = renderer();
+            if registered_fallback {
+                renderer
+                    .register_fallback_font("Liberation Sans", false, false, FONT)
+                    .unwrap();
+            }
+            let run = paragraph(
+                &renderer,
+                "l",
+                "\n\t\u{200B}\u{FE0F}Latin\u{FE0F}\u{200B}\t\n",
+            )
+            .runs
+            .remove(0);
+            let pieces = renderer.browser_coverage_pieces(&run.style.face, &run.text, false, false);
+            assert_eq!(pieces.len(), 1);
+            assert_eq!(pieces[0].0, 0);
+            assert!(pieces[0].1.is_none());
+
+            for character in (0..=0x1F)
+                .chain(0x7F..=0x9F)
+                .filter_map(char::from_u32)
+                .chain([
+                    '\u{00A0}',
+                    '\u{00AD}',
+                    '\u{034F}',
+                    '\u{061C}',
+                    '\u{115F}',
+                    '\u{1160}',
+                    '\u{17B4}',
+                    '\u{17B5}',
+                    '\u{180B}',
+                    '\u{180F}',
+                    '\u{200B}',
+                    '\u{200C}',
+                    '\u{200D}',
+                    '\u{200F}',
+                    '\u{2028}',
+                    '\u{2029}',
+                    '\u{202A}',
+                    '\u{202E}',
+                    '\u{2060}',
+                    '\u{206F}',
+                    '\u{3164}',
+                    '\u{FE00}',
+                    '\u{FE0F}',
+                    '\u{FEFF}',
+                    '\u{FFA0}',
+                    '\u{FFF0}',
+                    '\u{FFF8}',
+                    '\u{1BCA0}',
+                    '\u{1BCA3}',
+                    '\u{1D173}',
+                    '\u{1D17A}',
+                    '\u{E0000}',
+                    '\u{E0100}',
+                    '\u{E01EF}',
+                    '\u{E0FFF}',
+                ])
+            {
+                let text = format!("{character}Latin{character}");
+                let pieces = renderer.browser_coverage_pieces(&run.style.face, &text, false, false);
+                assert_eq!(pieces.len(), 1, "{character:?}");
+                assert_eq!(pieces[0].0, 0);
+                assert!(pieces[0].1.is_none(), "{character:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn browser_coverage_still_splits_an_uncovered_visible_character() {
+        for registered_fallback in [false, true] {
+            let mut renderer = renderer();
+            if registered_fallback {
+                renderer
+                    .register_fallback_font("Liberation Sans", false, false, FONT)
+                    .unwrap();
+            }
+            let run = paragraph(&renderer, "l", "A\u{0939}B").runs.remove(0);
+            assert_eq!(
+                renderer.fonts.covers(run.style.face.id, '\u{0939}'),
+                Ok(false)
+            );
+            for browser_fallback in [false, true] {
+                let pieces = if browser_fallback {
+                    renderer.browser_coverage_pieces(&run.style.face, &run.text, false, false)
+                } else {
+                    renderer.coverage_pieces(&run.style.face, &run.text, false, false)
+                };
+                let pieces: Vec<_> = pieces
+                    .iter()
+                    .map(|(start, face)| (*start, face.as_ref().map(|face| face.id.to_u32())))
+                    .collect();
+                if browser_fallback {
+                    assert_eq!(pieces, [(0, None), (1, Some(BROWSER_FONT_ID)), (4, None)]);
+                } else {
+                    assert_eq!(pieces, [(0, None)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn browser_coverage_keeps_registered_fallback_nonbreaking_spaces() {
+        let mut renderer = renderer();
+        let arabic = renderer
+            .register_fallback_font(
+                "Noto Sans Arabic",
+                false,
+                false,
+                include_bytes!("../../../packages/fonts/assets/NotoSansArabic-Regular.ttf"),
+            )
+            .unwrap();
+        let run = paragraph(&renderer, "l", "A\u{0645}\u{00A0}B")
+            .runs
+            .remove(0);
+        for browser_fallback in [false, true] {
+            let pieces = if browser_fallback {
+                renderer.browser_coverage_pieces(&run.style.face, &run.text, false, false)
+            } else {
+                renderer.coverage_pieces(&run.style.face, &run.text, false, false)
+            };
+            let pieces: Vec<_> = pieces
+                .iter()
+                .map(|(start, face)| (*start, face.as_ref().map(|face| face.id.to_u32())))
+                .collect();
+            assert_eq!(pieces, [(0, None), (1, Some(arabic)), (5, None)]);
+        }
+    }
+
+    #[test]
+    fn a_character_its_face_cannot_draw_moves_to_a_fallback_that_can() {
+        let arabic: &[u8] =
+            include_bytes!("../../../packages/fonts/assets/NotoSansArabic-Regular.ttf");
+        let mut renderer = renderer();
+        let run = paragraph(
+            &renderer,
+            "l",
+            "Hello \u{645}\u{631}\u{62d}\u{628}\u{627} world",
+        )
+        .runs
+        .remove(0);
+        let mut unchanged = Vec::new();
+        renderer.split_by_coverage(
+            ResolvedRun {
+                text: run.text.clone(),
+                start: 3,
+                style: run.style.clone(),
+            },
+            &mut unchanged,
+        );
+        assert_eq!(unchanged.len(), 1, "no fallback registered, nothing moves");
+        assert_eq!(unchanged[0].style.face.id, run.style.face.id);
+
+        renderer
+            .register_fallback_font("Noto Sans Arabic", false, false, arabic)
+            .unwrap();
+        let mut pieces = Vec::new();
+        renderer.split_by_coverage(
+            ResolvedRun {
+                text: run.text.clone(),
+                start: 3,
+                style: run.style.clone(),
+            },
+            &mut pieces,
+        );
+        let parts: Vec<(&str, u32, &str)> = pieces
+            .iter()
+            .map(|piece| {
+                (
+                    piece.text.as_str(),
+                    piece.start,
+                    piece.style.family.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                ("Hello ", 3, "Arial"),
+                (
+                    "\u{645}\u{631}\u{62d}\u{628}\u{627} ",
+                    9,
+                    "Noto Sans Arabic"
+                ),
+                ("world", 15, "Arial"),
+            ]
+        );
+        assert_eq!(pieces[1].style.face.line_id, run.style.face.id);
+        assert_ne!(pieces[1].style.face.id, run.style.face.id);
+    }
+
+    #[test]
+    fn a_chart_label_draws_what_its_face_lacks_in_a_fallback() {
+        let arabic: &[u8] =
+            include_bytes!("../../../packages/fonts/assets/NotoSansArabic-Regular.ttf");
+        let mut renderer = renderer();
+        renderer
+            .register_fallback_font("Noto Sans Arabic", false, false, arabic)
+            .unwrap();
+        let label = "Sales \u{645}\u{628}\u{64a}\u{639}\u{627}\u{62a}";
+        let primitive = chart_text_primitive(
+            &renderer,
+            &Theme::default(),
+            "chart:1",
+            ChartText {
+                object_id: 1,
+                text: label,
+                x: 10.0,
+                baseline_y: 40.0,
+                width: 200.0,
+                font: ooxml_drawingml::chart::PlotFont {
+                    weight: 400,
+                    size_px: 14.0,
+                    family: "Arial".to_owned(),
+                    italic: false,
+                    letter_spacing_px: 2.0,
+                },
+                color: "#000000",
+                align: PlotTextAlign::Start,
+                rotation_deg: 0.0,
+            },
+            &mut SubstitutionLog::default(),
+        )
+        .unwrap();
+        let Primitive::TextBox { lines, .. } = primitive else {
+            panic!("a text box");
+        };
+        for run in &lines[0].runs {
+            assert_eq!(run.x, run.glyphs[0].x, "a run starts at its first glyph");
+        }
+        let runs: Vec<(&str, &str)> = lines[0]
+            .runs
+            .iter()
+            .map(|run| (run.text.as_str(), run.font_family.as_str()))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("Sales ", "Arial"),
+                (
+                    "\u{645}\u{628}\u{64a}\u{639}\u{627}\u{62a}",
+                    "Noto Sans Arabic"
+                ),
+            ]
+        );
+        assert!(
+            (lines[0].runs[1].x - (lines[0].runs[0].x + lines[0].runs[0].width + 2.0)).abs() < 0.01,
+            "the tracked gap sits between the pieces"
+        );
+    }
+
+    fn renderer() -> SlideRenderer {
+        let mut renderer = SlideRenderer::new();
+        for bold in [false, true] {
+            renderer.register_font("Arial", bold, false, FONT).unwrap();
+        }
+        renderer
+    }
+
+    fn tabbed(
+        renderer: &SlideRenderer,
+        text: &str,
+        stops: Vec<f32>,
+        default_px: f32,
+    ) -> ResolvedParagraph {
+        let mut paragraph = paragraph(renderer, "l", text);
+        paragraph.tab_stops = stops;
+        paragraph.default_tab_px = default_px;
+        paragraph
+    }
+
+    fn glyph_positions(lines: &[PositionedTextLine]) -> Vec<f32> {
+        lines
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| glyph.x)
+            .collect()
+    }
+
+    #[test]
+    fn an_unmarked_hanging_indent_starts_its_first_line_at_the_indent() {
+        let renderer = renderer();
+        let mut paragraph = paragraph(&renderer, "l", "one two three four five six seven");
+        paragraph.margin_left_px = 30.0;
+        paragraph.indent_px = -30.0;
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            30.0,
+            0.0,
+            120.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!((lines[0].x - 0.0).abs() < 0.01, "{:?}", lines[0].x);
+        assert!((lines[1].x - 30.0).abs() < 0.01, "{:?}", lines[1].x);
+        assert!(lines[0].width > lines[1].width, "the first line is wider");
+    }
+
+    #[test]
+    fn a_body_that_does_not_wrap_keeps_its_paragraph_on_one_line() {
+        let renderer = renderer();
+        let paragraph = paragraph(&renderer, "l", "one two three four five six seven eight");
+        let wrapped = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            120.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let flat = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            120.0,
+            1.0,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(wrapped.len() > 1, "{}", wrapped.len());
+        assert_eq!(flat.len(), 1);
+        assert!(flat[0].width > 120.0, "the line runs past the shape");
+    }
+
+    #[test]
+    fn a_bitmap_reports_the_resolution_it_declares() {
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        jpeg.extend(b"JFIF\0");
+        jpeg.extend([0x01, 0x02, 0x01, 0x00, 0x4B, 0x00, 0x4B, 0x00, 0x00]);
+        assert_eq!(image_dpi(&jpeg), Some(75.0));
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend(9_u32.to_be_bytes());
+        png.extend(b"pHYs");
+        png.extend(2835_u32.to_be_bytes());
+        png.extend(2835_u32.to_be_bytes());
+        png.push(1);
+        png.extend([0, 0, 0, 0]);
+        assert_eq!(image_dpi(&png).map(|dpi| dpi.round()), Some(72.0));
+        assert_eq!(image_dpi(b"not an image"), None);
+    }
+
+    #[test]
+    fn a_rounded_box_and_an_ellipse_hold_their_text_inside_the_curve() {
+        let frame = PxRect {
+            x: 10.0,
+            y: 20.0,
+            w: 400.0,
+            h: 200.0,
+        };
+        let none = BTreeMap::new();
+        assert_eq!(preset_text_inset("rect", &none, frame.w, frame.h), None);
+        let [x, y, ..] = preset_text_inset("roundRect", &none, frame.w, frame.h).unwrap();
+        assert!((x - 9.76).abs() < 0.05, "{x}");
+        assert!((x - y).abs() < 1e-3);
+        let [x, y, ..] = preset_text_inset("ellipse", &none, frame.w, frame.h).unwrap();
+        assert!((x - 58.58).abs() < 0.05, "{x}");
+        assert!((y - 29.29).abs() < 0.05, "{y}");
+    }
+
+    #[test]
+    fn a_chevron_keeps_its_text_between_the_notches() {
+        // ECMA-376 chevron: x1 = ss * adj, il = x1, ir = r - x1.
+        let none = BTreeMap::new();
+        let [l, t, r, b] = preset_text_inset("chevron", &none, 120.0, 80.0).unwrap();
+        assert_eq!([l, t, r, b], [40.0, 0.0, 40.0, 0.0]);
+        // Notches that meet leave the whole frame.
+        let wide = BTreeMap::from([("adj".to_owned(), 100_000.0)]);
+        assert_eq!(
+            preset_text_inset("chevron", &wide, 120.0, 80.0),
+            Some([0.0; 4])
+        );
+        // homePlate: ir sits halfway between the point's base and the tip.
+        let [_, _, r, _] = preset_text_inset("homePlate", &none, 120.0, 80.0).unwrap();
+        assert!((r - 20.0).abs() < 1e-4, "{r}");
+    }
+
+    #[test]
+    fn a_tab_advances_to_the_next_default_stop_without_painting_a_glyph() {
+        let renderer = renderer();
+        let paragraph = tabbed(&renderer, "A\tB", Vec::new(), 96.0);
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            1_000.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let positions = glyph_positions(&lines);
+        assert_eq!(positions.len(), 2, "the tab paints nothing");
+        assert!(positions[0].abs() < 0.01, "{positions:?}");
+        assert!((positions[1] - 96.0).abs() < 0.01, "{positions:?}");
+    }
+
+    #[test]
+    fn a_declared_stop_wins_over_the_default_pitch() {
+        let renderer = renderer();
+        let paragraph = tabbed(&renderer, "A\tB", vec![40.0, 300.0], 96.0);
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            1_000.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let positions = glyph_positions(&lines);
+        assert!((positions[1] - 40.0).abs() < 0.01, "{positions:?}");
+    }
+
+    #[test]
+    fn the_left_margin_offsets_the_stop_a_tab_reaches() {
+        let renderer = renderer();
+        let mut paragraph = tabbed(&renderer, "A\tB", vec![40.0, 200.0], 96.0);
+        paragraph.margin_left_px = 50.0;
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            50.0,
+            0.0,
+            950.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let positions = glyph_positions(&lines);
+        assert!((positions[1] - 200.0).abs() < 0.01, "{positions:?}");
+    }
+
+    #[test]
+    fn a_tab_never_reaches_past_the_line() {
+        let renderer = renderer();
+        let paragraph = tabbed(&renderer, "A\tB", Vec::new(), 96.0);
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            40.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        for line in &lines {
+            assert!(line.width <= 40.01, "{}", line.width);
+        }
+    }
+
+    #[test]
+    fn a_leading_tab_in_a_hanging_indent_lands_on_the_margin_the_line_already_starts_at() {
+        let renderer = renderer();
+        let mut paragraph = tabbed(&renderer, "\tItem", Vec::new(), 96.0);
+        paragraph.margin_left_px = 30.0;
+        paragraph.indent_px = -30.0;
+        paragraph.tab_stops = resolve_tab_stops(None, 285_750, -285_750);
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            30.0,
+            0.0,
+            300.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let positions = glyph_positions(&lines);
+        assert!((positions[0] - 30.0).abs() < 0.01, "{positions:?}");
+    }
+
+    #[test]
+    fn only_the_first_tab_of_a_hanging_paragraph_measures_from_the_hanging_position() {
+        let renderer = renderer();
+        let mut paragraph = tabbed(&renderer, "\tItem\tNote", Vec::new(), 96.0);
+        paragraph.margin_left_px = 30.0;
+        paragraph.indent_px = -30.0;
+        paragraph.tab_stops = resolve_tab_stops(None, 285_750, -285_750);
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            30.0,
+            0.0,
+            400.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let positions = glyph_positions(&lines);
+        assert!((positions[0] - 30.0).abs() < 0.01, "{positions:?}");
+        assert!((positions[4] - 96.0).abs() < 0.01, "{positions:?}");
+    }
+
+    #[test]
+    fn a_marker_leaves_no_hanging_space_for_a_tab_to_take() {
+        let renderer = renderer();
+        let mut paragraph = tabbed(&renderer, "\tItem", Vec::new(), 96.0);
+        paragraph.margin_left_px = 30.0;
+        paragraph.indent_px = -30.0;
+        paragraph.marker = Some("\u{2022}".to_owned());
+        paragraph.tab_stops = resolve_tab_stops(None, 285_750, -285_750);
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            30.0,
+            0.0,
+            300.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let text = lines[0]
+            .runs
+            .iter()
+            .find(|run| run.text.contains("Item"))
+            .unwrap();
+        assert!(
+            (text.glyphs[0].x - 96.0).abs() < 0.01,
+            "{}",
+            text.glyphs[0].x
+        );
+    }
+
+    #[test]
+    fn tab_advance_bounds_a_hostile_pitch_and_offset() {
+        assert_eq!(tab_advance(0.0, 0.0, &[], 96.0, 1_000.0), 96.0);
+        assert_eq!(tab_advance(96.0, 96.0, &[], 96.0, 1_000.0), 96.0);
+        assert_eq!(tab_advance(1.0, 1.0, &[40.0], 96.0, 1_000.0), 39.0);
+        assert_eq!(tab_advance(10.0, 40.0, &[30.0], 96.0, 1_000.0), 0.0);
+        assert_eq!(tab_advance(f32::NAN, 0.0, &[], 96.0, 1_000.0), 0.0);
+        assert_eq!(tab_advance(0.0, f32::NAN, &[], 96.0, 1_000.0), 0.0);
+        assert_eq!(tab_advance(0.0, 0.0, &[], 96.0, f32::NAN), 0.0);
+        assert!((0.0..=10.0).contains(&tab_advance(f32::MAX, f32::MAX, &[], 96.0, 10.0)));
+        assert_eq!(resolve_default_tab(Some(0)), 96.0);
+        assert_eq!(resolve_default_tab(Some(-914_400)), 96.0);
+    }
+
+    fn justify(widths: &[(f32, bool, bool)]) -> Vec<JustifyCluster> {
+        widths
+            .iter()
+            .map(|(width, break_after, blank)| JustifyCluster {
+                width: *width,
+                break_after: *break_after,
+                blank: *blank,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_layout_cache_key_changes_with_every_input_layout_reads() {
+        let renderer = renderer();
+        let rect = PxRect {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let content = |space_first_last_para| ResolvedContent {
+            paragraphs: vec![paragraph(&renderer, "l", "Text")],
+            space_first_last_para,
+        };
+        let key = |content: &ResolvedContent| text_layout_key(content, rect, 1.0, false, true);
+        let base = key(&content(false));
+        assert_ne!(base, key(&content(true)));
+        let mut changed = content(false);
+        changed.paragraphs[0].tab_stops = vec![40.0];
+        assert_ne!(base, key(&changed));
+        let mut changed = content(false);
+        changed.paragraphs[0].default_tab_px = 48.0;
+        assert_ne!(base, key(&changed));
+        let mut changed = content(false);
+        changed.paragraphs[0].runs[0].style.line_font_size_pt = 24.0;
+        assert_ne!(base, key(&changed));
+    }
+
+    #[test]
+    fn a_line_that_fills_the_width_exactly_does_not_wrap() {
+        let renderer = renderer();
+        let paragraph = paragraph(&renderer, "l", "word word");
+        let mut clusters = shape_paragraph(&renderer.fonts, &paragraph, 1.0).unwrap();
+        let total: f32 = clusters.iter().map(|cluster| cluster.width).sum();
+        let lines = wrap_clusters(&mut clusters, total - 0.005, 0.0, 0.0, &[], 48.0);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    fn paragraph(renderer: &SlideRenderer, alignment: &str, text: &str) -> ResolvedParagraph {
+        let face = renderer
+            .resolve_face("Arial", false, false, &mut SubstitutionLog::default())
+            .unwrap();
+        ResolvedParagraph {
+            align: parse_align(Some(alignment)),
+            justify: is_full_justification(Some(alignment)),
+            level: 0,
+            margin_left_px: 0.0,
+            margin_right_px: 0.0,
+            line_spacing: None,
+            space_before: None,
+            space_after: None,
+            line_space_reduction: 0.0,
+            indent_px: 0.0,
+            tab_stops: Vec::new(),
+            default_tab_px: resolve_default_tab(None),
+            marker: None,
+            bullet_style: None,
+            rtl: false,
+            runs: vec![ResolvedRun {
+                text: text.to_owned(),
+                start: 0,
+                style: ResolvedStyle {
+                    face,
+                    family: "Arial".to_owned(),
+                    font_size_pt: 18.0,
+                    line_font_size_pt: 18.0,
+                    spacing_pt: 0.0,
+                    kern_pt: None,
+                    baseline_shift_px: 0.0,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strike: None,
+                    color: "#000000".to_owned(),
+                    caps: TextCaps::None,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn justification_spreads_the_slack_across_the_gaps() {
+        // "aa bb cc" laid out in 100px: 80px of clusters, two gaps to share 20px
+        let line = justify(&[
+            (20.0, false, false),
+            (10.0, true, true),
+            (20.0, false, false),
+            (10.0, true, true),
+            (20.0, false, false),
+        ]);
+        let padding = justification_padding(&line, 100.0);
+        assert_eq!(padding, vec![0.0, 10.0, 0.0, 10.0, 0.0]);
+        let width: f32 = line
+            .iter()
+            .zip(&padding)
+            .map(|(cluster, pad)| cluster.width + pad)
+            .sum();
+        assert_eq!(width, 100.0);
+    }
+
+    #[test]
+    fn justification_ignores_a_trailing_blank() {
+        // the wrap keeps the space that ended the line; stretching to it would
+        // leave the last glyph short of the edge
+        let line = justify(&[
+            (20.0, false, false),
+            (10.0, true, true),
+            (20.0, false, false),
+            (10.0, true, true),
+        ]);
+        let padding = justification_padding(&line, 60.0);
+        assert_eq!(padding, vec![0.0, 10.0, 0.0, 0.0]);
+        let width: f32 = line[..3]
+            .iter()
+            .zip(&padding)
+            .map(|(cluster, pad)| cluster.width + pad)
+            .sum();
+        assert_eq!(width, 60.0);
+    }
+
+    #[test]
+    fn justification_leaves_a_line_it_cannot_stretch() {
+        // one unbroken word has no gap to widen, and an overfull line no slack
+        assert_eq!(
+            justification_padding(&justify(&[(80.0, false, false)]), 100.0),
+            vec![0.0]
+        );
+        assert_eq!(
+            justification_padding(
+                &justify(&[
+                    (80.0, false, false),
+                    (10.0, true, true),
+                    (80.0, false, false)
+                ]),
+                100.0
+            ),
+            vec![0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn justified_layout_stretches_non_last_lines_only() {
+        let renderer = renderer();
+        let text = "alpha beta    gamma delta";
+        let justified = paragraph(&renderer, "just", text);
+        let clusters = shape_paragraph(&renderer.fonts, &justified, 1.0).unwrap();
+        let second_break = clusters
+            .iter()
+            .enumerate()
+            .find(|(_, cluster)| cluster.end == utf16_len("alpha beta    "))
+            .map(|(index, _)| index + 1)
+            .unwrap();
+        let prefix_width = clusters[..second_break]
+            .iter()
+            .map(|cluster| cluster.width)
+            .sum::<f32>();
+        let trailing_count = clusters[..second_break]
+            .iter()
+            .rev()
+            .take_while(|cluster| cluster_is_blank(cluster))
+            .count();
+        let width = prefix_width + clusters[second_break].width / 2.0;
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &justified,
+            20.0,
+            30.0,
+            width,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let natural = layout_paragraph(
+            &renderer.fonts,
+            &paragraph(&renderer, "justLow", text),
+            20.0,
+            30.0,
+            width,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert!(lines.len() > 1);
+        assert_eq!(lines.len(), natural.len());
+        let beta = utf16_len("alpha ");
+        let stretched_beta = lines[0]
+            .caret_stops
+            .iter()
+            .find(|stop| stop.position == beta)
+            .unwrap();
+        let natural_beta = natural[0]
+            .caret_stops
+            .iter()
+            .find(|stop| stop.position == beta)
+            .unwrap();
+        assert!(stretched_beta.x > natural_beta.x);
+        assert!((lines[0].width - width).abs() < 0.001);
+        let trailing = &lines[0].caret_stops;
+        let edge = trailing.last().unwrap().x;
+        assert!(trailing_count >= 2);
+        assert!(
+            trailing
+                .iter()
+                .rev()
+                .take(trailing_count + 1)
+                .all(|stop| stop.x == edge)
+        );
+        assert_eq!(lines.last(), natural.last());
+    }
+
+    #[test]
+    fn only_full_justification_enables_stretching() {
+        assert!(is_full_justification(Some("just")));
+        for alignment in ["justLow", "dist", "thaiDist"] {
+            assert_eq!(parse_align(Some(alignment)), TextAlign::Justify);
+            assert!(!is_full_justification(Some(alignment)));
+        }
+    }
+
+    #[test]
+    fn duotone_colours_resolve_against_the_theme() {
+        let theme = Theme {
+            color_scheme: ThemeColorScheme {
+                lt2: "FFFFFF".to_owned(),
+                ..ThemeColorScheme::default()
+            },
+            ..Theme::default()
+        };
+        let effects = image_effects(
+            &[
+                BlipEffect::Duotone {
+                    shadow: Some(ColorValue {
+                        theme_color: Some("background2".to_owned()),
+                        transforms: vec![ooxml_drawingml::ColorTransform::Shade(0.45)],
+                        ..ColorValue::default()
+                    }),
+                    highlight: Some(ColorValue {
+                        rgb: Some("FFFFFF".to_owned()),
+                        ..ColorValue::default()
+                    }),
+                },
+                BlipEffect::BiLevel { threshold: 0.25 },
+            ],
+            &theme,
+        );
+
+        assert_eq!(
+            effects,
+            vec![
+                ImageEffect::Duotone {
+                    shadow: "#B3B3B3FF".to_owned(),
+                    highlight: "#FFFFFFFF".to_owned(),
+                },
+                ImageEffect::BiLevel { threshold: 0.25 },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_duotone_is_dropped() {
+        let effects = image_effects(
+            &[BlipEffect::Duotone {
+                shadow: Some(ColorValue::default()),
+                highlight: Some(ColorValue {
+                    rgb: Some("FFFFFF".to_owned()),
+                    ..ColorValue::default()
+                }),
+            }],
+            &Theme::default(),
+        );
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn luminance_outside_the_legal_range_clamps() {
+        let effects = image_effects(
+            &[BlipEffect::Luminance {
+                brightness: 4.0,
+                contrast: -3.0,
+            }],
+            &Theme::default(),
+        );
+
+        assert_eq!(
+            effects,
+            vec![ImageEffect::Luminance {
+                brightness: 1.0,
+                contrast: -1.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn adjacent_runs_keep_their_own_paint_attributes() {
+        let renderer = renderer();
+        let style = ResolvedStyle {
+            face: renderer
+                .resolve_face("Arial", false, false, &mut SubstitutionLog::default())
+                .unwrap(),
+            family: "Arial".to_owned(),
+            font_size_pt: 14.0,
+            line_font_size_pt: 14.0,
+            spacing_pt: 0.0,
+            kern_pt: None,
+            baseline_shift_px: 0.0,
+            bold: false,
+            italic: false,
+            underline: false,
+            strike: None,
+            color: "#000000".to_owned(),
+            caps: TextCaps::None,
+        };
+        let mut variants = vec![style.clone(); 10];
+        variants[0].color = "#A99A72".to_owned();
+        variants[1].bold = true;
+        variants[2].italic = true;
+        variants[3].underline = true;
+        variants[4].font_size_pt = 28.0;
+        variants[5].family = "Fallback".to_owned();
+        variants[6].face = renderer
+            .resolve_face("Arial", true, false, &mut SubstitutionLog::default())
+            .unwrap();
+        variants[7].strike = Some("sngStrike".to_owned());
+        variants[8].strike = Some("dblStrike".to_owned());
+        variants[9].strike = Some("noStrike".to_owned());
+        for changed in variants {
+            let mut original_key = Vec::new();
+            let mut changed_key = Vec::new();
+            key_style(&mut original_key, &style);
+            key_style(&mut changed_key, &changed);
+            assert_ne!(original_key, changed_key);
+            let paragraph = ResolvedParagraph {
+                align: TextAlign::Left,
+                justify: false,
+                level: 0,
+                margin_left_px: 0.0,
+                margin_right_px: 0.0,
+                line_spacing: None,
+                space_before: None,
+                space_after: None,
+                line_space_reduction: 0.0,
+                indent_px: 0.0,
+                tab_stops: Vec::new(),
+                default_tab_px: resolve_default_tab(None),
+                marker: None,
+                bullet_style: None,
+                rtl: false,
+                runs: [style.clone(), changed.clone(), style.clone()]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, style)| ResolvedRun {
+                        text: "word ".to_owned(),
+                        start: index as u32 * 5,
+                        style,
+                    })
+                    .collect(),
+            };
+            for scale in [1.0, 0.5] {
+                let lines = layout_paragraph(
+                    &renderer.fonts,
+                    &paragraph,
+                    10.0,
+                    20.0,
+                    10_000.0,
+                    scale,
+                    false,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(lines.len(), 1);
+                let runs = &lines[0].runs;
+                assert_eq!(runs.len(), 3);
+                for (index, (actual, expected)) in runs.iter().zip(&paragraph.runs).enumerate() {
+                    assert_eq!(actual.text, expected.text);
+                    assert_eq!(
+                        (actual.start, actual.end),
+                        (index as u32 * 5, index as u32 * 5 + 5)
+                    );
+                    assert_eq!(actual.color, expected.style.color);
+                    assert_eq!(actual.bold, expected.style.bold);
+                    assert_eq!(actual.italic, expected.style.italic);
+                    assert_eq!(actual.underline, expected.style.underline);
+                    assert_eq!(actual.strike, expected.style.strike);
+                    assert_eq!(actual.font_id, expected.style.face.id.to_u32());
+                    assert_eq!(actual.font_family, expected.style.family);
+                    assert_eq!(
+                        actual.font_size_px,
+                        points_to_px(autofit_size_pt(expected.style.font_size_pt, scale))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn identical_adjacent_runs_keep_the_same_display_list() {
+        let renderer = renderer();
+        let style = ResolvedStyle {
+            face: renderer
+                .resolve_face("Arial", false, false, &mut SubstitutionLog::default())
+                .unwrap(),
+            family: "Arial".to_owned(),
+            font_size_pt: 14.0,
+            line_font_size_pt: 14.0,
+            spacing_pt: 0.0,
+            kern_pt: None,
+            baseline_shift_px: 0.0,
+            bold: false,
+            italic: false,
+            underline: true,
+            strike: None,
+            color: "#A99A72".to_owned(),
+            caps: TextCaps::None,
+        };
+        let paragraph = |parts: &[&str]| {
+            let mut start = 0;
+            ResolvedParagraph {
+                align: TextAlign::Justify,
+                justify: true,
+                level: 0,
+                margin_left_px: 0.0,
+                margin_right_px: 0.0,
+                line_spacing: None,
+                space_before: None,
+                space_after: None,
+                line_space_reduction: 0.0,
+                indent_px: 0.0,
+                tab_stops: Vec::new(),
+                default_tab_px: resolve_default_tab(None),
+                marker: None,
+                bullet_style: None,
+                rtl: false,
+                runs: parts
+                    .iter()
+                    .map(|text| {
+                        let run = ResolvedRun {
+                            text: (*text).to_owned(),
+                            start,
+                            style: style.clone(),
+                        };
+                        start += utf16_len(text);
+                        run
+                    })
+                    .collect(),
+            }
+        };
+        let split = paragraph(&["alpha ", "", "beta ", "gamma ", "delta"]);
+        let joined = paragraph(&["alpha beta gamma delta"]);
+        for width in [100.0, 10_000.0] {
+            let render = |paragraph| {
+                layout_paragraph(
+                    &renderer.fonts,
+                    paragraph,
+                    10.0,
+                    20.0,
+                    width,
+                    1.0,
+                    false,
+                    true,
+                )
+                .unwrap()
+            };
+            assert_eq!(render(&split), render(&joined));
+        }
+    }
+
+    #[test]
+    fn a_stack_puts_one_glyph_on_each_line_and_no_line_on_a_break() {
+        let mut renderer = SlideRenderer::new();
+        renderer
+            .register_font(
+                "Arial",
+                false,
+                false,
+                include_bytes!("../../ooxml-text/tests/fonts/LiberationSans-Regular.ttf"),
+            )
+            .unwrap();
+        let style = ResolvedStyle {
+            face: renderer
+                .resolve_face("Arial", false, false, &mut SubstitutionLog::default())
+                .unwrap(),
+            family: "Arial".to_owned(),
+            font_size_pt: 24.0,
+            line_font_size_pt: 24.0,
+            spacing_pt: 0.0,
+            kern_pt: None,
+            baseline_shift_px: 0.0,
+            bold: false,
+            italic: false,
+            underline: false,
+            strike: None,
+            color: "#000000".to_owned(),
+            caps: TextCaps::None,
+        };
+        let stack = |text: &str| {
+            let paragraph = ResolvedParagraph {
+                align: TextAlign::Left,
+                justify: false,
+                level: 0,
+                margin_left_px: 0.0,
+                margin_right_px: 0.0,
+                space_before: None,
+                space_after: None,
+                line_spacing: None,
+                line_space_reduction: 0.0,
+                indent_px: 0.0,
+                tab_stops: Vec::new(),
+                default_tab_px: resolve_default_tab(None),
+                marker: None,
+                bullet_style: None,
+                rtl: false,
+                runs: vec![ResolvedRun {
+                    text: text.to_owned(),
+                    start: 0,
+                    style: style.clone(),
+                }],
+            };
+            layout_paragraph(
+                &renderer.fonts,
+                &paragraph,
+                0.0,
+                0.0,
+                1000.0,
+                1.0,
+                true,
+                true,
+            )
+            .unwrap()
+            .iter()
+            .map(|line| {
+                line.runs
+                    .iter()
+                    .map(|run| run.text.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(stack("A\nB"), ["A", "B"]);
+        assert_eq!(stack("A B"), ["A", " ", "B"]);
+        assert_eq!(stack("ffi"), ["f", "f", "i"]);
+    }
+
+    #[test]
+    fn gradient_stops_reach_the_display_list_in_position_order() {
+        use ooxml_drawingml::{ColorValue, GradientStop as ModelStop};
+
+        let stop = |position, rgb: &str, alpha| ModelStop {
+            position,
+            color: ColorValue {
+                rgb: Some(rgb.to_owned()),
+                alpha,
+                ..ColorValue::default()
+            },
+        };
+        let ordered = [
+            stop(0.0, "404040", None),
+            stop(50_000.0, "FF0000", Some(0.5)),
+            stop(50_000.0, "00FF00", None),
+            stop(100_000.0, "262626", None),
+        ];
+        for (kind, gradient_type) in [
+            ("linear", GradientType::Linear),
+            ("radial", GradientType::Radial),
+            ("rectangular", GradientType::Rectangular),
+            ("path", GradientType::Path),
+        ] {
+            for indices in [[0, 1, 2, 3], [3, 1, 0, 2]] {
+                let fill = ShapeFill {
+                    fill_type: "gradient".to_owned(),
+                    color: None,
+                    gradient: Some(ooxml_drawingml::GradientFill {
+                        gradient_type: kind.to_owned(),
+                        angle: Some(45.0),
+                        stops: indices.map(|index| ordered[index].clone()).to_vec(),
+                    }),
+                };
+                let source = serde_json::to_vec(&fill).unwrap();
+                assert_eq!(
+                    paint(&fill, &Theme::default()),
+                    Some(Paint::Gradient {
+                        gradient_type,
+                        angle_deg: Some(45.0),
+                        stops: [
+                            (0.0, "#404040"),
+                            (0.5, "#FF000080"),
+                            (0.5, "#00FF00"),
+                            (1.0, "#262626"),
+                        ]
+                        .map(|(position, color)| GradientStop {
+                            position,
+                            color: color.to_owned(),
+                        })
+                        .to_vec(),
+                    }),
+                    "{kind}: {indices:?}",
+                );
+                assert_eq!(serde_json::to_vec(&fill).unwrap(), source);
+            }
+        }
+        let session = DeckSession::open(
+            include_bytes!("../tests/fixtures/gradient-stop-order.pptx"),
+            306,
+        )
+        .unwrap();
+        let rendered = renderer()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 2)
+            .unwrap();
+        let Some(Paint::Gradient { stops, .. }) = rendered.display_list.background else {
+            panic!("expected a gradient");
+        };
+        assert_eq!(
+            stops
+                .iter()
+                .map(|stop| stop.color.as_str())
+                .collect::<Vec<_>>(),
+            ["#FF0000", "#FF00FF", "#00FF00", "#FFFF00", "#0000FF"]
+        );
+    }
+
+    #[test]
+    fn an_unregistered_family_keeps_its_weight_through_the_fallback() {
+        let mut renderer = SlideRenderer::new();
+        renderer.register_font("Arial", false, false, FONT).unwrap();
+        let bold = renderer
+            .register_font("Arial", true, false, BOLD_FONT)
+            .unwrap();
+
+        let resolved = renderer
+            .resolve_face("Segoe UI", true, false, &mut SubstitutionLog::default())
+            .unwrap();
+        assert_eq!(resolved.id.to_u32(), bold);
+        assert_eq!(renderer.fonts.font_bytes(resolved.id).unwrap(), BOLD_FONT);
+    }
+
+    #[test]
+    fn an_unregistered_family_keeps_its_slant_through_the_fallback() {
+        let mut renderer = SlideRenderer::new();
+        renderer.register_font("Arial", false, false, FONT).unwrap();
+        let italic = renderer
+            .register_font("Arial", false, true, ITALIC_FONT)
+            .unwrap();
+
+        let resolved = renderer
+            .resolve_face("Segoe UI", false, true, &mut SubstitutionLog::default())
+            .unwrap();
+        assert_eq!(resolved.id.to_u32(), italic);
+        assert_eq!(renderer.fonts.font_bytes(resolved.id).unwrap(), ITALIC_FONT);
+    }
+
+    #[test]
+    fn fallback_keeps_combined_style_and_prefers_a_registered_family() {
+        let mut renderer = SlideRenderer::new();
+        let regular = renderer.register_font("Arial", false, false, FONT).unwrap();
+        renderer
+            .register_font("ARIAL", true, false, BOLD_FONT)
+            .unwrap();
+        renderer
+            .register_font("Arial", false, true, ITALIC_FONT)
+            .unwrap();
+        let bold_italic = renderer
+            .register_font(" arial ", true, true, BOLD_ITALIC_FONT)
+            .unwrap();
+        let georgia = renderer
+            .register_font("Georgia", false, false, FONT)
+            .unwrap();
+
+        let resolved = renderer
+            .resolve_face(" geORGia ", true, true, &mut SubstitutionLog::default())
+            .unwrap();
+        assert_eq!(resolved.id.to_u32(), georgia);
+        let resolved = renderer
+            .resolve_face("Segoe UI", true, true, &mut SubstitutionLog::default())
+            .unwrap();
+        assert_eq!(resolved.id.to_u32(), bold_italic);
+        assert_eq!(renderer.fallback_font().unwrap().to_u32(), regular);
+    }
+
+    #[test]
+    fn one_face_under_many_families_holds_its_bytes_once() {
+        let mut renderer = SlideRenderer::new();
+        for index in 0..300 {
+            let family = format!("Alias {index}");
+            renderer
+                .register_font(&family, index % 2 == 1, false, FONT)
+                .unwrap();
+            renderer
+                .register_fallback_font(&family, false, index % 3 == 1, FONT)
+                .unwrap();
+        }
+        assert_eq!(renderer.fonts().face_count(), 1);
+        assert_eq!(renderer.font_count, 600);
+        let face = &renderer.faces[&(normalize_family("Alias 299"), true, false)];
+        assert_eq!(face.family, "Alias 299");
+        assert_eq!(renderer.fonts().byte_owner(face.id).unwrap().to_u32(), 0);
+        assert!(renderer.fonts().covers(face.id, 'A').unwrap());
+    }
+
+    #[test]
+    fn distinct_faces_past_the_budget_are_refused_but_aliases_are_not() {
+        let mut renderer = SlideRenderer::new();
+        let face = |index: usize| {
+            let mut bytes =
+                include_bytes!("../../docx-edit/tests/fonts/LiberationSans-Regular.ttf").to_vec();
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+            bytes
+        };
+        for index in 0..MAX_FONTS {
+            renderer
+                .register_font(&format!("Face {index}"), false, false, face(index))
+                .unwrap();
+        }
+        let error = renderer
+            .register_font("Overflow", false, false, face(MAX_FONTS))
+            .unwrap_err();
+        assert!(
+            matches!(&error, RenderError::ResourceLimit(message) if message == "more than 256 font faces"),
+            "{error}"
+        );
+        assert!(
+            !renderer
+                .faces
+                .contains_key(&(normalize_family("Overflow"), false, false))
+        );
+        renderer
+            .register_fallback_font("Overflow", false, false, face(7))
+            .unwrap();
+        renderer
+            .register_font("Face 3", true, false, face(3))
+            .unwrap();
+        assert_eq!(renderer.fonts().face_count(), MAX_FONTS);
+    }
+
+    #[test]
+    fn registrations_past_their_own_budget_are_refused() {
+        let mut renderer = SlideRenderer::new();
+        for index in 0..MAX_FONT_REGISTRATIONS {
+            renderer
+                .register_font(&format!("Alias {index}"), false, false, FONT)
+                .unwrap();
+        }
+        let error = renderer
+            .register_font("One more", false, false, FONT)
+            .unwrap_err();
+        assert!(
+            matches!(&error, RenderError::ResourceLimit(message) if message.contains("font registrations")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn no_registered_fonts_preserve_shapes_and_text() {
+        let session = DeckSession::open(FIXTURE, 8_002).unwrap();
+        let rendered = SlideRenderer::new()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap();
+        assert!(
+            rendered
+                .display_list
+                .primitives
+                .iter()
+                .any(|primitive| { matches!(primitive, Primitive::Shape { fill: Some(_), .. }) })
+        );
+        assert!(rendered.display_list.primitives.iter().any(|primitive| {
+            matches!(primitive, Primitive::TextBox { lines, .. } if lines.iter().flat_map(|line| &line.runs).any(|run| !run.text.is_empty() && run.width > 0.0 && run.glyphs.iter().any(|glyph| glyph.advance > 0.0)))
+        }));
+        assert!(!rendered.font_substitutions.is_empty());
+    }
+
+    #[test]
+    fn fallback_with_only_bold_and_italic_is_independent_of_registration_order() {
+        fn substitute_family(shapes: &mut [ShapeSnapshot]) {
+            for shape in shapes {
+                for story in &mut shape.text_stories {
+                    for paragraph in &mut story.paragraphs {
+                        for run in &mut paragraph.runs {
+                            run.style.font_family = Some("Segoe UI".to_owned());
+                        }
+                    }
+                }
+                substitute_family(&mut shape.children);
+            }
+        }
+
+        fn normalize_font_ids(primitives: &mut [Primitive], bold_id: u32) {
+            for primitive in primitives {
+                match primitive {
+                    Primitive::TextBox { lines, .. } => {
+                        for run in lines.iter_mut().flat_map(|line| &mut line.runs) {
+                            run.font_id = u32::from(run.font_id != bold_id);
+                        }
+                    }
+                    Primitive::Chart { primitives, .. } | Primitive::Table { primitives, .. } => {
+                        normalize_font_ids(primitives, bold_id)
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(
+            SlideRenderer::new()
+                .resolve_face("Segoe UI", false, false, &mut SubstitutionLog::default())
+                .is_ok()
+        );
+        let package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_010).unwrap();
+        let mut snapshot = session.snapshot().unwrap();
+        for slide in &mut snapshot.slides {
+            substitute_family(&mut slide.shapes);
+        }
+        let mut outputs = Vec::new();
+        let mut renderers = Vec::new();
+        for reverse in [false, true] {
+            let mut renderer = SlideRenderer::new();
+            let mut faces = [(true, false, BOLD_FONT), (false, true, ITALIC_FONT)];
+            if reverse {
+                faces.reverse();
+            }
+            for (bold, italic, bytes) in faces {
+                renderer
+                    .register_font("Arial", bold, italic, bytes)
+                    .unwrap();
+            }
+            let bold_id = renderer
+                .resolve_face("Arial", true, false, &mut SubstitutionLog::default())
+                .unwrap()
+                .id;
+            let mut slides = Vec::new();
+            for index in 0..snapshot.slides.len() {
+                let mut rendered = renderer.layout_slide(&package, &snapshot, index).unwrap();
+                normalize_font_ids(&mut rendered.display_list.primitives, bold_id.to_u32());
+                slides.push(rendered.display_list);
+            }
+            outputs.push(serde_json::to_vec(&slides).unwrap());
+            renderers.push(renderer);
+        }
+        assert!(outputs[0] == outputs[1], "fallback display lists differ");
+        for renderer in renderers {
+            for (bold, italic, expected) in [
+                (false, false, ITALIC_FONT),
+                (true, false, BOLD_FONT),
+                (false, true, ITALIC_FONT),
+                (true, true, BOLD_FONT),
+            ] {
+                let resolved = renderer
+                    .resolve_face("Segoe UI", bold, italic, &mut SubstitutionLog::default())
+                    .unwrap();
+                assert!(
+                    renderer.fonts.font_bytes(resolved.id).unwrap() == expected,
+                    "wrong fallback for bold={bold}, italic={italic}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_translucent_fill_carries_its_alpha_into_the_display_list() {
+        let theme = Theme::default();
+        let translucent = ShapeFill {
+            fill_type: "solid".to_owned(),
+            color: Some(ColorValue {
+                rgb: Some("112233".to_owned()),
+                alpha: Some(0.5),
+                ..ColorValue::default()
+            }),
+            gradient: None,
+        };
+        assert_eq!(
+            paint(&translucent, &theme),
+            Some(Paint::Solid {
+                color: "#11223380".to_owned()
+            })
+        );
+
+        let opaque = ShapeFill {
+            color: Some(ColorValue {
+                rgb: Some("112233".to_owned()),
+                ..ColorValue::default()
+            }),
+            ..translucent
+        };
+        assert_eq!(
+            paint(&opaque, &theme),
+            Some(Paint::Solid {
+                color: "#112233".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_translucent_gradient_stop_and_outline_carry_their_alpha() {
+        let theme = Theme::default();
+        let color = |rgb: &str, alpha: Option<f64>| ColorValue {
+            rgb: Some(rgb.to_owned()),
+            alpha,
+            ..ColorValue::default()
+        };
+
+        let gradient = ShapeFill {
+            fill_type: "gradient".to_owned(),
+            color: None,
+            gradient: Some(ooxml_drawingml::GradientFill {
+                gradient_type: "linear".to_owned(),
+                angle: None,
+                stops: vec![
+                    ooxml_drawingml::GradientStop {
+                        position: 0.0,
+                        color: color("112233", Some(0.5)),
+                    },
+                    ooxml_drawingml::GradientStop {
+                        position: 100_000.0,
+                        color: color("445566", None),
+                    },
+                ],
+            }),
+        };
+        let Some(Paint::Gradient { stops, .. }) = paint(&gradient, &theme) else {
+            panic!("expected a gradient paint");
+        };
+        assert_eq!(
+            stops
+                .iter()
+                .map(|stop| stop.color.as_str())
+                .collect::<Vec<_>>(),
+            ["#11223380", "#445566"]
+        );
+
+        let outline = |alpha| ShapeOutline {
+            color: Some(color("112233", alpha)),
+            ..ShapeOutline::default()
+        };
+        assert_eq!(
+            stroke(&outline(Some(0.5)), &theme).map(|stroke| stroke.color),
+            Some("#11223380".to_owned())
+        );
+        assert_eq!(
+            stroke(&outline(None), &theme).map(|stroke| stroke.color),
+            Some("#112233".to_owned())
+        );
+    }
+
+    #[test]
+    fn text_color_preserves_transparency() {
+        let theme = Theme::default();
+        let properties = RunProperties {
+            color: Some(ColorValue {
+                rgb: Some("112233".to_owned()),
+                alpha: Some(0.5),
+                ..ColorValue::default()
+            }),
+            ..RunProperties::default()
+        };
+        let style = style_from_properties(&properties, &theme);
+        assert_eq!(style.color.as_deref(), Some("#11223380"));
+        assert!(valid_color(style.color.as_deref().unwrap()));
+        assert!(!valid_color("#1122338Z"));
+    }
+
+    #[test]
+    fn an_outer_shadow_resolves_to_translucent_pixels_offset_along_its_direction() {
+        let theme = Theme::default();
+        let effects = |alpha| ShapeEffects {
+            outer_shadow: Some(ooxml_drawingml::OuterShadow {
+                color: Some(ColorValue {
+                    rgb: Some("000000".to_owned()),
+                    alpha: Some(alpha),
+                    ..ColorValue::default()
+                }),
+                blur_radius: 76_200,
+                distance: 38_100,
+                direction: 2_700_000,
+                ..Default::default()
+            }),
+        };
+        let box_ = PxRect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 50.0,
+        };
+        let resolved = shadow(
+            &effects(0.4),
+            &theme,
+            Space::root(),
+            box_,
+            0.0,
+            false,
+            false,
+        )
+        .expect("a painted shadow");
+        assert_eq!(resolved.color, "#00000066");
+        assert!((resolved.blur - 8.0).abs() < 0.01);
+        assert!((resolved.dx - 2.828).abs() < 0.01);
+        assert!((resolved.dy - 2.828).abs() < 0.01);
+
+        let rotated = shadow(
+            &effects(0.4),
+            &theme,
+            Space::root(),
+            box_,
+            90.0,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!((rotated.dx + 2.828).abs() < 0.01);
+        assert!((rotated.dy + 2.828).abs() < 0.01);
+        let mut fixed = effects(0.4);
+        fixed.outer_shadow.as_mut().unwrap().rotate_with_shape = false;
+        assert_eq!(
+            shadow(&fixed, &theme, Space::root(), box_, 90.0, true, false).unwrap(),
+            resolved
+        );
+
+        assert_eq!(
+            shadow(
+                &effects(0.0),
+                &theme,
+                Space::root(),
+                box_,
+                0.0,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            shadow(
+                &ShapeEffects::default(),
+                &theme,
+                Space::root(),
+                box_,
+                0.0,
+                false,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_scaled_shadow_keeps_the_point_its_alignment_names() {
+        let theme = Theme::default();
+        let scaled = |alignment: &str, sx: f64| ShapeEffects {
+            outer_shadow: Some(ooxml_drawingml::OuterShadow {
+                color: Some(ColorValue {
+                    rgb: Some("000000".to_owned()),
+                    alpha: Some(0.4),
+                    ..ColorValue::default()
+                }),
+                scale_x: sx,
+                scale_y: sx,
+                alignment: alignment.to_owned(),
+                ..Default::default()
+            }),
+        };
+        let box_ = PxRect {
+            x: 100.0,
+            y: 200.0,
+            w: 40.0,
+            h: 80.0,
+        };
+        let centre = shadow(
+            &scaled("ctr", 1.02),
+            &theme,
+            Space::root(),
+            box_,
+            0.0,
+            false,
+            false,
+        )
+        .expect("a painted shadow");
+        assert!((centre.scale_x - 1.02).abs() < 1e-6);
+        // 102% about the box centre (120, 240) leaves it where it was.
+        assert!((120.0 * centre.scale_x + centre.dx - 120.0).abs() < 0.01);
+        assert!((240.0 * centre.scale_y + centre.dy - 240.0).abs() < 0.01);
+
+        // The default anchor is the bottom edge, so only that edge stays put.
+        let bottom = shadow(
+            &scaled("b", 1.02),
+            &theme,
+            Space::root(),
+            box_,
+            0.0,
+            false,
+            false,
+        )
+        .expect("a painted shadow");
+        assert!((280.0 * bottom.scale_y + bottom.dy - 280.0).abs() < 0.01);
+        assert!(200.0 * bottom.scale_y + bottom.dy < 200.0);
+
+        let plain = shadow(
+            &scaled("ctr", 1.0),
+            &theme,
+            Space::root(),
+            box_,
+            0.0,
+            false,
+            false,
+        )
+        .expect("a painted shadow");
+        assert_eq!((plain.scale_x, plain.dx, plain.dy), (1.0, 0.0, 0.0));
+
+        for (alignment, x, y) in [
+            ("tl", 100.0, 200.0),
+            ("t", 120.0, 200.0),
+            ("tr", 140.0, 200.0),
+            ("l", 100.0, 240.0),
+            ("ctr", 120.0, 240.0),
+            ("r", 140.0, 240.0),
+            ("bl", 100.0, 280.0),
+            ("b", 120.0, 280.0),
+            ("br", 140.0, 280.0),
+        ] {
+            let mut effects = scaled(alignment, -1.5);
+            effects.outer_shadow.as_mut().unwrap().scale_y = 0.5;
+            let result = shadow(&effects, &theme, Space::root(), box_, 0.0, false, false).unwrap();
+            assert_eq!((result.scale_x, result.scale_y), (-1.5, 0.5));
+            assert_eq!(result.dx, x * 2.5, "{alignment}");
+            assert_eq!(result.dy, y * 0.5, "{alignment}");
+        }
+        assert!(
+            shadow(
+                &scaled("ctr", 0.0),
+                &theme,
+                Space::root(),
+                box_,
+                0.0,
+                false,
+                false
+            )
+            .is_none()
+        );
+        let invalid = shadow(
+            &scaled("ctr", f64::INFINITY),
+            &theme,
+            Space::root(),
+            box_,
+            0.0,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            (invalid.scale_x, invalid.scale_y, invalid.dx, invalid.dy),
+            (1.0, 1.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_slide_number_field_resolves_to_the_slide_it_is_drawn_on() {
+        let run = |field_type: Option<&str>, text: &str| pptx_parse::TextRun {
+            text: text.to_owned(),
+            properties: RunProperties::default(),
+            field_id: field_type.map(|_| "{GUID}".to_owned()),
+            field_type: field_type.map(str::to_owned),
+            line_break: false,
+        };
+
+        assert_eq!(
+            field_text(&run(Some("slidenum"), "\u{2039}#\u{203a}"), 7),
+            "7"
+        );
+        assert_eq!(
+            field_text(&run(Some("datetime"), "16/08/2026"), 7),
+            "16/08/2026"
+        );
+        assert_eq!(field_text(&run(None, "Chapter 3"), 7), "Chapter 3");
+    }
+
+    #[test]
+    fn slide_number_fields_count_from_first_slide_num_through_the_edit_snapshot() {
+        for first in [10, -3, i32::MAX] {
+            assert_slide_number_fields(first);
+        }
+    }
+
+    fn assert_slide_number_fields(first: i32) {
+        let mut source = pptx_parse::parse_pptx(NUMBERED_FIXTURE).unwrap();
+        assert_eq!(source.presentation.first_slide_num, 10);
+        assert!(
+            std::str::from_utf8(source.part_bytes("ppt/slides/slide1.xml").unwrap())
+                .unwrap()
+                .contains("show=\"0\"")
+        );
+        let presentation = std::str::from_utf8(source.part_bytes("ppt/presentation.xml").unwrap())
+            .unwrap()
+            .replace(
+                "firstSlideNum=\"10\"",
+                &format!("firstSlideNum=\"{first}\""),
+            );
+        assert!(source.replace_part("ppt/presentation.xml", presentation.into_bytes()));
+        let bytes = pptx_parse::write_pptx(&source).unwrap();
+        let parsed = pptx_parse::parse_pptx(&bytes).unwrap();
+        let opened = DeckSession::from_package_with_source(parsed, &bytes, 8_006).unwrap();
+        let session =
+            DeckSession::open_from_update(&opened.encode_state_as_update_v1(), 8_007).unwrap();
+        let package = session.package();
+        assert_eq!(package.presentation.first_slide_num, first);
+        let deck = session.snapshot().unwrap();
+        assert_eq!(deck.slides.len(), 3);
+        let master = &package.masters[0];
+        let layout = &package.layouts[0];
+        let master_probe = format!("master:{}:{}", master.part_path, master.shapes.len() - 1);
+        let layout_probe = format!("layout:{}:{}", layout.part_path, layout.shapes.len() - 1);
+        let slide_probe = deck.slides[1].shapes.last().unwrap();
+        assert_eq!(slide_probe.text_stories[0].plain_text(), "77");
+
+        let run = |text: &str, size: f32, emphasis: bool, color: &str| TextRun {
+            text: text.to_owned(),
+            font_family: "Arial".to_owned(),
+            font_size_pt: size,
+            bold: emphasis,
+            italic: emphasis,
+            underline: emphasis,
+            color: color.to_owned(),
+        };
+        let renderer = renderer();
+        for index in 0..3 {
+            let number = (i64::from(first) + index as i64).to_string();
+            let number = number.as_str();
+            let rendered = renderer.layout_slide(package, &deck, index).unwrap();
+            let (runs, line) = drawn_text(&rendered, &master_probe);
+            assert_eq!(
+                runs.iter().map(|run| run.text.as_str()).collect::<Vec<_>>(),
+                [number, "|", "CACHED-DATE"]
+            );
+            assert_eq!(runs[0], run(number, 23.0, true, "#FF0066"));
+            assert_eq!(runs[2], run("CACHED-DATE", 13.0, false, "#00AA55"));
+            assert_eq!(line, format!("{number}|CACHED-DATE"));
+            let (runs, line) = drawn_text(&rendered, &layout_probe);
+            assert_eq!(runs, [run(number, 17.0, false, "#1122CC")]);
+            assert_eq!(line, number);
+            if index == 1 {
+                let (runs, line) = drawn_text(&rendered, &slide_probe.id);
+                assert_eq!(runs, [run(number, 19.0, false, "#AA5500")]);
+                assert_eq!(line, number);
+            }
+        }
+    }
+
+    fn drawn_text(rendered: &RenderedSlide, shape_id: &str) -> (Vec<TextRun>, String) {
+        rendered
+            .display_list
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::TextBox {
+                    shape_id: Some(id),
+                    paragraphs,
+                    lines,
+                    ..
+                } if id == shape_id => Some((
+                    paragraphs
+                        .iter()
+                        .flat_map(|paragraph| paragraph.runs.iter().cloned())
+                        .collect(),
+                    lines
+                        .iter()
+                        .flat_map(|line| line.runs.iter().map(|run| run.text.as_str()))
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{shape_id} was not drawn"))
+    }
+
+    #[test]
+    fn a_placeholder_without_a_transform_draws_with_the_orientation_it_inherits() {
+        let mut package = pptx_parse::parse_pptx(STYLE_MATRIX_FIXTURE).unwrap();
+        let session = DeckSession::open(STYLE_MATRIX_FIXTURE, 8_320).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let title = snapshot.slides[1].shapes[0].id.clone();
+        let layout = package
+            .layouts
+            .iter_mut()
+            .find(|layout| layout.part_path == "ppt/slideLayouts/slideLayout2.xml")
+            .unwrap();
+        let ShapeNode::Shape(placeholder) = &mut layout.shapes[0] else {
+            panic!("the layout title is a shape")
+        };
+        placeholder.base.transform.rotation_deg = 30.0;
+        placeholder.base.transform.flip_v = true;
+
+        let rendered = renderer().layout_slide(&package, &snapshot, 1).unwrap();
+        assert_eq!(
+            drawn_transform(&rendered, &title),
+            Transform {
+                rotation_deg: 30.0,
+                flip_h: false,
+                flip_v: true,
+            }
+        );
+    }
+
+    fn drawn_transform(rendered: &RenderedSlide, shape_id: &str) -> Transform {
+        rendered
+            .display_list
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Shape {
+                    shape_id: Some(id),
+                    transform,
+                    ..
+                } if id == shape_id => Some(*transform),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{shape_id} was not drawn"))
+    }
+
+    #[test]
+    fn hiding_master_shapes_drops_the_layout_decoration_too() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_301).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        package.layouts[0]
+            .shapes
+            .push(package.slides[0].shapes[0].clone());
+        let shown = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        assert!(
+            painted_shape_ids(&shown)
+                .iter()
+                .any(|id| id.starts_with("layout:"))
+        );
+        package.slides[0].show_master_shapes = false;
+        let hidden = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        assert!(
+            painted_shape_ids(&hidden)
+                .iter()
+                .all(|id| !id.starts_with("layout:") && !id.starts_with("master:"))
+        );
+        assert_eq!(
+            hidden.display_list.background,
+            shown.display_list.background
+        );
+    }
+
+    #[test]
+    fn a_background_picture_paints_first_from_the_slide_or_the_theme() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_302).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let picture = PictureFill {
+            relationship_id: None,
+            media_part_path: Some("ppt/media/image1.png".to_owned()),
+            effects: Vec::new(),
+            tile: None,
+            crop: PictureCrop::default(),
+            fill_rect: PictureCrop {
+                top: -6_000,
+                bottom: -6_000,
+                ..PictureCrop::default()
+            },
+        };
+        package.slides[0].background_picture = Some(Box::new(picture.clone()));
+        let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        let Primitive::Image {
+            object_id,
+            asset_id,
+            x,
+            y,
+            w,
+            h,
+            crop,
+            ..
+        } = &rendered.display_list.primitives[0]
+        else {
+            panic!("the background paints before every shape")
+        };
+        assert_eq!(*object_id, 0);
+        assert_eq!(asset_id.as_deref(), Some("ppt/media/image1.png"));
+        assert_eq!(
+            (*x, *y, *w, *h),
+            (
+                0.0,
+                0.0,
+                rendered.display_list.width,
+                rendered.display_list.height
+            )
+        );
+        assert!(crop.top > 0.0 && crop.bottom > 0.0);
+
+        package.slides[0].background_picture = None;
+        package.slides[0].background = None;
+        package.slides[0].background_reference = Some(StyleReference {
+            index: 1_003,
+            color: None,
+        });
+        package.themes[0].background_pictures = vec![None, None, Some(picture)];
+        let referenced = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        assert_eq!(
+            referenced.display_list.primitives[0],
+            rendered.display_list.primitives[0]
+        );
+    }
+
+    #[test]
+    fn a_theme_background_picture_resolves_effects_with_the_master_reference_color() {
+        let mut parts = ooxml_opc::unzip_parts(FIXTURE).unwrap();
+        for (path, bytes) in &mut parts {
+            if path == "ppt/slides/slide1.xml" {
+                let mut xml = String::from_utf8(bytes.clone()).unwrap();
+                let start = xml.find("<p:bg>").unwrap();
+                let end = xml.find("</p:bg>").unwrap() + "</p:bg>".len();
+                xml.replace_range(start..end, "");
+                *bytes = xml.into_bytes();
+            } else if path == "ppt/slideMasters/slideMaster1.xml" {
+                let mut xml = String::from_utf8(bytes.clone()).unwrap();
+                let start = xml.find("<p:bg>").unwrap();
+                let end = xml.find("</p:bg>").unwrap() + "</p:bg>".len();
+                xml.replace_range(start..end, r#"<p:bg><p:bgRef idx="1001"><a:schemeClr val="accent1"><a:shade val="50000"/><a:alpha val="50000"/></a:schemeClr></p:bgRef></p:bg>"#);
+                *bytes = xml.into_bytes();
+            } else if path == "ppt/theme/theme1.xml" {
+                let mut xml = String::from_utf8(bytes.clone()).unwrap();
+                let start = xml.find("<a:bgFillStyleLst>").unwrap();
+                let end = xml.find("</a:bgFillStyleLst>").unwrap() + "</a:bgFillStyleLst>".len();
+                xml.replace_range(start..end, r#"<a:bgFillStyleLst><a:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="background"><a:duotone><a:schemeClr val="phClr"><a:shade val="50000"/></a:schemeClr><a:schemeClr val="phClr"><a:tint val="50000"/><a:alpha val="25000"/></a:schemeClr></a:duotone><a:clrChange><a:clrFrom><a:schemeClr val="phClr"/></a:clrFrom><a:clrTo><a:srgbClr val="FFFFFF"/></a:clrTo></a:clrChange></a:blip><a:stretch><a:fillRect/></a:stretch></a:blipFill></a:bgFillStyleLst>"#);
+                *bytes = xml.into_bytes();
+            }
+        }
+        parts.push((
+            "ppt/theme/_rels/theme1.xml.rels".to_owned(),
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="background" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#.to_vec(),
+        ));
+        let source = ooxml_opc::rezip_parts(&parts).unwrap();
+        let mut package = pptx_parse::parse_pptx(&source).unwrap();
+        package.themes[0].theme.color_scheme.accent1 = "808080".to_owned();
+        let session = DeckSession::open(&source, 8_321).unwrap();
+        let rendered = renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), 0)
+            .unwrap();
+        let Primitive::Image { effects, .. } = &rendered.display_list.primitives[0] else {
+            panic!("the theme background paints before every shape")
+        };
+        assert_eq!(
+            *effects,
+            vec![
+                ImageEffect::Duotone {
+                    shadow: "#42424280".to_owned(),
+                    highlight: "#C4C4C440".to_owned(),
+                },
+                ImageEffect::ColorChange {
+                    from: "#5C5C5C80".to_owned(),
+                    to: "#FFFFFFFF".to_owned(),
+                    use_alpha: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_background_picture_fill_keeps_its_blip_effects() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_318).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let picture: PictureFill = serde_json::from_value(serde_json::json!({
+            "mediaPartPath": "ppt/media/image1.png",
+            "effects": [
+                { "type": "alpha", "amount": 0.2 },
+                { "type": "luminance", "brightness": 0.1, "contrast": -0.2 }
+            ]
+        }))
+        .unwrap();
+        package.slides[0].background_picture = Some(Box::new(picture));
+        let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        let Primitive::Image { effects, .. } = &rendered.display_list.primitives[0] else {
+            panic!("the background paints before every shape")
+        };
+        assert_eq!(
+            *effects,
+            vec![
+                ImageEffect::Alpha { amount: 0.2 },
+                ImageEffect::Luminance {
+                    brightness: 0.1,
+                    contrast: -0.2
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shape_picture_fill_keeps_its_blip_effects() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_319).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let picture: PictureFill = serde_json::from_value(serde_json::json!({
+            "mediaPartPath": "ppt/media/image1.png",
+            "tile": { "scaleX": 0.5, "scaleY": 0.5 },
+            "effects": [{ "type": "alpha", "amount": 0.2 }]
+        }))
+        .unwrap();
+        package.masters[0]
+            .shapes
+            .push(ShapeNode::Shape(pptx_parse::Shape {
+                has_preset_geometry: true,
+                effects: None,
+                base: pptx_parse::ShapeBase {
+                    id: 9_002,
+                    name: "Filled".to_owned(),
+                    title: None,
+                    description: None,
+                    decorative: false,
+                    hidden: false,
+                    placeholder: None,
+                    transform: ShapeTransform {
+                        x: 0,
+                        y: 0,
+                        width: 1_000_000,
+                        height: 1_000_000,
+                        ..ShapeTransform::default()
+                    },
+                },
+                geometry: "rect".to_owned(),
+                adjust_values: BTreeMap::new(),
+                paths: Vec::new(),
+                use_bg_fill: false,
+                style: None,
+                fill: Some(ShapeFill::named("picture")),
+                picture_fill: Some(Box::new(picture)),
+                outline: None,
+                text: None,
+            }));
+        let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        let image = rendered
+            .display_list
+            .primitives
+            .iter()
+            .find(|primitive| {
+                matches!(
+                    primitive,
+                    Primitive::Image {
+                        object_id: 9_002,
+                        ..
+                    }
+                )
+            })
+            .expect("the picture-filled master shape paints as an image");
+        let Primitive::Image { effects, tile, .. } = image else {
+            unreachable!()
+        };
+        assert_eq!(*effects, vec![ImageEffect::Alpha { amount: 0.2 }]);
+        assert!(tile.is_some());
+    }
+
+    #[test]
+    fn an_edited_slide_background_paints_before_the_deck_is_saved() {
+        let session = DeckSession::open(FIXTURE, 8_303).unwrap();
+        let slide_id = session.snapshot().unwrap().slides[0].id.clone();
+        let context = EditCtx::local("background");
+        let painted = |session: &DeckSession| {
+            renderer()
+                .layout_scoped_slide(session.package(), &session.slide_scope(0).unwrap())
+                .unwrap()
+                .display_list
+                .background
+        };
+        let declared = painted(&session);
+        let mut inherited = session.package().clone();
+        inherited.slides[0].background = None;
+        let inherited = renderer()
+            .layout_slide(&inherited, &session.snapshot().unwrap(), 0)
+            .unwrap()
+            .display_list
+            .background;
+        assert_ne!(inherited, declared);
+
+        session
+            .set_slide_background(
+                &context,
+                &slide_id,
+                Some(&ShapeFill {
+                    fill_type: "solid".to_owned(),
+                    color: Some(ColorValue {
+                        rgb: Some("0F1720".to_owned()),
+                        ..ColorValue::default()
+                    }),
+                    gradient: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            painted(&session),
+            Some(Paint::Solid {
+                color: "#0F1720".to_owned()
+            })
+        );
+
+        session
+            .set_slide_background(&context, &slide_id, None)
+            .unwrap();
+        assert_eq!(painted(&session), inherited);
+    }
+
+    #[test]
+    fn a_scheme_alias_background_paints_its_theme_colour() {
+        let session = DeckSession::open(FIXTURE, 8_304).unwrap();
+        let slide_id = session.snapshot().unwrap().slides[0].id.clone();
+        session
+            .set_slide_background(
+                &EditCtx::local("background"),
+                &slide_id,
+                Some(&ShapeFill {
+                    fill_type: "solid".to_owned(),
+                    color: Some(ColorValue {
+                        theme_color: Some("bg1".to_owned()),
+                        ..ColorValue::default()
+                    }),
+                    gradient: None,
+                }),
+            )
+            .unwrap();
+        let rendered = renderer()
+            .layout_scoped_slide(session.package(), &session.slide_scope(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            rendered.display_list.background,
+            Some(Paint::Solid {
+                color: "#FFFFFF".to_owned()
+            })
+        );
+    }
+
+    /// a deck whose master fills the slide at alpha 0 still renders on paper.
+    #[test]
+    fn a_fully_transparent_background_renders_as_white_paper() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_311).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        package.slides[0].background_reference = None;
+        package.slides[0].background = Some(ShapeFill {
+            fill_type: "solid".to_owned(),
+            color: Some(ColorValue {
+                rgb: Some("123456".to_owned()),
+                alpha: Some(0.0),
+                ..ColorValue::default()
+            }),
+            gradient: None,
+        });
+        let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        assert_eq!(
+            rendered.display_list.background,
+            Some(Paint::Solid {
+                color: "#ffffff".to_owned()
+            })
+        );
+    }
+
+    /// a gradient whose every stop is transparent is paper too, while one
+    /// visible stop keeps the gradient.
+    #[test]
+    fn a_gradient_paints_unless_every_stop_is_transparent() {
+        let clear = |alpha: f64| ColorValue {
+            rgb: Some("123456".to_owned()),
+            alpha: Some(alpha),
+            ..ColorValue::default()
+        };
+        let gradient = |stops: Vec<ColorValue>| ShapeFill {
+            fill_type: "gradient".to_owned(),
+            color: None,
+            gradient: Some(ooxml_drawingml::GradientFill {
+                gradient_type: "linear".to_owned(),
+                angle: None,
+                stops: stops
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, color)| ooxml_drawingml::GradientStop {
+                        position: index as f64,
+                        color,
+                    })
+                    .collect(),
+            }),
+        };
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_317).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        package.slides[0].background_reference = None;
+        package.slides[0].background = Some(gradient(vec![clear(0.0), clear(0.0)]));
+        assert_eq!(
+            renderer()
+                .layout_slide(&package, &snapshot, 0)
+                .unwrap()
+                .display_list
+                .background,
+            Some(Paint::Solid {
+                color: "#ffffff".to_owned()
+            })
+        );
+        package.slides[0].background = Some(gradient(vec![clear(0.0), clear(1.0)]));
+        assert!(matches!(
+            renderer()
+                .layout_slide(&package, &snapshot, 0)
+                .unwrap()
+                .display_list
+                .background,
+            Some(Paint::Gradient { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unpaintable_background_style_keeps_the_reference_colour() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_303).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let color = ColorValue {
+            rgb: Some("123456".to_owned()),
+            ..ColorValue::default()
+        };
+        package.slides[0].background = Some(ShapeFill {
+            fill_type: "theme".to_owned(),
+            color: Some(color),
+            gradient: None,
+        });
+        package.slides[0].background_reference = Some(StyleReference {
+            index: 1_003,
+            color: None,
+        });
+        package.themes[0].format_scheme.background_fills =
+            vec![None, None, Some(ShapeFill::named("picture"))];
+        package.themes[0].background_pictures = Vec::new();
+        let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        assert_eq!(
+            rendered.display_list.background,
+            Some(Paint::Solid {
+                color: "#123456".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn seeded_hidden_shapes_are_neither_painted_nor_hit_testable() {
+        let package = pptx_parse::parse_pptx(HIDDEN_FIXTURE).unwrap();
+        let session = DeckSession::open(HIDDEN_FIXTURE, 8_103).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let shapes = &snapshot.slides[0].shapes;
+        assert!(shapes[0].hidden);
+        assert!(shapes[8].hidden);
+        assert_eq!(shapes[8].children.len(), 14);
+        assert!(shapes[8].children[..13].iter().all(|child| !child.hidden));
+        assert!(shapes[8].children[13].hidden);
+        assert!(
+            shapes
+                .iter()
+                .enumerate()
+                .all(|(index, shape)| shape.hidden == (index == 0 || index == 8))
+        );
+
+        let mut visible = snapshot.clone();
+        clear_hidden(&mut visible.slides[0].shapes);
+        let before = renderer().layout_slide(&package, &visible, 0).unwrap();
+        let after = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+
+        let hidden_ids: BTreeSet<String> = std::iter::once("slide:0:256:shape:0".to_owned())
+            .chain((0..14).map(|child| format!("slide:0:256:shape:8.{child}")))
+            .collect();
+        let removed: BTreeSet<String> = painted_shape_ids(&before)
+            .difference(&painted_shape_ids(&after))
+            .cloned()
+            .collect();
+        assert_eq!(removed, hidden_ids);
+        assert_eq!(before.display_list.primitives.len(), 41);
+        assert_eq!(after.display_list.primitives.len(), 20);
+        let expected: Vec<Primitive> = before
+            .display_list
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                !primitive_shape_id(primitive).is_some_and(|id| hidden_ids.contains(id))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(after.display_list.primitives, expected);
+
+        assert_eq!(
+            before.hit_test(12.0, 200.0),
+            Some(HitTestResult::Shape {
+                shape_id: "slide:0:256:shape:0".to_owned()
+            })
+        );
+        assert_eq!(after.hit_test(12.0, 200.0), None);
+        let child = match before.hit_test(760.0, 100.0) {
+            Some(HitTestResult::Shape { shape_id } | HitTestResult::Text { shape_id, .. }) => {
+                shape_id
+            }
+            None => panic!("a child of the visible group is painted"),
+        };
+        assert!(child.starts_with("slide:0:256:shape:8."));
+        assert_eq!(after.hit_test(760.0, 100.0), None);
+    }
+
+    #[test]
+    fn a_v2_deck_renders_its_hidden_shapes_hidden_after_migration() {
+        let fresh = DeckSession::open(HIDDEN_FIXTURE, 8_104).unwrap();
+        let mut visible = fresh.snapshot().unwrap();
+        let expected = renderer()
+            .layout_slide(fresh.package(), &visible, 0)
+            .unwrap();
+        clear_hidden(&mut visible.slides[1].shapes);
+        let painted_when_visible = painted_shape_ids(
+            &renderer()
+                .layout_slide(fresh.package(), &visible, 1)
+                .unwrap(),
+        );
+        assert!(painted_when_visible.contains("slide:1:257:shape:16"));
+
+        let session = DeckSession::open_from_update(V2_UPDATE, 8_105).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let slide = |id: &str| {
+            snapshot
+                .slides
+                .iter()
+                .position(|slide| slide.id == id)
+                .unwrap()
+        };
+        let migrated = renderer()
+            .layout_slide(session.package(), &snapshot, slide("slide:0:256"))
+            .unwrap();
+        assert_eq!(migrated.display_list, expected.display_list);
+        assert_eq!(migrated.hit_test(12.0, 200.0), None);
+        assert_eq!(migrated.hit_test(760.0, 100.0), None);
+
+        let painted = painted_shape_ids(
+            &renderer()
+                .layout_slide(session.package(), &snapshot, slide("slide:1:257"))
+                .unwrap(),
+        );
+        assert!(!painted.contains("slide:1:257:shape:16"));
+        assert!(painted.contains("shape:4343:0"));
+    }
+
+    fn clear_hidden(shapes: &mut [ShapeSnapshot]) {
+        for shape in shapes {
+            shape.hidden = false;
+            clear_hidden(&mut shape.children);
+        }
+    }
+
+    fn primitive_shape_id(primitive: &Primitive) -> Option<&str> {
+        match primitive {
+            Primitive::Shape { shape_id, .. }
+            | Primitive::Image { shape_id, .. }
+            | Primitive::TextBox { shape_id, .. }
+            | Primitive::Placeholder { shape_id, .. }
+            | Primitive::Chart { shape_id, .. }
+            | Primitive::Table { shape_id, .. } => shape_id.as_deref(),
+        }
+    }
+
+    fn painted_shape_ids(slide: &RenderedSlide) -> BTreeSet<String> {
+        slide
+            .display_list
+            .primitives
+            .iter()
+            .filter_map(primitive_shape_id)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn hit_testing_a_rotated_shape_follows_its_painted_frame() {
+        let slide = |transform| RenderedSlide {
+            display_list: SurfaceDisplayList {
+                contract_version: CONTRACT_VERSION,
+                width: 400.0,
+                height: 400.0,
+                background: None,
+                primitives: Vec::new(),
+            },
+            font_substitutions: Vec::new(),
+            autofit: HashMap::new(),
+            hit_regions: vec![HitRegion {
+                shape_id: "rotated".to_owned(),
+                rect: PxRect {
+                    x: 100.0,
+                    y: 100.0,
+                    w: 100.0,
+                    h: 100.0,
+                },
+                hit_rect: PxRect {
+                    x: 100.0,
+                    y: 100.0,
+                    w: 100.0,
+                    h: 100.0,
+                },
+                transform,
+                text: None,
+            }],
+        };
+        let turned = |rotation_deg| Transform {
+            rotation_deg,
+            ..Transform::default()
+        };
+
+        // turned 45°, the square's corners point along the axes: its bounding box
+        // corners fall outside it and the axis midpoints fall inside
+        assert!(slide(turned(0.0)).hit_test(105.0, 105.0).is_some());
+        assert!(slide(turned(45.0)).hit_test(105.0, 105.0).is_none());
+        assert!(slide(turned(0.0)).hit_test(150.0, 90.0).is_none());
+        assert!(slide(turned(45.0)).hit_test(150.0, 90.0).is_some());
+
+        // a flip maps the square onto itself, so membership is unchanged
+        let flipped = Transform {
+            rotation_deg: 45.0,
+            flip_h: true,
+            flip_v: false,
+        };
+        assert!(slide(flipped).hit_test(150.0, 90.0).is_some());
+        assert!(slide(flipped).hit_test(105.0, 105.0).is_none());
+    }
+
+    #[test]
+    fn hit_testing_flipped_text_keeps_the_upright_caret() {
+        let slide = |flip_h| RenderedSlide {
+            display_list: SurfaceDisplayList {
+                contract_version: CONTRACT_VERSION,
+                width: 400.0,
+                height: 400.0,
+                background: None,
+                primitives: Vec::new(),
+            },
+            font_substitutions: Vec::new(),
+            autofit: HashMap::new(),
+            hit_regions: vec![HitRegion {
+                shape_id: "mirrored".to_owned(),
+                rect: PxRect {
+                    x: 100.0,
+                    y: 100.0,
+                    w: 120.0,
+                    h: 40.0,
+                },
+                hit_rect: PxRect {
+                    x: 100.0,
+                    y: 100.0,
+                    w: 120.0,
+                    h: 40.0,
+                },
+                transform: Transform {
+                    rotation_deg: 0.0,
+                    flip_h,
+                    flip_v: false,
+                },
+                text: Some(TextHit {
+                    overflow: false,
+                    story_id: "story".to_owned(),
+                    rect: PxRect {
+                        x: 100.0,
+                        y: 100.0,
+                        w: 120.0,
+                        h: 40.0,
+                    },
+                    transform: text_transform(
+                        Transform {
+                            rotation_deg: 0.0,
+                            flip_h,
+                            flip_v: false,
+                        },
+                        TextFlow::Horizontal,
+                    ),
+                    lines: vec![PositionedTextLine {
+                        column_offset: 0.0,
+                        x: 110.0,
+                        y: 110.0,
+                        width: 100.0,
+                        height: 20.0,
+                        baseline: 125.0,
+                        start: 0,
+                        end: 5,
+                        runs: Vec::new(),
+                        caret_stops: vec![
+                            CaretStop {
+                                position: 0,
+                                x: 110.0,
+                            },
+                            CaretStop {
+                                position: 5,
+                                x: 210.0,
+                            },
+                        ],
+                    }],
+                }),
+            }],
+        };
+        let position = |flip_h| match slide(flip_h).hit_test(120.0, 120.0) {
+            Some(HitTestResult::Text { position, .. }) => position,
+            other => panic!("expected a text hit, got {other:?}"),
+        };
+
+        assert_eq!(position(false), 0);
+        assert_eq!(position(true), 0);
+    }
+
+    #[test]
+    fn hit_testing_vertical_text_reads_the_caret_in_the_turned_frame() {
+        let shape = Transform {
+            rotation_deg: 0.0,
+            flip_h: false,
+            flip_v: false,
+        };
+        let rect = PxRect {
+            x: 100.0,
+            y: 100.0,
+            w: 40.0,
+            h: 120.0,
+        };
+        let slide = RenderedSlide {
+            display_list: SurfaceDisplayList {
+                contract_version: CONTRACT_VERSION,
+                width: 400.0,
+                height: 400.0,
+                background: None,
+                primitives: Vec::new(),
+            },
+            font_substitutions: Vec::new(),
+            autofit: HashMap::new(),
+            hit_regions: vec![HitRegion {
+                shape_id: "sideways".to_owned(),
+                hit_rect: rect,
+                rect,
+                transform: shape,
+                text: Some(TextHit {
+                    overflow: false,
+                    story_id: "story".to_owned(),
+                    rect: TextFlow::Vert270.layout_rect(rect),
+                    transform: text_transform(shape, TextFlow::Vert270),
+                    lines: vec![PositionedTextLine {
+                        column_offset: 0.0,
+                        x: 60.0,
+                        y: 150.0,
+                        width: 100.0,
+                        height: 20.0,
+                        baseline: 165.0,
+                        start: 0,
+                        end: 5,
+                        runs: Vec::new(),
+                        caret_stops: vec![
+                            CaretStop {
+                                position: 0,
+                                x: 60.0,
+                            },
+                            CaretStop {
+                                position: 5,
+                                x: 160.0,
+                            },
+                        ],
+                    }],
+                }),
+            }],
+        };
+        let position = |y| match slide.hit_test(120.0, y) {
+            Some(HitTestResult::Text { position, .. }) => position,
+            other => panic!("expected a text hit, got {other:?}"),
+        };
+
+        assert_eq!(position(205.0), 0);
+        assert_eq!(position(115.0), 5);
+    }
+
+    #[test]
+    fn text_follows_the_shape_rotation_but_is_never_mirrored() {
+        let turned = |rotation_deg, flip_h, flip_v| {
+            text_transform(
+                Transform {
+                    rotation_deg,
+                    flip_h,
+                    flip_v,
+                },
+                TextFlow::Horizontal,
+            )
+        };
+        let upright = |rotation_deg: f32| Transform {
+            rotation_deg,
+            flip_h: false,
+            flip_v: false,
+        };
+
+        assert_eq!(turned(180.0, false, true), upright(0.0));
+        assert_eq!(turned(0.0, true, false), upright(0.0));
+        assert_eq!(turned(90.0, true, false), upright(90.0));
+        assert_eq!(turned(0.0, true, true), upright(180.0));
+        assert_eq!(turned(45.0, false, false), upright(45.0));
+    }
+
+    #[test]
+    fn body_vert_turns_the_text_and_lays_it_out_in_the_swapped_box() {
+        assert_eq!(TextFlow::from_body_vert(Some("vert")), TextFlow::Vert);
+        assert_eq!(TextFlow::from_body_vert(Some("vert270")), TextFlow::Vert270);
+        assert_eq!(TextFlow::from_body_vert(Some("horz")), TextFlow::Horizontal);
+        assert_eq!(TextFlow::from_body_vert(None), TextFlow::Horizontal);
+        assert_eq!(TextFlow::from_body_vert(Some("eaVert")), TextFlow::Vert);
+        assert_eq!(
+            TextFlow::from_body_vert(Some("mongolianVert")),
+            TextFlow::VertLeftToRight
+        );
+        for mode in ["wordArtVert", "wordArtVertRtl"] {
+            assert_eq!(TextFlow::from_body_vert(Some(mode)), TextFlow::Stacked);
+        }
+
+        let shape = |rotation_deg| Transform {
+            rotation_deg,
+            flip_h: false,
+            flip_v: false,
+        };
+        assert_eq!(
+            text_transform(shape(90.0), TextFlow::Vert270).rotation_deg,
+            0.0
+        );
+        assert_eq!(
+            text_transform(shape(270.0), TextFlow::Vert).rotation_deg,
+            0.0
+        );
+
+        let rect = PxRect {
+            x: 100.0,
+            y: 0.0,
+            w: 40.0,
+            h: 240.0,
+        };
+        assert_eq!(
+            TextFlow::Vert.layout_rect(rect),
+            PxRect {
+                x: 0.0,
+                y: 100.0,
+                w: 240.0,
+                h: 40.0,
+            }
+        );
+        assert_eq!(TextFlow::Horizontal.layout_rect(rect), rect);
+        assert_eq!(
+            TextFlow::VertLeftToRight.layout_rect(rect),
+            TextFlow::Vert.layout_rect(rect)
+        );
+        assert_eq!(TextFlow::Stacked.layout_rect(rect), rect);
+        assert_eq!(TextFlow::Stacked.rotation_deg(), 0.0);
+    }
+
+    /// Renders a synthetic master text box.
+    fn text_box_on_master(
+        transform: ShapeTransform,
+        vertical: Option<&str>,
+        text: &str,
+    ) -> Primitive {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_010).unwrap();
+        package.masters[0]
+            .shapes
+            .push(ShapeNode::Shape(pptx_parse::Shape {
+                has_preset_geometry: true,
+                effects: None,
+                base: pptx_parse::ShapeBase {
+                    id: 9_001,
+                    name: "turned".to_owned(),
+                    title: None,
+                    description: None,
+                    decorative: false,
+                    hidden: false,
+                    placeholder: None,
+                    transform,
+                },
+                geometry: "rect".to_owned(),
+                adjust_values: BTreeMap::new(),
+                use_bg_fill: false,
+                paths: Vec::new(),
+                style: None,
+                fill: None,
+                picture_fill: None,
+                outline: None,
+                text: Some(TextBody {
+                    vertical_overflow: None,
+                    horizontal_overflow: None,
+                    num_col: None,
+                    spc_col: None,
+                    rtl_col: None,
+                    wrap: None,
+                    anchor: Some("ctr".to_owned()),
+                    vertical: vertical.map(str::to_owned),
+                    compat_line_spacing: None,
+                    space_first_last_para: None,
+                    autofit: None,
+                    inset_left: None,
+                    inset_top: None,
+                    inset_right: None,
+                    inset_bottom: None,
+                    default_list_style: None,
+                    list_style: Vec::new(),
+                    paragraphs: vec![pptx_parse::TextParagraph {
+                        properties: ParagraphProperties::default(),
+                        runs: vec![pptx_parse::TextRun {
+                            text: text.to_owned(),
+                            properties: RunProperties {
+                                font_size_pt: Some(12.0),
+                                font_family: Some("Arial".to_owned()),
+                                ..RunProperties::default()
+                            },
+                            field_id: None,
+                            field_type: None,
+                            line_break: false,
+                        }],
+                        end_properties: None,
+                    }],
+                }),
+            }));
+        renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), 0)
+            .unwrap()
+            .display_list
+            .primitives
+            .into_iter()
+            .find(|primitive| {
+                matches!(
+                    primitive,
+                    Primitive::TextBox {
+                        object_id: 9_001,
+                        ..
+                    }
+                )
+            })
+            .expect("the master text box was laid out")
+    }
+
+    fn text_columns_body() -> TextBody {
+        let body = TextBody {
+            anchor: Some("t".to_owned()),
+            inset_left: Some(95_250),
+            inset_right: Some(95_250),
+            inset_top: Some(47_625),
+            inset_bottom: Some(47_625),
+            paragraphs: vec![pptx_parse::TextParagraph {
+                properties: ParagraphProperties {
+                    line_spacing: Some(LineSpacing::Points { value: 12.0 }),
+                    ..ParagraphProperties::default()
+                },
+                runs: vec![pptx_parse::TextRun {
+                    text: "first\nsecond\nthird\nfourth\nfifth".to_owned(),
+                    properties: RunProperties {
+                        font_size_pt: Some(12.0),
+                        font_family: Some("Arial".to_owned()),
+                        ..RunProperties::default()
+                    },
+                    field_id: None,
+                    field_type: None,
+                    line_break: false,
+                }],
+                ..pptx_parse::TextParagraph::default()
+            }],
+            ..TextBody::default()
+        };
+        let mut json = serde_json::to_value(body).unwrap();
+        json["numCol"] = 2.into();
+        json["spcCol"] = 95_250.into();
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn text_columns_slide(body: TextBody) -> RenderedSlide {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_012).unwrap();
+        let mut snapshot = session.snapshot().unwrap();
+        snapshot.slides[0].shapes.clear();
+        let mut shape = package.slides[0]
+            .shapes
+            .iter()
+            .find_map(|node| match node {
+                ShapeNode::Shape(shape) if shape.text.is_some() => Some(shape.clone()),
+                _ => None,
+            })
+            .unwrap();
+        shape.base.id = 9_002;
+        shape.base.placeholder = None;
+        shape.base.transform = ShapeTransform {
+            x: 0,
+            y: 0,
+            width: 2_000_250,
+            height: 428_625,
+            ..ShapeTransform::default()
+        };
+        shape.geometry = "rect".to_owned();
+        shape.text = Some(body);
+        package.masters[0].shapes = vec![ShapeNode::Shape(shape)];
+        package.layouts[0].shapes.clear();
+        renderer().layout_slide(&package, &snapshot, 0).unwrap()
+    }
+
+    fn text_columns_lines(rendered: &RenderedSlide) -> &[PositionedTextLine] {
+        rendered
+            .display_list
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::TextBox {
+                    object_id: 9_002,
+                    lines,
+                    ..
+                } => Some(lines.as_slice()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// CPU time this thread has used.
+    #[cfg(unix)]
+    fn thread_cpu_time() -> std::time::Duration {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `now` is a valid timespec for the call to write into.
+        let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+        assert_eq!(status, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+        std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    }
+
+    #[cfg(not(unix))]
+    fn thread_cpu_time() -> std::time::Duration {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
+    }
+
+    fn best_of_three<T>(mut workload: impl FnMut() -> T) -> (std::time::Duration, T) {
+        let mut best: Option<std::time::Duration> = None;
+        let mut output = None;
+        for _ in 0..3 {
+            let start = thread_cpu_time();
+            let result = workload();
+            let elapsed = thread_cpu_time() - start;
+            if best.is_none_or(|best_elapsed| elapsed < best_elapsed) {
+                best = Some(elapsed);
+            }
+            output = Some(result);
+        }
+        (best.unwrap(), output.unwrap())
+    }
+
+    #[test]
+    fn a_text_box_with_a_large_single_run_lays_out_in_linear_time() {
+        let make_body = |text: String| TextBody {
+            paragraphs: vec![pptx_parse::TextParagraph {
+                runs: vec![pptx_parse::TextRun {
+                    text,
+                    properties: RunProperties {
+                        font_size_pt: Some(12.0),
+                        font_family: Some("Arial".to_owned()),
+                        ..RunProperties::default()
+                    },
+                    field_id: None,
+                    field_type: None,
+                    line_break: false,
+                }],
+                ..pptx_parse::TextParagraph::default()
+            }],
+            ..TextBody::default()
+        };
+        let (small_elapsed, _) =
+            best_of_three(|| text_columns_slide(make_body("x".repeat(12_500))));
+        let (large_elapsed, rendered) =
+            best_of_three(|| text_columns_slide(make_body("x".repeat(50_000))));
+        let ratio = large_elapsed.as_secs_f64() / small_elapsed.as_secs_f64();
+        assert!(
+            ratio < 8.0,
+            "quadrupling the size changed the time from {small_elapsed:?} to {large_elapsed:?} (ratio {ratio:.2})"
+        );
+        let text = "x".repeat(50_000);
+        let lines = text_columns_lines(&rendered);
+        let laid_out: String = lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|run| run.text.as_str())
+            .collect();
+        assert_eq!(laid_out, text);
+        assert_eq!(lines.last().unwrap().end, 50_000);
+    }
+
+    #[test]
+    fn a_text_box_with_a_large_mixed_direction_run_lays_out_in_linear_time() {
+        let make_body = |text: String| TextBody {
+            paragraphs: vec![pptx_parse::TextParagraph {
+                properties: ParagraphProperties {
+                    rtl: Some(true),
+                    ..ParagraphProperties::default()
+                },
+                runs: vec![pptx_parse::TextRun {
+                    text,
+                    properties: RunProperties {
+                        font_size_pt: Some(12.0),
+                        font_family: Some("Arial".to_owned()),
+                        ..RunProperties::default()
+                    },
+                    field_id: None,
+                    field_type: None,
+                    line_break: false,
+                }],
+                ..pptx_parse::TextParagraph::default()
+            }],
+            ..TextBody::default()
+        };
+        let (small_elapsed, _) =
+            best_of_three(|| text_columns_slide(make_body("a\u{5d0}".repeat(6_250))));
+        let (large_elapsed, rendered) =
+            best_of_three(|| text_columns_slide(make_body("a\u{5d0}".repeat(25_000))));
+        let ratio = large_elapsed.as_secs_f64() / small_elapsed.as_secs_f64();
+        assert!(
+            ratio < 8.0,
+            "quadrupling the size changed the time from {small_elapsed:?} to {large_elapsed:?} (ratio {ratio:.2})"
+        );
+        let text = "a\u{5d0}".repeat(25_000);
+        let lines = text_columns_lines(&rendered);
+        let laid_out: String = lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|run| run.text.as_str())
+            .collect();
+        assert_eq!(laid_out, text);
+        assert_eq!(lines.last().unwrap().end, 50_000);
+    }
+
+    #[test]
+    fn text_columns_fill_then_continue_at_the_next_column() {
+        let rendered = text_columns_slide(text_columns_body());
+        let lines = text_columns_lines(&rendered);
+        assert_eq!(lines.len(), 5);
+        assert!((lines[0].x - 10.0).abs() < 0.01);
+        assert!((lines[1].x - 10.0).abs() < 0.01);
+        assert!((lines[2].x - 110.0).abs() < 0.01, "{:?}", lines[2]);
+        assert!((lines[2].y - lines[0].y).abs() < 0.01);
+        assert!((lines[3].y - lines[1].y).abs() < 0.01);
+        assert!(lines[4].y + lines[4].height > 40.0);
+        let stop = &lines[2].caret_stops[0];
+        assert!((stop.x - lines[2].x).abs() < 0.01);
+        assert!((lines[2].runs[0].x - lines[2].x).abs() < 0.01);
+    }
+
+    #[test]
+    fn single_column_hit_testing_keeps_the_row_right_of_a_short_line() {
+        let mut body = text_columns_body();
+        body.num_col = None;
+        body.paragraphs[0].runs[0].text = "i\na considerably longer line".to_owned();
+        let rendered = text_columns_slide(body);
+        let lines = text_columns_lines(&rendered);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].end, 2);
+        let x = lines[0].x + 150.0;
+        let y = lines[0].y + lines[0].height / 2.0;
+        assert!(matches!(
+            rendered.hit_test(x, y),
+            Some(HitTestResult::Text { position: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn single_column_hit_testing_keeps_the_row_in_reversed_vertical_flow() {
+        let mut body = text_columns_body();
+        body.num_col = None;
+        body.vertical = Some("mongolianVert".to_owned());
+        body.paragraphs[0].properties.alignment = Some("ctr".to_owned());
+        body.paragraphs[0].runs[0].text = "i\nwide".to_owned();
+        let rendered = text_columns_slide(body);
+        let lines = text_columns_lines(&rendered);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].y > lines[1].y);
+        assert!(lines[0].x > lines[1].x);
+        let x = lines[1].x;
+        let y = lines[0].y + lines[0].height / 2.0;
+        assert_eq!(nearest_line(lines, x, y).unwrap().start, lines[0].start);
+    }
+
+    #[test]
+    fn text_columns_keep_their_origin_for_centered_short_lines() {
+        let mut body = text_columns_body();
+        body.paragraphs[0].properties.alignment = Some("ctr".to_owned());
+        body.paragraphs[0].runs[0].text = "i\ni\ni".to_owned();
+        let rendered = text_columns_slide(body);
+        let lines = text_columns_lines(&rendered);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].x > 10.0);
+        assert!(lines[2].x > 110.0);
+        let json = serde_json::to_value(lines).unwrap();
+        assert!(json[0].get("columnOffset").is_none());
+        assert_eq!(json[2]["columnOffset"], 100.0);
+        assert!((lines[2].x - lines[0].x - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_columns_hit_test_finds_a_caret_in_column_two() {
+        let rendered = text_columns_slide(text_columns_body());
+        let lines = text_columns_lines(&rendered);
+        assert!(matches!(
+            rendered.hit_test(110.0, lines[0].y + lines[0].height / 2.0),
+            Some(HitTestResult::Text { position, .. }) if position == lines[2].start
+        ));
+    }
+
+    #[test]
+    fn text_columns_wrap_to_the_column_width() {
+        let mut body = text_columns_body();
+        body.paragraphs[0].runs[0].text =
+            "several words that must wrap within each narrow column".to_owned();
+        let rendered = text_columns_slide(body);
+        let lines = text_columns_lines(&rendered);
+        assert!(lines.len() > 2);
+        assert!(lines.iter().all(|line| line.width <= 90.01));
+        assert!((lines[2].x - 110.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_columns_anchor_the_whole_block() {
+        let mut body = text_columns_body();
+        body.paragraphs[0].runs[0].text = "first\nsecond\nthird\nfourth".to_owned();
+        let top = text_columns_slide(body.clone());
+        let top_lines = text_columns_lines(&top);
+        for (anchor, shift) in [("ctr", 1.5), ("b", 3.0)] {
+            body.anchor = Some(anchor.to_owned());
+            let rendered = text_columns_slide(body.clone());
+            for (line, original) in text_columns_lines(&rendered).iter().zip(top_lines) {
+                assert!((line.y - original.y - shift).abs() < 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn text_columns_use_the_stored_normal_autofit_scale() {
+        let mut body = text_columns_body();
+        body.paragraphs[0].properties.line_spacing = None;
+        body.autofit = Some(TextAutofit::Normal {
+            font_scale: Some(0.5),
+            line_space_reduction: None,
+        });
+        let rendered = text_columns_slide(body);
+        let lines = text_columns_lines(&rendered);
+        assert!((lines[3].x - 110.0).abs() < 0.01);
+        assert!((lines[3].y - lines[0].y).abs() < 0.01);
+        assert!((lines[0].runs[0].font_size_px - 8.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_columns_follow_right_to_left_column_order() {
+        let mut json = serde_json::to_value(text_columns_body()).unwrap();
+        json["rtlCol"] = true.into();
+        let rendered = text_columns_slide(serde_json::from_value(json).unwrap());
+        let lines = text_columns_lines(&rendered);
+        assert!((lines[0].x - 110.0).abs() < 0.01);
+        assert!((lines[2].x - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_columns_leave_vertical_and_single_column_layout_unchanged() {
+        for vertical in [None, Some("vert"), Some("vert270"), Some("wordArtVert")] {
+            let mut json = serde_json::to_value(text_columns_body()).unwrap();
+            json["vertical"] = serde_json::to_value(vertical).unwrap();
+            json["numCol"] = 1.into();
+            let single = text_columns_slide(serde_json::from_value(json.clone()).unwrap());
+            if vertical.is_some() {
+                json["numCol"] = 2.into();
+            } else {
+                json.as_object_mut().unwrap().remove("numCol");
+            }
+            let other = text_columns_slide(serde_json::from_value(json).unwrap());
+            assert_eq!(
+                serde_json::to_value(&single.display_list).unwrap(),
+                serde_json::to_value(&other.display_list).unwrap()
+            );
+        }
+        let mut body = text_columns_body();
+        let natural = text_columns_slide(body.clone());
+        body.autofit = Some(TextAutofit::Shape);
+        let shape_fit = text_columns_slide(body);
+        assert_eq!(
+            serde_json::to_value(&natural.display_list).unwrap(),
+            serde_json::to_value(&shape_fit.display_list).unwrap()
+        );
+    }
+
+    #[test]
+    fn text_columns_inherit_properties_and_keep_explicit_overrides() {
+        let master = text_columns_body();
+        let layout = TextBody {
+            spc_col: Some(190_500),
+            rtl_col: Some(true),
+            ..TextBody::default()
+        };
+        let primary = TextBody::default();
+        let mut cascade = cell_cascade(&primary, &master);
+        cascade.layout = Some(&layout);
+        assert_eq!(cascade.num_col(), 2);
+        assert_eq!(cascade.spc_col(), 190_500);
+        assert!(cascade.rtl_col());
+        let primary = TextBody {
+            num_col: Some(1),
+            spc_col: Some(0),
+            rtl_col: Some(false),
+            ..TextBody::default()
+        };
+        cascade.primary = Some(&primary);
+        assert_eq!(cascade.num_col(), 1);
+        assert_eq!(cascade.spc_col(), 0);
+        assert!(!cascade.rtl_col());
+    }
+
+    #[test]
+    fn text_columns_keep_paragraph_spacing_inside_a_column() {
+        let mut body = text_columns_body();
+        let mut first = body.paragraphs[0].clone();
+        first.runs[0].text = "first".to_owned();
+        first.properties.space_after = Some(LineSpacing::Points { value: 3.0 });
+        let mut second = body.paragraphs[0].clone();
+        second.runs[0].text = "second\nthird".to_owned();
+        second.properties.space_before = Some(LineSpacing::Points { value: 6.0 });
+        let mut third = body.paragraphs[0].clone();
+        third.runs[0].text = "fourth".to_owned();
+        third.properties.space_before = Some(LineSpacing::Points { value: 3.0 });
+        body.paragraphs = vec![first, second, third];
+        let rendered = text_columns_slide(body);
+        let lines = text_columns_lines(&rendered);
+        assert_eq!(lines.len(), 4);
+        assert!((lines[1].x - 110.0).abs() < 0.01);
+        assert!((lines[1].y - 5.0).abs() < 0.01);
+        assert!((lines[3].y - 41.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_flipped_shape_lays_its_text_out_unmirrored() {
+        let primitive = text_box_on_master(
+            ShapeTransform {
+                x: 1_000_000,
+                y: 1_000_000,
+                width: 4_000_000,
+                height: 1_000_000,
+                rotation_deg: 180.0,
+                flip_v: true,
+                ..ShapeTransform::default()
+            },
+            None,
+            "Audit",
+        );
+        let Primitive::TextBox { transform, .. } = &primitive else {
+            unreachable!()
+        };
+        assert_eq!(
+            *transform,
+            Transform {
+                rotation_deg: 0.0,
+                flip_h: false,
+                flip_v: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_vert270_label_bar_lays_its_sentence_out_on_one_line() {
+        let turned = ShapeTransform {
+            x: 4_601_452,
+            y: -2_333_065,
+            width: 639_990,
+            height: 7_718_032,
+            rotation_deg: 90.0,
+            ..ShapeTransform::default()
+        };
+        let sentence = "Take the Shadow IT and Data Risk Assessments";
+        let primitive = text_box_on_master(turned.clone(), Some("vert270"), sentence);
+        let Primitive::TextBox {
+            w,
+            h,
+            lines,
+            transform,
+            ..
+        } = &primitive
+        else {
+            unreachable!()
+        };
+        assert!(w > h, "the layout box is the shape box on its side");
+        assert_eq!(transform.rotation_deg, 0.0);
+        assert_eq!(lines.len(), 1);
+
+        let upright = text_box_on_master(turned, None, sentence);
+        let Primitive::TextBox { lines, .. } = &upright else {
+            unreachable!()
+        };
+        assert!(lines.len() > 1);
+    }
+
+    #[test]
+    fn lays_out_demo_with_master_shapes_geometry_and_glyphs() {
+        let package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_001).unwrap();
+        let rendered = renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), 0)
+            .unwrap();
+        assert_eq!(
+            (rendered.display_list.width, rendered.display_list.height),
+            (1280.0, 720.0)
+        );
+        let shape_index = rendered
+            .display_list
+            .primitives
+            .iter()
+            .position(|primitive| matches!(primitive, Primitive::Shape { .. }))
+            .unwrap();
+        let text_index = rendered
+            .display_list
+            .primitives
+            .iter()
+            .position(|primitive| matches!(primitive, Primitive::TextBox { lines, .. } if !lines.is_empty()))
+            .unwrap();
+        assert!(shape_index < text_index);
+        assert!(rendered.display_list.primitives.iter().any(|primitive| {
+            matches!(primitive, Primitive::Shape { path, .. } if !path.is_empty())
+        }));
+        assert!(rendered.display_list.primitives.iter().any(|primitive| {
+            matches!(primitive, Primitive::TextBox { lines, .. } if lines.iter().flat_map(|line| &line.runs).any(|run| !run.glyphs.is_empty()))
+        }));
+        assert!(rendered.display_list.primitives.iter().any(|primitive| {
+            matches!(primitive, Primitive::TextBox { shape_id: Some(id), .. } if id.starts_with("master:"))
+        }));
+        let master_index = rendered
+            .display_list
+            .primitives
+            .iter()
+            .position(|primitive| {
+                matches!(primitive, Primitive::Shape { shape_id: Some(id), .. } if id.starts_with("master:"))
+            })
+            .unwrap();
+        let slide_index = rendered
+            .display_list
+            .primitives
+            .iter()
+            .position(|primitive| {
+                matches!(primitive, Primitive::Shape { shape_id: Some(id), .. } if id.starts_with("slide:"))
+            })
+            .unwrap();
+        assert!(master_index < slide_index);
+    }
+
+    #[test]
+    fn a_baseline_shifted_run_is_raised_lowered_and_shrunk() {
+        let session = DeckSession::open(
+            include_bytes!("../tests/fixtures/text-baseline-script.pptx"),
+            289,
+        )
+        .unwrap();
+        let rendered = renderer()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap();
+        let Some(Primitive::TextBox { lines, .. }) =
+            rendered.display_list.primitives.iter().find(|primitive| {
+                matches!(primitive, Primitive::TextBox { lines, .. }
+                    if lines.iter().flat_map(|line| &line.runs).any(|run| run.text.starts_with("E = mc")))
+            })
+        else {
+            panic!("expected the script text box");
+        };
+        let line = lines
+            .iter()
+            .find(|line| line.runs.iter().any(|run| run.text == "E = mc"))
+            .unwrap();
+        let base = &line.runs[0];
+        let raised = &line.runs[1];
+        let plain = &line.runs[2];
+        let lowered = &line.runs[3];
+        assert_eq!(
+            [
+                base.text.as_str(),
+                raised.text.as_str(),
+                plain.text.as_str(),
+                lowered.text.as_str()
+            ],
+            ["E = mc", "2", " and H", "2"]
+        );
+        assert_eq!(base.baseline_offset_px, 0.0);
+        assert_eq!(plain.baseline_offset_px, 0.0);
+        assert_eq!(base.font_size_px, plain.font_size_px);
+
+        let em = points_to_px(17.0);
+        assert!((raised.baseline_offset_px - em * 0.30).abs() < 0.01);
+        assert!((lowered.baseline_offset_px + em * 0.25).abs() < 0.01);
+        assert!((raised.font_size_px - 13.146666).abs() < 0.01);
+        assert!((lowered.font_size_px - 13.146666).abs() < 0.01);
+        assert!(
+            (raised.glyphs[0].y_offset - (base.glyphs[0].y_offset - raised.baseline_offset_px))
+                .abs()
+                < 0.01
+        );
+        assert!(lowered.glyphs[0].y_offset > base.glyphs[0].y_offset);
+        assert!(line.baseline - raised.baseline_offset_px - raised.font_size_px >= line.y);
+    }
+
+    #[test]
+    fn baseline_cascade_keeps_zero_overrides_and_expands_line_metrics() {
+        let mut package = pptx_parse::parse_pptx(include_bytes!(
+            "../tests/fixtures/text-baseline-script.pptx"
+        ))
+        .unwrap();
+        let ShapeNode::Shape(shape) = &mut package.slides[0].shapes[3] else {
+            panic!("shape")
+        };
+        let body = shape.text.as_mut().unwrap();
+        body.list_style = vec![pptx_parse::ParagraphProperties {
+            default_run: Some(RunProperties {
+                baseline_pct: Some(150.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        body.paragraphs[0]
+            .properties
+            .default_run
+            .as_mut()
+            .unwrap()
+            .baseline_pct = None;
+        body.paragraphs[0].runs = [None, Some(-150.0), Some(0.0)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, baseline)| pptx_parse::TextRun {
+                text: ["A", "B", "C"][i].into(),
+                properties: RunProperties {
+                    font_size_pt: Some(17.0),
+                    baseline_pct: baseline,
+                    ..Default::default()
+                },
+                field_id: None,
+                field_type: None,
+                line_break: false,
+            })
+            .collect();
+        let session = DeckSession::from_package(package, 331).unwrap();
+        let rendered = renderer()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap();
+        let Primitive::TextBox { lines, .. } = rendered
+            .display_list
+            .primitives
+            .iter()
+            .find(|p| matches!(p, Primitive::TextBox { object_id: 5, .. }))
+            .unwrap()
+        else {
+            panic!("text")
+        };
+        let line = &lines[0];
+        assert_eq!(line.runs.len(), 3);
+        for (run, shift, size) in [
+            (&line.runs[0], 34.0, 13.146666),
+            (&line.runs[1], -34.0, 13.146666),
+            (&line.runs[2], 0.0, 22.666666),
+        ] {
+            assert!((run.baseline_offset_px - shift).abs() < 0.001);
+            assert!((run.font_size_px - size).abs() < 0.001);
+            assert!((run.glyphs[0].y_offset - (line.baseline - shift)).abs() < 0.001);
+        }
+        assert!(line.baseline - line.y > 34.0);
+        assert!(line.y + line.height - line.baseline > 34.0);
+    }
+
+    #[test]
+    fn edited_text_reflows_and_hit_testing_returns_a_story_position() {
+        let package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_002).unwrap();
+        let initial = session.snapshot().unwrap();
+        let slide_id = initial.slides[0].id.clone();
+        let shape = initial.slides[0]
+            .shapes
+            .iter()
+            .find(|shape| !shape.text_stories.is_empty())
+            .unwrap();
+        let shape_id = shape.id.clone();
+        let story_id = shape.text_stories[0].id.clone();
+        let index = shape.text_stories[0].length - 1;
+        session
+            .resize_shape(
+                &EditCtx::local("test"),
+                &slide_id,
+                &shape_id,
+                1_200_000,
+                1_524_000,
+            )
+            .unwrap();
+        session
+            .insert_text(
+                &EditCtx::local("test"),
+                &story_id,
+                index,
+                " with enough collaborative text to wrap across several shaped lines",
+                &TextStyle::default(),
+            )
+            .unwrap();
+        let rendered = renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), 0)
+            .unwrap();
+        let (line_count, first_line) = rendered
+            .display_list
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::TextBox {
+                    shape_id: Some(id),
+                    lines,
+                    ..
+                } if id == &shape_id => Some((lines.len(), lines.first().unwrap())),
+                _ => None,
+            })
+            .unwrap();
+        assert!(line_count > 1);
+        assert!(matches!(
+            rendered.hit_test(first_line.x + 1.0, first_line.y + 1.0),
+            Some(HitTestResult::Text {
+                story_id: hit_story,
+                ..
+            }) if hit_story == story_id
+        ));
+    }
+
+    /// Wrap the demo text with inherited spacing.
+    fn wrapped_text_box(
+        seed: u64,
+        spacing: Option<LineSpacing>,
+        paragraph_spacing: Option<LineSpacing>,
+        height_emu: i64,
+        compat: bool,
+    ) -> (Vec<PositionedTextLine>, f32) {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, seed).unwrap();
+        let initial = session.snapshot().unwrap();
+        let slide_id = initial.slides[0].id.clone();
+        let shape = initial.slides[0]
+            .shapes
+            .iter()
+            .find(|shape| !shape.text_stories.is_empty())
+            .unwrap();
+        let shape_id = shape.id.clone();
+        let source_id = shape.source_id;
+        let story_id = shape.text_stories[0].id.clone();
+        let index = shape.text_stories[0].length - 1;
+        for master in &mut package.masters {
+            for level in [
+                &mut master.text_styles.title,
+                &mut master.text_styles.body,
+                &mut master.text_styles.other,
+            ] {
+                *level = vec![ParagraphProperties {
+                    line_spacing: spacing,
+                    ..ParagraphProperties::default()
+                }];
+            }
+        }
+        let parsed = package.slides[0]
+            .shapes
+            .iter_mut()
+            .find(|shape| shape.id() == source_id)
+            .unwrap();
+        let ShapeNode::Shape(parsed) = parsed else {
+            panic!("expected text shape");
+        };
+        let body = parsed.text.as_mut().unwrap();
+        body.compat_line_spacing = compat.then_some(true);
+        body.anchor = Some("t".to_owned());
+        for paragraph in &mut body.paragraphs {
+            paragraph.properties.line_spacing = paragraph_spacing;
+        }
+        session
+            .resize_shape(
+                &EditCtx::local("test"),
+                &slide_id,
+                &shape_id,
+                1_200_000,
+                height_emu,
+            )
+            .unwrap();
+        session
+            .insert_text(
+                &EditCtx::local("test"),
+                &story_id,
+                index,
+                " with enough text to wrap across several shaped lines",
+                &TextStyle::default(),
+            )
+            .unwrap();
+        renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), 0)
+            .unwrap()
+            .display_list
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::TextBox {
+                    shape_id: Some(id),
+                    lines,
+                    paragraphs,
+                    ..
+                } if id == &shape_id => Some((lines.clone(), paragraphs[0].runs[0].font_size_pt)),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn master_line_spacing_sets_the_line_pitch() {
+        let percent = |value| Some(LineSpacing::Percent { value });
+        let (single, size_pt) = wrapped_text_box(8_010, None, None, 1_524_000, true);
+        let (tight, _) = wrapped_text_box(8_011, percent(0.8), None, 1_524_000, true);
+        let (loose, _) = wrapped_text_box(
+            8_012,
+            Some(LineSpacing::Points { value: 40.0 }),
+            None,
+            1_524_000,
+            true,
+        );
+        let (no_compat, _) = wrapped_text_box(8_017, percent(0.8), None, 1_524_000, false);
+        let (tighter, _) = wrapped_text_box(8_018, percent(0.6), None, 1_524_000, true);
+        let pitch = |lines: &[PositionedTextLine]| {
+            assert!(lines.len() > 1, "expected the text to wrap");
+            lines[1].y - lines[0].y
+        };
+        let size_px = points_to_px(size_pt);
+
+        assert!((pitch(&single) - 1.2 * size_px).abs() < 0.05);
+        assert!((pitch(&tight) - 0.8 * 1.2 * size_px).abs() < 0.05);
+        assert!((pitch(&no_compat) - pitch(&tight)).abs() < 0.05);
+        assert!(pitch(&tight) < pitch(&single));
+        assert!((pitch(&loose) - points_to_px(40.0)).abs() < 0.05);
+
+        let share =
+            |lines: &[PositionedTextLine]| (lines[0].baseline - lines[0].y) / lines[0].height;
+        assert!((share(&tight) - share(&tighter)).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_slide_paragraph_overrides_the_master_line_spacing() {
+        let (lines, size_pt) = wrapped_text_box(
+            8_015,
+            Some(LineSpacing::Percent { value: 0.8 }),
+            Some(LineSpacing::Percent { value: 1.5 }),
+            1_524_000,
+            true,
+        );
+        assert!(lines.len() > 1, "expected the text to wrap");
+        let pitch = lines[1].y - lines[0].y;
+        assert!((pitch - 1.5 * 1.2 * points_to_px(size_pt)).abs() < 0.05);
+
+        // The room the spacing adds is split above and below the line, so a
+        // looser paragraph starts lower by half of what it added.
+        let (single, _) = wrapped_text_box(8_016, None, None, 1_524_000, true);
+        let added = (lines[0].height - single[0].height) / 2.0;
+        assert!((lines[0].baseline - single[0].baseline - added).abs() < 0.001);
+    }
+
+    #[test]
+    fn adjacent_runs_keep_their_own_tracking() {
+        let renderer = renderer();
+        let mut paragraph = paragraph(&renderer, "l", "AA");
+        let mut second = ResolvedRun {
+            text: "BB".into(),
+            start: 2,
+            style: paragraph.runs[0].style.clone(),
+        };
+        second.style.spacing_pt = 6.0;
+        paragraph.runs.push(second);
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            1000.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(lines[0].runs.len(), 2);
+        assert_eq!(lines[0].runs[0].letter_spacing_px, 0.0);
+        assert_eq!(lines[0].runs[1].letter_spacing_px, 8.0);
+    }
+
+    #[test]
+    fn tracking_separates_optional_ligatures_and_preserves_combining_clusters() {
+        let mut renderer = SlideRenderer::new();
+        renderer
+            .register_font(
+                "Arial",
+                false,
+                false,
+                include_bytes!("../../../packages/fonts/assets/Carlito-Regular.ttf"),
+            )
+            .unwrap();
+        let mut paragraph = paragraph(&renderer, "l", "fi a\u{301}");
+        let plain = shape_paragraph(&renderer.fonts, &paragraph, 1.0).unwrap();
+        assert!(plain.iter().any(|cluster| cluster.text == "fi"));
+        paragraph.runs[0].style.spacing_pt = 3.0;
+        let tracked = shape_paragraph(&renderer.fonts, &paragraph, 1.0).unwrap();
+        assert_eq!(
+            tracked
+                .iter()
+                .map(|cluster| cluster.text.as_str())
+                .collect::<Vec<_>>(),
+            ["f", "i", " ", "a\u{301}"]
+        );
+    }
+
+    #[test]
+    fn tracking_justification_reaches_the_right_edge() {
+        let renderer = renderer();
+        let mut paragraph = paragraph(&renderer, "just", "AA BB CC AA BB CC");
+        paragraph.runs[0].style.spacing_pt = 6.0;
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            160.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(lines.len() > 1);
+        assert!((lines[0].width - 160.0).abs() < 0.001, "{}", lines[0].width);
+    }
+
+    #[test]
+    fn tracking_before_a_hard_break_has_no_trailing_gap() {
+        let renderer = renderer();
+        let mut paragraph = paragraph(&renderer, "ctr", "AA\nAA");
+        paragraph.runs[0].style.spacing_pt = 6.0;
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            1000.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!((lines[0].width - lines[1].width).abs() < 0.001);
+        assert!((lines[0].x - lines[1].x).abs() < 0.001);
+        let tight = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            lines[1].width + 0.001,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(tight.len(), 2);
+    }
+
+    #[test]
+    fn shape_autofit_keeps_tracked_font_size() {
+        let session =
+            DeckSession::open(include_bytes!("../tests/fixtures/run-spacing.pptx"), 32510).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let id = &snapshot.slides[0].shapes[2].id;
+        let rendered = renderer()
+            .layout_slide(session.package(), &snapshot, 0)
+            .unwrap();
+        let lines = rendered
+            .display_list
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::TextBox {
+                    shape_id: Some(shape_id),
+                    lines,
+                    ..
+                } if shape_id == id => Some(lines),
+                _ => None,
+            })
+            .unwrap();
+        assert!(lines.len() > 1);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.runs)
+                .all(|run| (run.font_size_px - points_to_px(32.0)).abs() < 0.01)
+        );
+    }
+
+    /// Formats the demo title for tracking assertions.
+    fn tracked_text_box(
+        seed: u64,
+        spacing_pt: Option<f64>,
+        align: Option<&str>,
+        width_emu: i64,
+    ) -> Vec<PositionedTextLine> {
+        let package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, seed).unwrap();
+        let initial = session.snapshot().unwrap();
+        let slide_id = initial.slides[0].id.clone();
+        let shape = initial.slides[0]
+            .shapes
+            .iter()
+            .find(|shape| !shape.text_stories.is_empty())
+            .unwrap();
+        let shape_id = shape.id.clone();
+        let story_id = shape.text_stories[0].id.clone();
+        let context = EditCtx::local("test");
+        session
+            .resize_shape(&context, &slide_id, &shape_id, width_emu, 3_000_000)
+            .unwrap();
+        let end = session.story(&story_id).unwrap().length.saturating_sub(1);
+        session
+            .format_text(
+                &context,
+                &story_id,
+                0,
+                end,
+                &TextStylePatch {
+                    spacing_pt,
+                    ..TextStylePatch::default()
+                },
+            )
+            .unwrap();
+        session
+            .set_paragraph_alignment(&context, &story_id, 0, end, align)
+            .unwrap();
+        renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), 0)
+            .unwrap()
+            .display_list
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::TextBox {
+                    shape_id: Some(id),
+                    lines,
+                    ..
+                } if id == &shape_id => Some(lines.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn run_spacing_tracks_the_line_and_keeps_it_centred() {
+        let wide = 5_000_000;
+        let plain = tracked_text_box(9_001, None, Some("ctr"), wide);
+        let tracked = tracked_text_box(9_002, Some(6.0), Some("ctr"), wide);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(tracked.len(), 1);
+
+        let gaps = (plain[0].end - plain[0].start - 1) as f32;
+        let gap_px = points_to_px(6.0);
+        assert!(
+            (tracked[0].width - plain[0].width - gaps * gap_px).abs() < 0.5,
+            "{} vs {}",
+            tracked[0].width,
+            plain[0].width
+        );
+        let centre = |line: &PositionedTextLine| line.x + line.width / 2.0;
+        assert!((centre(&tracked[0]) - centre(&plain[0])).abs() < 0.5);
+
+        let caret = tracked[0].caret_stops.last().unwrap().x;
+        assert!((caret - (tracked[0].x + tracked[0].width + gap_px)).abs() < 0.5);
+    }
+
+    #[test]
+    fn run_spacing_moves_the_wrap_point() {
+        let plain = tracked_text_box(9_003, None, None, 1_500_000);
+        let tracked = tracked_text_box(9_004, Some(6.0), None, 1_500_000);
+
+        assert!(
+            tracked.len() > plain.len(),
+            "{} vs {}",
+            tracked.len(),
+            plain.len()
+        );
+        assert!(tracked[0].end < plain[0].end);
+    }
+
+    #[test]
+    fn tightening_past_a_glyph_advance_never_widens_the_line() {
+        let wide = 5_000_000;
+        let plain = tracked_text_box(9_005, None, None, wide);
+        let tight = tracked_text_box(9_006, Some(-4_000.0), None, wide);
+
+        assert_eq!(tight.len(), plain.len());
+        assert!(
+            tight[0].width <= plain[0].width,
+            "{} vs {}",
+            tight[0].width,
+            plain[0].width
+        );
+        assert!(tight[0].width >= 0.0, "{}", tight[0].width);
+    }
+
+    #[test]
+    fn autofit_edit_scan_is_linear_for_large_unchanged_slides() {
+        let shape = ShapeSnapshot {
+            id: String::new(),
+            source_id: 0,
+            kind: ShapeKind::Shape,
+            name: String::new(),
+            title: None,
+            description: None,
+            decorative: false,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            rotation_deg: 0.0,
+            flip_h: false,
+            flip_v: false,
+            inherited: None,
+            hidden: false,
+            text_box: false,
+            aspect_ratio_locked: false,
+            geometry: "rect".to_owned(),
+            adjust_values: BTreeMap::new(),
+            placeholder: None,
+            fill: None,
+            resolved_fill_color: None,
+            outline: None,
+            resolved_outline_color: None,
+            media_part_path: None,
+            pending_media: None,
+            blip_effects: Vec::new(),
+            table_structure: None,
+            graphic: None,
+            text_stories: Vec::new(),
+            children: Vec::new(),
+        };
+        let make_shapes = |count: u32| {
+            let baseline: Vec<_> = (0..count)
+                .map(|index| ShapeSnapshot {
+                    id: format!("slide1/shape{index:05}"),
+                    source_id: index,
+                    ..shape.clone()
+                })
+                .collect();
+            let mut current = baseline.clone();
+            current
+                .last_mut()
+                .unwrap()
+                .text_stories
+                .push(StorySnapshot {
+                    id: "changed".to_owned(),
+                    length: 7,
+                    paragraphs: vec![pptx_edit::ParagraphSnapshot {
+                        runs: vec![pptx_edit::TextRunSnapshot {
+                            text: "Changed".to_owned(),
+                            style: TextStyle::default(),
+                        }],
+                        ..pptx_edit::ParagraphSnapshot::default()
+                    }],
+                });
+            (current, baseline)
+        };
+        let (small_current, small_baseline) = make_shapes(7_500);
+        let (large_current, large_baseline) = make_shapes(30_000);
+        let mut small_elapsed = std::time::Duration::MAX;
+        let mut large_elapsed = std::time::Duration::MAX;
+        let mut edited = HashSet::new();
+        for _ in 0..5 {
+            let start = thread_cpu_time();
+            autofit_edited_shapes(&small_current, &small_baseline, &SlideParents::default());
+            small_elapsed = small_elapsed.min(thread_cpu_time() - start);
+            let start = thread_cpu_time();
+            edited =
+                autofit_edited_shapes(&large_current, &large_baseline, &SlideParents::default());
+            large_elapsed = large_elapsed.min(thread_cpu_time() - start);
+        }
+        let ratio = large_elapsed.as_secs_f64() / small_elapsed.as_secs_f64();
+        assert!(
+            ratio < 8.0,
+            "quadrupling the size changed the time from {small_elapsed:?} to {large_elapsed:?} (ratio {ratio:.2})"
+        );
+        assert!(edited.is_empty());
+    }
+
+    fn edited_autofit_session(
+        untouched_text: &str,
+        inherited: bool,
+        grouped: bool,
+    ) -> (DeckSession, StorySnapshot) {
+        edited_autofit_session_with_graphics(
+            untouched_text,
+            inherited,
+            grouped,
+            "",
+            &" words that must shrink to stay inside the title".repeat(6),
+        )
+    }
+
+    fn edited_autofit_session_with_graphics(
+        untouched_text: &str,
+        inherited: bool,
+        grouped: bool,
+        graphics: &str,
+        inserted_text: &str,
+    ) -> (DeckSession, StorySnapshot) {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let normal = r#"<a:normAutofit fontScale="100000"/>"#;
+        let transform =
+            r#"<a:xfrm><a:off x="476250" y="476250"/><a:ext cx="1905000" cy="952500"/></a:xfrm>"#;
+        let title = format!(
+            r#"<p:sp>
+<p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+<p:spPr>{}{graphics}</p:spPr>
+<p:txBody><a:bodyPr lIns="0" rIns="0" tIns="0" bIns="0">{}</a:bodyPr><a:lstStyle/>
+<a:p><a:pPr><a:buNone/></a:pPr><a:r><a:rPr sz="2400"><a:latin typeface="Arial"/></a:rPr><a:t>Start</a:t></a:r></a:p>
+</p:txBody></p:sp>"#,
+            if inherited { "" } else { transform },
+            if inherited { "" } else { normal },
+        );
+        let title = if grouped {
+            format!(
+                r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="4" name="Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+<p:grpSpPr><a:xfrm><a:off x="952500" y="952500"/><a:ext cx="3810000" cy="1905000"/><a:chOff x="0" y="0"/><a:chExt cx="1905000" cy="952500"/></a:xfrm></p:grpSpPr>
+{title}</p:grpSp>"#
+            )
+        } else {
+            title
+        };
+        let slide = format!(
+            r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+<p:cSld><p:spTree>{title}<p:sp>
+<p:nvSpPr><p:cNvPr id="3" name="Untouched"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
+<p:spPr><a:xfrm><a:off x="476250" y="1905000"/><a:ext cx="1905000" cy="952500"/></a:xfrm></p:spPr>
+<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr sz="1200"><a:latin typeface="Arial"/></a:rPr><a:t>{untouched_text}</a:t></a:r></a:p></p:txBody>
+</p:sp></p:spTree></p:cSld></p:sld>"#
+        );
+        let slide_path = package.slides[0].part_path.clone();
+        assert!(package.replace_part(&slide_path, slide.into_bytes()));
+        if inherited {
+            let layout = format!(
+                r#"<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" type="title">
+<p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Inherited title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+<p:spPr>{transform}</p:spPr><p:txBody><a:bodyPr>{normal}</a:bodyPr><a:lstStyle/><a:p/></p:txBody></p:sp></p:spTree></p:cSld></p:sldLayout>"#
+            );
+            let layout_path = package.slides[0].layout_part_path.clone().unwrap();
+            assert!(package.replace_part(&layout_path, layout.into_bytes()));
+        }
+        let bytes = pptx_parse::write_pptx(&package).unwrap();
+        let session = DeckSession::open(&bytes, 8_031).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let root = &snapshot.slides[0].shapes[0];
+        let title = if grouped { &root.children[0] } else { root };
+        let story = title.text_stories[0].clone();
+        session
+            .insert_text(
+                &EditCtx::local("test"),
+                &story.id,
+                story.length - 1,
+                inserted_text,
+                &TextStyle::default(),
+            )
+            .unwrap();
+        (session, story)
+    }
+
+    fn autofit_custom_graphics(path_count: usize, stop_count: usize) -> String {
+        use std::fmt::Write as _;
+
+        let path = r#"<a:path w="100" h="100"><a:moveTo><a:pt x="0" y="0"/></a:moveTo><a:lnTo><a:pt x="100" y="0"/></a:lnTo><a:lnTo><a:pt x="50" y="100"/></a:lnTo><a:close/></a:path>"#;
+        let mut graphics = format!(
+            "<a:custGeom><a:pathLst>{}</a:pathLst></a:custGeom><a:gradFill><a:gsLst>",
+            path.repeat(path_count)
+        );
+        for index in 0..stop_count {
+            let position = index as u64 * 100_000 / stop_count.saturating_sub(1).max(1) as u64;
+            let color = if index % 2 == 0 { "112233" } else { "445566" };
+            write!(
+                graphics,
+                r#"<a:gs pos="{position}"><a:srgbClr val="{color}"/></a:gs>"#
+            )
+            .unwrap();
+        }
+        graphics.push_str(
+            r#"</a:gsLst><a:lin ang="5400000" scaled="1"/></a:gradFill>
+<a:ln w="19050"><a:solidFill><a:srgbClr val="778899"/></a:solidFill></a:ln>
+<a:effectLst><a:outerShdw blurRad="12700" dist="12700" dir="5400000"><a:srgbClr val="000000"/></a:outerShdw></a:effectLst>"#,
+        );
+        graphics
+    }
+
+    fn edited_autofit_session_with_text(text: &str, inherited: bool, grouped: bool) -> DeckSession {
+        let (session, story) = edited_autofit_session("Untouched", inherited, grouped);
+        let story = session.story(&story.id).unwrap();
+        let context = EditCtx::local("test");
+        session
+            .delete_text(&context, &story.id, 0, story.length - 1)
+            .unwrap();
+        session
+            .insert_text(
+                &context,
+                &story.id,
+                0,
+                text,
+                &story.paragraphs[0].runs[0].style,
+            )
+            .unwrap();
+        session
+    }
+
+    #[test]
+    fn fitted_save_skips_edited_text_over_the_utf16_limit() {
+        let build = |text: &str| {
+            let mut contexts = Vec::new();
+            for inherited in [false, true] {
+                for grouped in [false, true] {
+                    let session = edited_autofit_session_with_text(text, inherited, grouped);
+                    let plain = pptx_parse::parse_pptx(&session.save().unwrap()).unwrap();
+                    let part = &plain.slides[0].part_path;
+                    let plain_bytes = plain.part_bytes(part).unwrap().to_vec();
+                    let plain_autofit = node_text(find_node(&plain.slides[0].shapes, 2).unwrap())
+                        .unwrap()
+                        .autofit
+                        .clone();
+                    contexts.push((session, plain_bytes, plain_autofit));
+                }
+            }
+            contexts
+        };
+        let small_text = format!("{}x", "\u{1f600}".repeat(32_768));
+        assert_eq!(utf16_len(&small_text), 65_537);
+        let large_text = format!("{}xx", "\u{1f600}".repeat(131_072));
+        assert_eq!(utf16_len(&large_text), 262_146);
+        let small_contexts = build(&small_text);
+        let large_contexts = build(&large_text);
+        let renderer = renderer();
+        let (small_elapsed, small_saved) = best_of_three(|| {
+            small_contexts
+                .iter()
+                .map(|(session, _, _)| renderer.save(session).unwrap())
+                .collect::<Vec<_>>()
+        });
+        let (large_elapsed, large_saved) = best_of_three(|| {
+            large_contexts
+                .iter()
+                .map(|(session, _, _)| renderer.save(session).unwrap())
+                .collect::<Vec<_>>()
+        });
+        let ratio = large_elapsed.as_secs_f64() / small_elapsed.as_secs_f64();
+        assert!(
+            ratio < 8.0,
+            "quadrupling the size changed the time from {small_elapsed:?} to {large_elapsed:?} (ratio {ratio:.2})"
+        );
+        for ((_, plain_bytes, plain_autofit), saved) in small_contexts
+            .iter()
+            .zip(small_saved.iter())
+            .chain(large_contexts.iter().zip(large_saved.iter()))
+        {
+            let reopened = pptx_parse::parse_pptx(saved).unwrap();
+            let part = &reopened.slides[0].part_path;
+            assert_eq!(reopened.part_bytes(part).unwrap(), plain_bytes.as_slice());
+            let title = node_text(find_node(&reopened.slides[0].shapes, 2).unwrap()).unwrap();
+            assert_eq!(&title.autofit, plain_autofit);
+        }
+    }
+
+    #[test]
+    fn fitted_save_fits_edited_text_at_the_utf16_limit() {
+        let text = "\u{1f600}".repeat(32_768);
+        assert_eq!(utf16_len(&text), 65_536);
+        for inherited in [false, true] {
+            for grouped in [false, true] {
+                let session = edited_autofit_session_with_text(&text, inherited, grouped);
+                let saved = renderer().save(&session).unwrap();
+                let reopened = pptx_parse::parse_pptx(&saved).unwrap();
+                let title = node_text(find_node(&reopened.slides[0].shapes, 2).unwrap()).unwrap();
+                assert!(matches!(
+                    title.autofit,
+                    Some(TextAutofit::Normal { font_scale: Some(scale), .. }) if scale < 1.0
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_save_skips_untouched_text_over_the_render_limit() {
+        let untouched = "x".repeat(MAX_TEXT_BYTES + 1);
+        let (session, _) = edited_autofit_session(&untouched, false, false);
+        let renderer = renderer();
+        assert!(matches!(
+            renderer.layout_slide(session.package(), &session.snapshot().unwrap(), 0),
+            Err(RenderError::ResourceLimit(message)) if message.contains("text exceeds")
+        ));
+        let saved = renderer.save(&session).unwrap();
+        let reopened = pptx_parse::parse_pptx(&saved).unwrap();
+        let title = node_text(find_node(&reopened.slides[0].shapes, 2).unwrap()).unwrap();
+        assert!(matches!(
+            title.autofit,
+            Some(TextAutofit::Normal { font_scale: Some(scale), .. }) if scale < 1.0
+        ));
+        let untouched_node = find_node(&reopened.slides[0].shapes, 3).unwrap();
+        assert_eq!(
+            node_text(untouched_node).unwrap().paragraphs[0].runs[0].text,
+            untouched
+        );
+        assert_eq!(
+            Some(untouched_node),
+            find_node(&session.package().slides[0].shapes, 3)
+        );
+    }
+
+    #[test]
+    fn fitted_save_matches_full_layout_autofit() {
+        let graphics = autofit_custom_graphics(2, 2);
+        for inherited in [false, true] {
+            for grouped in [false, true] {
+                for graphics in ["", graphics.as_str()] {
+                    let (session, story) = edited_autofit_session_with_graphics(
+                        "Untouched",
+                        inherited,
+                        grouped,
+                        graphics,
+                        &" words that must shrink to stay inside the title".repeat(6),
+                    );
+                    let renderer = renderer();
+                    let rendered = renderer
+                        .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+                        .unwrap();
+                    let expected = rendered.autofit.get(&story.id).unwrap();
+                    assert!(matches!(
+                        expected,
+                        TextAutofit::Normal { font_scale: Some(scale), .. } if *scale < 1.0
+                    ));
+                    let saved = renderer.save(&session).unwrap();
+                    let reopened = pptx_parse::parse_pptx(&saved).unwrap();
+                    let title =
+                        node_text(find_node(&reopened.slides[0].shapes, 2).unwrap()).unwrap();
+                    assert_eq!(title.autofit.as_ref(), Some(expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_save_layout_emits_no_graphic_primitives() {
+        let graphics = autofit_custom_graphics(2, 2);
+        let (session, story) = edited_autofit_session_with_graphics(
+            "Untouched",
+            false,
+            false,
+            &graphics,
+            &" words that must shrink to stay inside the title".repeat(6),
+        );
+        let renderer = renderer();
+        let snapshot = session.snapshot().unwrap();
+        let full = renderer
+            .layout_slide(session.package(), &snapshot, 0)
+            .unwrap();
+        assert!(
+            full.display_list
+                .primitives
+                .iter()
+                .any(|primitive| matches!(
+                    primitive,
+                    Primitive::Shape {
+                        fill: Some(_),
+                        stroke: Some(_),
+                        shadow: Some(_),
+                        ..
+                    }
+                ))
+        );
+        let shapes = HashSet::from([snapshot.slides[0].shapes[0].id.clone()]);
+        let fitted = renderer
+            .layout_resolved(
+                session.package(),
+                &snapshot.slides[0],
+                snapshot.width_emu,
+                snapshot.height_emu,
+                0,
+                Some(&shapes),
+            )
+            .unwrap();
+        assert!(fitted.display_list.primitives.is_empty());
+        assert!(fitted.display_list.background.is_none());
+        assert!(fitted.hit_regions.is_empty());
+        assert!(fitted.autofit.contains_key(&story.id));
+        assert_eq!(fitted.autofit, full.autofit);
+    }
+
+    #[test]
+    fn fitted_save_skips_large_custom_geometry_and_gradient() {
+        let build = |path_count: usize, stop_count: usize| {
+            let graphics = autofit_custom_graphics(path_count, stop_count);
+            edited_autofit_session_with_graphics("Untouched", false, false, &graphics, "!")
+        };
+        let (small_session, _) = build(375, 12_500);
+        let (session, story) = build(1_500, 50_000);
+        assert_eq!(session.story(&story.id).unwrap().length, story.length + 1);
+        let ShapeNode::Shape(shape) = find_node(&session.package().slides[0].shapes, 2).unwrap()
+        else {
+            panic!("a custom shape");
+        };
+        assert_eq!(shape.paths.len(), 1_500);
+        assert!(shape.paths.iter().all(|path| path.commands.len() == 4));
+        assert_eq!(
+            shape
+                .fill
+                .as_ref()
+                .unwrap()
+                .gradient
+                .as_ref()
+                .unwrap()
+                .stops
+                .len(),
+            50_000
+        );
+        let renderer = renderer();
+        let (small_elapsed, _) = best_of_three(|| renderer.save(&small_session).unwrap());
+        let (large_elapsed, saved) = best_of_three(|| renderer.save(&session).unwrap());
+        let ratio = large_elapsed.as_secs_f64() / small_elapsed.as_secs_f64();
+        assert!(
+            ratio < 8.0,
+            "quadrupling the size changed the time from {small_elapsed:?} to {large_elapsed:?} (ratio {ratio:.2})"
+        );
+        let reopened = pptx_parse::parse_pptx(&saved).unwrap();
+        let title = node_text(find_node(&reopened.slides[0].shapes, 2).unwrap()).unwrap();
+        assert_eq!(
+            title.autofit,
+            Some(TextAutofit::Normal {
+                font_scale: Some(1.0),
+                line_space_reduction: Some(0.0),
+            })
+        );
+        assert_eq!(
+            title.paragraphs[0]
+                .runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "Start!"
+        );
+    }
+
+    #[test]
+    fn normal_autofit_refits_edited_text_and_restores_stored_scale_on_undo() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let parsed = package.slides[0]
+            .shapes
+            .iter_mut()
+            .find_map(|node| match node {
+                ShapeNode::Shape(shape) if shape.text.is_some() => Some(shape),
+                _ => None,
+            })
+            .unwrap();
+        parsed.base.transform.width = 2_476_500;
+        parsed.base.transform.height = 952_500;
+        parsed.base.placeholder = None;
+        let body = parsed.text.as_mut().unwrap();
+        body.autofit = Some(TextAutofit::Normal {
+            font_scale: Some(0.5),
+            line_space_reduction: Some(0.1),
+        });
+        body.paragraphs.truncate(1);
+        body.paragraphs[0].runs.truncate(1);
+        body.paragraphs[0].runs[0].text = "Start".into();
+        body.paragraphs[0].runs[0].properties.font_size_pt = Some(24.0);
+        let session = DeckSession::from_package(package, 8_004).unwrap();
+        session.set_undo_capture_mode(pptx_edit::UndoCaptureMode::Manual);
+        let initial = session.snapshot().unwrap();
+        let shape = initial.slides[0]
+            .shapes
+            .iter()
+            .find(|shape| !shape.text_stories.is_empty())
+            .unwrap();
+        let story = &shape.text_stories[0];
+        let renderer = renderer();
+        let lines = |snapshot: &DeckSnapshot| {
+            renderer
+                .layout_slide(session.package(), snapshot, 0)
+                .unwrap()
+                .display_list
+                .primitives
+                .into_iter()
+                .find_map(|primitive| match primitive {
+                    Primitive::TextBox {
+                        shape_id: Some(id),
+                        lines,
+                        ..
+                    } if id == shape.id => Some(lines),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let before = lines(&initial);
+        assert!((before[0].runs[0].font_size_px - points_to_px(12.0)).abs() < 0.01);
+        session
+            .insert_text(
+                &EditCtx::local("test"),
+                &story.id,
+                story.length - 1,
+                &" words that must shrink to stay inside the box".repeat(8),
+                &TextStyle::default(),
+            )
+            .unwrap();
+        let after = lines(&session.snapshot().unwrap());
+        let bottom = emu_to_px(shape.y + shape.height);
+        assert!(
+            after
+                .iter()
+                .all(|line| line.y + line.height <= bottom + 0.01),
+            "typed text must fit inside its shape"
+        );
+        session.add_undo_barrier();
+        assert!(session.undo());
+        assert_eq!(lines(&session.snapshot().unwrap()), before);
+        assert!(session.redo());
+        assert_eq!(lines(&session.snapshot().unwrap()), after);
+    }
+
+    #[test]
+    fn normal_autofit_steps_the_type_down_by_its_stored_scale() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_003).unwrap();
+        let initial = session.snapshot().unwrap();
+        let slide_id = initial.slides[0].id.clone();
+        let shape = initial.slides[0]
+            .shapes
+            .iter()
+            .find(|shape| !shape.text_stories.is_empty())
+            .unwrap();
+        let shape_id = shape.id.clone();
+        let source_id = shape.source_id;
+        let parsed = package.slides[0]
+            .shapes
+            .iter_mut()
+            .find(|shape| shape.id() == source_id)
+            .unwrap();
+        let ShapeNode::Shape(parsed) = parsed else {
+            panic!("expected text shape");
+        };
+        parsed.text.as_mut().unwrap().autofit = Some(TextAutofit::Normal {
+            font_scale: None,
+            line_space_reduction: None,
+        });
+        session
+            .resize_shape(
+                &EditCtx::local("test"),
+                &slide_id,
+                &shape_id,
+                2_000_000,
+                500_000,
+            )
+            .unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let font_size = |package: &PptxPackage| {
+            renderer()
+                .layout_slide(package, &snapshot, 0)
+                .unwrap()
+                .display_list
+                .primitives
+                .iter()
+                .find_map(|primitive| match primitive {
+                    Primitive::TextBox {
+                        shape_id: Some(id),
+                        paragraphs,
+                        ..
+                    } if id == &shape_id => Some(paragraphs[0].runs[0].font_size_pt),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let scaled = font_size(&package);
+        let ShapeNode::Shape(parsed) = package.slides[0]
+            .shapes
+            .iter_mut()
+            .find(|shape| shape.id() == source_id)
+            .unwrap()
+        else {
+            panic!("expected text shape");
+        };
+        parsed.text.as_mut().unwrap().autofit = Some(TextAutofit::None);
+        let natural = font_size(&package);
+        assert!((scaled - natural).abs() < 0.001);
+        let ShapeNode::Shape(parsed) = package.slides[0]
+            .shapes
+            .iter_mut()
+            .find(|shape| shape.id() == source_id)
+            .unwrap()
+        else {
+            panic!("expected text shape");
+        };
+        parsed.text.as_mut().unwrap().autofit = Some(TextAutofit::Normal {
+            font_scale: Some(0.5),
+            line_space_reduction: None,
+        });
+        assert!((font_size(&package) - (natural * 0.5).round()).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_gradient_outline_strokes_with_its_gradient_and_keeps_a_flat_fallback() {
+        let package = pptx_parse::parse_pptx(GRADIENT_OUTLINE_FIXTURE).unwrap();
+        let session = DeckSession::open(GRADIENT_OUTLINE_FIXTURE, 8_010).unwrap();
+        let primitives = renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), 0)
+            .unwrap()
+            .display_list
+            .primitives;
+        let strokes = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Shape { name, stroke, .. } => Some((name.clone(), stroke.clone()?)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let (_, gradient) = strokes
+            .iter()
+            .find(|(name, _)| name == "Gradient outline rectangle")
+            .expect("the gradient-stroked rectangle must reach the display list");
+        assert_eq!(
+            gradient.paint,
+            Some(Paint::Gradient {
+                gradient_type: GradientType::Linear,
+                angle_deg: Some(0.0),
+                stops: vec![
+                    GradientStop {
+                        position: 0.0,
+                        color: "#C00000".to_owned(),
+                    },
+                    GradientStop {
+                        position: 0.5,
+                        color: "#FFC000".to_owned(),
+                    },
+                    GradientStop {
+                        position: 1.0,
+                        color: "#1F7A3D".to_owned(),
+                    },
+                ],
+            })
+        );
+        assert_eq!(gradient.color, "#C00000");
+        assert_eq!(gradient.width, 8.0);
+
+        assert!(
+            strokes
+                .iter()
+                .any(|(name, stroke)| name == "Gradient outline line" && stroke.paint.is_some())
+        );
+
+        let (_, solid) = strokes
+            .iter()
+            .find(|(name, _)| name == "Solid outline rectangle")
+            .expect("the solid-stroked rectangle must reach the display list");
+        assert_eq!(solid.paint, None);
+        assert_eq!(solid.color, "#C00000");
+    }
+
+    #[test]
+    fn gradient_outline_keeps_sorted_alpha_paint_through_theme_fallback() {
+        let gradient: ShapeOutline = serde_json::from_value(serde_json::json!({
+            "gradient": {
+                "type": "linear", "angle": 0.0,
+                "stops": [
+                    {"position": 100000.0, "color": {"rgb": "0000FF"}},
+                    {"position": 50000.0, "color": {"rgb": "00FF00"}},
+                    {"position": 0.0, "color": {"rgb": "FF0000", "alpha": 0.5}},
+                    {"position": 50000.0, "color": {"rgb": "FFFF00"}}
+                ]
+            }
+        }))
+        .unwrap();
+        let solid = ShapeOutline {
+            color: Some(ColorValue {
+                rgb: Some("123456".into()),
+                ..Default::default()
+            }),
+            width: Some(76_200.0),
+            head_end: Some(LineEnd {
+                end_type: "triangle".into(),
+                width: None,
+                length: None,
+            }),
+            ..Default::default()
+        };
+        let merged = merge_outline(&gradient, Some(&solid));
+        let stroke = stroke(&merged, &Theme::default()).unwrap();
+        assert_eq!(stroke.width, 8.0);
+        assert_eq!(stroke.color, "#FF000080");
+        assert!(stroke.head_end.is_some());
+        let Some(Paint::Gradient { stops, .. }) = stroke.paint else {
+            panic!("gradient")
+        };
+        assert_eq!(
+            stops
+                .iter()
+                .map(|stop| (stop.position, stop.color.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0.0, "#FF000080"),
+                (0.5, "#00FF00"),
+                (0.5, "#FFFF00"),
+                (1.0, "#0000FF")
+            ]
+        );
+        assert!(merge_outline(&solid, Some(&gradient)).gradient.is_none());
+        assert_eq!(
+            merge_outline(
+                &ShapeOutline {
+                    width: Some(12_700.0),
+                    ..Default::default()
+                },
+                Some(&gradient)
+            )
+            .gradient,
+            gradient.gradient
+        );
+    }
+
+    fn chart_slide(index: usize) -> Vec<Primitive> {
+        let package = pptx_parse::parse_pptx(CHART_FIXTURE).unwrap();
+        let session = DeckSession::open(CHART_FIXTURE, 8_004 + index as u64).unwrap();
+        renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), index)
+            .unwrap()
+            .display_list
+            .primitives
+    }
+
+    #[test]
+    fn a_chart_frame_plots_with_the_deck_theme_and_an_aria_label() {
+        let primitives = chart_slide(0);
+        let (label, parts, rect) = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Chart {
+                    label,
+                    primitives,
+                    x,
+                    y,
+                    w,
+                    h,
+                    name,
+                    shape_id: Some(_),
+                    ..
+                } if name == "Revenue chart" => Some((label, primitives, (*x, *y, *w, *h))),
+                _ => None,
+            })
+            .expect("the chart frame plots");
+        assert_eq!(label, "Revenue, column chart, 2 series, 3 categories");
+        assert_eq!(rect, (96.0, 96.0, 576.0, 336.0));
+        let fills = parts
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Shape {
+                    fill: Some(Paint::Solid { color }),
+                    ..
+                } => Some(color.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(fills.contains(&"#6254E7"), "theme accent1 bars are missing");
+        assert!(fills.contains(&"#1FA97A"), "theme accent2 bars are missing");
+        let text = parts
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::TextBox { lines, .. } => Some(
+                    lines
+                        .iter()
+                        .flat_map(|line| line.runs.iter())
+                        .map(|run| run.text.clone())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(text.contains(&"Revenue".to_owned()));
+        assert!(text.contains(&"North".to_owned()));
+        assert!(text.contains(&"Q1".to_owned()));
+        assert!(text.contains(&"12".to_owned()), "data labels are missing");
+        assert!(
+            text.contains(&"Quarter".to_owned()),
+            "no category axis title"
+        );
+        assert!(text.contains(&"Millions".to_owned()), "no value axis title");
+        assert!(
+            parts.iter().any(|primitive| matches!(
+                primitive,
+                Primitive::TextBox { lines, .. }
+                    if lines.iter().flat_map(|line| &line.runs).any(|run| !run.glyphs.is_empty())
+            )),
+            "chart text is not shaped"
+        );
+    }
+
+    /// A one-record EMF: a black triangle filling the left half of its frame.
+    fn triangle_emf() -> Vec<u8> {
+        let mut bytes = vec![0u8; 88];
+        let mut put = |offset: usize, value: i32| {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put(0, 1);
+        put(4, 88);
+        put(16, 99);
+        put(20, 99);
+        put(32, 10_000);
+        put(36, 10_000);
+        put(40, 0x464D_4520);
+        put(56, 4);
+        put(72, 100);
+        put(76, 100);
+        put(80, 100);
+        put(84, 100);
+        let record = |kind: u32, body: Vec<u8>| {
+            let mut out = kind.to_le_bytes().to_vec();
+            out.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
+            out.extend(body);
+            out
+        };
+        let i32s =
+            |values: &[i32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        bytes.extend(record(39, i32s(&[1, 0, 0, 0])));
+        bytes.extend(record(37, i32s(&[1])));
+        let mut polygon = i32s(&[0, 0, 0, 0, 3]);
+        for (x, y) in [(0i16, 0i16), (50, 0), (0, 100)] {
+            polygon.extend_from_slice(&x.to_le_bytes());
+            polygon.extend_from_slice(&y.to_le_bytes());
+        }
+        bytes.extend(record(86, polygon));
+        bytes.extend(record(14, i32s(&[0, 0, 0])));
+        bytes
+    }
+
+    /// `triangle_emf` with the left-top quarter of the frame selected as the
+    /// clip path before the fill.
+    fn clipped_triangle_emf() -> Vec<u8> {
+        let mut bytes = triangle_emf();
+        let record = |kind: u32, body: Vec<u8>| {
+            let mut out = kind.to_le_bytes().to_vec();
+            out.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
+            out.extend(body);
+            out
+        };
+        let i32s =
+            |values: &[i32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let mut polyline = i32s(&[0, 0, 0, 0, 4]);
+        for (x, y) in [(0i16, 0i16), (0, 50), (50, 50), (50, 0)] {
+            polyline.extend_from_slice(&x.to_le_bytes());
+            polyline.extend_from_slice(&y.to_le_bytes());
+        }
+        let mut clip = record(59, Vec::new());
+        clip.extend(record(27, i32s(&[0, 0])));
+        clip.extend(record(89, polyline));
+        clip.extend(record(60, Vec::new()));
+        clip.extend(record(67, i32s(&[5])));
+        bytes.splice(88..88, clip);
+        bytes
+    }
+
+    /// The demo deck with one extra master picture pointing at `media`.
+    fn deck_with_master_picture(media: Vec<u8>) -> (PptxPackage, DeckSnapshot) {
+        deck_with_cropped_master_picture(media, PictureCrop::default())
+    }
+
+    fn deck_with_cropped_master_picture(
+        media: Vec<u8>,
+        crop: PictureCrop,
+    ) -> (PptxPackage, DeckSnapshot) {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_100).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        package.media.push(pptx_parse::MediaPart {
+            part_path: "ppt/media/logo.emf".to_owned(),
+            content_type: "image/x-emf".to_owned(),
+            bytes: media,
+        });
+        let picture = pptx_parse::Picture {
+            aspect_ratio_locked: false,
+            effects: Vec::new(),
+            shape_effects: None,
+            base: pptx_parse::ShapeBase {
+                id: 4_242,
+                name: "Logo".to_owned(),
+                title: None,
+                description: None,
+                decorative: false,
+                hidden: false,
+                placeholder: None,
+                transform: ShapeTransform {
+                    width: 914_400,
+                    height: 914_400,
+                    ..ShapeTransform::default()
+                },
+            },
+            relationship_id: None,
+            media_part_path: Some("ppt/media/logo.emf".to_owned()),
+            crop,
+            geometry: "rect".to_owned(),
+            paths: Vec::new(),
+            adjust_values: BTreeMap::new(),
+            style: None,
+            fill: None,
+            outline: None,
+        };
+        package.masters[0].shapes.push(ShapeNode::Picture(picture));
+        (package, snapshot)
+    }
+
+    #[test]
+    fn metafile_masks_borders_and_empty_crops_preserve_picture_geometry() {
+        for empty in [false, true] {
+            let (mut package, snapshot) = deck_with_cropped_master_picture(
+                triangle_emf(),
+                PictureCrop {
+                    left: if empty { 100_000 } else { 25_000 },
+                    ..Default::default()
+                },
+            );
+            let ShapeNode::Picture(picture) = package.masters[0].shapes.last_mut().unwrap() else {
+                panic!()
+            };
+            picture.geometry = "ellipse".into();
+            picture.outline = Some(ShapeOutline {
+                width: Some(9525.0),
+                color: Some(ColorValue {
+                    rgb: Some("0000FF".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let mask = picture_mask(
+                picture,
+                PxRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 96.0,
+                    h: 96.0,
+                },
+            )
+            .path
+            .unwrap();
+            let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+            let shapes = rendered
+                .display_list
+                .primitives
+                .iter()
+                .filter(|p| matches!(p, Primitive::Shape { name, .. } if name == "Logo"))
+                .collect::<Vec<_>>();
+            assert_eq!(shapes.len(), if empty { 1 } else { 2 });
+            if !empty {
+                let Primitive::Shape { path, clip, .. } = shapes[0] else {
+                    panic!()
+                };
+                assert_eq!(clip.as_ref(), Some(&mask));
+                assert!(
+                    matches!(path[0], GeometryPathCommand::Move { x, y: 0.0 } if (x + 1.0 / 3.0).abs() < 1e-6)
+                );
+            }
+            let Primitive::Shape {
+                path,
+                fill,
+                stroke: Some(stroke),
+                ..
+            } = shapes.last().unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(*path, mask);
+            assert!(fill.is_none());
+            assert_eq!(stroke.color, "#0000FF");
+        }
+    }
+
+    #[test]
+    fn unsupported_picture_masks_report_fallbacks_for_bitmaps_and_metafiles() {
+        for media in [b"not a metafile".to_vec(), triangle_emf()] {
+            let (mut package, snapshot) = deck_with_master_picture(media);
+            let ShapeNode::Picture(picture) = package.masters[0].shapes.last_mut().unwrap() else {
+                panic!()
+            };
+            picture.geometry = "unknownPreset".into();
+            let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+            let primitives: Vec<_> = rendered
+                .display_list
+                .primitives
+                .iter()
+                .filter(|p| match p {
+                    Primitive::Shape { name, .. } | Primitive::Image { name, .. } => name == "Logo",
+                    _ => false,
+                })
+                .collect();
+            assert!(!primitives.is_empty());
+            for primitive in primitives {
+                assert_eq!(
+                    serde_json::to_value(primitive).unwrap()["geometryFallback"],
+                    true
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metafile_picture_operations_share_the_slide_budget() {
+        let mut bytes = triangle_emf();
+        let polygon = bytes[124..164].to_vec();
+        let eof = bytes.split_off(bytes.len() - 20);
+        for _ in 1..2001 {
+            bytes.extend_from_slice(&polygon);
+        }
+        bytes.extend(eof);
+        let (mut package, snapshot) = deck_with_master_picture(bytes);
+        let mut duplicate = package.masters[0].shapes.last().unwrap().clone();
+        if let ShapeNode::Picture(picture) = &mut duplicate {
+            picture.base.id += 1;
+        }
+        package.masters[0].shapes.push(duplicate);
+        let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        let primitives = rendered.display_list.primitives;
+        assert_eq!(
+            primitives
+                .iter()
+                .filter(|p| matches!(p, Primitive::Shape { name, .. } if name == "Logo"))
+                .count(),
+            2001
+        );
+        assert_eq!(
+            primitives
+                .iter()
+                .filter(|p| matches!(p, Primitive::Image { name, .. } if name == "Logo"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_metafile_picture_paints_shapes_instead_of_an_undecodable_image() {
+        let (package, snapshot) = deck_with_master_picture(triangle_emf());
+        let primitives = renderer()
+            .layout_slide(&package, &snapshot, 0)
+            .unwrap()
+            .display_list
+            .primitives;
+
+        assert!(
+            !primitives.iter().any(|primitive| matches!(
+                primitive,
+                Primitive::Image { asset_id: Some(asset), .. } if asset == "ppt/media/logo.emf"
+            )),
+            "the metafile is still handed to the image decoder"
+        );
+        let shapes: Vec<_> = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Shape {
+                    name,
+                    path,
+                    fill,
+                    w,
+                    h,
+                    ..
+                } if name == "Logo" => Some((path, fill, *w, *h)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shapes.len(), 1, "one fill becomes one shape");
+        let (path, fill, w, h) = shapes[0];
+        assert_eq!(
+            *fill,
+            Some(Paint::Solid {
+                color: "#000000".to_owned()
+            })
+        );
+        assert_eq!((w, h), (96.0, 96.0));
+        assert_eq!(
+            path[1],
+            ooxml_drawingml::GeometryPathCommand::Line { x: 0.5, y: 0.0 }
+        );
+    }
+
+    #[test]
+    fn a_metafile_clip_narrows_the_shape_clip_to_the_clipped_region() {
+        let (package, snapshot) = deck_with_master_picture(clipped_triangle_emf());
+        let primitives = renderer()
+            .layout_slide(&package, &snapshot, 0)
+            .unwrap()
+            .display_list
+            .primitives;
+
+        let clip = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Shape { name, clip, .. } if name == "Logo" => clip.clone(),
+                _ => None,
+            })
+            .expect("the clipped metafile paints");
+        assert_eq!(
+            clip,
+            vec![
+                ooxml_drawingml::GeometryPathCommand::Move { x: 0.0, y: 0.0 },
+                ooxml_drawingml::GeometryPathCommand::Line { x: 0.5, y: 0.0 },
+                ooxml_drawingml::GeometryPathCommand::Line { x: 0.5, y: 0.5 },
+                ooxml_drawingml::GeometryPathCommand::Line { x: 0.0, y: 0.5 },
+                ooxml_drawingml::GeometryPathCommand::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_negative_source_rectangle_insets_the_metafile_inside_its_box() {
+        let (package, snapshot) = deck_with_cropped_master_picture(
+            triangle_emf(),
+            PictureCrop {
+                left: -25_000,
+                right: -25_000,
+                ..PictureCrop::default()
+            },
+        );
+        let primitives = renderer()
+            .layout_slide(&package, &snapshot, 0)
+            .unwrap()
+            .display_list
+            .primitives;
+
+        let path = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Shape { name, path, .. } if name == "Logo" => Some(path),
+                _ => None,
+            })
+            .expect("the metafile paints");
+        let GeometryPathCommand::Move { x, .. } = path[0] else {
+            panic!("expected a move");
+        };
+        assert!((x - 1.0 / 6.0).abs() < 1e-6, "left edge at {x}");
+        let GeometryPathCommand::Line { x, .. } = path[1] else {
+            panic!("expected a line");
+        };
+        assert!((x - 0.5).abs() < 1e-6, "apex at {x}");
+    }
+
+    #[test]
+    fn media_that_is_not_a_metafile_still_becomes_an_image() {
+        let (package, snapshot) = deck_with_master_picture(b"\x89PNG\r\n\x1a\n".to_vec());
+        let primitives = renderer()
+            .layout_slide(&package, &snapshot, 0)
+            .unwrap()
+            .display_list
+            .primitives;
+
+        assert!(primitives.iter().any(|primitive| matches!(
+            primitive,
+            Primitive::Image { asset_id: Some(asset), .. } if asset == "ppt/media/logo.emf"
+        )));
+    }
+
+    #[test]
+    fn a_chart_title_is_shaped_into_the_centre_of_its_box() {
+        let parts = chart_slide(0)
+            .into_iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Chart {
+                    primitives, name, ..
+                } if name == "Revenue chart" => Some(primitives),
+                _ => None,
+            })
+            .expect("the chart frame plots");
+        let (align, x, width) = parts
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::TextBox {
+                    lines, paragraphs, ..
+                } if lines
+                    .iter()
+                    .flat_map(|line| &line.runs)
+                    .any(|run| run.text == "Revenue") =>
+                {
+                    let run = &lines[0].runs[0];
+                    Some((paragraphs[0].align, run.x, run.width))
+                }
+                _ => None,
+            })
+            .expect("the chart title is laid out");
+        assert_eq!(align, Some(TextAlign::Center));
+        let centre = x + width / 2.0;
+        assert!(
+            (centre - (96.0 + 576.0 / 2.0)).abs() < 2.0,
+            "the title is not centred on the frame: {centre}"
+        );
+    }
+
+    #[test]
+    fn a_graphic_frame_without_a_chart_part_keeps_its_placeholder() {
+        assert!(chart_slide(0).iter().any(|primitive| matches!(
+            primitive,
+            Primitive::Placeholder { name, label, .. }
+                if name == "Broken chart" && label.as_deref() == Some("Chart")
+        )));
+    }
+
+    #[test]
+    fn a_chart_inside_a_group_plots_in_the_group_space() {
+        let primitives = chart_slide(1);
+        let (label, parts) = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Chart {
+                    label, primitives, ..
+                } => Some((label, primitives)),
+                _ => None,
+            })
+            .expect("the grouped chart plots");
+        assert_eq!(label, "Share, pie chart, 1 series, 2 categories");
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|primitive| matches!(primitive, Primitive::Shape { geometry, .. } if geometry == "custom"))
+                .count(),
+            2
+        );
+        assert!(parts.iter().any(|primitive| matches!(
+            primitive,
+            Primitive::Shape { fill: Some(Paint::Solid { color }), .. } if color == "#E7A954"
+        )));
+    }
+
+    #[test]
+    fn a_shared_chart_uses_the_rendering_slides_theme_key() {
+        let mut package = pptx_parse::parse_pptx(CHART_FIXTURE).unwrap();
+        let session = DeckSession::open(CHART_FIXTURE, 8_006).unwrap();
+        let mut snapshot = session.snapshot().unwrap();
+        let mut theme = package.themes[0].clone();
+        theme.part_path = "ppt/theme/theme2.xml".to_owned();
+        let mut master = package.masters[0].clone();
+        master.part_path = "ppt/slideMasters/slideMaster2.xml".to_owned();
+        master.theme_part_path = Some(theme.part_path.clone());
+        master.layout_part_paths = vec!["ppt/slideLayouts/slideLayout2.xml".to_owned()];
+        let mut layout = package.layouts[0].clone();
+        layout.part_path = "ppt/slideLayouts/slideLayout2.xml".to_owned();
+        layout.master_part_path = Some(master.part_path.clone());
+        snapshot.slides[1].layout_part_path = Some(layout.part_path.clone());
+        package.themes.push(theme);
+        package.masters.push(master);
+        package.layouts.push(layout);
+        let mut chart = package
+            .charts
+            .iter()
+            .find(|part| part.part_path == "ppt/charts/chart2.xml")
+            .unwrap()
+            .clone();
+        chart.theme_part_path = Some("ppt/theme/theme2.xml".to_owned());
+        for series in &mut chart.chart.series {
+            series.color = "#ABCDEF".to_owned();
+        }
+        for series in chart
+            .chart
+            .plot_groups
+            .iter_mut()
+            .flat_map(|group| &mut group.series)
+        {
+            series.color = "#ABCDEF".to_owned();
+            for point in series.points.iter_mut().flatten() {
+                point.color = "#ABCDEF".to_owned();
+            }
+        }
+        package.charts.push(chart);
+
+        let rendered = renderer()
+            .layout_slide(&package, &snapshot, 1)
+            .unwrap()
+            .display_list
+            .primitives;
+
+        assert!(rendered.iter().any(|primitive| matches!(
+            primitive,
+            Primitive::Chart { primitives, .. }
+                if primitives.iter().any(|primitive| matches!(
+                    primitive,
+                    Primitive::Shape {
+                        fill: Some(Paint::Solid { color }),
+                        ..
+                    } if color == "#ABCDEF"
+                ))
+        )));
+    }
+
+    #[test]
+    fn a_deck_without_charts_plots_no_chart_primitives() {
+        let package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_009).unwrap();
+        let rendered = renderer()
+            .layout_slide(&package, &session.snapshot().unwrap(), 0)
+            .unwrap();
+        assert!(
+            !rendered
+                .display_list
+                .primitives
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Chart { .. }))
+        );
+    }
+
+    #[test]
+    fn placeholder_matching_prefers_indices_and_normalizes_common_types() {
+        let indexed = Placeholder {
+            placeholder_type: Some("body".to_owned()),
+            index: Some(4),
+            orientation: None,
+            size: None,
+        };
+        let same_index = Placeholder {
+            placeholder_type: Some("title".to_owned()),
+            index: Some(4),
+            orientation: None,
+            size: None,
+        };
+        let centered_title = Placeholder {
+            placeholder_type: Some("ctrTitle".to_owned()),
+            index: None,
+            orientation: None,
+            size: None,
+        };
+        let title = Placeholder {
+            placeholder_type: Some("title".to_owned()),
+            index: None,
+            orientation: None,
+            size: None,
+        };
+        assert!(!indexed.matches(&same_index));
+        assert!(centered_title.matches(&title));
+        let slide_number = |index| Placeholder {
+            placeholder_type: Some("sldNum".to_owned()),
+            index: Some(index),
+            orientation: None,
+            size: None,
+        };
+        assert!(slide_number(12).matches(&slide_number(4)));
+        assert!(!slide_number(12).matches(&indexed));
+
+        let snapshot = ShapeSnapshot {
+            aspect_ratio_locked: false,
+            id: "placeholder".to_owned(),
+            source_id: 1,
+            kind: ShapeKind::Shape,
+            name: "Title".to_owned(),
+            title: None,
+            description: None,
+            decorative: false,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            rotation_deg: 0.0,
+            flip_h: false,
+            flip_v: false,
+            inherited: None,
+            hidden: false,
+            text_box: false,
+            geometry: "rect".to_owned(),
+            adjust_values: BTreeMap::new(),
+            placeholder: Some(title.clone()),
+            fill: None,
+            resolved_fill_color: None,
+            outline: None,
+            resolved_outline_color: None,
+            media_part_path: None,
+            pending_media: None,
+            blip_effects: Vec::new(),
+            table_structure: None,
+            graphic: None,
+            text_stories: Vec::new(),
+            children: Vec::new(),
+        };
+        let layout_shape = ShapeNode::Shape(pptx_parse::Shape {
+            has_preset_geometry: true,
+            style: None,
+            paths: Vec::new(),
+            base: pptx_parse::ShapeBase {
+                id: 2,
+                name: "Layout title".to_owned(),
+                title: None,
+                description: None,
+                decorative: false,
+                hidden: false,
+                placeholder: Some(title),
+                transform: ShapeTransform {
+                    x: 100,
+                    y: 200,
+                    width: 300,
+                    height: 400,
+                    ..ShapeTransform::default()
+                },
+            },
+            geometry: "rect".to_owned(),
+            adjust_values: BTreeMap::new(),
+            use_bg_fill: false,
+            fill: None,
+            picture_fill: None,
+            outline: None,
+            effects: None,
+            text: None,
+        });
+        let resolved = resolved_transform_value(&snapshot, None, Some(&layout_shape), None);
+        assert_eq!(
+            (resolved.x, resolved.y, resolved.width, resolved.height),
+            (100, 200, 300, 400)
+        );
+    }
+
+    #[test]
+    fn a_shape_style_colour_sits_between_inherited_bodies_and_master_defaults() {
+        let package = pptx_parse::parse_pptx(STYLE_FIXTURE).unwrap();
+        let session = DeckSession::open(STYLE_FIXTURE, 8_010).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let renderer = renderer();
+        let expected = [
+            (
+                "#EEEEEE",
+                "fontRef schemeClr resolves through the deck theme",
+            ),
+            ("#FF0000", "fontRef srgbClr"),
+            ("#00B050", "run colour beats fontRef"),
+            ("#0070C0", "paragraph defRPr beats fontRef"),
+            ("#0070C0", "layout placeholder colour beats fontRef"),
+            ("#595959", "fontRef without a colour falls to otherStyle"),
+            ("#595959", "no p:style falls to otherStyle"),
+            (
+                "#EEEEEE",
+                "fontRef beats bodyStyle when no placeholder sets a colour",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (index, (color, case)) in expected.iter().enumerate() {
+            let rendered = renderer.layout_slide(&package, &snapshot, index).unwrap();
+            let colors: Vec<&str> = rendered
+                .display_list
+                .primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::TextBox {
+                        shape_id: Some(id),
+                        paragraphs,
+                        ..
+                    } if id.starts_with("slide:") => Some(paragraphs),
+                    _ => None,
+                })
+                .flat_map(|paragraphs| paragraphs.iter().flat_map(|paragraph| &paragraph.runs))
+                .map(|run| run.color.as_str())
+                .collect();
+            if colors.is_empty() || colors.iter().any(|value| value != color) {
+                failures.push(format!("slide {}: {case}: {colors:?}", index + 1));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    fn assert_style_colours(rendered: &RenderedSlide, prefix: &str, expected: &[(&str, &str)]) {
+        let mut paragraphs = Vec::new();
+        let mut positioned = Vec::new();
+        for primitive in &rendered.display_list.primitives {
+            if let Primitive::TextBox {
+                shape_id: Some(id),
+                paragraphs: text,
+                lines,
+                ..
+            } = primitive
+                && id.starts_with(prefix)
+            {
+                paragraphs.extend(text.iter().flat_map(|paragraph| {
+                    paragraph
+                        .runs
+                        .iter()
+                        .map(|run| (run.text.as_str(), run.color.as_str()))
+                }));
+                positioned.extend(lines.iter().flat_map(|line| {
+                    line.runs
+                        .iter()
+                        .filter(|run| run.start != run.end)
+                        .map(|run| (run.text.as_str(), run.color.as_str()))
+                }));
+            }
+        }
+        assert_eq!(paragraphs, expected);
+        assert_eq!(positioned, expected);
+    }
+
+    #[test]
+    fn placeholder_colours_outrank_font_refs_per_paragraph() {
+        let session = DeckSession::open(STYLE_FIXTURE, 8_011).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let renderer = renderer();
+        let layout_placeholder = renderer
+            .layout_slide(session.package(), &snapshot, 4)
+            .unwrap();
+        assert_style_colours(
+            &layout_placeholder,
+            "slide:",
+            &[("layout title 0070C0", "#0070C0")],
+        );
+        let master_placeholder = renderer
+            .layout_slide(session.package(), &snapshot, 9)
+            .unwrap();
+        assert_style_colours(
+            &master_placeholder,
+            "slide:",
+            &[
+                ("master placeholder", "#7030A0"),
+                ("paragraph default", "#0070C0"),
+                ("explicit run", "#00B050"),
+            ],
+        );
+    }
+
+    #[test]
+    fn font_ref_scheme_colours_follow_the_slides_layout_master_and_theme() {
+        let session = DeckSession::open(STYLE_FIXTURE, 8_012).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let renderer = renderer();
+        let first_theme = renderer
+            .layout_slide(session.package(), &snapshot, 0)
+            .unwrap();
+        assert_style_colours(&first_theme, "slide:", &[("fontRef lt1", "#EEEEEE")]);
+        let second_theme = renderer
+            .layout_slide(session.package(), &snapshot, 8)
+            .unwrap();
+        for (prefix, expected) in [
+            ("slide:", ("second theme", "#123456")),
+            ("layout:", ("layout theme", "#234567")),
+            ("master:", ("master theme", "#345678")),
+        ] {
+            assert_style_colours(&second_theme, prefix, &[expected]);
+        }
+    }
+
+    fn end(kind: &str, width: Option<&str>, length: Option<&str>) -> LineEnd {
+        LineEnd {
+            end_type: kind.to_owned(),
+            width: width.map(str::to_owned),
+            length: length.map(str::to_owned),
+        }
+    }
+
+    fn red_outline(width_emu: f64) -> ShapeOutline {
+        ShapeOutline {
+            width: Some(width_emu),
+            color: Some(ooxml_drawingml::ColorValue {
+                rgb: Some("FF0000".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn line_ends_carry_their_kind_and_sizes_from_ooxml() {
+        let bytes = include_bytes!("../tests/fixtures/line-ends.pptx");
+        let package = pptx_parse::parse_pptx(bytes).unwrap();
+        let session = DeckSession::open(bytes, 8_005).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        let strokes: BTreeMap<_, _> = rendered
+            .display_list
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Shape {
+                    name,
+                    stroke: Some(stroke),
+                    ..
+                } => Some((name.as_str(), stroke)),
+                _ => None,
+            })
+            .collect();
+        for kind in ["triangle", "arrow", "stealth", "diamond", "oval"] {
+            for (size, width, length) in [
+                ("sm-lg", 8.0, 20.0),
+                ("med-sm", 12.0, 8.0),
+                ("lg-med", 20.0, 12.0),
+            ] {
+                let name = format!("{kind}-{size}");
+                let stroke = strokes[name.as_str()];
+                assert_eq!(stroke.color, "#315EFB");
+                assert_eq!(stroke.width, 4.0);
+                assert_eq!(
+                    stroke.head_end,
+                    Some(StrokeEnd {
+                        kind: kind.to_owned(),
+                        width,
+                        length,
+                    }),
+                    "{name} head"
+                );
+                assert_eq!(
+                    stroke.tail_end,
+                    Some(StrokeEnd {
+                        kind: kind.to_owned(),
+                        width: length,
+                        length: width,
+                    }),
+                    "{name} tail"
+                );
+            }
+        }
+        let defaults = serde_json::to_string(strokes["default-medium"]).unwrap();
+        assert_eq!(
+            defaults,
+            r##"{"color":"#315EFB","width":4.0,"headEnd":{"kind":"triangle","width":12.0,"length":12.0},"tailEnd":{"kind":"stealth","width":12.0,"length":12.0}}"##
+        );
+        assert_eq!(
+            strokes
+                .values()
+                .filter(|stroke| stroke.head_end.is_some())
+                .count(),
+            20
+        );
+    }
+
+    #[test]
+    fn strokes_without_ends_serialise_as_before() {
+        let theme = Theme::default();
+        let plain = stroke(&red_outline(9_525.0), &theme).unwrap();
+        let none = stroke(
+            &ShapeOutline {
+                head_end: Some(end("none", Some("lg"), None)),
+                tail_end: Some(end("none", None, None)),
+                ..red_outline(9_525.0)
+            },
+            &theme,
+        )
+        .unwrap();
+        let expected = r##"{"color":"#FF0000","width":1.0}"##;
+        assert_eq!(serde_json::from_str::<Stroke>(expected).unwrap(), plain);
+        assert_eq!(serde_json::to_string(&plain).unwrap(), expected);
+        assert_eq!(serde_json::to_string(&none).unwrap(), expected);
+    }
+
+    #[test]
+    fn thin_lines_keep_a_visible_end() {
+        let end = line_end(Some(&end("oval", Some("sm"), Some("lg"))), 1.0).unwrap();
+        assert!((end.width - 5.291_339).abs() < 1e-6);
+        assert!((end.length - 13.228_347).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_family_we_cannot_ship_lends_its_own_metrics_to_the_substitute() {
+        let mut renderer = SlideRenderer::new();
+        renderer
+            .register_font("Trebuchet MS", false, false, FONT)
+            .unwrap();
+        renderer.register_font("Arial", false, false, FONT).unwrap();
+        let substituted = renderer
+            .resolve_face(
+                "Trebuchet MS",
+                false,
+                false,
+                &mut SubstitutionLog::default(),
+            )
+            .unwrap();
+        let plain = renderer
+            .resolve_face("Arial", false, false, &mut SubstitutionLog::default())
+            .unwrap();
+        assert!(plain.widths.is_none() && plain.line.is_none());
+
+        let metrics = substituted.widths.expect("trebuchet ms widths");
+        assert!((family_advance(metrics, 'M').unwrap() - 0.709).abs() < 1e-6);
+        assert!((family_advance(metrics, ' ').unwrap() - 0.301).abs() < 1e-6);
+        assert!((family_advance(metrics, '\u{2019}').unwrap() - 0.367).abs() < 1e-6);
+        assert_eq!(family_advance(metrics, '\u{4e00}'), None);
+        assert!(family_metrics("trebuchet ms", true, false).is_some());
+        assert!(family_metrics("Trebuchet MS", false, false).is_none());
+        assert!(family_metrics("calibri", false, false).is_none());
+
+        let line = family_line_box(substituted.line.expect("trebuchet ms lines"), 1000.0);
+        assert!((line.ascent - 939.0).abs() < 1e-3);
+        assert!((line.descent - 222.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_run_below_its_kern_threshold_is_not_kerned() {
+        let renderer = renderer();
+        let width = |kern_pt: Option<f32>, scale: f32| {
+            let mut paragraph = paragraph(&renderer, "l", "AVAVAV");
+            paragraph.runs[0].style.kern_pt = kern_pt;
+            layout_paragraph(
+                &renderer.fonts,
+                &paragraph,
+                0.0,
+                0.0,
+                1_000.0,
+                scale,
+                false,
+                true,
+            )
+            .unwrap()[0]
+                .width
+        };
+        assert!(
+            width(Some(0.0), 1.0) > width(None, 1.0) + 1.0,
+            "{} vs {}",
+            width(Some(0.0), 1.0),
+            width(None, 1.0)
+        );
+        assert_eq!(width(Some(18.0), 1.0), width(None, 1.0));
+        assert!(
+            width(Some(18.0), 0.5) > width(None, 0.5) + 0.5,
+            "autofit shapes the 18pt run at 9pt, below its threshold"
+        );
+    }
+
+    #[test]
+    fn the_kern_threshold_resolves_against_the_shaped_size() {
+        let renderer = renderer();
+        let theme = Theme::default();
+        let resolved = |style: &TextStyle, fallback: RunProperties| {
+            let style = resolve_style(
+                &renderer,
+                &theme,
+                style,
+                None,
+                Some(&fallback),
+                &mut SubstitutionLog::default(),
+            )
+            .unwrap();
+            kerned(style.kern_pt, style.font_size_pt)
+        };
+        let inherited = |size: f64, kern: Option<f64>| {
+            let fallback = RunProperties {
+                font_size_pt: Some(size),
+                kern_pt: kern,
+                ..RunProperties::default()
+            };
+            resolved(&TextStyle::default(), fallback)
+        };
+        let direct = |size: f64, own: f64, inherited: f64| {
+            let fallback = RunProperties {
+                font_size_pt: Some(size),
+                kern_pt: Some(inherited),
+                ..RunProperties::default()
+            };
+            let style = TextStyle {
+                kern_pt: Some(own),
+                ..TextStyle::default()
+            };
+            resolved(&style, fallback)
+        };
+        assert!(direct(10.0, 1.0, 12.0), "the run's own threshold wins");
+        assert!(!direct(40.0, 0.0, 12.0), "a run can turn its kerning off");
+        assert!(inherited(11.0, None), "no threshold kerns every size");
+        assert!(!inherited(11.0, Some(12.0)));
+        assert!(inherited(12.0, Some(12.0)));
+        assert!(inherited(12.03, Some(12.03)), "sz=1203 kern=1203");
+        assert!(
+            !inherited(40.0, Some(0.0)),
+            "a zero threshold turns kerning off"
+        );
+        let superscript = RunProperties {
+            font_size_pt: Some(20.0),
+            kern_pt: Some(15.0),
+            baseline_pct: Some(30.0),
+            ..RunProperties::default()
+        };
+        assert!(
+            !resolved(&TextStyle::default(), superscript),
+            "a superscript shapes at 11.6pt"
+        );
+    }
+
+    #[test]
+    fn a_bullet_font_without_the_marker_character_paints_no_marker() {
+        let mut renderer = SlideRenderer::new();
+        renderer
+            .register_font("Liberation Sans", false, false, FONT)
+            .unwrap();
+        let theme = Theme::default();
+        let face = renderer
+            .resolve_face(
+                "Liberation Sans",
+                false,
+                false,
+                &mut SubstitutionLog::default(),
+            )
+            .unwrap()
+            .id;
+        let draws = |family: Option<&str>, marker: &str| {
+            let font = family.map(|family| BulletFont::Typeface(family.to_owned()));
+            bullet_font_draws(&renderer, &theme, font.as_ref(), face, marker)
+        };
+        assert!(!renderer.fonts.covers(face, '\u{2713}').unwrap());
+        assert!(draws(Some("Liberation Sans"), "\u{2022}"));
+        assert!(!draws(Some("Liberation Sans"), "\u{2713}"));
+        assert!(draws(Some("Wingdings"), "\u{2713}"));
+        assert!(draws(Some("Futura"), "\u{2713}"));
+        assert!(draws(None, "\u{2713}"));
+    }
+
+    #[test]
+    fn a_substitute_bullet_face_hides_only_private_use_markers() {
+        const CARLITO: &[u8] = include_bytes!("../../../packages/fonts/assets/Carlito-Regular.ttf");
+        let mut renderer = SlideRenderer::new();
+        renderer
+            .register_font("Calibri", false, false, CARLITO)
+            .unwrap();
+        renderer
+            .register_font("Carlito", false, false, CARLITO)
+            .unwrap();
+        let theme = Theme::default();
+        let draws = |family: &str, marker: &str| {
+            let face = renderer
+                .resolve_face(family, false, false, &mut SubstitutionLog::default())
+                .unwrap()
+                .id;
+            assert!(!renderer.fonts.covers(face, '\u{25a0}').unwrap());
+            let font = BulletFont::Typeface(family.to_owned());
+            bullet_font_draws(&renderer, &theme, Some(&font), face, marker)
+        };
+        assert!(draws("Calibri", "\u{25a0}"));
+        assert!(draws("Calibri", "\u{2022}"));
+        assert!(!draws("Calibri", "\u{e83a}"));
+        assert!(!draws("Carlito", "\u{25a0}"));
+    }
+
+    #[test]
+    fn a_light_face_under_its_legacy_family_name_is_the_real_font() {
+        const SELAWIK_LIGHT: &[u8] =
+            include_bytes!("../../../packages/fonts/assets/Selawik-Light.ttf");
+        let mut renderer = SlideRenderer::new();
+        renderer
+            .register_font("Selawik Light", false, false, SELAWIK_LIGHT)
+            .unwrap();
+        let theme = Theme::default();
+        let face = renderer
+            .resolve_face(
+                "Selawik Light",
+                false,
+                false,
+                &mut SubstitutionLog::default(),
+            )
+            .unwrap()
+            .id;
+        assert!(!renderer.fonts.covers(face, '\u{2713}').unwrap());
+        let font = BulletFont::Typeface("Selawik Light".to_owned());
+        let draws = |marker: &str| bullet_font_draws(&renderer, &theme, Some(&font), face, marker);
+        assert!(!draws("\u{2713}"));
+        assert!(draws("\u{2022}"));
+    }
+
+    #[test]
+    fn a_run_on_the_named_family_widths_keeps_one_cluster_per_character() {
+        const CARLITO: &[u8] = include_bytes!("../../../packages/fonts/assets/Carlito-Regular.ttf");
+        let mut renderer = SlideRenderer::new();
+        renderer
+            .register_font("Arial", false, false, CARLITO)
+            .unwrap();
+        renderer
+            .register_font("Trebuchet MS", false, false, CARLITO)
+            .unwrap();
+        let text = "Transmigration";
+        let lay = |family: &str| {
+            let mut paragraph = paragraph(&renderer, "l", text);
+            paragraph.runs[0].style.face = renderer
+                .resolve_face(family, false, false, &mut SubstitutionLog::default())
+                .unwrap();
+            paragraph.runs[0].style.family = family.to_owned();
+            layout_paragraph(
+                &renderer.fonts,
+                &paragraph,
+                0.0,
+                0.0,
+                1_000.0,
+                1.0,
+                false,
+                true,
+            )
+            .unwrap()
+        };
+        assert!(
+            glyph_positions(&lay("Arial")).len() < text.len(),
+            "Carlito ligates ti on its own widths"
+        );
+        let named = lay("Trebuchet MS");
+        let positions = glyph_positions(&named);
+        assert_eq!(positions.len(), text.len());
+        let metrics = family_metrics("trebuchet ms", false, false).unwrap();
+        let size = points_to_px(18.0);
+        let mut pen = positions[0];
+        for (character, x) in text.chars().zip(&positions) {
+            assert!((x - pen).abs() < 0.01, "{character} at {x}, expected {pen}");
+            pen += family_advance(metrics, character).unwrap() * size;
+        }
+    }
+
+    #[test]
+    fn named_japanese_clusters_use_composed_kana_advances() {
+        let font = nimbleoffice_fonts::decode(
+            include_bytes!("../../../packages/fonts-cjk/assets/NotoSansJP-Regular.otf.zst"),
+            None,
+            64 << 20,
+        )
+        .unwrap();
+        for family in ["MS PGothic", "MS PMincho", "MS UI Gothic"] {
+            let mut renderer = SlideRenderer::new();
+            renderer.register_font(family, false, false, &font).unwrap();
+            let face = renderer
+                .resolve_face(family, false, false, &mut SubstitutionLog::default())
+                .unwrap();
+            let metrics = family_metrics(&family.to_lowercase(), false, false).unwrap();
+            for (text, composed) in [("か\u{3099}中", 'が'), ("は\u{309a}中", 'ぱ')] {
+                let mut paragraph = paragraph(&renderer, "l", text);
+                paragraph.runs[0].style.face = face.clone();
+                paragraph.runs[0].style.family = family.to_owned();
+                let size = points_to_px(paragraph.runs[0].style.font_size_pt);
+                let lines = layout_paragraph(
+                    &renderer.fonts,
+                    &paragraph,
+                    0.0,
+                    0.0,
+                    1_000.0,
+                    1.0,
+                    false,
+                    true,
+                )
+                .unwrap();
+                let expected = (family_advance(metrics, composed).unwrap() + 1.0) * size;
+                assert_eq!(lines.len(), 1);
+                assert!((lines[0].width - expected).abs() < 1e-3, "{family} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn unregistered_japanese_faces_keep_decomposed_kana_in_one_cluster() {
+        let renderer = SlideRenderer::new();
+        for family in [
+            "MS UI Gothic",
+            "MS PGothic",
+            "ＭＳ Ｐゴシック",
+            "MS PMincho",
+            "ＭＳ Ｐ明朝",
+        ] {
+            let face = renderer
+                .resolve_face(family, false, false, &mut SubstitutionLog::default())
+                .unwrap();
+            assert_eq!(face.id.to_u32(), BROWSER_FONT_ID);
+            let metrics = family_metrics(&family.to_lowercase(), false, false).unwrap();
+            for (decomposed, composed) in [
+                ("か\u{3099}", 'が'),
+                ("き\u{3099}", 'ぎ'),
+                ("は\u{309a}", 'ぱ'),
+                ("ヒ\u{309a}", 'ピ'),
+            ] {
+                let mut paragraph = paragraph(&renderer, "l", decomposed);
+                paragraph.runs[0].style.face = face.clone();
+                paragraph.runs[0].style.family = family.to_owned();
+                paragraph.runs[0].style.font_size_pt = 12.0;
+                paragraph.runs[0].style.line_font_size_pt = 12.0;
+                let lines = layout_paragraph(
+                    &renderer.fonts,
+                    &paragraph,
+                    0.0,
+                    0.0,
+                    1_000.0,
+                    1.0,
+                    false,
+                    true,
+                )
+                .unwrap();
+                let expected = family_advance(metrics, composed).unwrap() * 16.0;
+                assert_eq!(lines.len(), 1);
+                assert!(
+                    (lines[0].width - expected).abs() < 1e-3,
+                    "{family} {decomposed}"
+                );
+                assert!(!lines[0].caret_stops.iter().any(|stop| stop.position == 1));
+                let glyphs = shape_face(&renderer.fonts, &face, decomposed, 16.0, &[]).unwrap();
+                assert_eq!(glyphs.len(), 2);
+                assert!(glyphs.iter().all(|glyph| glyph.cluster == 0));
+                assert!((glyphs[0].x_advance - expected).abs() < 1e-3);
+                assert_eq!(glyphs[1].x_advance, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn unregistered_fixed_japanese_faces_keep_decomposed_kana_scalar_widths() {
+        let renderer = SlideRenderer::new();
+        for family in ["MS Gothic", "ＭＳ ゴシック", "MS Mincho", "ＭＳ 明朝"] {
+            let face = renderer
+                .resolve_face(family, false, false, &mut SubstitutionLog::default())
+                .unwrap();
+            assert_eq!(face.id.to_u32(), BROWSER_FONT_ID);
+            for text in ["か\u{3099}", "は\u{309a}", "ヒ\u{309a}"] {
+                let mut paragraph = paragraph(&renderer, "l", text);
+                paragraph.runs[0].style.face = face.clone();
+                paragraph.runs[0].style.family = family.to_owned();
+                paragraph.runs[0].style.font_size_pt = 12.0;
+                paragraph.runs[0].style.line_font_size_pt = 12.0;
+                let lines = layout_paragraph(
+                    &renderer.fonts,
+                    &paragraph,
+                    0.0,
+                    0.0,
+                    1_000.0,
+                    1.0,
+                    false,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0].width, 16.0, "{family} {text}");
+                let glyphs = shape_face(&renderer.fonts, &face, text, 16.0, &[]).unwrap();
+                assert_eq!(glyphs.len(), 2);
+                assert_eq!(glyphs[0].cluster, 0);
+                assert_eq!(glyphs[1].cluster, 3);
+                assert!(glyphs.iter().all(|glyph| glyph.x_advance == 8.0));
+            }
+        }
+    }
+
+    #[test]
+    fn unregistered_faces_preserve_scalar_advances_outside_kana_voicing() {
+        let renderer = SlideRenderer::new();
+        for family in ["MS UI Gothic", "MS Mincho", "MS Gothic", "Aptos"] {
+            let face = renderer
+                .resolve_face(family, false, false, &mut SubstitutionLog::default())
+                .unwrap();
+            for text in [
+                "x\u{0301}x",
+                "x\u{1ab0}x",
+                "x\u{20d0}x",
+                "x\u{fe20}x",
+                "x\u{0301}\u{1ab0}x",
+                "\u{0301}\u{1ab0}",
+                "❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}",
+                "👩\u{200d}💻",
+                "\u{fe0f}",
+                "\u{200d}",
+                "か\u{fe0f}",
+                "か\u{0301}",
+                "あ\u{3099}",
+                "あ\u{309a}",
+                "ｶ\u{3099}",
+                "x\u{3099}",
+                "x\u{309a}",
+                "\u{3099}\u{309a}",
+                "あ\u{309b}",
+                "あ\u{309c}",
+            ] {
+                let glyphs = shape_face(&renderer.fonts, &face, text, 16.0, &[]).unwrap();
+                assert_eq!(glyphs.len(), text.chars().count(), "{family} {text}");
+                for (glyph, (index, character)) in glyphs.iter().zip(text.char_indices()) {
+                    let expected = face
+                        .widths
+                        .and_then(|metrics| family_advance(metrics, character))
+                        .unwrap_or(0.5)
+                        * 16.0;
+                    assert_eq!(glyph.cluster as usize, index, "{family} {text}");
+                    assert_eq!(glyph.x_advance, expected, "{family} {text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unregistered_aptos_keeps_emoji_variation_selector_widths() {
+        let renderer = SlideRenderer::new();
+        let face = renderer
+            .resolve_face("Aptos", false, false, &mut SubstitutionLog::default())
+            .unwrap();
+        assert_eq!(face.id.to_u32(), BROWSER_FONT_ID);
+        let text = "❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}";
+        let mut paragraph = paragraph(&renderer, "l", text);
+        paragraph.runs[0].style.face = face;
+        paragraph.runs[0].style.family = "Aptos".to_owned();
+        paragraph.runs[0].style.font_size_pt = 12.0;
+        paragraph.runs[0].style.line_font_size_pt = 12.0;
+        let lines = layout_paragraph(
+            &renderer.fonts,
+            &paragraph,
+            0.0,
+            0.0,
+            1_000.0,
+            1.0,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].width, 48.0);
+    }
+
+    #[test]
+    fn missing_faces_keep_the_requested_family_and_style_metrics() {
+        for registered in ["Arial", "Trebuchet MS"] {
+            let mut renderer = SlideRenderer::new();
+            renderer
+                .register_font(registered, false, false, FONT)
+                .unwrap();
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                let face = renderer
+                    .resolve_face(
+                        "Trebuchet MS",
+                        bold,
+                        italic,
+                        &mut SubstitutionLog::default(),
+                    )
+                    .unwrap();
+                let expected = family_metrics("trebuchet ms", bold, italic).unwrap();
+                assert_eq!(renderer.fonts.font_bytes(face.id).unwrap(), FONT);
+                assert!(std::ptr::eq(face.widths.unwrap(), expected));
+                assert!(std::ptr::eq(face.line.unwrap(), expected));
+            }
+            let unknown = renderer
+                .resolve_face(
+                    "Unknown family",
+                    false,
+                    false,
+                    &mut SubstitutionLog::default(),
+                )
+                .unwrap();
+            assert!(unknown.widths.is_none() && unknown.line.is_none());
+        }
+    }
+
+    #[test]
+    fn an_empty_family_draws_the_fallback_without_reporting_it() {
+        let mut renderer = SlideRenderer::new();
+        renderer.register_font("Arial", false, false, FONT).unwrap();
+        let mut log = SubstitutionLog::default();
+        renderer.resolve_face("", false, false, &mut log).unwrap();
+        renderer.resolve_face("  ", false, false, &mut log).unwrap();
+        assert!(log.entries.is_empty());
+        renderer
+            .resolve_face("Missing", false, false, &mut log)
+            .unwrap();
+        assert_eq!(log.entries.len(), 1);
+    }
+
+    #[test]
+    fn only_a_different_drawn_family_is_reported() {
+        let mut renderer = SlideRenderer::new();
+        renderer.register_font("Arial", true, false, FONT).unwrap();
+        let mut log = SubstitutionLog::default();
+        let face = renderer
+            .resolve_face("Arial", false, false, &mut log)
+            .unwrap();
+        assert_eq!(face.family, "Arial");
+        assert!(log.entries.is_empty());
+
+        let mut renderer = SlideRenderer::new();
+        renderer
+            .register_font("Liberation Sans", false, false, FONT)
+            .unwrap();
+        renderer.register_font("Arial", true, false, FONT).unwrap();
+        renderer
+            .resolve_face("Arial", false, false, &mut log)
+            .unwrap();
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].requested_family, "Arial");
+        assert_eq!(log.entries[0].selected_family, "Liberation Sans");
+    }
+
+    #[test]
+    fn a_symbol_bullet_is_reported_unless_every_character_is_emulated() {
+        let mut renderer = SlideRenderer::new();
+        renderer.register_font("Arial", false, false, FONT).unwrap();
+        let text = paragraph(&renderer, "l", "Item").runs[0].style.clone();
+        let properties = ParagraphProperties {
+            bullet_font: Some(BulletFont::Typeface("Wingdings".to_owned())),
+            ..ParagraphProperties::default()
+        };
+        let theme = Theme::default();
+        let mut log = SubstitutionLog::default();
+        resolve_bullet_style(&renderer, &theme, &properties, &text, "\u{a7}", &mut log).unwrap();
+        assert!(log.entries.is_empty());
+        resolve_bullet_style(&renderer, &theme, &properties, &text, "\u{2192}", &mut log).unwrap();
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].requested_family, "Wingdings");
+    }
+
+    #[test]
+    fn different_requested_metrics_do_not_share_cached_fallback_layouts() {
+        let session = DeckSession::open(
+            include_bytes!("../tests/fixtures/paragraph-spacing.pptx"),
+            8_020,
+        )
+        .unwrap();
+        let new_renderer = || {
+            let mut renderer = SlideRenderer::new();
+            renderer.register_font("Arial", false, false, FONT).unwrap();
+            renderer
+        };
+        let render = |renderer: &SlideRenderer, family: &str| {
+            let mut snapshot = session.snapshot().unwrap();
+            let story = &mut snapshot.slides[0]
+                .shapes
+                .iter_mut()
+                .find(|shape| shape.source_id == 2)
+                .unwrap()
+                .text_stories[0];
+            for paragraph in &mut story.paragraphs {
+                for run in &mut paragraph.runs {
+                    run.style.font_family = Some(family.to_owned());
+                    run.style.font_size_pt = Some(24.0);
+                    run.text = "MMMMMMMM".to_owned();
+                }
+            }
+            renderer
+                .layout_slide(session.package(), &snapshot, 0)
+                .unwrap()
+                .display_list
+                .primitives
+                .into_iter()
+                .find_map(|primitive| match primitive {
+                    Primitive::TextBox {
+                        object_id: 2,
+                        lines,
+                        ..
+                    } => Some(lines),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let renderer = new_renderer();
+        let trebuchet = render(&renderer, "Trebuchet MS");
+        let consolas = render(&renderer, "Consolas");
+        assert!((trebuchet[0].width - consolas[0].width).abs() > 1.0);
+        assert_eq!(consolas, render(&new_renderer(), "Consolas"));
+        assert_eq!(trebuchet, render(&renderer, "Trebuchet MS"));
+    }
+
+    fn smartart_test_deck(
+        data_xml: Option<&[u8]>,
+        layout_xml: Option<&[u8]>,
+        include_drawing_rel: bool,
+    ) -> Vec<u8> {
+        let mut parts = ooxml_opc::unzip_parts(FIXTURE).unwrap();
+        let frame = r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="901" name="SmartArt Diagram"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="914400" y="914400"/><a:ext cx="3657600" cy="1828800"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rIdData1" r:lo="rIdLayout1" r:qs="" r:cs=""/></a:graphicData></a:graphic></p:graphicFrame>"#;
+        let mut rels = String::from(
+            r#"<Relationship Id="rIdData1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/>"#,
+        );
+        if layout_xml.is_some() {
+            rels.push_str(
+                r#"<Relationship Id="rIdLayout1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout" Target="../diagrams/layout1.xml"/>"#,
+            );
+        }
+        if include_drawing_rel {
+            rels.push_str(
+                r#"<Relationship Id="rIdDrawing1" Type="http://schemas.microsoft.com/office/2007/relationships/diagramDrawing" Target="../diagrams/drawing1.xml"/>"#,
+            );
+        }
+        for (path, bytes) in &mut parts {
+            let edited = match path.as_str() {
+                "ppt/slides/slide1.xml" => String::from_utf8(bytes.clone())
+                    .unwrap()
+                    .replace("</p:spTree>", &format!("{frame}</p:spTree>")),
+                "ppt/slides/_rels/slide1.xml.rels" => String::from_utf8(bytes.clone())
+                    .unwrap()
+                    .replace("</Relationships>", &format!("{rels}</Relationships>")),
+                _ => continue,
+            };
+            *bytes = edited.into_bytes();
+        }
+        if let Some(data) = data_xml {
+            parts.push(("ppt/diagrams/data1.xml".to_owned(), data.to_vec()));
+        }
+        parts.push((
+            "ppt/diagrams/drawing1.xml".to_owned(),
+            br#"<dsp:drawing xmlns:dsp="http://schemas.microsoft.com/office/drawing/2008/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dsp:spTree><dsp:nvGrpSpPr><dsp:cNvPr id="0" name=""/><dsp:cNvGrpSpPr/></dsp:nvGrpSpPr><dsp:grpSpPr/></dsp:spTree></dsp:drawing>"#.to_vec(),
+        ));
+        if let Some(layout) = layout_xml {
+            parts.push(("ppt/diagrams/layout1.xml".to_owned(), layout.to_vec()));
+        }
+        ooxml_opc::rezip_parts(&parts).unwrap()
+    }
+
+    fn synthesized_smartart_deck(text: &str) -> Vec<u8> {
+        let data = format!(
+            r#"<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt modelId="p1"><dgm:t><a:p><a:r><a:t>{text}</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#
+        );
+        smartart_test_deck(Some(data.as_bytes()), None, false)
+    }
+
+    #[test]
+    fn synthesized_smartart_boxes_follow_frame_resize() {
+        let deck = synthesized_smartart_deck("Resize me");
+        let session = DeckSession::open(&deck, 8_033).unwrap();
+        let initial = session.snapshot().unwrap();
+        let frame = initial.slides[0]
+            .shapes
+            .iter()
+            .find(|shape| shape.name == "SmartArt Diagram")
+            .unwrap();
+        let prefix = format!("{}:", frame.id);
+        let boxes = |session: &DeckSession| {
+            renderer()
+                .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+                .unwrap()
+                .display_list
+                .primitives
+                .into_iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::Shape {
+                        shape_id: Some(id),
+                        x,
+                        y,
+                        w,
+                        h,
+                        ..
+                    } if id.starts_with(&prefix) => Some((x, y, w, h)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = boxes(&session);
+        assert_eq!(before.len(), 1);
+        session
+            .resize_shape(
+                &EditCtx::local("test"),
+                &initial.slides[0].id,
+                &frame.id,
+                1_828_800,
+                3_657_600,
+            )
+            .unwrap();
+        let after = boxes(&session);
+        assert_eq!(after.len(), before.len());
+        for ((x, y, w, h), (rx, ry, rw, rh)) in before.iter().zip(&after) {
+            assert!(
+                (rw - w * 0.5).abs() < 0.01,
+                "box width must follow frame resize"
+            );
+            assert!(
+                (rh - h * 2.0).abs() < 0.01,
+                "box height must follow frame resize"
+            );
+            assert!((rx - 96.0 - (x - 96.0) * 0.5).abs() < 0.01);
+            assert!((ry - 96.0 - (y - 96.0) * 2.0).abs() < 0.01);
+        }
+        let reopened = DeckSession::open(&session.save().unwrap(), 8_034).unwrap();
+        for (current, saved) in after.iter().zip(boxes(&reopened)) {
+            assert!((current.0 - saved.0).abs() < 0.01 && (current.1 - saved.1).abs() < 0.01);
+            assert!((current.2 - saved.2).abs() < 0.01 && (current.3 - saved.3).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn synthesized_smartart_fits_long_text_inside_its_box() {
+        let text = "A long paragraph with several process details that must remain inside the diagram box. ".repeat(12);
+        let deck = synthesized_smartart_deck(&text);
+        let session = DeckSession::open(&deck, 8_035).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let frame = snapshot.slides[0]
+            .shapes
+            .iter()
+            .find(|shape| shape.name == "SmartArt Diagram")
+            .unwrap();
+        let prefix = format!("{}:", frame.id);
+        for (width, height) in [(3_657_600, 1_828_800), (1_828_800, 914_400)] {
+            session
+                .resize_shape(
+                    &EditCtx::local("test"),
+                    &snapshot.slides[0].id,
+                    &frame.id,
+                    width,
+                    height,
+                )
+                .unwrap();
+            let rendered = renderer()
+                .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+                .unwrap();
+            let mut found = false;
+            for primitive in &rendered.display_list.primitives {
+                if let Primitive::TextBox {
+                    shape_id: Some(id),
+                    x,
+                    y,
+                    w,
+                    h,
+                    lines,
+                    overflow,
+                    ..
+                } = primitive
+                    && id.starts_with(&prefix)
+                {
+                    found = true;
+                    assert!(!lines.is_empty());
+                    assert!(!overflow, "synthesized text must fit vertically");
+                    for line in lines {
+                        assert!(line.x >= x - 0.01 && line.y >= y - 0.01);
+                        assert!(
+                            line.x + line.width <= x + w + 0.01,
+                            "text line exceeds box width"
+                        );
+                        assert!(
+                            line.y + line.height <= y + h + 0.01,
+                            "text line exceeds box height"
+                        );
+                    }
+                    assert_eq!(lines.last().unwrap().end as usize, text.trim_end().len());
+                }
+            }
+            assert!(found);
+        }
+    }
+
+    #[test]
+    fn a_text_free_diagram_with_an_empty_drawing_renders_no_placeholder() {
+        let data = br#"<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt modelId="{0}" type="doc"/><dgm:pt modelId="{1}" type="pres"/></dgm:ptLst><dgm:cxnLst/></dgm:dataModel>"#;
+        for include_drawing_rel in [true, false] {
+            let deck = smartart_test_deck(Some(data), None, include_drawing_rel);
+            let session = DeckSession::open(&deck, 8_030).unwrap();
+            let rendered = renderer()
+                .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+                .unwrap();
+            assert!(
+                !rendered
+                    .display_list
+                    .primitives
+                    .iter()
+                    .any(|primitive| matches!(primitive, Primitive::Placeholder { .. }))
+            );
+        }
+
+        let missing_data = smartart_test_deck(None, None, false);
+        let session = DeckSession::open(&missing_data, 8_031).unwrap();
+        let rendered = renderer()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap();
+        assert!(rendered.display_list.primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                Primitive::Placeholder { name, label, .. }
+                    if name == "SmartArt Diagram" && label.as_deref() == Some("Diagram")
+            )
+        }));
+    }
+
+    #[test]
+    fn a_diagram_with_empty_drawing_synthesizes_boxes_within_its_frame_and_round_trips() {
+        let data = br#"<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt modelId="doc" type="doc"/><dgm:pt modelId="p1"><dgm:t><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Alpha</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt modelId="c1"><dgm:t><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Alpha detail</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt modelId="p2"><dgm:t><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Beta</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt modelId="c2"><dgm:t><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Beta detail</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst><dgm:cxnLst><dgm:cxn modelId="x1" srcId="doc" destId="p1" srcOrd="0"/><dgm:cxn modelId="x2" srcId="doc" destId="p2" srcOrd="1"/><dgm:cxn modelId="x3" srcId="p1" destId="c1" srcOrd="0"/><dgm:cxn modelId="x4" srcId="p2" destId="c2" srcOrd="0"/></dgm:cxnLst></dgm:dataModel>"#;
+        let layout = br#"<dgm:layoutDef xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" uniqueId="urn:microsoft.com/office/officeart/2005/8/layout/hList1"/>"#;
+        let deck = smartart_test_deck(Some(data), Some(layout), false);
+        let session = DeckSession::open(&deck, 8_032).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let diagram_shape_id = snapshot.slides[0]
+            .shapes
+            .iter()
+            .find(|shape| shape.name == "SmartArt Diagram")
+            .unwrap()
+            .id
+            .clone();
+        let prefix = format!("{diagram_shape_id}:");
+        let rendered = renderer()
+            .layout_slide(session.package(), &snapshot, 0)
+            .unwrap();
+        assert!(
+            !rendered
+                .display_list
+                .primitives
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Placeholder { .. }))
+        );
+        let boxes: Vec<_> = rendered
+            .display_list
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Shape {
+                    shape_id: Some(id),
+                    x,
+                    y,
+                    w,
+                    h,
+                    ..
+                } if id.starts_with(&prefix) => Some((*x, *y, *w, *h)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boxes.len(), 2);
+        for (x, y, w, h) in boxes {
+            assert!(
+                x >= 96.0 && y >= 96.0,
+                "box ({x}, {y}) outside frame origin"
+            );
+            assert!(w > 0.0 && h > 0.0);
+            assert!(
+                x + w <= 96.0 + 384.0 + 0.01 && y + h <= 96.0 + 192.0 + 0.01,
+                "box ({x}, {y}, {w}, {h}) exceeds frame bounds"
+            );
+        }
+        let texts: Vec<_> = rendered
+            .display_list
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::TextBox {
+                    shape_id: Some(id),
+                    paragraphs,
+                    ..
+                } if id.starts_with(&prefix) => Some(paragraphs),
+                _ => None,
+            })
+            .flat_map(|paragraphs| paragraphs.iter().flat_map(|paragraph| &paragraph.runs))
+            .map(|run| run.text.as_str())
+            .collect();
+        assert_eq!(texts, ["Alpha", "Alpha detail", "Beta", "Beta detail"]);
+
+        let saved = session.save().unwrap();
+        assert_eq!(
+            ooxml_opc::unzip_parts(&saved).unwrap(),
+            ooxml_opc::unzip_parts(&deck).unwrap()
+        );
+    }
+}
+
+#[cfg(any(not(target_arch = "wasm32"), feature = "font-registration"))]
+#[path = "native.rs"]
+mod native;

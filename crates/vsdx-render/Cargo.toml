@@ -1,0 +1,25 @@
+[package]
+name = "nimbleoffice-vsdx-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Rust-owned VSDX display-list compiler and hit testing."
+readme = "README.md"
+keywords = ["vsdx", "visio", "rendering"]
+categories = ["rendering", "graphics"]
+
+[lib]
+name = "vsdx_render"
+
+[dependencies]
+ooxml-drawingml.workspace = true
+ooxml-text.workspace = true
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+vsdx-eval.workspace = true
+vsdx-parse.workspace = true
+vsdx-resolve.workspace = true

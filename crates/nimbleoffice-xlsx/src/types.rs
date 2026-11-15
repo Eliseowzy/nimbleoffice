@@ -1,0 +1,245 @@
+use serde::{Deserialize, Serialize};
+use xlsx_model::{CellRange, CellRef, SheetId};
+
+use xlsx_ops::{
+    BorderLineStyle, BorderPreset, HorizontalAlignment, NumberFormatMutation, TextWrapping,
+    VerticalAlignment,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOrigin {
+    Local,
+    Remote,
+    /// Recalculation alone changed values; the shared document did not change, so `update`
+    /// is empty and is not for peers.
+    Recalculation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateEvent {
+    pub update: Vec<u8>,
+    pub origin: UpdateOrigin,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct CalculationOptions {
+    pub now_serial: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CellAddress {
+    pub sheet: SheetId,
+    pub cell: CellRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellInput {
+    pub cell: CellRef,
+    pub input: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellEdit {
+    pub cell: CellRef,
+    pub input: String,
+    pub is_formula: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSearchMatch {
+    pub address: CellAddress,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SheetInfo {
+    pub sheet_ids: Vec<String>,
+    pub sheet_names: Vec<String>,
+    pub active_sheet: SheetId,
+    pub content_width: f32,
+    pub content_height: f32,
+    pub frozen_rows: u32,
+    pub frozen_cols: u32,
+    pub initial_scroll_x: f32,
+    pub initial_scroll_y: f32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalculationResult {
+    pub changed: Vec<CellAddress>,
+    pub cycle_cells: Vec<CellAddress>,
+    pub limited_cells: Vec<CellAddress>,
+    /// the recalculation ran out of its shared budget: formulas it could not
+    /// evaluate kept their cached values, or show `#NUM!` without one.
+    #[serde(default)]
+    pub budget_exhausted: bool,
+    /// formula cells the engine could not compute, in address order. snapshots
+    /// and recovery checkpoints do not carry the list: a restored session
+    /// re-derives it from its formulas, which show the uncomputable calls and
+    /// their readers but not the engine's other gaps until a recalculation
+    /// evaluates them again.
+    #[serde(default)]
+    pub unevaluated_cells: Vec<UnevaluatedCell>,
+}
+
+/// a formula cell the engine could not compute, because it calls a function
+/// no offline engine can (`WEBSERVICE`, `RTD`, a `CUBE` function, an add-in)
+/// or reads a cell that does, or meets another gap of the engine, whose
+/// readers recalculate from the value it keeps. it keeps the value excel saved,
+/// or stays blank when the file saved none, unless only an engine gap was
+/// involved, which shows its error; excel recalculates it on open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnevaluatedCell {
+    pub address: CellAddress,
+    /// the uncomputable functions involved, sorted; empty when only gaps of
+    /// this engine were.
+    pub functions: Vec<String>,
+}
+
+/// where a timed mutation stands; see [`Workbook::edit_cell_profiled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditStage {
+    Validated,
+    Applied,
+    Recalculated,
+}
+
+/// stage latencies of one profiled mutation, in milliseconds. the clock comes
+/// from the caller, so the ordinary mutation path pays no timer calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditProfile {
+    pub validate_ms: f64,
+    pub apply_ms: f64,
+    pub recalc_ms: f64,
+    pub result_ms: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MutationResult {
+    pub applied: bool,
+    pub changed: Vec<CellAddress>,
+    pub cycle_cells: Vec<CellAddress>,
+    pub limited_cells: Vec<CellAddress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NumberFormatKind {
+    Automatic,
+    PlainText,
+    Number,
+    Percent,
+    Scientific,
+    Currency,
+    Date,
+    Time,
+    Custom,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionFormatting {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number_format: Option<NumberFormatKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number_format_pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strikethrough: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border_preset: Option<BorderPreset>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border_style: Option<BorderLineStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horizontal_alignment: Option<HorizontalAlignment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vertical_alignment: Option<VerticalAlignment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_wrapping: Option<TextWrapping>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryState {
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub undo_depth: usize,
+    pub redo_depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalEditInput {
+    pub sheet: SheetId,
+    pub cell: CellRef,
+    pub input: String,
+    pub number_format: Option<NumberFormatMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalRequest {
+    pub agent_id: String,
+    pub note: Option<String>,
+    pub edits: Vec<ProposalEditInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalAcceptance {
+    pub proposal_id: String,
+    pub mutation: MutationResult,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PngTarget {
+    Viewport {
+        sheet: SheetId,
+        viewport: crate::Viewport,
+    },
+    Range {
+        sheet: SheetId,
+        range: CellRange,
+    },
+    /// The sheet's used range at render time.
+    UsedRange {
+        sheet: SheetId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderOptions {
+    pub range: Option<CellRange>,
+    pub scale: f32,
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            range: None,
+            scale: 1.0,
+            max_width: None,
+            max_height: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedPng {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}

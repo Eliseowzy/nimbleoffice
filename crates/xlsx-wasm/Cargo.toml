@@ -1,0 +1,29 @@
+[package]
+name = "xlsx-wasm"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "The single wasm-bindgen boundary: coarse JSON-string calls over the workbook core. Thin by design."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["raster", "peer-snapshot"]
+raster = ["nimbleoffice-xlsx/raster", "nimbleoffice-xlsx-engine/raster"]
+peer-snapshot = []
+
+[dependencies]
+nimbleoffice-fonts = { workspace = true }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nimbleoffice-xlsx = { workspace = true, default-features = false }
+nimbleoffice-xlsx-engine = { path = "../xlsx-engine", default-features = false }
+
+[dev-dependencies]
+ooxml-opc.workspace = true
+xlsx-model.workspace = true
+xlsx-parse.workspace = true

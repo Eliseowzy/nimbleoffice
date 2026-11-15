@@ -1,0 +1,450 @@
+import type {
+  ParagraphFormatting,
+  TableCellFormatting,
+  TableCellPropertyChange,
+  TableFormatting,
+  TablePropertyChange,
+  TableRowFormatting,
+  TableRowPropertyChange,
+} from '../types/document';
+import type { RevisionInfo } from '../types/content/trackedChange';
+
+export interface ParagraphSaveAttrs extends Record<string, unknown> {
+  alignment?: ParagraphFormatting['alignment'];
+  spaceBefore?: number;
+  spaceAfter?: number;
+  spaceBeforeLines?: number;
+  spaceAfterLines?: number;
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
+  lineSpacing?: number;
+  lineSpacingRule?: ParagraphFormatting['lineSpacingRule'];
+  indentLeft?: number;
+  indentRight?: number;
+  indentFirstLine?: number;
+  hangingIndent?: boolean;
+  numPr?: ParagraphFormatting['numPr'];
+  numPrFromStyle?: ParagraphFormatting['numPr'];
+  styleId?: string;
+  borders?: ParagraphFormatting['borders'];
+  shading?: ParagraphFormatting['shading'];
+  tabs?: ParagraphFormatting['tabs'];
+  outlineLevel?: number;
+  contextualSpacing?: boolean;
+  pageBreakBefore?: boolean;
+  widowControl?: boolean | null;
+  autoSpaceDE?: boolean | null;
+  autoSpaceDN?: boolean | null;
+  adjustRightInd?: boolean | null;
+  cnfStyle?: ParagraphFormatting['cnfStyle'];
+  bidi?: boolean;
+  _originalFormatting?: ParagraphFormatting;
+  _originalRunBoundaries?: unknown[];
+}
+
+function isStyleSourcedNumPr(attrs: ParagraphSaveAttrs): boolean {
+  return (
+    attrs.numPrFromStyle != null &&
+    attrs.numPr != null &&
+    JSON.stringify(attrs.numPr) === JSON.stringify(attrs.numPrFromStyle)
+  );
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return left === right || JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** Whether `attrs[key]` only restates what the paragraph inherits and `orig` leaves unset. */
+function inheritsValue(
+  attrs: ParagraphSaveAttrs,
+  orig: ParagraphFormatting,
+  inherited: ParagraphFormatting | undefined,
+  key: keyof ParagraphFormatting
+): boolean {
+  return (
+    orig[key] === undefined &&
+    inherited?.[key] !== undefined &&
+    sameValue(attrs[key], inherited[key])
+  );
+}
+
+/**
+ * `formatting` without the values that only restate `inherited`, the
+ * docDefaults and style properties the paragraph inherits.
+ */
+function withoutInherited(
+  formatting: ParagraphFormatting,
+  inherited: ParagraphFormatting
+): ParagraphFormatting | undefined {
+  const result: ParagraphFormatting = { ...formatting };
+  const drop = (keys: (keyof ParagraphFormatting)[], same: boolean) => {
+    if (same) for (const key of keys) delete result[key];
+  };
+  for (const key of Object.keys(result) as (keyof ParagraphFormatting)[]) {
+    if (
+      key === 'styleId' ||
+      key === 'numPr' ||
+      key === 'lineSpacing' ||
+      key === 'lineSpacingRule' ||
+      key === 'indentFirstLine' ||
+      key === 'hangingIndent'
+    ) {
+      continue;
+    }
+    drop([key], inherited[key] !== undefined && sameValue(result[key], inherited[key]));
+  }
+  drop(
+    ['lineSpacing', 'lineSpacingRule'],
+    inherited.lineSpacing !== undefined &&
+      result.lineSpacing === inherited.lineSpacing &&
+      (result.lineSpacingRule ?? 'auto') === (inherited.lineSpacingRule ?? 'auto')
+  );
+  return Object.values(result).some((value) => value !== undefined) ? result : undefined;
+}
+
+/**
+ * The paragraph formatting `attrs` save as. `inherited`, when given, is what
+ * the paragraph inherits from docDefaults and its style: values that only
+ * restate it are left out, so inherited properties stay inherited.
+ */
+export function paragraphAttrsToFormatting(
+  attrs: ParagraphSaveAttrs,
+  inherited?: ParagraphFormatting
+): ParagraphFormatting | undefined {
+  if (attrs._originalFormatting) {
+    const orig = attrs._originalFormatting;
+    const result = { ...orig };
+    const inherits = (key: keyof ParagraphFormatting) =>
+      inheritsValue(attrs, orig, inherited, key);
+    if (!inherits('alignment') && attrs.alignment !== (orig.alignment || undefined)) {
+      result.alignment = attrs.alignment || undefined;
+    }
+    if (isStyleSourcedNumPr(attrs)) {
+      delete result.numPr;
+      delete result.numPrFromStyle;
+    } else if (
+      attrs.numPr !== orig.numPr &&
+      JSON.stringify(attrs.numPr) !== JSON.stringify(orig.numPr)
+    ) {
+      result.numPr = attrs.numPr || undefined;
+      delete result.numPrFromStyle;
+    }
+    if (attrs.styleId !== (orig.styleId || undefined)) {
+      result.styleId = attrs.styleId || undefined;
+    }
+    if (
+      !inherits('pageBreakBefore') &&
+      attrs.pageBreakBefore !== (orig.pageBreakBefore || undefined)
+    ) {
+      result.pageBreakBefore = attrs.pageBreakBefore || undefined;
+    }
+    if (!inherits('widowControl') && attrs.widowControl !== (orig.widowControl ?? undefined)) {
+      result.widowControl = attrs.widowControl ?? undefined;
+    }
+    if (!inherits('autoSpaceDE') && attrs.autoSpaceDE !== (orig.autoSpaceDE ?? undefined)) {
+      result.autoSpaceDE = attrs.autoSpaceDE ?? undefined;
+    }
+    if (!inherits('autoSpaceDN') && attrs.autoSpaceDN !== (orig.autoSpaceDN ?? undefined)) {
+      result.autoSpaceDN = attrs.autoSpaceDN ?? undefined;
+    }
+    if (
+      !inherits('adjustRightInd') &&
+      attrs.adjustRightInd !== (orig.adjustRightInd ?? undefined)
+    ) {
+      result.adjustRightInd = attrs.adjustRightInd ?? undefined;
+    }
+    if (attrs.cnfStyle != null && !sameValue(attrs.cnfStyle, orig.cnfStyle)) {
+      result.cnfStyle = attrs.cnfStyle;
+    }
+    if (!inherits('bidi') && attrs.bidi !== (orig.bidi || undefined)) {
+      result.bidi = attrs.bidi || undefined;
+    }
+    return result;
+  }
+
+  const hasFormatting =
+    attrs.alignment ||
+    attrs.spaceBefore != null ||
+    attrs.spaceAfter != null ||
+    attrs.spaceBeforeLines != null ||
+    attrs.spaceAfterLines != null ||
+    attrs.beforeAutospacing != null ||
+    attrs.afterAutospacing != null ||
+    attrs.lineSpacing ||
+    attrs.indentLeft ||
+    attrs.indentRight ||
+    attrs.indentFirstLine ||
+    attrs.numPr ||
+    attrs.styleId ||
+    attrs.borders ||
+    attrs.shading ||
+    attrs.tabs ||
+    attrs.outlineLevel != null ||
+    attrs.contextualSpacing ||
+    attrs.pageBreakBefore ||
+    attrs.widowControl != null ||
+    attrs.autoSpaceDE != null ||
+    attrs.autoSpaceDN != null ||
+    attrs.adjustRightInd != null ||
+    attrs.cnfStyle ||
+    attrs.bidi;
+  if (!hasFormatting) return undefined;
+
+  const formatting: ParagraphFormatting = {
+    alignment: attrs.alignment || undefined,
+    spaceBefore: attrs.spaceBefore ?? undefined,
+    spaceAfter: attrs.spaceAfter ?? undefined,
+    spaceBeforeLines: attrs.spaceBeforeLines ?? undefined,
+    spaceAfterLines: attrs.spaceAfterLines ?? undefined,
+    beforeAutospacing: attrs.beforeAutospacing ?? undefined,
+    afterAutospacing: attrs.afterAutospacing ?? undefined,
+    lineSpacing: attrs.lineSpacing || undefined,
+    lineSpacingRule: attrs.lineSpacingRule || undefined,
+    indentLeft: attrs.indentLeft || undefined,
+    indentRight: attrs.indentRight || undefined,
+    indentFirstLine: attrs.indentFirstLine || undefined,
+    hangingIndent: attrs.hangingIndent || undefined,
+    numPr: isStyleSourcedNumPr(attrs) ? undefined : attrs.numPr || undefined,
+    styleId: attrs.styleId || undefined,
+    borders: attrs.borders || undefined,
+    shading: attrs.shading || undefined,
+    tabs: attrs.tabs || undefined,
+    outlineLevel: attrs.outlineLevel ?? undefined,
+    contextualSpacing: attrs.contextualSpacing || undefined,
+    pageBreakBefore: attrs.pageBreakBefore || undefined,
+    widowControl: attrs.widowControl ?? undefined,
+    autoSpaceDE: attrs.autoSpaceDE ?? undefined,
+    autoSpaceDN: attrs.autoSpaceDN ?? undefined,
+    adjustRightInd: attrs.adjustRightInd ?? undefined,
+    cnfStyle: attrs.cnfStyle || undefined,
+    bidi: attrs.bidi || undefined,
+  };
+  return inherited ? withoutInherited(formatting, inherited) : formatting;
+}
+
+export interface TableSaveAttrs extends Record<string, unknown> {
+  styleId?: string;
+  width?: number;
+  widthType?: string;
+  justification?: TableFormatting['justification'];
+  columnWidths?: number[];
+  tableLayout?: TableFormatting['layout'];
+  floating?: TableFormatting['floating'];
+  cellMargins?: { top?: number; bottom?: number; left?: number; right?: number };
+  _originalResolvedMargins?: TableSaveAttrs['cellMargins'];
+  look?: TableFormatting['look'];
+  bidi?: boolean;
+  _originalFormatting?: TableFormatting;
+  tblPrChange?: TablePropertyChange[] | null;
+}
+
+export function tableAttrsToFormatting(attrs: TableSaveAttrs): TableFormatting | undefined {
+  const margins = sameValue(attrs.cellMargins, attrs._originalResolvedMargins)
+    ? attrs._originalFormatting?.cellMargins
+    : attrs.cellMargins ? measurementMargins(attrs.cellMargins) : undefined;
+  if (attrs._originalFormatting) {
+    const orig = attrs._originalFormatting;
+    const result = { ...orig };
+    if (attrs.styleId !== (orig.styleId || undefined)) result.styleId = attrs.styleId || undefined;
+    if (attrs.justification !== (orig.justification || undefined)) {
+      result.justification = attrs.justification || undefined;
+    }
+    if (attrs.floating !== (orig.floating || undefined)) {
+      result.floating = attrs.floating || undefined;
+    }
+    if (attrs.tableLayout !== (orig.layout || undefined)) {
+      result.layout = attrs.tableLayout || undefined;
+    }
+    if (attrs.look !== (orig.look || undefined)) result.look = attrs.look || undefined;
+    if (attrs.bidi !== (orig.bidi || undefined)) result.bidi = attrs.bidi || undefined;
+    if (attrs.width !== orig.width?.value || attrs.widthType !== orig.width?.type) {
+      result.width =
+        attrs.width != null || attrs.widthType
+          ? {
+              value: attrs.width ?? 0,
+              type: (attrs.widthType as 'auto' | 'dxa' | 'pct' | 'nil') || 'dxa',
+            }
+          : undefined;
+    }
+    if (margins !== orig.cellMargins) result.cellMargins = margins;
+    return result;
+  }
+
+  const hasFormatting =
+    attrs.styleId ||
+    attrs.width != null ||
+    attrs.widthType ||
+    attrs.justification ||
+    attrs.tableLayout ||
+    attrs.floating ||
+    margins ||
+    attrs.look ||
+    attrs.bidi;
+  if (!hasFormatting) return undefined;
+  return {
+    styleId: attrs.styleId || undefined,
+    width:
+      attrs.width != null || attrs.widthType
+        ? {
+            value: attrs.width ?? 0,
+            type: (attrs.widthType as 'auto' | 'dxa' | 'pct' | 'nil') || 'dxa',
+          }
+        : undefined,
+    justification: attrs.justification || undefined,
+    layout: attrs.tableLayout || undefined,
+    floating: attrs.floating || undefined,
+    cellMargins: margins,
+    look: attrs.look || undefined,
+    bidi: attrs.bidi || undefined,
+  };
+}
+
+function measurementMargins(margins: {
+  top?: number;
+  bottom?: number;
+  left?: number;
+  right?: number;
+}): NonNullable<TableFormatting['cellMargins']> {
+  return {
+    top: margins.top != null ? { value: margins.top, type: 'dxa' } : undefined,
+    bottom: margins.bottom != null ? { value: margins.bottom, type: 'dxa' } : undefined,
+    left: margins.left != null ? { value: margins.left, type: 'dxa' } : undefined,
+    right: margins.right != null ? { value: margins.right, type: 'dxa' } : undefined,
+  };
+}
+
+export interface TableRowSaveAttrs extends Record<string, unknown> {
+  _extraAttributes?: { name: string; value: string }[];
+  height?: number;
+  heightRule?: string;
+  isHeader?: boolean;
+  _originalFormatting?: TableRowFormatting;
+  trIns?: RevisionInfo | null;
+  trDel?: RevisionInfo | null;
+  trPrChange?: TableRowPropertyChange[] | null;
+}
+
+export function tableRowAttrsToFormatting(
+  attrs: TableRowSaveAttrs
+): TableRowFormatting | undefined {
+  if (attrs._originalFormatting) {
+    const orig = attrs._originalFormatting;
+    const result = { ...orig };
+    if (attrs.height !== (orig.height?.value || undefined)) {
+      result.height = attrs.height ? { value: attrs.height, type: 'dxa' } : undefined;
+    }
+    if (attrs.heightRule !== (orig.heightRule || undefined)) {
+      result.heightRule = (attrs.heightRule as 'auto' | 'atLeast' | 'exact') || undefined;
+    }
+    if (attrs.isHeader !== (orig.header || undefined)) {
+      result.header = attrs.isHeader || undefined;
+    }
+    return result;
+  }
+  if (!attrs.height && !attrs.isHeader) return undefined;
+  return {
+    height: attrs.height ? { value: attrs.height, type: 'dxa' } : undefined,
+    heightRule: (attrs.heightRule as 'auto' | 'atLeast' | 'exact') || undefined,
+    header: attrs.isHeader || undefined,
+  };
+}
+
+export interface TableCellSaveAttrs extends Record<string, unknown> {
+  colspan: number;
+  rowspan: number;
+  width?: number;
+  widthType?: string;
+  verticalAlign?: TableCellFormatting['verticalAlign'];
+  backgroundColor?: string;
+  textDirection?: TableCellFormatting['textDirection'];
+  borders?: TableCellFormatting['borders'];
+  margins?: { top?: number; bottom?: number; left?: number; right?: number };
+  _originalFormatting?: TableCellFormatting;
+  _originalResolvedFill?: string;
+  _originalResolvedBorders?: TableCellSaveAttrs['borders'];
+  _originalResolvedMargins?: TableCellSaveAttrs['margins'];
+  cellMarker?:
+    | { kind: 'ins'; info: RevisionInfo }
+    | { kind: 'del'; info: RevisionInfo }
+    | {
+        kind: 'merge';
+        info: RevisionInfo;
+        vMerge: 'rest' | 'cont';
+        vMergeOrig?: 'rest' | 'cont';
+      }
+    | null;
+  tcPrChange?: TableCellPropertyChange[] | null;
+}
+
+export function tableCellAttrsToFormatting(
+  attrs: TableCellSaveAttrs
+): TableCellFormatting | undefined {
+  const borders = sameValue(attrs.borders, attrs._originalResolvedBorders)
+    ? attrs._originalFormatting?.borders : attrs.borders || undefined;
+  const margins = sameValue(attrs.margins, attrs._originalResolvedMargins)
+    ? attrs._originalFormatting?.margins
+    : attrs.margins ? cellMargins(attrs.margins) : undefined;
+  if (attrs._originalFormatting) {
+    const orig = attrs._originalFormatting;
+    const result = { ...orig };
+    if (attrs.colspan > 1) result.gridSpan = attrs.colspan;
+    if (attrs.width != null) {
+      result.width = {
+        value: attrs.width,
+        type: (attrs.widthType as 'auto' | 'dxa' | 'pct' | 'nil') || 'dxa',
+      };
+    }
+    if (attrs.verticalAlign !== (orig.verticalAlign || undefined)) {
+      result.verticalAlign = attrs.verticalAlign || undefined;
+    }
+    if ((attrs.backgroundColor ?? null) !== (attrs._originalResolvedFill ?? null)) {
+      result.shading = attrs.backgroundColor ? { fill: { rgb: attrs.backgroundColor } } : undefined;
+    }
+    if (borders !== orig.borders) result.borders = borders;
+    if (margins !== orig.margins) result.margins = margins;
+    if (attrs.textDirection !== (orig.textDirection || undefined)) {
+      result.textDirection = attrs.textDirection || undefined;
+    }
+    return result;
+  }
+
+  const hasFormatting =
+    attrs.colspan > 1 ||
+    attrs.rowspan > 1 ||
+    attrs.width != null ||
+    attrs.verticalAlign ||
+    attrs.backgroundColor ||
+    borders ||
+    margins ||
+    attrs.textDirection;
+  if (!hasFormatting) return undefined;
+  return {
+    gridSpan: attrs.colspan > 1 ? attrs.colspan : undefined,
+    width:
+      attrs.width != null
+        ? {
+            value: attrs.width,
+            type: (attrs.widthType as 'auto' | 'dxa' | 'pct' | 'nil') || 'dxa',
+          }
+        : undefined,
+    verticalAlign: attrs.verticalAlign || undefined,
+    textDirection: attrs.textDirection || undefined,
+    shading: attrs.backgroundColor ? { fill: { rgb: attrs.backgroundColor } } : undefined,
+    borders,
+    margins,
+  };
+}
+
+function cellMargins(margins: {
+  top?: number;
+  bottom?: number;
+  left?: number;
+  right?: number;
+}): NonNullable<TableCellFormatting['margins']> {
+  const result: NonNullable<TableCellFormatting['margins']> = {};
+  if (margins.top != null) result.top = { value: margins.top, type: 'dxa' };
+  if (margins.bottom != null) result.bottom = { value: margins.bottom, type: 'dxa' };
+  if (margins.left != null) result.left = { value: margins.left, type: 'dxa' };
+  if (margins.right != null) result.right = { value: margins.right, type: 'dxa' };
+  return result;
+}

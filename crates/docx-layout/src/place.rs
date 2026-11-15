@@ -1,0 +1,5960 @@
+//! The placement walk: measured blocks in, pages of positioned fragments out.
+//!
+//! One pass over the measured list, a per-kind placer for each block, the
+//! paginator holding page and column state, and every look-ahead answered from
+//! the prescan plan rather than by re-scanning. Contextual spacing
+//! (`w:contextualSpacing`, ECMA-376 §17.3.1.9) is folded into adjacent
+//! same-style paragraphs before the walk starts, recursing through table cells.
+//!
+//! Each block is processed in a fixed order: record a checkpoint if placement
+//! stands at a pristine page start; force a page when the block carries
+//! `w:pageBreakBefore` or opens with a hard `w:br w:type="page"` run, either
+//! carrying the paragraph's space-before onto the new page; at the head of a
+//! keep-with-next group, force a page when the group would otherwise straddle
+//! the boundary; then dispatch to the placer.
+//! A section break reads the *next* section's configuration and break type,
+//! falling back to the current break's when the plan has no successor. Column
+//! balancing runs over the range up to the next section break, both at the start
+//! of the document and after each break that opens multi-column geometry, except
+//! when that range ends with `nextColumn` and its successor needs the full band.
+//!
+//! Unknown block and run kinds raise `Unsupported` rather than being silently
+//! dropped, and a measure whose kind disagrees with its block raises `Invalid`.
+//!
+//! Anchored images and floating text boxes overlay the page and never move the
+//! pen; inline images, shapes, charts and inline text boxes consume their
+//! measured bbox in flow. Paragraph placement is described on
+//! `layout_paragraph`.
+//!
+//! Checkpoints are resume bookmarks at pristine page starts. They stay resident
+//! and never appear in a serialized `Layout`. [`layout_document_incremental`]
+//! restarts from the last checkpoint before the edit and stops as soon as
+//! page-start geometry and the measured suffix converge with the retained
+//! layout, so an edit late in a document does not re-place everything above it.
+
+use crate::LayoutError;
+use crate::hooks;
+use crate::keep_together::{
+    KeepRun, paragraph_can_split, paragraph_is_unbreakable, paragraph_min_leading_slice,
+    paragraph_min_trailing_slice, paragraph_widow_control,
+};
+use crate::line_fit::{slice_fit_height, trailing_leading};
+use crate::line_geometry::{HorizontalLineGeometry, horizontal_line_box, runs_base_is_rtl};
+use crate::page_flow::{PageFlowGeometry, Paginator};
+use crate::paragraph_spacing::{
+    apply_contextual_spacing_measured, get_spacing_after, get_spacing_before,
+};
+use crate::prescan::{LayoutPlan, SectionLayoutConfig, default_columns, prescan};
+use crate::resolve_lines::{ResolvedLine, ResolvedSegment, resolve_line_segments, utf16_len};
+use crate::section_breaks::resolve_page_margins;
+use crate::types::{
+    BlockExtent, BlockId, ChartBlock, ChartExtent, ChartFragment, Fragment, ImageBlock,
+    ImageExtent, ImageFragment, ImageRunPosition, Input, Layout, LayoutBlock, MeasuredBlock,
+    ParagraphBlock, ParagraphExtent, ParagraphFragment, ReservedBlock, ReservedFragment, Run,
+    SectionBreakType, ShapeBlock, ShapeExtent, ShapeFragment, Size, TextBoxBlock, TextBoxExtent,
+    TextBoxFragment,
+};
+
+/// Default page size (US Letter in pixels at 96 DPI).
+const DEFAULT_PAGE_SIZE: Size = Size {
+    w: 816.0,
+    h: 1056.0,
+};
+
+/// A restart point at the beginning of a pristine page. These bookmarks stay
+/// resident in Rust and are deliberately absent from serialized `Layout`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayoutCheckpoint {
+    pub block_index: usize,
+    pub section_index: usize,
+    pub page_index: usize,
+    pub page_number: u32,
+    pub flow: PageFlowGeometry,
+}
+
+/// Resident result of one placement pass, including execution metadata used
+/// by the editor engine to propagate dirty-page damage.
+#[derive(Debug)]
+pub struct CheckpointedLayout {
+    pub layout: Layout,
+    pub checkpoints: Vec<LayoutCheckpoint>,
+    pub placed_blocks: usize,
+    pub rebuilt_page_start: usize,
+    pub rebuilt_page_end: usize,
+}
+
+/// [`CheckpointedLayout`] of an incremental pass with the page ranges it placed afresh.
+#[derive(Debug)]
+pub struct IncrementalLayout {
+    pub checkpointed: CheckpointedLayout,
+    /// Ascending within `rebuilt_page_start..rebuilt_page_end`; the pages between
+    /// them are retained.
+    pub rebuilt_page_ranges: Vec<std::ops::Range<usize>>,
+}
+
+struct ConvergenceInput<'a, F: PartialEq> {
+    previous_checkpoints: &'a [LayoutCheckpoint],
+    previous_fingerprints: &'a [F],
+    next_fingerprints: &'a [F],
+    dirty_index: usize,
+    /// Every dirty block, ascending, when the block count is unchanged.
+    dirty: Option<&'a [usize]>,
+    /// Whether placement may skip the clean pages between dirty blocks.
+    skippable: bool,
+    keep_with_next: &'a crate::keep_together::KeepWithNextScan,
+    measured: &'a [MeasuredBlock],
+    previous_pages: &'a [crate::types::Page],
+    /// The last dirty block looked up, with the latest resumable checkpoint
+    /// ahead of its restart.
+    resume_before: std::cell::Cell<Option<(usize, Option<usize>)>>,
+}
+
+/// Where a placement walk met the retained layout.
+enum Convergence {
+    /// Every later block and page start matches: the retained suffix follows.
+    Suffix {
+        next: LayoutCheckpoint,
+        previous: LayoutCheckpoint,
+    },
+    /// The retained pages up to `resume` follow unchanged, and placement
+    /// resumes there ahead of the next dirty block.
+    Skip {
+        previous: LayoutCheckpoint,
+        resume: LayoutCheckpoint,
+        dirty_index: usize,
+    },
+}
+
+fn pristine_paragraph_start(
+    block_index: usize,
+    measured: &[MeasuredBlock],
+    page: &crate::types::Page,
+) -> bool {
+    let Some(block) = measured.get(block_index) else {
+        return false;
+    };
+    let Some(Fragment::Paragraph(fragment)) = page.fragments.first() else {
+        return false;
+    };
+    page.columns
+        .as_ref()
+        .is_none_or(|columns| columns.count <= 1.0)
+        && page.float_bands.is_empty()
+        && Some(&fragment.block_id) == block.block.block_id()
+        && fragment.from_line == 0
+        && fragment.carried_from_prev != Some(true)
+        && (crate::break_policy::breaks_before_block(&block.block).is_some()
+            || block_index
+                .checked_sub(1)
+                .and_then(|before| measured.get(before))
+                .is_some_and(|before| {
+                    matches!(
+                        before.block,
+                        LayoutBlock::PageBreak(_) | LayoutBlock::ColumnBreak(_)
+                    )
+                }))
+}
+
+fn is_floating_drawing(block: &LayoutBlock) -> bool {
+    match block {
+        LayoutBlock::Shape(shape) => shape.position.is_some(),
+        LayoutBlock::TextBox(text_box) => is_floating_text_box_block(text_box),
+        LayoutBlock::Table(table) => table.floating.is_some(),
+        LayoutBlock::Image(image) => is_anchored_image(image),
+        _ => false,
+    }
+}
+
+fn is_anchored_image(image: &ImageBlock) -> bool {
+    image
+        .anchor
+        .as_ref()
+        .and_then(|anchor| anchor.is_anchored)
+        .unwrap_or(false)
+}
+
+fn has_lead_float_skip(measured: &MeasuredBlock) -> bool {
+    matches!(&measured.measure, BlockExtent::Paragraph(extent)
+        if extent.lines.first().and_then(|line| line.float_skip_before)
+            .is_some_and(|skip| skip > 0.0))
+}
+
+impl<F: PartialEq> ConvergenceInput<'_, F> {
+    fn retained_match(
+        &self,
+        checkpoint: &LayoutCheckpoint,
+        opening_fragment_geometry: Option<&crate::page_flow::OpeningFragmentGeometry>,
+    ) -> Option<Convergence> {
+        // A lead skip's drop depends on the floats right before its paragraph,
+        // which a retained suffix would not re-check.
+        if checkpoint.block_index <= self.dirty_index
+            || self
+                .measured
+                .get(checkpoint.block_index..)
+                .and_then(|rest| rest.iter().find(|block| !is_floating_drawing(&block.block)))
+                .is_some_and(has_lead_float_skip)
+        {
+            return None;
+        }
+        let suffix_matches = match self.dirty {
+            Some(dirty) => dirty
+                .last()
+                .is_none_or(|&last| last < checkpoint.block_index),
+            None => {
+                self.previous_fingerprints.get(checkpoint.block_index..)
+                    == self.next_fingerprints.get(checkpoint.block_index..)
+            }
+        };
+        if !suffix_matches && !self.skippable {
+            return None;
+        }
+        // Checkpoints are in placement order, so those of one block are adjacent.
+        let first = self
+            .previous_checkpoints
+            .partition_point(|previous| previous.block_index < checkpoint.block_index);
+        let previous = self.previous_checkpoints[first..]
+            .iter()
+            .take_while(|previous| previous.block_index == checkpoint.block_index)
+            .find(|previous| {
+                previous.section_index == checkpoint.section_index
+                    && previous.page_number == checkpoint.page_number
+                    && self
+                        .previous_pages
+                        .get(previous.page_index)
+                        .is_some_and(|page| {
+                            page.opening_fragment_geometry.as_deref() == opening_fragment_geometry
+                        })
+                    && if suffix_matches {
+                        flow_matches_from_page(
+                            &previous.flow,
+                            &checkpoint.flow,
+                            checkpoint.page_number,
+                        )
+                    } else {
+                        previous.flow == checkpoint.flow
+                    }
+            })?;
+        if suffix_matches {
+            return Some(Convergence::Suffix {
+                next: checkpoint.clone(),
+                previous: previous.clone(),
+            });
+        }
+        if previous.page_index != checkpoint.page_index {
+            return None;
+        }
+        let dirty = self.dirty?;
+        let next_dirty =
+            *dirty.get(dirty.partition_point(|&index| index < checkpoint.block_index))?;
+        let resume_index = match self.resume_before.get() {
+            Some((dirty_index, resume)) if dirty_index == next_dirty => resume,
+            _ => {
+                let restart = restart_index(self.keep_with_next, next_dirty);
+                let end = self
+                    .previous_checkpoints
+                    .partition_point(|resume| resume.block_index < restart);
+                let resume = self.previous_checkpoints[..end]
+                    .iter()
+                    .rposition(|resume| resumable(resume, self.measured, self.previous_pages));
+                self.resume_before.set(Some((next_dirty, resume)));
+                resume
+            }
+        };
+        let resume = &self.previous_checkpoints[resume_index?];
+        if resume.page_index <= previous.page_index {
+            return None;
+        }
+        Some(Convergence::Skip {
+            previous: previous.clone(),
+            resume: resume.clone(),
+            dirty_index: next_dirty,
+        })
+    }
+}
+
+fn flow_matches_from_page(
+    previous: &PageFlowGeometry,
+    next: &PageFlowGeometry,
+    page_number: u32,
+) -> bool {
+    if previous == next {
+        return true;
+    }
+    let mut flow = previous.clone();
+    flow.footnote_reserved_heights
+        .clone_from(&next.footnote_reserved_heights);
+    if flow != *next {
+        return false;
+    }
+    let previous = previous.footnote_reserved_heights.as_deref();
+    let next = next.footnote_reserved_heights.as_deref();
+    let reservation = |heights: Option<&std::collections::BTreeMap<String, f64>>, page: u32| {
+        heights
+            .and_then(|heights| heights.get(&page.to_string()).copied())
+            .unwrap_or(0.0)
+    };
+    previous
+        .into_iter()
+        .flat_map(|heights| heights.keys())
+        .chain(next.into_iter().flat_map(|heights| heights.keys()))
+        .filter_map(|key| key.parse::<u32>().ok())
+        .filter(|&page| page > 0 && page >= page_number)
+        .all(|page| reservation(previous, page) == reservation(next, page))
+}
+
+/// Whether placement restarted at `checkpoint` lays out what follows as the walk
+/// that recorded it did. A queued section geometry belongs to the page after the
+/// checkpoint's; a block that opened a page whose geometry differs from the page
+/// before was fitted under the earlier geometry; a table's rows were fitted
+/// against the room left on the page before; and a floating or anchored object
+/// that opened its page would be placed again from its anchor's offset, as
+/// would a paragraph whose first-line clearance depends on earlier floats.
+/// The first page restarts from the document's origin instead.
+fn resumable(
+    checkpoint: &LayoutCheckpoint,
+    measured: &[MeasuredBlock],
+    pages: &[crate::types::Page],
+) -> bool {
+    let Some(MeasuredBlock {
+        block: LayoutBlock::Paragraph(block),
+        ..
+    }) = measured.get(checkpoint.block_index)
+    else {
+        return false;
+    };
+    if has_lead_float_skip(&measured[checkpoint.block_index]) {
+        return false;
+    }
+    let Some(page) = pages.get(checkpoint.page_index) else {
+        return false;
+    };
+    let mut fragments = page.fragments.iter().filter_map(|fragment| match fragment {
+        Fragment::Paragraph(fragment) if fragment.block_id == block.id => Some(fragment),
+        _ => None,
+    });
+    let starts_paragraph = fragments.next().is_some_and(|fragment| {
+        fragment.from_line == 0 && fragment.carried_from_prev != Some(true)
+    }) && (fragments.next().is_none()
+        || pristine_paragraph_start(checkpoint.block_index, measured, page));
+    let flow = &checkpoint.flow;
+    checkpoint.page_index > 0
+        && page.opening_fragment_geometry.is_none()
+        && starts_paragraph
+        && flow.pending_page_size.is_none()
+        && flow.pending_margins.is_none()
+        && flow.pending_columns.is_none()
+}
+
+/// Checkpoints in placement order: by block, then by page for a block that
+/// opens two.
+fn checkpoint_order(checkpoint: &LayoutCheckpoint) -> (usize, usize) {
+    (checkpoint.block_index, checkpoint.page_index)
+}
+
+/// The block placement resumes before for a change at `dirty_index`. A dirty
+/// block that opened a page may now start on the one before it (a removed page
+/// break, a paragraph that now fits), and one inside or right after a
+/// keep-with-next run can move that run's head, so resume strictly before either.
+/// Right after a run counts even when the dirty block is no longer its
+/// follower: a page break it gained releases the run from it.
+fn restart_index(
+    keep_with_next: &crate::keep_together::KeepWithNextScan,
+    dirty_index: usize,
+) -> usize {
+    keep_with_next
+        .groups_by_head
+        .range(..=dirty_index)
+        .rev()
+        .take(2)
+        .filter(|(_, group)| {
+            group.members.contains(&dirty_index) || group.tail_index + 1 == dirty_index
+        })
+        .map(|(&head, _)| head)
+        .min()
+        .unwrap_or(dirty_index)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Edge {
+    Start,
+    End,
+}
+
+fn run_boundary_pm_pos(run: Option<&Run>, char_offset: usize, edge: Edge) -> Option<f64> {
+    let run = run?;
+
+    if let Run::Text(r) = run {
+        if let Some(pm_start) = r.pm_start {
+            let clamped = char_offset.min(utf16_len(&r.text));
+            return Some(pm_start + clamped as f64);
+        }
+        return if edge == Edge::End { r.pm_end } else { None };
+    }
+
+    if edge == Edge::End {
+        if let Some(pm_end) = run.pm_end() {
+            return Some(pm_end);
+        }
+        return run.pm_start().map(|pm| pm + 1.0);
+    }
+    run.pm_start()
+}
+
+/// Document range covered by lines `[from_line, to_line)`.
+///
+/// The paragraph's own bounds win at its true first and last line, so a
+/// single-fragment paragraph keeps the range it declared; interior fragment
+/// edges come from the head and tail runs of their boundary lines. Any edge
+/// that stays unresolved falls back to the paragraph, and an end that would not
+/// exceed its start is nudged forward by one so the range is never empty.
+fn get_paragraph_fragment_pm_range(
+    block: &ParagraphBlock,
+    measure: &ParagraphExtent,
+    from_line: usize,
+    to_line: usize,
+) -> (Option<f64>, Option<f64>) {
+    if measure.lines.is_empty() || from_line >= to_line {
+        return (block.pm_start, block.pm_end);
+    }
+
+    let first_line = measure.lines.get(from_line);
+    let last_line = measure.lines.get(to_line - 1);
+    let first_run = first_line.and_then(|l| block.runs.get(l.head_run));
+    let last_run = last_line.and_then(|l| block.runs.get(l.tail_run));
+    let first_char = first_line.map_or(0, |l| l.head_char);
+    let last_char = last_line.map_or(0, |l| l.tail_char);
+
+    let mut pm_start = if from_line == 0 {
+        block
+            .pm_start
+            .or_else(|| run_boundary_pm_pos(first_run, first_char, Edge::Start))
+    } else {
+        run_boundary_pm_pos(first_run, first_char, Edge::Start)
+    };
+    let mut pm_end = if to_line >= measure.lines.len() {
+        block
+            .pm_end
+            .or_else(|| run_boundary_pm_pos(last_run, last_char, Edge::End))
+    } else {
+        run_boundary_pm_pos(last_run, last_char, Edge::End)
+    };
+
+    if pm_start.is_none() {
+        pm_start = block.pm_start;
+    }
+    if pm_end.is_none() {
+        pm_end = block.pm_end;
+    }
+    if let (Some(s), Some(e)) = (pm_start, pm_end)
+        && e <= s
+    {
+        pm_end = Some(s + 1.0);
+    }
+
+    (pm_start, pm_end)
+}
+
+fn is_floating_wrap_type(wrap_type: Option<&str>) -> bool {
+    matches!(
+        wrap_type,
+        Some("square") | Some("tight") | Some("through") | Some("behind") | Some("inFront")
+    )
+}
+
+/// A text box floats when it declares float display, a floating wrap type, or
+/// `topAndBottom` wrapping.
+fn is_floating_text_box_block(block: &TextBoxBlock) -> bool {
+    block.display_mode.as_deref() == Some("float")
+        || is_floating_wrap_type(block.wrap_type.as_deref())
+        || block.wrap_type.as_deref() == Some("topAndBottom")
+}
+
+/// The paginator a pass from the document's first block starts with.
+fn origin_paginator(
+    initial_config: &SectionLayoutConfig,
+    plan: &LayoutPlan,
+    options: &crate::types::LayoutOptions,
+) -> Result<Paginator, LayoutError> {
+    let mut paginator = Paginator::new(
+        initial_config.page_size.clone(),
+        initial_config.margins.clone(),
+        initial_config
+            .columns
+            .clone()
+            .unwrap_or_else(default_columns),
+        options.footnote_reserved_heights.clone(),
+    )?;
+    if let Some(indices) = &plan.region_section_indices {
+        paginator.set_region_section_indices(indices.clone());
+    }
+    paginator.set_section_page_margins(options.section_page_margins.clone().unwrap_or_default());
+    paginator.set_physical_section_page_margins(
+        options
+            .physical_section_page_margins
+            .clone()
+            .unwrap_or_default(),
+    );
+    paginator
+        .set_section_page_float_bands(options.section_page_float_bands.clone().unwrap_or_default());
+    if let Some(Some(restart)) = plan.section_page_restarts.first() {
+        paginator.restart_page_numbering(restart.start);
+    }
+    Ok(paginator)
+}
+
+/// Converts measured blocks into positioned pages, discarding checkpoints.
+pub fn layout_document(input: &mut Input) -> Result<Layout, LayoutError> {
+    Ok(layout_document_checkpointed(input)?.layout)
+}
+
+/// Full placement while retaining clean page-start checkpoints in Rust.
+pub fn layout_document_checkpointed(input: &mut Input) -> Result<CheckpointedLayout, LayoutError> {
+    layout_document_recording_columns(input, None)
+}
+
+/// Placement with each flow fragment's containing column width.
+pub fn layout_document_with_column_widths(
+    input: &mut Input,
+) -> Result<(Layout, Vec<(BlockId, f64)>), LayoutError> {
+    let mut widths = Vec::new();
+    let run = layout_document_recording_columns(input, Some(&mut widths))?;
+    Ok((run.layout, widths))
+}
+
+fn layout_document_recording_columns(
+    input: &mut Input,
+    column_widths: Option<&mut Vec<(BlockId, f64)>>,
+) -> Result<CheckpointedLayout, LayoutError> {
+    let measured = &mut input.measured;
+    let options = &input.options;
+
+    let page_size = options.page_size.clone().unwrap_or(DEFAULT_PAGE_SIZE);
+    let margins = resolve_page_margins(options.margins.as_ref());
+    let final_page_size = options
+        .final_page_size
+        .clone()
+        .unwrap_or_else(|| page_size.clone());
+    let final_margins = options
+        .final_margins
+        .clone()
+        .unwrap_or_else(|| margins.clone());
+
+    let content_width = page_size.w - margins.left - margins.right;
+    if content_width <= 0.0 {
+        return Err(LayoutError::Invalid(
+            "layoutDocument: page size and margins yield no content area".into(),
+        ));
+    }
+
+    let body_config = SectionLayoutConfig {
+        page_size: page_size.clone(),
+        margins: margins.clone(),
+        columns: options.columns.clone(),
+    };
+    let final_config = SectionLayoutConfig {
+        page_size: final_page_size,
+        margins: final_margins,
+        columns: options.columns.clone(),
+    };
+
+    // mutate spacing attrs before anything reads them — the keep-with-next
+    // group height must see contextual-spacing suppression (§17.3.1.9)
+    apply_contextual_spacing_measured(measured);
+
+    let mut plan = prescan(
+        measured,
+        &body_config,
+        final_config,
+        options.body_break_type,
+    )?;
+    plan.section_page_restarts = options.section_page_restarts.clone().unwrap_or_default();
+
+    let initial_config = plan.section_configs.first().cloned().unwrap_or(body_config);
+
+    let mut paginator = origin_paginator(&initial_config, &plan, options)?;
+    paginator.fragment_column_widths = column_widths.as_ref().map(|_| Vec::new());
+
+    let placement = place::<u64>(
+        measured,
+        &plan,
+        &mut paginator,
+        &initial_config,
+        0,
+        0,
+        0,
+        None,
+    )?;
+
+    // an empty document still yields page 1
+    if paginator.pages.is_empty() {
+        paginator.get_current();
+    }
+
+    let page_count = paginator.pages.len();
+    if let Some(widths) = column_widths {
+        *widths = paginator.fragment_column_widths.take().unwrap_or_default();
+    }
+    Ok(CheckpointedLayout {
+        layout: Layout {
+            page_size,
+            pages: paginator.pages,
+            columns: options.columns.clone(),
+            headers: None,
+            footers: None,
+            page_gap: options.page_gap,
+            partial: false,
+            cached_page_totals: false,
+        },
+        checkpoints: placement.checkpoints,
+        placed_blocks: placement.placed_blocks,
+        rebuilt_page_start: 0,
+        rebuilt_page_end: page_count,
+    })
+}
+
+/// Resume placement from the last clean checkpoint preceding `dirty_index`,
+/// then stop as soon as page-start geometry and the measured suffix converge
+/// with the retained layout. Callers must conservatively gate unsupported
+/// dependency shapes (floats, notes, structural edits) before entering here.
+///
+/// Equal fingerprints declare a measured block unchanged apart from its
+/// document positions: retained pages keep the run slices of such a block and
+/// move them by the delta its positions moved by, checked against its new run
+/// positions.
+pub fn layout_document_incremental<F: PartialEq>(
+    input: &mut Input,
+    previous_layout: &mut Layout,
+    previous_checkpoints: &[LayoutCheckpoint],
+    previous_fingerprints: &[F],
+    next_fingerprints: &[F],
+    dirty_index: usize,
+) -> Result<CheckpointedLayout, LayoutError> {
+    layout_document_incremental_ranges(
+        input,
+        previous_layout,
+        previous_checkpoints,
+        previous_fingerprints,
+        next_fingerprints,
+        dirty_index,
+    )
+    .map(|run| run.checkpointed)
+}
+
+/// [`layout_document_incremental`], reporting the page ranges it placed afresh.
+pub fn layout_document_incremental_ranges<F: PartialEq>(
+    input: &mut Input,
+    previous_layout: &mut Layout,
+    previous_checkpoints: &[LayoutCheckpoint],
+    previous_fingerprints: &[F],
+    next_fingerprints: &[F],
+    dirty_index: usize,
+) -> Result<IncrementalLayout, LayoutError> {
+    let options = &input.options;
+    let page_size = options.page_size.clone().unwrap_or(DEFAULT_PAGE_SIZE);
+    let margins = resolve_page_margins(options.margins.as_ref());
+    let final_page_size = options
+        .final_page_size
+        .clone()
+        .unwrap_or_else(|| page_size.clone());
+    let final_margins = options
+        .final_margins
+        .clone()
+        .unwrap_or_else(|| margins.clone());
+    if page_size.w - margins.left - margins.right <= 0.0 {
+        return Err(LayoutError::Invalid(
+            "layoutDocument: page size and margins yield no content area".into(),
+        ));
+    }
+
+    let body_config = SectionLayoutConfig {
+        page_size: page_size.clone(),
+        margins,
+        columns: options.columns.clone(),
+    };
+    let final_config = SectionLayoutConfig {
+        page_size: final_page_size,
+        margins: final_margins,
+        columns: options.columns.clone(),
+    };
+    apply_contextual_spacing_measured(&mut input.measured);
+    let mut plan = prescan(
+        &input.measured,
+        &body_config,
+        final_config,
+        options.body_break_type,
+    )?;
+    plan.section_page_restarts = options.section_page_restarts.clone().unwrap_or_default();
+    let initial_config = plan.section_configs.first().cloned().unwrap_or(body_config);
+    let restart = restart_index(&plan.keep_with_next, dirty_index);
+    // Balancing weighs all of a section's content, so an edit anywhere in a
+    // section whose columns balance resumes before the section opens them.
+    let dirty_section = plan
+        .break_indices
+        .partition_point(|&index| index < dirty_index);
+    let restart = if section_balances_columns(&plan, dirty_section, &initial_config) {
+        restart.min(section_start(&plan, dirty_section))
+    } else {
+        restart
+    };
+    // Without a resumable checkpoint ahead of the change, placement starts
+    // afresh at the document's origin, still converging with the retained layout.
+    let resume = previous_checkpoints.iter().rev().find(|checkpoint| {
+        checkpoint.block_index < restart
+            && resumable(checkpoint, &input.measured, &previous_layout.pages)
+    });
+    let resume_page = resume.map_or(0, |resume| resume.page_index);
+    let dirty: Option<Vec<usize>> =
+        (previous_fingerprints.len() == next_fingerprints.len()).then(|| {
+            previous_fingerprints
+                .iter()
+                .zip(next_fingerprints)
+                .enumerate()
+                .filter(|(_, (previous, next))| previous != next)
+                .map(|(index, _)| index)
+                .collect()
+        });
+    // Clean stretches between dirty blocks are skipped only where a page start
+    // alone decides what follows: one column throughout, no reserved note space,
+    // and no later section break that changed.
+    let skippable = dirty.as_ref().is_some_and(|dirty| !dirty.is_empty())
+        && plan
+            .section_configs
+            .iter()
+            .chain([&initial_config])
+            .all(|config| {
+                config
+                    .columns
+                    .as_ref()
+                    .is_none_or(|columns| columns.count <= 1.0)
+            })
+        && options
+            .footnote_reserved_heights
+            .as_ref()
+            .is_none_or(|heights| heights.is_empty())
+        && !dirty
+            .iter()
+            .flatten()
+            .skip(1)
+            .any(|&index| matches!(input.measured[index].block, LayoutBlock::SectionBreak(_)));
+
+    // Place each dirty stretch in turn without touching the retained pages, so
+    // a failure leaves the caller's layout as it was.
+    let mut segments: Vec<(usize, Vec<crate::types::Page>, Option<Convergence>)> = Vec::new();
+    let mut checkpoints: Vec<_> = resume.map_or_else(Vec::new, |resume| {
+        previous_checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint_order(checkpoint) < checkpoint_order(resume))
+            .cloned()
+            .collect()
+    });
+    let mut placed_blocks = 0;
+    let mut start = resume.cloned();
+    let mut segment_dirty = dirty_index;
+    loop {
+        let (block_index, section_index, page_index, mut paginator) = match &start {
+            Some(start) => {
+                let mut paginator = Paginator::resume_in_section(
+                    &start.flow,
+                    start.page_number,
+                    start.section_index,
+                    options.footnote_reserved_heights.clone(),
+                )?;
+                if let Some(indices) = &plan.region_section_indices {
+                    paginator.set_region_section_indices(indices.clone());
+                }
+                paginator.set_section_page_margins(
+                    options.section_page_margins.clone().unwrap_or_default(),
+                );
+                paginator.set_physical_section_page_margins(
+                    options
+                        .physical_section_page_margins
+                        .clone()
+                        .unwrap_or_default(),
+                );
+                paginator.set_section_page_float_bands(
+                    options.section_page_float_bands.clone().unwrap_or_default(),
+                );
+                (
+                    start.block_index,
+                    start.section_index,
+                    start.page_index,
+                    paginator,
+                )
+            }
+            None => (0, 0, 0, origin_paginator(&initial_config, &plan, options)?),
+        };
+        if segments.is_empty() && !checkpoints.is_empty() {
+            let reservations = paginator.snapshot_geometry().footnote_reserved_heights;
+            for checkpoint in &mut checkpoints {
+                checkpoint
+                    .flow
+                    .footnote_reserved_heights
+                    .clone_from(&reservations);
+            }
+        }
+        let convergence = ConvergenceInput {
+            previous_checkpoints,
+            previous_fingerprints,
+            next_fingerprints,
+            dirty_index: segment_dirty,
+            dirty: dirty.as_deref(),
+            skippable,
+            keep_with_next: &plan.keep_with_next,
+            measured: &input.measured,
+            previous_pages: &previous_layout.pages,
+            resume_before: std::cell::Cell::new(None),
+        };
+        let placement = place(
+            &input.measured,
+            &plan,
+            &mut paginator,
+            &initial_config,
+            block_index,
+            section_index,
+            page_index,
+            Some(&convergence),
+        )?;
+        placed_blocks += placement.placed_blocks;
+        checkpoints.extend(placement.checkpoints);
+        let next = match &placement.converged {
+            Some(Convergence::Skip {
+                previous,
+                resume,
+                dirty_index,
+            }) => {
+                let bound = |checkpoint: &LayoutCheckpoint| {
+                    previous_checkpoints.partition_point(|retained| {
+                        checkpoint_order(retained) < checkpoint_order(checkpoint)
+                    })
+                };
+                checkpoints
+                    .extend_from_slice(&previous_checkpoints[bound(previous)..bound(resume)]);
+                segment_dirty = *dirty_index;
+                Some(resume.clone())
+            }
+            _ => None,
+        };
+        segments.push((page_index, paginator.pages, placement.converged));
+        match next {
+            Some(resume) => start = Some(resume),
+            None => break,
+        }
+    }
+
+    let mut retained = std::mem::take(&mut previous_layout.pages)
+        .into_iter()
+        .enumerate()
+        .peekable();
+    let mut take_retained = |from: usize, to: usize, pages: &mut Vec<crate::types::Page>| {
+        while let Some((index, _)) = retained.peek() {
+            if *index >= to {
+                break;
+            }
+            let (index, page) = retained.next().expect("peeked page");
+            if index >= from {
+                pages.push(page);
+            }
+        }
+    };
+    let mut pages = Vec::new();
+    take_retained(0, resume_page, &mut pages);
+    let mut rebuilt_page_ranges = Vec::with_capacity(segments.len());
+    let mut reused_ranges = Vec::new();
+    for (start_page, mut placed, converged) in segments {
+        debug_assert_eq!(pages.len(), start_page);
+        let rebuilt_start = pages.len();
+        pages.append(&mut placed);
+        rebuilt_page_ranges.push(rebuilt_start..pages.len());
+        let reused_start = pages.len();
+        let first_block = match &converged {
+            Some(Convergence::Skip { previous, .. } | Convergence::Suffix { previous, .. }) => {
+                previous.block_index
+            }
+            None => 0,
+        };
+        match converged {
+            Some(Convergence::Skip {
+                previous, resume, ..
+            }) => take_retained(previous.page_index, resume.page_index, &mut pages),
+            Some(Convergence::Suffix { next, previous }) => {
+                debug_assert_eq!(pages.len(), next.page_index);
+                take_retained(previous.page_index, usize::MAX, &mut pages);
+                let page_shift = next.page_index as isize - previous.page_index as isize;
+                checkpoints.extend(
+                    previous_checkpoints
+                        .iter()
+                        .filter(|checkpoint| {
+                            checkpoint_order(checkpoint) >= checkpoint_order(&previous)
+                        })
+                        .cloned()
+                        .map(|mut checkpoint| {
+                            checkpoint.page_index =
+                                (checkpoint.page_index as isize + page_shift) as usize;
+                            checkpoint
+                                .flow
+                                .footnote_reserved_heights
+                                .clone_from(&next.flow.footnote_reserved_heights);
+                            checkpoint
+                        }),
+                );
+            }
+            None => {}
+        }
+        reused_ranges.push((reused_start..pages.len(), first_block));
+    }
+    refresh_reused_page_ranges(&mut pages, &reused_ranges, &input.measured);
+
+    Ok(IncrementalLayout {
+        checkpointed: CheckpointedLayout {
+            layout: Layout {
+                page_size,
+                pages,
+                columns: options.columns.clone(),
+                headers: None,
+                footers: None,
+                page_gap: options.page_gap,
+                partial: false,
+                cached_page_totals: false,
+            },
+            checkpoints,
+            placed_blocks,
+            rebuilt_page_start: resume_page,
+            rebuilt_page_end: rebuilt_page_ranges
+                .last()
+                .map_or(resume_page, |range| range.end),
+        },
+        rebuilt_page_ranges,
+    })
+}
+
+struct PlacementOutcome {
+    checkpoints: Vec<LayoutCheckpoint>,
+    placed_blocks: usize,
+    converged: Option<Convergence>,
+}
+
+/// How the section after `section_index` starts: its own type, which ECMA-376 17.6.22
+/// defaults to `nextPage` when absent, so it never inherits the preceding section's.
+fn break_type_after_section(plan: &LayoutPlan, section_index: usize) -> Option<SectionBreakType> {
+    plan.section_break_types
+        .get(section_index + 1)
+        .copied()
+        .flatten()
+}
+
+fn continuous_horizontal_frame(plan: &LayoutPlan, section_index: usize) -> bool {
+    let mut changed = false;
+    for index in 1..=section_index {
+        if break_type_after_section(plan, index - 1) != Some(SectionBreakType::Continuous) {
+            changed = false;
+            continue;
+        }
+        let previous = &plan.section_configs[index - 1];
+        let current = &plan.section_configs[index];
+        let previous_columns = previous.columns.clone().unwrap_or_else(default_columns);
+        let current_columns = current.columns.clone().unwrap_or_else(default_columns);
+        changed |= previous.margins.left != current.margins.left
+            || previous.margins.right != current.margins.right
+            || previous_columns.count != current_columns.count
+            || (0..current_columns.count as usize).any(|column| {
+                let rectangle = |columns: &crate::types::ColumnLayout| {
+                    crate::page_flow::column_rectangle_at(
+                        current.page_size.w,
+                        current.margins.left,
+                        current.margins.right,
+                        columns,
+                        column,
+                    )
+                };
+                rectangle(&previous_columns) != rectangle(&current_columns)
+            });
+    }
+    changed
+}
+
+fn section_ends_with_next_column(plan: &LayoutPlan, section_index: usize) -> bool {
+    plan.break_indices.get(section_index).is_some()
+        && break_type_after_section(plan, section_index) == Some(SectionBreakType::NextColumn)
+}
+
+/// Whether placement balances a section's columns where its column region opens.
+fn section_balances_columns(
+    plan: &LayoutPlan,
+    section_index: usize,
+    initial_config: &SectionLayoutConfig,
+) -> bool {
+    plan.section_configs
+        .get(section_index)
+        .unwrap_or(initial_config)
+        .columns
+        .as_ref()
+        .map_or(1.0, |columns| columns.count)
+        > 1.0
+        && !section_ends_with_next_column(plan, section_index)
+}
+
+/// The index of a section's first block.
+fn section_start(plan: &LayoutPlan, section_index: usize) -> usize {
+    section_index
+        .checked_sub(1)
+        .and_then(|previous| plan.break_indices.get(previous))
+        .map_or(0, |section_break| section_break + 1)
+}
+
+/// The block walk itself, per the module's ordering rules. Returns early once
+/// a checkpoint matches the retained layout, which is how incremental placement
+/// detects convergence.
+fn place<F: PartialEq>(
+    measured: &[MeasuredBlock],
+    plan: &LayoutPlan,
+    paginator: &mut Paginator,
+    initial_config: &SectionLayoutConfig,
+    start_index: usize,
+    mut section_idx: usize,
+    page_index_offset: usize,
+    convergence: Option<&ConvergenceInput<'_, F>>,
+) -> Result<PlacementOutcome, LayoutError> {
+    let mut checkpoints = Vec::new();
+    let mut placed_blocks = 0usize;
+    paginator.continuous_horizontal_frame = continuous_horizontal_frame(plan, section_idx);
+
+    // Balancing belongs to the page a section's column region opens on: a
+    // pass from the document start balances the first section, and a resumed
+    // pass rebalances only when its checkpoint's page is that page.
+    let balances = if start_index == 0 {
+        section_balances_columns(plan, 0, initial_config)
+    } else {
+        paginator.balances_region()
+    };
+    if balances {
+        hooks::balance_terminal_continuous_text_columns_with_marks(
+            measured,
+            paginator,
+            section_start(plan, section_idx),
+            plan.break_indices
+                .get(section_idx)
+                .copied()
+                .unwrap_or(measured.len()),
+            &plan.section_marks,
+        )?;
+        paginator.mark_balanced_region();
+    }
+
+    let mut keep_run: Option<KeepRun<'_>> = None;
+    for (i, mb) in measured.iter().enumerate().skip(start_index) {
+        crate::progress::tick();
+        let section_mark = plan.section_marks[i];
+        let mut checkpointed_page = None;
+        if let Some((page_index, page_number, flow)) = paginator.clean_page_start() {
+            let checkpoint = LayoutCheckpoint {
+                block_index: i,
+                section_index: section_idx,
+                page_index: page_index_offset + page_index,
+                page_number,
+                flow,
+            };
+            if let Some(converged) =
+                convergence.and_then(|value| value.retained_match(&checkpoint, None))
+            {
+                paginator.truncate_pages(page_index);
+                return Ok(PlacementOutcome {
+                    checkpoints,
+                    placed_blocks,
+                    converged: Some(converged),
+                });
+            }
+            checkpointed_page = Some(page_index);
+            checkpoints.push(checkpoint);
+        }
+        let fragments_before = paginator.page_fragment_counts();
+        // pageBreakBefore, or a hard page-break run, forces a fresh page and
+        // keeps the paragraph's space-before net of the previous space-after
+        if !section_mark && let Some(authored) = hooks::breaks_before_block(&mb.block)? {
+            paginator.force_authored_page_break(authored.keeps_leading_spacing());
+        }
+
+        let mut keep_with_next_after = None;
+        if !section_mark
+            && let Some((_, whole_group)) =
+                plan.keep_with_next.groups_by_head.range(..=i).next_back()
+            && i <= whole_group.tail_index
+        {
+            let state_idx = paginator.get_current();
+            let page_content_height =
+                paginator.state(state_idx).content_limit - paginator.state(state_idx).content_top;
+            let page_has_content = paginator.page_fragment_count(state_idx) > 0;
+            // between float bands a table row's first slice may not share a gap
+            // with the run, so a table follower keeps its whole first row there
+            let split_first_row = !paginator.has_float_bands();
+            let every_cell_starts = split_first_row && !paginator.next_page_may_be_shorter();
+            let droppable = can_drop_lead_skip(paginator);
+            let fresh_top = at_fresh_page_top(paginator, page_index_offset);
+            let (lead_skip, fresh_lead_skip) = match (&mb.block, &mb.measure) {
+                (LayoutBlock::Paragraph(block), BlockExtent::Paragraph(measure))
+                    if droppable && !paragraph_can_split(block, measure) =>
+                {
+                    let kept = paginator
+                        .leading_spacing(get_spacing_before(block))
+                        .max(paginator.state(state_idx).deferred_spacing);
+                    (
+                        if fresh_top {
+                            removable_lead_skip(&measured[..i], block, measure, kept)
+                        } else {
+                            0.0
+                        },
+                        removable_lead_skip(&measured[..i], block, measure, 0.0),
+                    )
+                }
+                _ => (0.0, 0.0),
+            };
+            if keep_run
+                .as_ref()
+                .is_none_or(|run| run.head_index() != whole_group.head_index)
+            {
+                keep_run = Some(KeepRun::new(whole_group, measured)?);
+            }
+            let run = keep_run.as_mut().unwrap();
+            run.starting_at(i);
+            let heights = run.heights(
+                measured,
+                |before| paginator.leading_spacing(before),
+                paginator.state(state_idx).deferred_spacing,
+                page_content_height,
+                split_first_row,
+                every_cell_starts,
+                lead_skip,
+                fresh_lead_skip,
+            );
+            if let (LayoutBlock::Paragraph(block), BlockExtent::Paragraph(measure)) =
+                (&mb.block, &mb.measure)
+                && let Some((group_height, fresh_page_height, group_trailing)) = heights
+            {
+                let leading = paginator
+                    .leading_spacing(get_spacing_before(block))
+                    .max(paginator.state(state_idx).deferred_spacing);
+                if paragraph_can_split(block, measure) && fresh_page_height <= page_content_height {
+                    keep_with_next_after = Some((
+                        (group_height + lead_skip
+                            - leading
+                            - paragraph_min_trailing_slice(block, measure))
+                        .max(0.0),
+                        group_trailing,
+                    ));
+                }
+                let must_advance = !paragraph_can_split(block, measure)
+                    && hooks::keep_with_next_group_must_advance_from(
+                        group_height,
+                        fresh_page_height,
+                        paginator.get_available_height()
+                            - if paginator.allows_trailing_leading() {
+                                0.0
+                            } else {
+                                group_trailing
+                            },
+                        paginator.get_column_capacity_with_trailing(group_trailing)
+                            - group_trailing,
+                        page_has_content,
+                    )?;
+                if must_advance {
+                    if paginator.has_float_bands() {
+                        paginator.ensure_fits_with_trailing(
+                            group_height + group_trailing,
+                            group_trailing,
+                        );
+                    } else {
+                        loop {
+                            let idx = paginator.advance_for_overflow();
+                            if paginator.state(idx).column_index == 0
+                                || fresh_page_height <= paginator.get_available_height()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match &mb.block {
+            LayoutBlock::Paragraph(block) => {
+                let BlockExtent::Paragraph(measure) = &mb.measure else {
+                    return Err(LayoutError::Invalid(
+                        "layoutParagraph: expected paragraph measure".into(),
+                    ));
+                };
+                let lead_skip = if section_mark {
+                    0.0
+                } else {
+                    stale_lead_skip(&measured[..i], block, measure, paginator, page_index_offset)
+                };
+                layout_paragraph(
+                    block,
+                    measure,
+                    paginator,
+                    section_mark,
+                    lead_skip,
+                    keep_with_next_after,
+                )?;
+            }
+
+            LayoutBlock::Table(block) => {
+                let BlockExtent::Table(measure) = &mb.measure else {
+                    return Err(LayoutError::Invalid(
+                        "layoutTable: expected table measure".into(),
+                    ));
+                };
+                if block.floating.is_some() {
+                    let content_width = paginator.get_content_width();
+                    hooks::layout_floating_table(block, measure, paginator, content_width)?;
+                } else {
+                    hooks::layout_table(block, measure, paginator)?;
+                }
+            }
+
+            LayoutBlock::Image(block) => {
+                let BlockExtent::Image(measure) = &mb.measure else {
+                    return Err(LayoutError::Invalid(
+                        "layoutImage: expected image measure".into(),
+                    ));
+                };
+                layout_image(block, measure, paginator);
+            }
+
+            LayoutBlock::Shape(block) => {
+                let BlockExtent::Shape(measure) = &mb.measure else {
+                    return Err(LayoutError::Invalid(
+                        "layoutShape: expected shape measure".into(),
+                    ));
+                };
+                layout_shape(block, measure, paginator);
+            }
+
+            LayoutBlock::Chart(block) => {
+                let BlockExtent::Chart(measure) = &mb.measure else {
+                    return Err(LayoutError::Invalid(
+                        "layoutChart: expected chart measure".into(),
+                    ));
+                };
+                layout_chart(block, measure, paginator);
+            }
+
+            LayoutBlock::TextBox(block) => {
+                let BlockExtent::TextBox(measure) = &mb.measure else {
+                    return Err(LayoutError::Invalid(
+                        "layoutTextBox: expected textBox measure".into(),
+                    ));
+                };
+                layout_text_box(block, measure, paginator);
+            }
+
+            LayoutBlock::Reserved(block) => {
+                let BlockExtent::Image(measure) = &mb.measure else {
+                    return Err(LayoutError::Invalid(
+                        "layoutReserved: expected image measure".into(),
+                    ));
+                };
+                layout_reserved(block, measure, paginator);
+            }
+
+            LayoutBlock::PageBreak(_) => {
+                let ends_section_mark = i >= 2
+                    && matches!(measured[i - 1].block, LayoutBlock::SectionBreak(_))
+                    && matches!(measured[i - 2].block, LayoutBlock::Paragraph(_));
+                paginator.force_authored_page_break(ends_section_mark);
+            }
+
+            LayoutBlock::ColumnBreak(_) => {
+                paginator.force_column_break();
+            }
+
+            LayoutBlock::SectionBreak(block) => {
+                // the NEXT section's columns and its own start type
+                let next_type = break_type_after_section(plan, section_idx);
+                let restart = plan.section_page_restart(section_idx + 1);
+                let next_section_config = plan
+                    .section_configs
+                    .get(section_idx + 1)
+                    .cloned()
+                    .unwrap_or_else(|| initial_config.clone());
+                let restart_starts_page = restart.is_some()
+                    && crate::section_breaks::restart_starts_page(
+                        paginator,
+                        &next_section_config,
+                        next_type,
+                    );
+                // Word places an odd/even-page section by the restarted page
+                // number, except under `w:evenAndOddHeaders`, where it goes by
+                // the physical sheet so odd pages keep their recto headers.
+                let parity_restart = match next_type {
+                    Some(SectionBreakType::OddPage | SectionBreakType::EvenPage) => restart
+                        .filter(|restart| !restart.align_parity)
+                        .map(|restart| restart.start),
+                    _ => None,
+                };
+                let next_type = match (next_type, restart) {
+                    (Some(SectionBreakType::OddPage | SectionBreakType::EvenPage), _) => next_type,
+                    (_, Some(restart)) if restart.align_parity && restart_starts_page => {
+                        Some(if paginator.physical_parity_is_odd(restart.start) {
+                            SectionBreakType::OddPage
+                        } else {
+                            SectionBreakType::EvenPage
+                        })
+                    }
+                    _ => next_type,
+                };
+                let opened_column_region = hooks::handle_section_break(
+                    block,
+                    paginator,
+                    &next_section_config,
+                    next_type,
+                    parity_restart,
+                )?;
+                paginator.set_section_index(section_idx + 1);
+                if let Some(restart) = restart
+                    && restart_starts_page
+                {
+                    paginator.restart_page_numbering(restart.start);
+                }
+
+                let next_break_index = plan.break_indices.get(section_idx + 1).copied();
+                if opened_column_region
+                    && next_section_config
+                        .columns
+                        .as_ref()
+                        .map_or(1.0, |c| c.count)
+                        > 1.0
+                    && !section_ends_with_next_column(plan, section_idx + 1)
+                {
+                    hooks::balance_terminal_continuous_text_columns_with_marks(
+                        measured,
+                        paginator,
+                        i + 1,
+                        next_break_index.unwrap_or(measured.len()),
+                        &plan.section_marks,
+                    )?;
+                    paginator.mark_balanced_region();
+                }
+
+                section_idx += 1;
+                paginator.continuous_horizontal_frame =
+                    continuous_horizontal_frame(plan, section_idx);
+            }
+
+            LayoutBlock::Unsupported => {
+                return Err(LayoutError::Unsupported("unknown block kind".into()));
+            }
+        }
+
+        placed_blocks += 1;
+        let fragments_after = paginator.page_fragment_counts();
+        let first_changed_page = fragments_after
+            .iter()
+            .enumerate()
+            .find_map(|(page, count)| {
+                let before = fragments_before.get(page).copied().unwrap_or(0);
+                (*count > before).then_some((page, before))
+            });
+        if let Some((page_index, 0)) = first_changed_page
+            && checkpointed_page != Some(page_index)
+            && (!matches!(mb.block, LayoutBlock::Paragraph(_))
+                || fragments_after[page_index] == 1
+                || pristine_paragraph_start(i, measured, &paginator.pages[page_index]))
+            && paginator
+                .current_page_start()
+                .is_some_and(|(current, _, _)| current == page_index)
+        {
+            let (_, page_number, flow) = paginator
+                .current_page_start()
+                .expect("current page was checked above");
+            let checkpoint = LayoutCheckpoint {
+                block_index: i,
+                section_index: section_idx,
+                page_index: page_index_offset + page_index,
+                page_number,
+                flow,
+            };
+            if let Some(converged) = convergence.and_then(|value| {
+                value.retained_match(
+                    &checkpoint,
+                    paginator.pages[page_index]
+                        .opening_fragment_geometry
+                        .as_deref(),
+                )
+            }) {
+                paginator.truncate_pages(page_index);
+                return Ok(PlacementOutcome {
+                    checkpoints,
+                    placed_blocks,
+                    converged: Some(converged),
+                });
+            }
+            checkpoints.push(checkpoint);
+        }
+    }
+
+    Ok(PlacementOutcome {
+        checkpoints,
+        placed_blocks,
+        converged: None,
+    })
+}
+
+fn block_id_key(id: &crate::types::BlockId) -> String {
+    serde_json::to_string(id).expect("block ids always serialize")
+}
+
+/// A fragment's block id, and whether it continues that block's previous fragment.
+fn fragment_source(fragment: &Fragment) -> (&crate::types::BlockId, bool) {
+    match fragment {
+        Fragment::Paragraph(fragment) => {
+            (&fragment.block_id, fragment.carried_from_prev == Some(true))
+        }
+        Fragment::Table(fragment) => (&fragment.block_id, fragment.carried_from_prev == Some(true)),
+        Fragment::Image(fragment) => (&fragment.block_id, false),
+        Fragment::Shape(fragment) => (&fragment.block_id, false),
+        Fragment::Chart(fragment) => (&fragment.block_id, false),
+        Fragment::TextBox(fragment) => (&fragment.block_id, false),
+        Fragment::Reserved(fragment) => (&fragment.block_id, false),
+    }
+}
+
+/// Walks a reused page range's fragments alongside the blocks placed on it,
+/// which follow in block order from the convergence checkpoint's block.
+struct ReusedBlocks {
+    next: usize,
+    current: Option<usize>,
+}
+
+impl ReusedBlocks {
+    /// The block `fragment` was placed from: the current block for a continued
+    /// fragment, else the next block carrying its id.
+    fn block<'a>(
+        &mut self,
+        fragment: &Fragment,
+        measured: &'a [MeasuredBlock],
+    ) -> Option<&'a MeasuredBlock> {
+        let (id, continued) = fragment_source(fragment);
+        let index = if continued {
+            self.current
+                .filter(|&index| measured[index].block.block_id() == Some(id))?
+        } else {
+            self.next
+                + measured
+                    .get(self.next..)?
+                    .iter()
+                    .position(|block| block.block.block_id() == Some(id))?
+        };
+        self.current = Some(index);
+        self.next = index + 1;
+        Some(&measured[index])
+    }
+}
+
+/// Retained pages keep their geometry, but an earlier edit moves the document
+/// positions of the blocks they hold. Each fragment takes its block's new range,
+/// and a paragraph fragment moves its resolved run slices by its position delta
+/// where they agree with the new block; anything else, and every fragment after
+/// one whose block is not found in order, is resolved again.
+fn refresh_reused_page_ranges(
+    pages: &mut [crate::types::Page],
+    ranges: &[(std::ops::Range<usize>, usize)],
+    measured: &[MeasuredBlock],
+) {
+    let mut by_id: Option<std::collections::HashMap<String, &MeasuredBlock>> = None;
+    for (range, first_block) in ranges {
+        let mut walk = Some(ReusedBlocks {
+            next: *first_block,
+            current: None,
+        });
+        for fragment in pages[range.clone()]
+            .iter_mut()
+            .flat_map(|page| page.fragments.iter_mut())
+        {
+            if let Some(block) = walk
+                .as_mut()
+                .and_then(|walk| walk.block(fragment, measured))
+            {
+                refresh_reused_fragment(fragment, block, true);
+                continue;
+            }
+            walk = None;
+            let blocks = by_id.get_or_insert_with(|| {
+                measured
+                    .iter()
+                    .filter_map(|measured| {
+                        measured
+                            .block
+                            .block_id()
+                            .map(|id| (block_id_key(id), measured))
+                    })
+                    .collect()
+            });
+            if let Some(block) = blocks.get(&block_id_key(fragment_source(fragment).0)) {
+                refresh_reused_fragment(fragment, block, false);
+            }
+        }
+    }
+}
+
+fn refresh_reused_fragment(fragment: &mut Fragment, measured: &MeasuredBlock, movable: bool) {
+    match (fragment, &measured.block, &measured.measure) {
+        (
+            Fragment::Paragraph(fragment),
+            LayoutBlock::Paragraph(block),
+            BlockExtent::Paragraph(extent),
+        ) => {
+            let range = get_paragraph_fragment_pm_range(
+                block,
+                extent,
+                fragment.from_line,
+                fragment.to_line,
+            );
+            let moved = movable && move_resolved_lines(fragment, block, extent, range);
+            (fragment.pm_start, fragment.pm_end) = range;
+            if !moved {
+                fragment.resolved_lines = Some(build_resolved_lines(
+                    block,
+                    extent,
+                    fragment.from_line,
+                    fragment.to_line,
+                ));
+            }
+        }
+        (Fragment::Table(fragment), LayoutBlock::Table(block), _) => {
+            fragment.pm_start = block.pm_start;
+            fragment.pm_end = block.pm_end;
+        }
+        (Fragment::Image(fragment), LayoutBlock::Image(block), _) => {
+            fragment.pm_start = block.pm_start;
+            fragment.pm_end = block.pm_end;
+        }
+        (Fragment::Shape(fragment), LayoutBlock::Shape(block), _) => {
+            fragment.pm_start = block.pm_start;
+            fragment.pm_end = block.pm_end;
+            fragment.doc_start = block.doc_start;
+            fragment.doc_end = block.doc_end;
+        }
+        (Fragment::Chart(fragment), LayoutBlock::Chart(block), _) => {
+            fragment.pm_start = block.pm_start;
+            fragment.pm_end = block.pm_end;
+            fragment.doc_start = block.doc_start;
+            fragment.doc_end = block.doc_end;
+        }
+        (Fragment::TextBox(fragment), LayoutBlock::TextBox(block), _) => {
+            fragment.pm_start = block.pm_start;
+            fragment.pm_end = block.pm_end;
+        }
+        _ => {}
+    }
+}
+
+/// A document position whose sum with another stays exact.
+fn exact_position(value: f64) -> bool {
+    value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_992.0
+}
+
+/// `value` moved by `delta`; `None` when either is not an exact position.
+fn moved_position(value: Option<f64>, delta: f64) -> Option<Option<f64>> {
+    match value {
+        None => Some(None),
+        Some(value) if exact_position(value) && exact_position(value + delta) => {
+            Some(Some(value + delta))
+        }
+        Some(_) => None,
+    }
+}
+
+/// Moves a retained fragment's resolved lines by the delta its document range
+/// moved by, when both ends moved alike and every run slice, moved, takes the
+/// positions the resolver gives it from the new block. False leaves the lines
+/// to be resolved again; the lines may then be partly moved.
+fn move_resolved_lines(
+    fragment: &mut ParagraphFragment,
+    block: &ParagraphBlock,
+    extent: &ParagraphExtent,
+    range: (Option<f64>, Option<f64>),
+) -> bool {
+    let (Some(start), Some(end), (Some(next_start), Some(next_end))) =
+        (fragment.pm_start, fragment.pm_end, range)
+    else {
+        return false;
+    };
+    let delta = next_start - start;
+    if next_end - end != delta || !exact_position(delta) {
+        return false;
+    }
+    let Some(lines) = extent.lines.get(fragment.from_line..fragment.to_line) else {
+        return false;
+    };
+    let Some(resolved) = fragment
+        .resolved_lines
+        .as_mut()
+        .filter(|resolved| resolved.len() == lines.len())
+    else {
+        return false;
+    };
+    lines.iter().zip(resolved).all(|(line, resolved)| {
+        let mut segments = resolved.segments.iter_mut();
+        (line.head_run..=line.tail_run)
+            .filter_map(|index| block.runs.get(index).map(|run| (index, run)))
+            .all(|(index, run)| {
+                let head = if index == line.head_run {
+                    line.head_char
+                } else {
+                    0
+                };
+                let tail = (index == line.tail_run).then_some(line.tail_char);
+                segments
+                    .next()
+                    .is_some_and(|segment| move_run_slice(segment, run, head, tail, delta))
+            })
+            && segments.next().is_none()
+    })
+}
+
+/// Moves one resolved run slice by `delta` when it is the slice of `run` the
+/// resolver takes from UTF-16 offset `head` to the line's `tail` offset, or to
+/// the run's end off the line's tail: both its positions, moved, must be the
+/// ones that slice takes from the new run. Runs holding positions of their own
+/// (an inline shape, an inline control widget) are never moved.
+fn move_run_slice(
+    segment: &mut ResolvedSegment,
+    run: &Run,
+    head: usize,
+    tail: Option<usize>,
+    delta: f64,
+) -> bool {
+    let ResolvedSegment { run: slice, text } = segment;
+    let (start, end, expected) = match (slice, run) {
+        (Run::Text(slice), Run::Text(run))
+            if slice.inline_sdt_widget.is_none() && run.inline_sdt_widget.is_none() =>
+        {
+            // A strict slice of a run's text is always shorter than the text.
+            let expected = if head == 0 && text.len() == run.text.len() {
+                (run.pm_start, run.pm_end)
+            } else {
+                let end = tail.unwrap_or_else(|| utf16_len(&run.text));
+                (
+                    run.pm_start.map(|start| start + head as f64),
+                    run.pm_start.map(|start| start + end as f64),
+                )
+            };
+            (&mut slice.pm_start, &mut slice.pm_end, expected)
+        }
+        (Run::Tab(slice), Run::Tab(run)) => (
+            &mut slice.pm_start,
+            &mut slice.pm_end,
+            (run.pm_start, run.pm_end),
+        ),
+        (Run::LineBreak(slice), Run::LineBreak(run)) => (
+            &mut slice.pm_start,
+            &mut slice.pm_end,
+            (run.pm_start, run.pm_end),
+        ),
+        (Run::Field(slice), Run::Field(run)) => (
+            &mut slice.pm_start,
+            &mut slice.pm_end,
+            (run.pm_start, run.pm_end),
+        ),
+        (Run::Image(slice), Run::Image(run))
+            if slice.inline_shape.is_none()
+                && run.inline_shape.is_none()
+                && slice.inline_chart.is_none()
+                && run.inline_chart.is_none() =>
+        {
+            (
+                &mut slice.pm_start,
+                &mut slice.pm_end,
+                (run.pm_start, run.pm_end),
+            )
+        }
+        _ => return false,
+    };
+    let (Some(moved_start), Some(moved_end)) =
+        (moved_position(*start, delta), moved_position(*end, delta))
+    else {
+        return false;
+    };
+    if (moved_start, moved_end) != expected {
+        return false;
+    }
+    (*start, *end) = (moved_start, moved_end);
+    true
+}
+
+// ---------------------------------------------------------------------------
+// per-kind placers
+// ---------------------------------------------------------------------------
+
+/// Materializes resolved run segments for a fragment line range.
+fn build_resolved_lines(
+    block: &ParagraphBlock,
+    measure: &ParagraphExtent,
+    from_line: usize,
+    to_line: usize,
+) -> Vec<ResolvedLine> {
+    let mut resolved = Vec::new();
+    for line_index in from_line..to_line {
+        let Some(line) = measure.lines.get(line_index) else {
+            continue;
+        };
+        resolved.push(ResolvedLine {
+            segments: resolve_line_segments(&block.runs, line),
+        });
+    }
+    resolved
+}
+
+fn paragraph_fragment_height(before: f64, lines_height: f64) -> f64 {
+    before + lines_height
+}
+
+/// Places a paragraph's measured lines, splitting into carried fragments
+/// whenever the page or column runs out of room.
+///
+/// Lines are fitted greedily, and a fragment always takes at least one line so
+/// an oversized line cannot stall the walk. A line's `floatSkipBefore` counts
+/// toward the fragment height, which is what makes following blocks flow below
+/// the float instead of over it.
+///
+/// Two rules can move lines before they are placed. `w:keepLines` advances to a
+/// fresh column when the whole paragraph fits a column but not the space left
+/// here. Widow and orphan control keeps two- and three-line paragraphs together
+/// unless they turn `w:widowControl` off. For longer paragraphs, a lone opening
+/// line moves the paragraph on when two lines would fit there, and a lone trailing line is
+/// avoided by pushing one more line down, provided the fragment keeps more than
+/// two.
+///
+/// Spacing before is charged to the first fragment only and spacing after to
+/// the last, and each fragment carries its own document range and resolved run
+/// slices.
+fn layout_paragraph(
+    block: &ParagraphBlock,
+    measure: &ParagraphExtent,
+    paginator: &mut Paginator,
+    section_mark: bool,
+    dropped_lead_skip: f64,
+    keep_with_next_after: Option<(f64, f64)>,
+) -> Result<(), LayoutError> {
+    // an unknown run kind can't be re-emitted faithfully in resolved lines
+    if block.runs.iter().any(|r| matches!(r, Run::Unsupported)) {
+        return Err(LayoutError::Unsupported("unknown run kind".into()));
+    }
+
+    let lines = &measure.lines;
+    if lines.is_empty() {
+        let (space_before, space_after) = if section_mark {
+            (0.0, 0.0)
+        } else {
+            (get_spacing_before(block), get_spacing_after(block))
+        };
+        let state_idx = paginator.get_current();
+        let column_index = paginator.state(state_idx).column_index;
+        let pen_y = paginator.state(state_idx).pen_y;
+
+        let fragment = ParagraphFragment {
+            horizontal_frame: None,
+            block_id: block.id.clone(),
+            x: paginator.get_column_x(column_index),
+            y: pen_y + paginator.leading_spacing(space_before),
+            width: paginator.get_content_width(),
+            height: 0.0,
+            from_line: 0,
+            to_line: 0,
+            pm_start: block.pm_start,
+            pm_end: block.pm_end,
+            carried_from_prev: None,
+            carried_to_next: None,
+            resolved_lines: Some(Vec::new()),
+        };
+
+        if section_mark {
+            paginator.push_section_mark(fragment);
+        } else if !paginator.fits_with_trailing(0.0, 0.0, state_idx) {
+            // A section break's empty mark hangs past the bottom rather than open a page.
+            paginator.push_fragment_direct(Fragment::Paragraph(fragment));
+        } else {
+            paginator.add_fragment(
+                Fragment::Paragraph(fragment),
+                0.0,
+                space_before,
+                space_after,
+            );
+        }
+        return Ok(());
+    }
+
+    let space_before = get_spacing_before(block);
+    let space_after = get_spacing_after(block);
+    let paragraph_height = lines.iter().fold(0.0, |sum, line| {
+        sum + line.line_height + line.float_skip_before.unwrap_or(0.0)
+    }) - dropped_lead_skip;
+    let widow_control = paragraph_widow_control(block, measure);
+
+    if paragraph_is_unbreakable(block, measure) {
+        let state_idx = paginator.get_current();
+        let state = paginator.state(state_idx);
+        let required = paginator
+            .leading_spacing(space_before)
+            .max(state.deferred_spacing)
+            + paragraph_height;
+        let trailing = trailing_leading(block, lines.last().unwrap());
+        let capacity = paginator.get_column_capacity_with_trailing(trailing);
+        let allowance = if paginator.allows_trailing_leading() {
+            trailing
+        } else {
+            0.0
+        };
+        if paragraph_height <= capacity && required - allowance > paginator.get_available_height() {
+            paginator.ensure_fits_with_trailing(required, trailing);
+        }
+    }
+
+    let mut current_line_index = 0usize;
+
+    while current_line_index < lines.len() {
+        if paginator.has_float_bands() {
+            let state_idx = paginator.get_current();
+            let before = if current_line_index == 0 {
+                paginator
+                    .leading_spacing(space_before)
+                    .max(paginator.state(state_idx).deferred_spacing)
+            } else {
+                0.0
+            };
+            paginator.ensure_fits_with_trailing(
+                paragraph_fragment_height(
+                    before,
+                    lines[current_line_index].line_height
+                        + lines[current_line_index].float_skip_before.unwrap_or(0.0),
+                ),
+                trailing_leading(block, &lines[current_line_index]),
+            );
+        }
+        let state_idx = paginator.get_current();
+        let deferred_spacing = paginator.state(state_idx).deferred_spacing;
+        let column_index = paginator.state(state_idx).column_index;
+
+        // Reserve leading space before fitting the first fragment.
+        let reserved_before = if current_line_index == 0 {
+            paginator
+                .leading_spacing(space_before)
+                .max(deferred_spacing)
+        } else {
+            0.0
+        };
+        let available_height = paginator.get_available_height();
+        let has_float_bands = paginator.has_float_bands();
+        let (fit_before, available_for_lines) = if has_float_bands {
+            (reserved_before, available_height)
+        } else {
+            (0.0, available_height - reserved_before)
+        };
+
+        // greedy fit; a fragment always takes at least one line
+        let mut lines_height = 0.0f64;
+        let mut fitting_lines = 0usize;
+        let mut blocked_by_split_table = false;
+
+        for (line_index, line) in lines.iter().enumerate().skip(current_line_index) {
+            let line_top = paginator.state(state_idx).pen_y
+                + reserved_before
+                + lines_height
+                + line.float_skip_before.unwrap_or(0.0)
+                - if line_index == 0 {
+                    dropped_lead_skip
+                } else {
+                    0.0
+                };
+            let attrs = block.attrs.as_ref();
+            let is_rtl = attrs.and_then(|attrs| attrs.bidi).unwrap_or(false)
+                || runs_base_is_rtl(block.runs.iter().filter_map(|run| match run {
+                    Run::Text(text) => Some((text.fmt.rtl == Some(true), text.text.as_str())),
+                    _ => None,
+                }));
+            let indent = attrs.and_then(|attrs| attrs.indent.as_ref());
+            let (indent_left, indent_right) = if is_rtl {
+                (
+                    indent.and_then(|indent| indent.right).unwrap_or(0.0),
+                    indent.and_then(|indent| indent.left).unwrap_or(0.0),
+                )
+            } else {
+                (
+                    indent.and_then(|indent| indent.left).unwrap_or(0.0),
+                    indent.and_then(|indent| indent.right).unwrap_or(0.0),
+                )
+            };
+            let has_list_marker = attrs
+                .and_then(|attrs| attrs.list_marker.as_deref())
+                .is_some_and(|marker| !marker.is_empty())
+                && attrs.and_then(|attrs| attrs.list_marker_hidden) != Some(true);
+            let line_box = horizontal_line_box(
+                HorizontalLineGeometry {
+                    frag_x: paginator.get_column_x(column_index),
+                    frag_width: paginator.get_content_width(),
+                    indent_left,
+                    indent_right,
+                    hanging: indent.and_then(|indent| indent.hanging).unwrap_or(0.0),
+                    first_line: indent.and_then(|indent| indent.first_line).unwrap_or(0.0),
+                    is_first_line: line_index == 0,
+                    is_last_line: line_index + 1 == lines.len(),
+                    is_rtl,
+                    alignment: attrs.and_then(|attrs| attrs.alignment.as_deref()),
+                    has_list_marker,
+                    left_offset: line.left_offset.unwrap_or(0.0),
+                    right_offset: line.right_offset.unwrap_or(0.0),
+                    marker_tab_offset: line.marker_tab_offset.unwrap_or(0.0),
+                    marker_inline_width: line.marker_inline_width.unwrap_or(0.0),
+                    marker_font_size_pt: attrs
+                        .and_then(|attrs| attrs.list_marker_font_size.or(attrs.default_font_size)),
+                },
+                line.width,
+            );
+            let previous_wrapped = line_index > 0
+                && (lines[line_index - 1].left_offset.unwrap_or(0.0) > 0.0
+                    || lines[line_index - 1].right_offset.unwrap_or(0.0) > 0.0);
+            let overlaps = paginator.pages[paginator.state(state_idx).page_index]
+                .fragments
+                .iter()
+                .any(|fragment| {
+                    matches!(fragment, Fragment::Table(table)
+                    if table.is_floating == Some(true)
+                        && table.carried_from_prev == Some(true)
+                        && line_top < table.y + table.height
+                        && line_top + line.line_height > table.y
+                        && line_box.left < table.x + table.width
+                        && line_box.right > table.x)
+                });
+            if previous_wrapped
+                && line.left_offset.unwrap_or(0.0) == 0.0
+                && line.right_offset.unwrap_or(0.0) == 0.0
+                && overlaps
+            {
+                blocked_by_split_table = true;
+                break;
+            }
+            // floatSkipBefore counts toward fragment height so following
+            // blocks flow below the float, not over it
+            let line_height = line.line_height + line.float_skip_before.unwrap_or(0.0)
+                - if line_index == 0 {
+                    dropped_lead_skip
+                } else {
+                    0.0
+                };
+            let total_with_line = lines_height + line_height;
+
+            let trailing = if paginator.allows_trailing_leading() {
+                trailing_leading(block, line)
+            } else {
+                0.0
+            };
+            if paragraph_fragment_height(fit_before, total_with_line - trailing)
+                <= available_for_lines
+                || fitting_lines == 0
+            {
+                lines_height = total_with_line;
+                fitting_lines += 1;
+            } else {
+                break;
+            }
+        }
+
+        if blocked_by_split_table
+            && (fitting_lines == 0 || paragraph_is_unbreakable(block, measure))
+        {
+            paginator.advance_for_overflow();
+            continue;
+        }
+        let remaining_after = lines.len() - (current_line_index + fitting_lines);
+        let mut pushed_widow = false;
+        let mut pushed_keep = false;
+        if widow_control && remaining_after > 0 && !blocked_by_split_table {
+            if current_line_index == 0 && fitting_lines == 1 {
+                let trailing = trailing_leading(block, &lines[1]);
+                let capacity = paginator.get_column_capacity_with_trailing(trailing);
+                let first_two_height =
+                    slice_fit_height(block, &lines[..2]) + trailing - dropped_lead_skip;
+                let required = paragraph_fragment_height(reserved_before, first_two_height);
+                if required <= capacity {
+                    let pen_y = paginator.state(state_idx).pen_y;
+                    let next_idx = if has_float_bands {
+                        paginator.ensure_fits_with_trailing(required, trailing)
+                    } else {
+                        paginator.advance_for_overflow()
+                    };
+                    let next = paginator.state(next_idx);
+                    if next_idx != state_idx
+                        || next.column_index != column_index
+                        || next.pen_y > pen_y
+                    {
+                        continue;
+                    }
+                }
+            }
+            if remaining_after == 1 && fitting_lines > 2 {
+                fitting_lines -= 1;
+                // at a float band the space below it still takes the line, and
+                // balancing chose its column depth with the line kept here
+                let tail = slice_fit_height(block, &lines[current_line_index + fitting_lines..]);
+                pushed_widow = !has_float_bands
+                    && !paginator.balances_region()
+                    && tail <= paginator.get_column_capacity();
+                let removed = &lines[current_line_index + fitting_lines];
+                lines_height -= removed.line_height + removed.float_skip_before.unwrap_or(0.0);
+            }
+        }
+
+        if current_line_index + fitting_lines == lines.len()
+            && let Some((after, trailing)) = keep_with_next_after.filter(|(after, _)| *after > 0.0)
+            && paragraph_fragment_height(
+                reserved_before,
+                lines_height
+                    + after
+                    + if paginator.allows_trailing_leading() {
+                        0.0
+                    } else {
+                        trailing
+                    },
+            ) > available_height
+        {
+            let trailing_lines = if paragraph_is_unbreakable(block, measure) {
+                lines.len()
+            } else if widow_control {
+                2
+            } else {
+                1
+            };
+            let prefix = (lines.len() - current_line_index).saturating_sub(trailing_lines);
+            if prefix == 0 || (current_line_index == 0 && widow_control && prefix < 2) {
+                let required = paragraph_fragment_height(reserved_before, lines_height + after);
+                if required - reserved_before
+                    <= paginator.get_column_capacity_with_trailing(trailing) - trailing
+                    && paginator.page_fragment_count(state_idx) > 0
+                {
+                    let pen_y = paginator.state(state_idx).pen_y;
+                    let next_idx = if has_float_bands {
+                        paginator.ensure_fits_with_trailing(required + trailing, trailing)
+                    } else {
+                        paginator.advance_for_overflow()
+                    };
+                    let next = paginator.state(next_idx);
+                    if next_idx != state_idx
+                        || next.column_index != column_index
+                        || next.pen_y > pen_y
+                    {
+                        continue;
+                    }
+                }
+            } else {
+                fitting_lines = prefix;
+                lines_height = lines[current_line_index..current_line_index + fitting_lines]
+                    .iter()
+                    .map(|line| line.line_height + line.float_skip_before.unwrap_or(0.0))
+                    .sum::<f64>()
+                    - if current_line_index == 0 {
+                        dropped_lead_skip
+                    } else {
+                        0.0
+                    };
+                pushed_keep = true;
+            }
+        }
+
+        let is_first_fragment = current_line_index == 0;
+        let paint_skip = if is_first_fragment {
+            dropped_lead_skip
+        } else {
+            0.0
+        };
+        let is_last_fragment = current_line_index + fitting_lines >= lines.len();
+        let effective_space_before = if is_first_fragment { space_before } else { 0.0 };
+        let effective_space_after = if is_last_fragment { space_after } else { 0.0 };
+        let (pm_start, pm_end) = get_paragraph_fragment_pm_range(
+            block,
+            measure,
+            current_line_index,
+            current_line_index + fitting_lines,
+        );
+
+        let fragment = Fragment::Paragraph(ParagraphFragment {
+            horizontal_frame: None,
+            block_id: block.id.clone(),
+            x: paginator.get_column_x(column_index),
+            y: 0.0, // set by add_fragment
+            width: paginator.get_content_width(),
+            height: lines_height + paint_skip,
+            from_line: current_line_index,
+            to_line: current_line_index + fitting_lines,
+            pm_start,
+            pm_end,
+            carried_from_prev: Some(!is_first_fragment),
+            carried_to_next: Some(!is_last_fragment),
+            resolved_lines: Some(build_resolved_lines(
+                block,
+                measure,
+                current_line_index,
+                current_line_index + fitting_lines,
+            )),
+        });
+
+        paginator.add_fragment_with_trailing(
+            fragment,
+            lines_height,
+            effective_space_before,
+            effective_space_after,
+            trailing_leading(block, &lines[current_line_index + fitting_lines - 1]),
+        );
+        if paint_skip > 0.0 {
+            // Painting still reads the measured skip; only its origin compensates.
+            paginator
+                .pages
+                .last_mut()
+                .and_then(|page| page.fragments.last_mut())
+                .expect("a paragraph was just added")
+                .shift_y(-paint_skip);
+        }
+
+        current_line_index += fitting_lines;
+
+        // leftover lines: move the pen to a column/page with room for the next;
+        // a line widow control pushed down still fits here, so break anyway
+        if pushed_keep && has_float_bands {
+            let (after, trailing) = keep_with_next_after.unwrap_or((0.0, 0.0));
+            paginator.ensure_fits_with_trailing(
+                paragraph_min_trailing_slice(block, measure) + after + trailing,
+                trailing,
+            );
+        } else if pushed_widow || pushed_keep || blocked_by_split_table {
+            paginator.advance_for_overflow();
+        } else if current_line_index < lines.len() {
+            paginator.ensure_fits_with_trailing(
+                lines[current_line_index].line_height
+                    + lines[current_line_index].float_skip_before.unwrap_or(0.0),
+                trailing_leading(block, &lines[current_line_index]),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn can_drop_lead_skip(paginator: &mut Paginator) -> bool {
+    use crate::column_balancing::ColumnBalancePaginator as _;
+    paginator.columns().count <= 1.0 && !paginator.has_float_bands() && !paginator.balances_region()
+}
+
+fn at_fresh_page_top(paginator: &mut Paginator, page_index_offset: usize) -> bool {
+    let state_idx = paginator.get_current();
+    let state = paginator.state(state_idx);
+    state.page_index + page_index_offset > 0
+        && state.column_index == 0
+        && state.pen_y == state.content_top
+}
+
+/// `kept_spacing` is the space-before placement keeps above the first line.
+fn removable_lead_skip(
+    preceding: &[MeasuredBlock],
+    block: &ParagraphBlock,
+    measure: &ParagraphExtent,
+    kept_spacing: f64,
+) -> f64 {
+    let Some(first) = measure.lines.first() else {
+        return 0.0;
+    };
+    let Some(skip) = first.float_skip_before.filter(|skip| *skip > 0.0) else {
+        return 0.0;
+    };
+    let decorated = block
+        .attrs
+        .as_ref()
+        .is_some_and(|attrs| attrs.shading.is_some() || attrs.borders.is_some());
+    let floats_inline = block.runs.iter().any(|run| match run {
+        Run::Image(image) => {
+            image.position.is_some() || image.display_mode.as_deref() == Some("float")
+        }
+        _ => false,
+    });
+    if decorated
+        || floats_inline
+        || owns_float_over_first_line(preceding, kept_spacing + first.line_height)
+    {
+        0.0
+    } else {
+        skip
+    }
+}
+
+/// Clearance left on an earlier page, excluded from first-fragment fitting.
+fn stale_lead_skip(
+    preceding: &[MeasuredBlock],
+    block: &ParagraphBlock,
+    measure: &ParagraphExtent,
+    paginator: &mut Paginator,
+    page_index_offset: usize,
+) -> f64 {
+    let skip = removable_lead_skip(preceding, block, measure, 0.0);
+    if skip == 0.0 || !can_drop_lead_skip(paginator) {
+        return 0.0;
+    }
+    let state_idx = paginator.get_current();
+    let state = paginator.state(state_idx);
+    let slice = paragraph_min_leading_slice(block, measure);
+    let need = paginator
+        .leading_spacing(get_spacing_before(block))
+        .max(state.deferred_spacing)
+        + slice;
+    // A slice that overflows even a fresh column splits where it stands; the
+    // break itself spends the leading spacing.
+    if need > paginator.get_available_height() && slice - skip <= paginator.get_column_capacity() {
+        paginator.ensure_fits(need);
+    }
+    if !at_fresh_page_top(paginator, page_index_offset) || !can_drop_lead_skip(paginator) {
+        return 0.0;
+    }
+    let state_idx = paginator.get_current();
+    let kept = paginator
+        .leading_spacing(get_spacing_before(block))
+        .max(paginator.state(state_idx).deferred_spacing);
+    removable_lead_skip(preceding, block, measure, kept)
+}
+
+/// Whether a float the paragraph anchors ahead of itself starts above the foot
+/// of its unskipped first line, `line_foot` below the paragraph top; one it
+/// cannot place, or a floating table or image, is assumed to.
+fn owns_float_over_first_line(preceding: &[MeasuredBlock], line_foot: f64) -> bool {
+    preceding
+        .iter()
+        .rev()
+        .map_while(|measured| match &measured.block {
+            LayoutBlock::Shape(shape) if shape.position.is_some() => Some(Some(shape)),
+            LayoutBlock::TextBox(text_box) if is_floating_text_box_block(text_box) => Some(None),
+            LayoutBlock::Table(table) if table.floating.is_some() => Some(None),
+            LayoutBlock::Image(image) if is_anchored_image(image) => Some(None),
+            _ => None,
+        })
+        .any(|shape| {
+            let Some(shape) = shape else {
+                return true;
+            };
+            if !matches!(
+                shape.wrap_type.as_deref(),
+                Some("square" | "tight" | "through" | "topAndBottom")
+            ) {
+                return false;
+            }
+            let vertical = shape
+                .position
+                .as_ref()
+                .and_then(|position| position.vertical.as_ref());
+            match vertical {
+                Some(axis)
+                    if axis.align.is_none()
+                        && matches!(axis.relative_to.as_deref(), Some("paragraph" | "line")) =>
+                {
+                    let top = shape.wrap_distances.as_ref().map_or(0.0, |gap| gap.top);
+                    axis.pos_offset.unwrap_or(0.0) - top < line_foot
+                }
+                _ => true,
+            }
+        })
+}
+
+/// Places inline images in flow and anchored images over the page.
+fn layout_image(block: &ImageBlock, measure: &ImageExtent, paginator: &mut Paginator) {
+    if is_anchored_image(block) {
+        layout_anchored_image(block, measure, paginator);
+        return;
+    }
+
+    let state_idx = paginator.ensure_fits(measure.height);
+    let column_index = paginator.state(state_idx).column_index;
+
+    let fragment = Fragment::Image(ImageFragment {
+        block_id: block.id.clone(),
+        x: paginator.get_column_x(column_index),
+        y: 0.0, // set by add_fragment
+        width: measure.width,
+        height: measure.height,
+        pm_start: block.pm_start,
+        pm_end: block.pm_end,
+        is_anchored: None,
+        z_index: None,
+    });
+
+    paginator.add_fragment(fragment, measure.height, 0.0, 0.0);
+}
+
+/// Places reserved space like an inline image block, clipped to the column it
+/// lands in.
+fn layout_reserved(block: &ReservedBlock, measure: &ImageExtent, paginator: &mut Paginator) {
+    let state_idx = paginator.ensure_fits(measure.height);
+    let column_index = paginator.state(state_idx).column_index;
+    let height = measure.height.min(paginator.get_column_capacity()).max(0.0);
+    let fragment = Fragment::Reserved(ReservedFragment {
+        block_id: block.id.clone(),
+        x: paginator.get_column_x(column_index),
+        y: 0.0,
+        width: measure
+            .width
+            .min(paginator.column_width().max(0.0))
+            .max(0.0),
+        height,
+    });
+    paginator.add_fragment(fragment, height, 0.0, 0.0);
+}
+
+/// Places anchored shapes at page coordinates.
+fn layout_shape(block: &ShapeBlock, measure: &ShapeExtent, paginator: &mut Paginator) {
+    if block.position.is_some() {
+        if block.scene.is_some()
+            && shape_has_text(block)
+            && let Some(position) = &block.position
+            && !position.use_simple_pos.unwrap_or(false)
+            && let Some(vertical) = &position.vertical
+            && matches!(vertical.relative_to.as_deref(), Some("paragraph" | "line"))
+        {
+            let required = vertical.pos_offset.unwrap_or(0.0).max(0.0) + measure.height;
+            if required <= paginator.get_column_capacity() {
+                paginator.ensure_fits(required);
+            }
+        }
+        let (x, y) = resolve_object_position(
+            block.position.as_ref(),
+            measure.width,
+            measure.height,
+            paginator,
+        );
+        let state_idx = paginator.get_current();
+        let column_x = paginator.get_column_x(paginator.state(state_idx).column_index);
+        paginator.push_fragment_direct(Fragment::Shape(ShapeFragment {
+            block_id: block.id.clone(),
+            wrap_offset_x: Some(x - column_x),
+            x,
+            y,
+            width: measure.width,
+            height: measure.height,
+            pm_start: block.pm_start,
+            pm_end: block.pm_end,
+            doc_start: block.doc_start,
+            doc_end: block.doc_end,
+            is_anchored: Some(true),
+            z_index: Some(if block.behind_doc.unwrap_or(false) {
+                -1.0
+            } else {
+                block.relative_height.unwrap_or(1).clamp(1, 2_147_483_647) as f64
+            }),
+        }));
+        return;
+    }
+    let state_idx = paginator.ensure_fits(measure.height);
+    let column_index = paginator.state(state_idx).column_index;
+    let fragment = Fragment::Shape(ShapeFragment {
+        block_id: block.id.clone(),
+        wrap_offset_x: None,
+        x: paginator.get_column_x(column_index),
+        y: 0.0,
+        width: measure.width,
+        height: measure.height,
+        pm_start: block.pm_start,
+        pm_end: block.pm_end,
+        doc_start: block.doc_start,
+        doc_end: block.doc_end,
+        is_anchored: None,
+        z_index: None,
+    });
+    paginator.add_fragment(fragment, measure.height, 0.0, 0.0);
+}
+
+fn shape_has_text(shape: &ShapeBlock) -> bool {
+    shape
+        .inner_text
+        .as_ref()
+        .is_some_and(|paragraphs| !paragraphs.is_empty())
+        || shape.children.iter().any(shape_has_text)
+}
+
+/// Charts use the same bbox placement rule as an in-flow image.
+fn layout_chart(block: &ChartBlock, measure: &ChartExtent, paginator: &mut Paginator) {
+    let state_idx = paginator.ensure_fits(measure.height);
+    let column_index = paginator.state(state_idx).column_index;
+    let fragment = Fragment::Chart(ChartFragment {
+        block_id: block.id.clone(),
+        x: paginator.get_column_x(column_index),
+        y: 0.0,
+        width: measure.width,
+        height: measure.height,
+        pm_start: block.pm_start,
+        pm_end: block.pm_end,
+        doc_start: block.doc_start,
+        doc_end: block.doc_end,
+        is_anchored: None,
+        z_index: None,
+    });
+    paginator.add_fragment(fragment, measure.height, 0.0, 0.0);
+}
+
+/// Resolves a DrawingML anchor to a page-coordinate origin.
+///
+/// A simple position is taken verbatim. Otherwise each axis picks a band from
+/// its `relativeFrom` — page, margin box, an individual margin strip, or the
+/// current column horizontally and the flow region vertically — and then
+/// applies either an explicit offset or an alignment within that band. The
+/// `insideMargin` and `outsideMargin` bands swap sides with page parity.
+fn resolve_object_position(
+    position: Option<&ImageRunPosition>,
+    width: f64,
+    height: f64,
+    paginator: &mut Paginator,
+) -> (f64, f64) {
+    let state_idx = paginator.get_current();
+    let state = paginator.state(state_idx);
+    let page = &paginator.pages[state.page_index];
+    let margins = page.body_anchor_margins.as_ref().unwrap_or(&page.margins);
+    let column_x = paginator.get_column_x(state.column_index);
+    crate::anchor::resolve_position(
+        position,
+        width,
+        height,
+        &crate::anchor::AnchorFrame {
+            page_width: page.size.w,
+            page_height: page.size.h,
+            margin_left: paginator.active_margins().left,
+            margin_right: paginator.active_margins().right,
+            margin_top: margins.top,
+            margin_bottom: margins.bottom,
+            flow_x: column_x,
+            flow_y: state.pen_y,
+            flow_width: paginator.column_width(),
+            flow_height: state.content_limit - state.pen_y,
+            odd_page: page.number % 2 == 1,
+        },
+    )
+}
+
+/// Places an anchored image at its resolved anchor without moving the pen.
+/// `behindDoc` decides whether it paints under or over body content.
+fn layout_anchored_image(block: &ImageBlock, measure: &ImageExtent, paginator: &mut Paginator) {
+    let anchor = block.anchor.as_ref().expect("anchored image has anchor");
+
+    let (resolved_x, resolved_y) = resolve_object_position(
+        anchor.position.as_ref(),
+        measure.width,
+        measure.height,
+        paginator,
+    );
+    let x = if anchor.position.is_some() {
+        resolved_x
+    } else {
+        anchor.offset_h.unwrap_or(resolved_x)
+    };
+    let mut y = if anchor.position.is_some() {
+        resolved_y
+    } else {
+        anchor.offset_v.unwrap_or(resolved_y)
+    };
+    if anchor.allow_overlap == Some(false) {
+        let state_idx = paginator.get_current();
+        let page_index = paginator.state(state_idx).page_index;
+        for existing in &paginator.pages[page_index].fragments {
+            let (ex, ey, ew, eh) = match existing {
+                Fragment::Paragraph(value) => (value.x, value.y, value.width, value.height),
+                Fragment::Table(value) => (value.x, value.y, value.width, value.height),
+                Fragment::Image(value) => (value.x, value.y, value.width, value.height),
+                Fragment::Shape(value) => (value.x, value.y, value.width, value.height),
+                Fragment::Chart(value) => (value.x, value.y, value.width, value.height),
+                Fragment::TextBox(value) => (value.x, value.y, value.width, value.height),
+                Fragment::Reserved(value) => (value.x, value.y, value.width, value.height),
+            };
+            if x < ex + ew && x + measure.width > ex && y < ey + eh && y + measure.height > ey {
+                y = ey + eh;
+            }
+        }
+    }
+
+    let fragment = Fragment::Image(ImageFragment {
+        block_id: block.id.clone(),
+        x,
+        y,
+        width: measure.width,
+        height: measure.height,
+        pm_start: block.pm_start,
+        pm_end: block.pm_end,
+        is_anchored: Some(true),
+        z_index: Some(if anchor.behind_doc.unwrap_or(false) {
+            -1.0
+        } else {
+            anchor
+                .relative_height
+                .or_else(|| {
+                    anchor
+                        .position
+                        .as_ref()
+                        .and_then(|value| value.relative_height)
+                })
+                .unwrap_or(1)
+                .clamp(1, 2_147_483_647) as f64
+        }),
+    });
+
+    paginator.push_fragment_direct(fragment);
+}
+
+/// Places floating text boxes as overlays and inline text boxes in flow.
+fn layout_text_box(block: &TextBoxBlock, measure: &TextBoxExtent, paginator: &mut Paginator) {
+    if is_floating_text_box_block(block) {
+        let (x, y) = resolve_object_position(
+            block.position.as_ref(),
+            measure.width,
+            measure.height,
+            paginator,
+        );
+        let fragment = Fragment::TextBox(TextBoxFragment {
+            block_id: block.id.clone(),
+            x,
+            y,
+            width: measure.width,
+            height: measure.height,
+            pm_start: block.pm_start,
+            pm_end: block.pm_end,
+            is_floating: Some(true),
+            z_index: Some(if block.wrap_type.as_deref() == Some("behind") {
+                -1.0
+            } else {
+                1.0
+            }),
+        });
+        paginator.push_fragment_direct(fragment);
+        return;
+    }
+
+    let state_idx = paginator.ensure_fits(measure.height);
+    let column_index = paginator.state(state_idx).column_index;
+
+    let fragment = Fragment::TextBox(TextBoxFragment {
+        block_id: block.id.clone(),
+        x: paginator.get_column_x(column_index),
+        y: 0.0, // set by add_fragment
+        width: measure.width,
+        height: measure.height,
+        pm_start: block.pm_start,
+        pm_end: block.pm_end,
+        is_floating: None,
+        z_index: None,
+    });
+
+    paginator.add_fragment(fragment, measure.height, 0.0, 0.0);
+}
+
+#[cfg(test)]
+mod pagination_rule_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn line(height: f64) -> serde_json::Value {
+        json!({
+            "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 1,
+            "width": 10, "ascent": height * 0.8, "descent": height * 0.2, "lineHeight": height,
+        })
+    }
+
+    fn paragraph(
+        id: u32,
+        lines: usize,
+        height: f64,
+        attrs: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "block": {
+                "kind": "paragraph", "id": id,
+                "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+                "attrs": attrs,
+            },
+            "measure": {
+                "kind": "paragraph",
+                "lines": vec![line(height); lines],
+                "totalHeight": lines as f64 * height,
+            },
+        })
+    }
+
+    fn paragraph_with_line_heights(
+        id: u32,
+        heights: &[f64],
+        attrs: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut block = paragraph(id, 0, 0.0, attrs);
+        block["measure"]["lines"] = json!(heights.iter().copied().map(line).collect::<Vec<_>>());
+        block["measure"]["totalHeight"] = json!(heights.iter().sum::<f64>());
+        block
+    }
+
+    fn layout(measured: Vec<serde_json::Value>) -> Layout {
+        let mut input: Input = serde_json::from_value(json!({
+            "measured": measured,
+            "options": {
+                "pageSize": { "w": 200, "h": 120 },
+                "margins": { "top": 10, "right": 10, "bottom": 10, "left": 10 },
+            },
+        }))
+        .unwrap();
+        layout_document(&mut input).unwrap()
+    }
+
+    fn input(measured: Vec<serde_json::Value>) -> Input {
+        serde_json::from_value(json!({
+            "measured": measured,
+            "options": {
+                "pageSize": { "w": 200, "h": 120 },
+                "margins": { "top": 10, "right": 10, "bottom": 10, "left": 10 },
+            },
+        }))
+        .unwrap()
+    }
+
+    fn counted_keep_layout(mut value: Input, reference: bool) -> (Vec<u8>, usize) {
+        use crate::keep_together::{KEEP_REFERENCE, KEEP_WORK};
+
+        KEEP_WORK.with(|work| work.set(0));
+        KEEP_REFERENCE.with(|flag| flag.set(reference));
+        let result = layout_document(&mut value);
+        KEEP_REFERENCE.with(|flag| flag.set(false));
+        let count = KEEP_WORK.with(|work| work.get());
+        (serde_json::to_vec(&result.unwrap()).unwrap(), count)
+    }
+
+    fn keep_run_input(count: usize, split_every_tenth: bool, height: f64) -> Input {
+        let mut blocks: Vec<_> = (0..count)
+            .map(|index| {
+                paragraph(
+                    index as u32,
+                    if split_every_tenth && index % 10 == 9 {
+                        2
+                    } else {
+                        1
+                    },
+                    height,
+                    json!({"keepNext": true, "widowControl": false}),
+                )
+            })
+            .collect();
+        blocks.push(paragraph(count as u32, 1, height, json!({})));
+        input(blocks)
+    }
+
+    #[test]
+    fn long_keep_runs_visit_members_linearly_with_page_bounded_witnesses() {
+        for split_every_tenth in [false, true] {
+            let mut counts = Vec::new();
+            let mut reference_counts = Vec::new();
+            for count in [100, 200] {
+                let value = keep_run_input(count, split_every_tenth, 10.0);
+                let (actual, work) = counted_keep_layout(value.clone(), false);
+                let (expected, reference_work) = counted_keep_layout(value, true);
+                assert_eq!(actual, expected);
+                let expected_work = if split_every_tenth {
+                    13 * count - 9
+                } else {
+                    14 * count - 11
+                };
+                assert_eq!(work, expected_work);
+                counts.push(work);
+                reference_counts.push(reference_work);
+            }
+            assert!(counts[1] * 10 <= counts[0] * 22, "{counts:?}");
+            assert!(reference_counts[1] * 10 >= reference_counts[0] * 37);
+        }
+    }
+
+    #[test]
+    fn zero_height_keep_runs_skip_zero_continuations() {
+        let (_, small) = counted_keep_layout(keep_run_input(100, false, 0.0), false);
+        let (_, large) = counted_keep_layout(keep_run_input(200, false, 0.0), false);
+        assert_eq!((small, large), (499, 999));
+        assert!(large * 10 <= small * 22);
+    }
+
+    #[test]
+    fn cached_keep_witnesses_preserve_reference_layout_bytes() {
+        for split_every_tenth in [false, true] {
+            for float_bands in [false, true] {
+                let mut value = keep_run_input(36, split_every_tenth, 7.3);
+                for (index, measured) in value.measured.iter_mut().enumerate() {
+                    let (LayoutBlock::Paragraph(block), BlockExtent::Paragraph(measure)) =
+                        (&mut measured.block, &mut measured.measure)
+                    else {
+                        unreachable!();
+                    };
+                    let attrs = block.attrs.as_mut().unwrap();
+                    attrs.spacing = Some(crate::types::ParagraphSpacing {
+                        before: Some(if index % 7 == 0 { -20.1 } else { 1.3 }),
+                        after: Some(if index % 7 == 6 { -20.7 } else { 2.9 }),
+                        ..Default::default()
+                    });
+                    if index % 6 == 0 {
+                        measure.lines = vec![measure.lines[0].clone(); 4];
+                        measure.total_height = 4.0 * 7.3;
+                        attrs.keep_lines = Some(true);
+                    }
+                    if index % 5 == 0 {
+                        attrs.widow_control = Some(true);
+                    }
+                    if index % 4 == 0 {
+                        measure.lines[0].float_skip_before = Some(13.7);
+                    }
+                }
+                if float_bands {
+                    let mut serialized = serde_json::to_value(&value).unwrap();
+                    serialized["options"]["sectionPageFloatBands"] = json!([
+                        {"default": [{"top": 40, "bottom": 47}]}
+                    ]);
+                    value = serde_json::from_value(serialized).unwrap();
+                }
+                let (actual, _) = counted_keep_layout(value.clone(), false);
+                let (expected, _) = counted_keep_layout(value, true);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_keep_table_witnesses_preserve_page_dependent_measurements() {
+        use crate::keep_together::{
+            analyze_keep_with_next, measure_keep_with_next_group_witnessing,
+        };
+
+        let mut value = keep_run_input(24, false, 3.7);
+        let cell = paragraph(100, 4, 7.3, json!({}));
+        value.measured[24] = serde_json::from_value(json!({
+            "block": {
+                "kind": "table", "id": 24, "columnWidths": [100],
+                "rows": [{"id": 200, "cells": [{"id": 300, "blocks": [cell["block"]]}]}]
+            },
+            "measure": {
+                "kind": "table", "totalWidth": 100, "totalHeight": 29.2,
+                "columnWidths": [100],
+                "rows": [{"height": 29.2, "cells": [{
+                    "width": 100, "height": 29.2, "blocks": [cell["measure"]]
+                }]}]
+            }
+        }))
+        .unwrap();
+        let scan = analyze_keep_with_next(&value.measured);
+        let whole_group = &scan.groups_by_head[&0];
+        let mut run = KeepRun::new(whole_group, &value.measured).unwrap();
+        for start in 0..24 {
+            run.starting_at(start);
+            let group = crate::keep_together::KeepWithNextGroup {
+                head_index: start,
+                tail_index: 23,
+                members: (start..24).collect(),
+                follower: Some(24),
+            };
+            for capacity in [20.0, 100.0, 500.0] {
+                for split_first_row in [false, true] {
+                    for every_cell_starts in [false, true] {
+                        let current = measure_keep_with_next_group_witnessing(
+                            &group,
+                            &value.measured,
+                            |before| before + 1.3,
+                            2.9,
+                            capacity,
+                            split_first_row,
+                            every_cell_starts,
+                        ) - 0.7;
+                        let fresh = measure_keep_with_next_group_witnessing(
+                            &group,
+                            &value.measured,
+                            |_| 0.0,
+                            0.0,
+                            capacity,
+                            split_first_row,
+                            every_cell_starts,
+                        ) - 1.1;
+                        let actual = run.heights(
+                            &value.measured,
+                            |before| before + 1.3,
+                            2.9,
+                            capacity,
+                            split_first_row,
+                            every_cell_starts,
+                            0.7,
+                            1.1,
+                        );
+                        if let Some((actual_current, actual_fresh, _)) = actual {
+                            assert_eq!(actual_current.to_bits(), current.to_bits());
+                            assert_eq!(actual_fresh.to_bits(), fresh.to_bits());
+                        } else {
+                            assert!(fresh > capacity);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn widow_rounding_input(
+        page_height: f64,
+        top: f64,
+        bottom: f64,
+        before: f64,
+        heights: &[f64],
+    ) -> Input {
+        let mut measured = paragraph(
+            1,
+            heights.len(),
+            heights[0],
+            json!({
+                "spacing": {"before": before},
+            }),
+        );
+        measured["measure"]["lines"] = json!(heights.iter().copied().map(line).collect::<Vec<_>>());
+        serde_json::from_value(json!({
+            "measured": [measured],
+            "options": {
+                "pageSize": {"w": 500, "h": page_height},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "sectionPageFloatBands": [{"default": [{"top": top, "bottom": bottom}]}],
+            },
+        }))
+        .unwrap()
+    }
+
+    fn assert_all_paragraph_lines(value: &mut Input, count: usize) -> Layout {
+        let result = layout_document(value).unwrap();
+        let mut next_line = 0;
+        for fragment in result.pages.iter().flat_map(|page| &page.fragments) {
+            let Fragment::Paragraph(fragment) = fragment else {
+                panic!("paragraph expected");
+            };
+            assert_eq!(fragment.from_line, next_line);
+            assert!(fragment.to_line > fragment.from_line);
+            next_line = fragment.to_line;
+        }
+        assert_eq!(next_line, count);
+        result
+    }
+
+    #[test]
+    fn a_long_layout_reports_progress() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn count() {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::progress::set_hook(Some(count));
+        layout(
+            (0..3000)
+                .map(|id| paragraph(id, 1, 10.0, json!({})))
+                .collect(),
+        );
+        crate::progress::set_hook(None);
+        assert!(CALLS.load(Ordering::Relaxed) >= 3000 / crate::progress::EVERY as usize);
+    }
+
+    #[test]
+    fn widow_control_terminates_when_fractional_spacing_rounds_two_lines_to_the_gap() {
+        let mut value = widow_rounding_input(300.0, 176.0, 200.0, 57.7, &[11.15; 4]);
+        let result = assert_all_paragraph_lines(&mut value, 4);
+        let Fragment::Paragraph(first) = &result.pages[0].fragments[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(first.to_line, 2);
+        value.options.section_page_float_bands = None;
+        assert_eq!(assert_all_paragraph_lines(&mut value, 4).pages.len(), 1);
+    }
+
+    #[test]
+    fn widow_control_terminates_when_line_rounding_matches_the_gap_with_spacing() {
+        let mut value =
+            widow_rounding_input(500.0, 200.0, 220.0, 64.0, &[20.0, 20.000000000000007]);
+        let result = assert_all_paragraph_lines(&mut value, 2);
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(result.pages[0].fragments.len(), 1);
+        value.options.section_page_float_bands = None;
+        assert_eq!(assert_all_paragraph_lines(&mut value, 2).pages.len(), 1);
+    }
+
+    #[test]
+    fn a_kept_row_pair_terminates_when_rounding_fits_it_at_the_cursor() {
+        let heights = [20.0, 20.000000000000007];
+        let cell = |row: usize| {
+            json!({ "id": 30 + row, "blocks": [{
+                "kind": "paragraph", "id": 40 + row,
+                "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+                "attrs": { "keepNext": row == 0 },
+            }] })
+        };
+        let extent = |row: usize| {
+            json!({ "height": heights[row], "cells": [{ "width": 100, "height": heights[row],
+                "blocks": [{ "kind": "paragraph", "lines": [line(heights[row])],
+                             "totalHeight": heights[row] }] }] })
+        };
+        let table = json!({
+            "block": {
+                "kind": "table", "id": 2,
+                "rows": [{ "id": 20, "cells": [cell(0)] }, { "id": 21, "cells": [cell(1)] }],
+                "columnWidths": [100],
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [100],
+                "totalWidth": 100, "totalHeight": heights[0] + heights[1],
+                "rows": [extent(0), extent(1)],
+            },
+        });
+        let mut value: Input = serde_json::from_value(json!({
+            "measured": [paragraph(1, 1, 20.0, json!({"spacing": {"after": 64}})), table],
+            "options": {
+                "pageSize": {"w": 500, "h": 500},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "sectionPageFloatBands": [{"default": [{"top": 220, "bottom": 240}]}],
+            },
+        }))
+        .unwrap();
+        let result = layout_document(&mut value).unwrap();
+        let last_row_end = result
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .filter_map(|fragment| match fragment {
+                Fragment::Table(table) => Some(table.row_end),
+                _ => None,
+            })
+            .next_back();
+        assert_eq!(last_row_end, Some(2));
+    }
+
+    fn two_column_keep_table(keeps: &[(bool, bool)]) -> serde_json::Value {
+        let cell = |row: usize, column: usize, keep_next: bool| {
+            json!({ "id": 30 + 2 * row + column, "blocks": [{
+                "kind": "paragraph", "id": 50 + 2 * row + column,
+                "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+                "attrs": { "keepNext": keep_next, "widowControl": false },
+            }] })
+        };
+        let extent = || {
+            json!({ "height": 20, "cells": [
+                { "width": 90, "height": 20,
+                  "blocks": [{ "kind": "paragraph", "lines": [line(20.0)], "totalHeight": 20 }] },
+                { "width": 90, "height": 20,
+                  "blocks": [{ "kind": "paragraph", "lines": [line(20.0)], "totalHeight": 20 }] },
+            ] })
+        };
+        json!({
+            "block": {
+                "kind": "table", "id": 2,
+                "rows": keeps.iter().enumerate().map(|(row, (first, second))| {
+                    json!({ "id": 20 + row, "cells": [cell(row, 0, *first), cell(row, 1, *second)] })
+                }).collect::<Vec<_>>(),
+                "columnWidths": [90, 90],
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [90, 90],
+                "totalWidth": 180, "totalHeight": 20 * keeps.len(),
+                "rows": keeps.iter().map(|_| extent()).collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    fn table_fragment_rows(result: &Layout) -> Vec<(usize, usize, usize)> {
+        result
+            .pages
+            .iter()
+            .enumerate()
+            .flat_map(|(page, value)| {
+                value
+                    .fragments
+                    .iter()
+                    .filter_map(move |fragment| match fragment {
+                        Fragment::Table(table) => Some((page, table.row_start, table.row_end)),
+                        _ => None,
+                    })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_with_keep_next_only_after_its_first_cell_does_not_chain_to_the_next_row() {
+        let table = two_column_keep_table(&[
+            (false, true),
+            (false, true),
+            (false, true),
+            (false, true),
+            (false, false),
+            (false, false),
+        ]);
+        let result = layout(vec![paragraph(1, 3, 20.0, json!({})), table]);
+        let fragments = table_fragment_rows(&result);
+        assert!(fragments.len() > 1);
+        assert_eq!(fragments[0].0, 0);
+        assert_eq!(fragments[0].1, 0);
+        assert!(fragments[0].2 > 1);
+    }
+
+    #[test]
+    fn a_row_with_keep_next_in_every_cell_chains_to_the_next_row() {
+        let table = two_column_keep_table(&[
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, true),
+            (false, false),
+            (false, false),
+        ]);
+        let result = layout(vec![paragraph(1, 3, 20.0, json!({})), table]);
+        let fragments = table_fragment_rows(&result);
+        assert!(fragments.len() > 1);
+        assert_eq!(fragments[0].0, 1);
+        assert_eq!(fragments[0].1, 0);
+        assert!(fragments[0].2 > 1);
+    }
+
+    #[test]
+    fn a_row_with_keep_next_in_its_first_cell_chains_to_the_next_row() {
+        let table = two_column_keep_table(&[
+            (true, false),
+            (true, false),
+            (true, false),
+            (true, false),
+            (false, false),
+            (false, false),
+        ]);
+        let result = layout(vec![paragraph(1, 3, 20.0, json!({})), table]);
+        let fragments = table_fragment_rows(&result);
+        assert!(fragments.len() > 1);
+        assert_eq!(fragments[0].0, 1);
+        assert_eq!(fragments[0].1, 0);
+        assert!(fragments[0].2 > 1);
+    }
+
+    #[test]
+    fn row_keep_chains_follow_the_first_cell() {
+        let chains = |table: serde_json::Value| {
+            let measured: MeasuredBlock = serde_json::from_value(table).unwrap();
+            let LayoutBlock::Table(block) = &measured.block else {
+                panic!("table block expected");
+            };
+            let BlockExtent::Table(measure) = &measured.measure else {
+                panic!("table measure expected");
+            };
+            hooks::row_keep_chains(block, measure)
+        };
+        let mixed = two_column_keep_table(&[(false, true), (false, true), (false, false)]);
+        assert_eq!(chains(mixed), vec![None, None, None]);
+        let every = two_column_keep_table(&[(true, true), (true, true), (false, false)]);
+        assert_eq!(chains(every), vec![Some((40.0, 2)), None, None]);
+        let first = two_column_keep_table(&[(true, false), (true, false), (false, false)]);
+        assert_eq!(chains(first), vec![Some((40.0, 2)), None, None]);
+        let mut empty = two_column_keep_table(&[(true, true), (true, true), (false, false)]);
+        empty["block"]["rows"][0]["cells"] = json!([]);
+        assert_eq!(chains(empty), vec![None, Some((20.0, 2)), None]);
+    }
+
+    #[test]
+    fn a_table_row_taller_than_the_room_above_a_float_band_moves_below_it() {
+        let table = |height: f64| {
+            json!({
+                "block": {
+                    "kind": "table", "id": 2,
+                    "rows": [{ "id": 20, "cells": [{ "id": 30, "blocks": [{
+                        "kind": "paragraph", "id": 40,
+                        "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+                    }] }] }],
+                    "columnWidths": [100],
+                },
+                "measure": {
+                    "kind": "table", "columnWidths": [100],
+                    "totalWidth": 100, "totalHeight": height,
+                    "rows": [{ "height": height, "cells": [{ "width": 100, "height": height,
+                        "blocks": [{ "kind": "paragraph", "lines": [line(height)],
+                                     "totalHeight": height }] }] }],
+                },
+            })
+        };
+        for (height, y) in [(40.0, Some(200.0)), (250.0, None)] {
+            let mut value: Input = serde_json::from_value(json!({
+                "measured": [table(height)],
+                "options": {
+                    "pageSize": {"w": 500, "h": 500},
+                    "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                    "sectionPageFloatBands": [{"default": [{"top": 120, "bottom": 200}]}],
+                },
+            }))
+            .unwrap();
+            let result = layout_document(&mut value).unwrap();
+            let fragments: Vec<_> = result
+                .pages
+                .iter()
+                .flat_map(|page| &page.fragments)
+                .collect();
+            let [Fragment::Table(fragment)] = fragments.as_slice() else {
+                panic!("one table fragment expected");
+            };
+            assert_eq!(fragment.row_end, 1, "{height}");
+            if let Some(y) = y {
+                assert_eq!((result.pages.len(), fragment.y), (1, y));
+            }
+        }
+    }
+
+    #[test]
+    fn a_repeated_header_row_below_a_float_band_terminates_when_rounding_fits_the_slice() {
+        let rows = [
+            (true, vec![64.0]),
+            (false, vec![20.0; 8]),
+            (false, vec![40.000000000000007, 40.0]),
+        ];
+        let block_rows: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (header, _))| {
+                json!({ "id": 20 + index, "isHeader": header, "cells": [{ "id": 30 + index,
+                    "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0},
+                    "blocks": [{ "kind": "paragraph", "id": 40 + index,
+                        "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+                        "attrs": { "widowControl": false } }] }] })
+            })
+            .collect();
+        let extents: Vec<_> = rows
+            .iter()
+            .map(|(_, lines)| {
+                let height: f64 = lines.iter().sum();
+                json!({ "height": height, "cells": [{ "width": 100, "height": height,
+                    "blocks": [{ "kind": "paragraph",
+                        "lines": lines.iter().copied().map(line).collect::<Vec<_>>(),
+                        "totalHeight": height }] }] })
+            })
+            .collect();
+        let total: f64 = rows.iter().flat_map(|(_, lines)| lines).sum();
+        let mut value: Input = serde_json::from_value(json!({
+            "measured": [{
+                "block": { "kind": "table", "id": 2, "rows": block_rows, "columnWidths": [100] },
+                "measure": { "kind": "table", "columnWidths": [100], "totalWidth": 100,
+                             "totalHeight": total, "rows": extents },
+            }],
+            "options": {
+                "pageSize": {"w": 500, "h": 580},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "sectionPageFloatBands": [{"default": [{"top": 200, "bottom": 300}]}],
+            },
+        }))
+        .unwrap();
+        let result = layout_document(&mut value).unwrap();
+        let last_row_end = result
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .filter_map(|fragment| match fragment {
+                Fragment::Table(table) => Some(table.row_end),
+                _ => None,
+            })
+            .next_back();
+        assert_eq!(last_row_end, Some(3));
+        assert!(result.pages.len() <= 4);
+    }
+
+    #[test]
+    fn a_carried_row_slice_that_rounding_fits_between_bands_is_placed() {
+        let paragraphs = [
+            (vec![10.3], false),
+            (vec![10.1, 25.0], true),
+            (vec![20.0], false),
+        ];
+        let blocks: Vec<_> = paragraphs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, keep))| {
+                json!({ "kind": "paragraph", "id": 40 + index,
+                    "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+                    "attrs": { "keepLines": keep, "widowControl": false } })
+            })
+            .collect();
+        let extents: Vec<_> = paragraphs
+            .iter()
+            .map(|(lines, _)| {
+                json!({ "kind": "paragraph",
+                    "lines": lines.iter().copied().map(line).collect::<Vec<_>>(),
+                    "totalHeight": lines.iter().sum::<f64>() })
+            })
+            .collect();
+        let height: f64 = paragraphs.iter().flat_map(|(lines, _)| lines).sum();
+        let mut value: Input = serde_json::from_value(json!({
+            "measured": [{
+                "block": { "kind": "table", "id": 2, "columnWidths": [100], "rows": [
+                    { "id": 20, "cells": [{ "id": 30, "blocks": blocks,
+                        "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0} }] }] },
+                "measure": { "kind": "table", "columnWidths": [100], "totalWidth": 100,
+                    "totalHeight": height, "rows": [{ "height": height, "cells": [
+                        { "width": 100, "height": height, "blocks": extents }] }] },
+            }],
+            "options": {
+                "pageSize": {"w": 500, "h": 650},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "sectionPageFloatBands": [{"default": [
+                    {"top": 116, "bottom": 200}, {"top": 235.1, "bottom": 300}]}],
+            },
+        }))
+        .unwrap();
+        let result = layout_document(&mut value).unwrap();
+        let fragments: Vec<_> = result
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .filter_map(|fragment| match fragment {
+                Fragment::Table(table) => Some(table),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fragments.last().map(|table| table.row_end), Some(1));
+        assert!(result.pages.len() <= 2);
+    }
+
+    #[test]
+    fn a_paragraph_split_across_columns_paints_its_float_in_each_column() {
+        let floating = |height: f64, lines: usize| {
+            json!({
+                "block": {"kind": "paragraph", "id": format!("p{lines}"), "runs": [
+                    {"kind": "text", "text": "abcdefghij"},
+                    {"kind": "image", "src": "float", "width": 20, "height": 20,
+                     "displayMode": "float", "wrapType": "square",
+                     "position": {"vertical": {"relativeTo": "paragraph", "posOffset": 0}}},
+                ], "attrs": {"widowControl": false}},
+                "measure": {"kind": "paragraph", "totalHeight": height * lines as f64,
+                            "lines": (0..lines).map(|index| json!({
+                                "headRun": 0, "headChar": index, "tailRun": 0,
+                                "tailChar": index + 1, "width": 10, "ascent": 15,
+                                "descent": 5, "lineHeight": height,
+                            })).collect::<Vec<_>>()},
+            })
+        };
+        let mut value: Input = serde_json::from_value(json!({
+            "measured": [paragraph(1, 5, 20.0, json!({})), floating(20.0, 15)],
+            "options": {
+                "pageSize": {"w": 500, "h": 492},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "columns": {"count": 2, "gap": 20},
+            },
+        }))
+        .unwrap();
+        let result = layout_document(&mut value).unwrap();
+        let split: Vec<_> = result.pages[0]
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Paragraph(fragment)
+                    if matches!(&fragment.block_id, crate::types::BlockId::Str(id) if id == "p15") =>
+                {
+                    Some(fragment)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(split.len(), 2);
+        let display: serde_json::Value = serde_json::from_str(
+            &crate::display_list::build_display_list_json(
+                &json!({"measured": value.measured, "options": value.options, "layout": result})
+                    .to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let images = display["pages"][0]["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|primitive| primitive["kind"] == "image")
+            .count();
+        assert_eq!(images, 2);
+    }
+
+    #[test]
+    fn a_paragraph_crosses_two_thousand_disjoint_float_bands_on_one_page() {
+        let count = 2_000;
+        let bands: Vec<_> = (0..count)
+            .map(|index| {
+                let top = 97 + index * 2;
+                json!({"top": top, "bottom": top + 1})
+            })
+            .collect();
+        let mut value: Input = serde_json::from_value(json!({
+            "measured": [paragraph(1, count + 1, 1.0, json!({"widowControl": false}))],
+            "options": {
+                "pageSize": {"w": 500, "h": 2 * count + 193},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "sectionPageFloatBands": [{"default": bands}],
+            },
+        }))
+        .unwrap();
+        let result = assert_all_paragraph_lines(&mut value, count + 1);
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(result.pages[0].fragments.len(), count + 1);
+        for (index, fragment) in result.pages[0].fragments.iter().enumerate() {
+            let Fragment::Paragraph(fragment) = fragment else {
+                panic!("paragraph expected");
+            };
+            assert_eq!(fragment.y, (96 + index * 2) as f64);
+            assert_eq!(fragment.height, 1.0);
+        }
+    }
+
+    #[test]
+    fn internal_float_bands_emit_paragraph_images_once_per_page_in_both_passes() {
+        for wrap in ["square", "behind"] {
+            let mut value: Input = serde_json::from_value(json!({
+                "measured": [{
+                    "block": {"kind": "paragraph", "id": "body", "runs": [
+                        {"kind": "text", "text": "abcdefghij"},
+                        {"kind": "image", "src": "float", "width": 20, "height": 20,
+                         "displayMode": "float", "wrapType": wrap,
+                         "position": {"vertical": {"relativeTo": "paragraph", "posOffset": 0}}},
+                    ]},
+                    "measure": {"kind": "paragraph", "totalHeight": 200,
+                                "lines": (0..10).map(|index| json!({
+                                    "headRun": 0, "headChar": index, "tailRun": 0,
+                                    "tailChar": index + 1, "width": 10, "ascent": 15,
+                                    "descent": 5, "lineHeight": 20,
+                                })).collect::<Vec<_>>()},
+                }],
+                "options": {
+                    "pageSize": {"w": 500, "h": 500},
+                    "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                    "sectionPageFloatBands": [{"default": [{"top": 200, "bottom": 240}]}],
+                },
+            }))
+            .unwrap();
+            let result = layout_document(&mut value).unwrap();
+            assert_eq!(result.pages.len(), 1);
+            let fragments = &result.pages[0].fragments;
+            assert_eq!(fragments.len(), 2);
+            for (fragment, expected_y) in fragments.iter().zip([96.0, 240.0]) {
+                let Fragment::Paragraph(fragment) = fragment else {
+                    panic!("paragraph expected");
+                };
+                assert_eq!(fragment.y, expected_y);
+            }
+            let display: serde_json::Value = serde_json::from_str(
+                &crate::display_list::build_display_list_json(
+                    &json!({"measured": value.measured, "options": value.options,
+                            "layout": result})
+                    .to_string(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let primitives = display["pages"][0]["primitives"].as_array().unwrap();
+            let images: Vec<_> = primitives
+                .iter()
+                .enumerate()
+                .filter(|(_, primitive)| primitive["kind"] == "image")
+                .collect();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].1["y"], 96);
+            for (index, primitive) in primitives.iter().enumerate() {
+                if primitive["kind"] == "text" {
+                    assert_eq!(images[0].0 < index, wrap == "behind");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn balanced_columns_with_an_internal_float_band_stay_on_one_page() {
+        let mut value = input(vec![paragraph(1, 16, 20.0, json!({}))]);
+        value.options.page_size = Some(crate::types::Size { w: 500.0, h: 300.0 });
+        value.options.columns = Some(
+            serde_json::from_value(json!({
+                "count": 2, "gap": 20,
+            }))
+            .unwrap(),
+        );
+        value.options.section_page_float_bands = Some(
+            serde_json::from_value(json!([{
+                "default": [{"top": 70, "bottom": 110}],
+            }]))
+            .unwrap(),
+        );
+
+        let result = layout_document(&mut value).unwrap();
+
+        assert_eq!(result.pages.len(), 1);
+        let fragments: Vec<_> = result.pages[0]
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Paragraph(paragraph) => Some(paragraph),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|p| p.to_line - p.from_line)
+                .sum::<usize>(),
+            16
+        );
+        assert!(fragments.iter().any(|p| p.x != fragments[0].x));
+        assert!(
+            fragments
+                .iter()
+                .all(|p| p.y + p.height <= 70.0 || p.y >= 110.0)
+        );
+    }
+
+    #[test]
+    fn a_standalone_break_paragraph_suppresses_leading_spacing_but_a_column_break_preserves_it() {
+        let mut value = input(vec![
+            paragraph(1, 1, 10.0, json!({})),
+            json!({"block":{"kind":"pageBreak","id":"page"},"measure":{"kind":"pageBreak"}}),
+            paragraph(2, 1, 10.0, json!({"spacing":{"before":20}})),
+            json!({"block":{"kind":"columnBreak","id":"column"},"measure":{"kind":"columnBreak"}}),
+            paragraph(3, 1, 10.0, json!({"spacing":{"before":20}})),
+        ]);
+        let result = layout_document(&mut value).unwrap();
+        assert_eq!(result.pages.len(), 3);
+        let Fragment::Paragraph(after_page) = &result.pages[1].fragments[0] else {
+            panic!()
+        };
+        let Fragment::Paragraph(after_column) = &result.pages[2].fragments[0] else {
+            panic!()
+        };
+        assert_eq!(after_page.y, 10.0);
+        assert_eq!(after_column.y, 30.0);
+        let recorded = layout_document_checkpointed(&mut value).unwrap();
+        let checkpoint = recorded
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.page_index == 1)
+            .unwrap();
+        assert!(checkpoint.flow.leading_spacing_spent.is_infinite());
+    }
+
+    /// Measured against Word 16.113 (oxi-ja-policies-01 pages 40 and 45, and
+    /// hand-authored probes): a paragraph that breaks the page itself, by
+    /// `w:br w:type="page"` or by `w:pageBreakBefore`, keeps its space-before
+    /// on the new page, however full the previous page was.
+    #[test]
+    fn a_paragraph_that_breaks_its_own_page_keeps_leading_spacing() {
+        for attrs in [
+            json!({"spacing":{"before":20},"pageBreakBeforeRun":true}),
+            json!({"spacing":{"before":20},"pageBreakBefore":true}),
+        ] {
+            for filler in [1, 5, 9] {
+                let mut measured = vec![paragraph(0, filler, 10.0, json!({}))];
+                measured.push(paragraph(1, 1, 10.0, attrs.clone()));
+                let mut value = input(measured);
+                let result = layout_document(&mut value).unwrap();
+                assert_eq!(result.pages.len(), 2, "filler {filler}");
+                let Fragment::Paragraph(after_break) = &result.pages[1].fragments[0] else {
+                    panic!()
+                };
+                assert_eq!(after_break.y, 30.0, "filler {filler}");
+                let recorded = layout_document_checkpointed(&mut value).unwrap();
+                let checkpoint = recorded
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.page_index == 1)
+                    .unwrap();
+                assert_eq!(
+                    checkpoint.flow.leading_spacing_spent, 0.0,
+                    "filler {filler}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_automatic_page_break_discards_leading_spacing() {
+        for attrs in [
+            json!({"spacing":{"before":20}}),
+            json!({"spacing":{"before":20},"keepNext":true}),
+            json!({"spacing":{"before":20},"keepLines":true}),
+        ] {
+            let mut value = input(vec![
+                paragraph(1, 1, 85.0, json!({"spacing":{"after":30}})),
+                paragraph(2, 1, 20.0, attrs),
+                paragraph(3, 1, 20.0, json!({})),
+            ]);
+            let result = layout_document(&mut value).unwrap();
+            assert_eq!(result.pages.len(), 2);
+            let Fragment::Paragraph(heading) = &result.pages[1].fragments[0] else {
+                panic!()
+            };
+            let Fragment::Paragraph(body) = &result.pages[1].fragments[1] else {
+                panic!()
+            };
+            assert_eq!(heading.y, 10.0);
+            assert_eq!(body.y, 30.0);
+        }
+    }
+
+    /// Measured against Word 16.113 (hand-authored probes, prev space-after
+    /// 0/12/24/36pt against 6/24/48pt space-before): the collapsed gap is
+    /// spent from the bottom up, so an authored break carries only
+    /// `max(0, before - after)` onto the new page.
+    #[test]
+    fn an_authored_break_spends_the_previous_space_after() {
+        for (after, before, expected) in [
+            (0.0, 24.0, 34.0),
+            (12.0, 24.0, 22.0),
+            (24.0, 24.0, 10.0),
+            (36.0, 24.0, 10.0),
+            (36.0, 48.0, 22.0),
+        ] {
+            for attrs in [
+                json!({"spacing":{"before":before},"pageBreakBefore":true}),
+                json!({"spacing":{"before":before},"pageBreakBeforeRun":true}),
+            ] {
+                let mut value = input(vec![
+                    paragraph(1, 1, 10.0, json!({"spacing":{"after":after}})),
+                    paragraph(2, 1, 10.0, attrs),
+                ]);
+                let result = layout_document(&mut value).unwrap();
+                assert_eq!(result.pages.len(), 2, "after {after} before {before}");
+                let Fragment::Paragraph(after_break) = &result.pages[1].fragments[0] else {
+                    panic!()
+                };
+                assert_eq!(after_break.y, expected, "after {after} before {before}");
+            }
+        }
+    }
+
+    /// Measured against Word 16.113: `w:contextualSpacing` between same-style
+    /// neighbours zeroes the space-before before pagination, so an authored
+    /// break has nothing to carry; a different previous style leaves it whole.
+    #[test]
+    fn contextual_spacing_leaves_an_authored_break_nothing_to_carry() {
+        let target = json!({
+            "styleId": "List", "effectiveStyleId": "List", "contextualSpacing": true,
+            "spacing": {"before": 20}, "pageBreakBefore": true
+        });
+        for (previous, expected) in [
+            (
+                json!({"styleId": "List", "effectiveStyleId": "List", "contextualSpacing": true}),
+                10.0,
+            ),
+            (json!({"styleId": "Body", "effectiveStyleId": "Body"}), 30.0),
+        ] {
+            let mut value = input(vec![
+                paragraph(1, 1, 10.0, previous),
+                paragraph(2, 1, 10.0, target.clone()),
+            ]);
+            let result = layout_document(&mut value).unwrap();
+            assert_eq!(result.pages.len(), 2);
+            let Fragment::Paragraph(after_break) = &result.pages[1].fragments[0] else {
+                panic!()
+            };
+            assert_eq!(after_break.y, expected);
+        }
+    }
+
+    fn caption(wrap: &str, offset: f64, height: f64) -> serde_json::Value {
+        json!({
+            "block": {
+                "kind": "shape", "id": "caption", "shapeType": "rect",
+                "width": 180, "height": height, "geometryPath": [], "children": [],
+                "wrapType": wrap,
+                "position": {
+                    "horizontal": {"relativeTo": "margin", "posOffset": 0},
+                    "vertical": {"relativeTo": "paragraph", "posOffset": offset}
+                }
+            },
+            "measure": {"kind": "shape", "width": 180, "height": height},
+        })
+    }
+
+    fn below_float(id: u32, height: f64, skip: f64) -> serde_json::Value {
+        let mut block = paragraph(id, 1, height, json!({}));
+        block["measure"]["lines"][0]["floatSkipBefore"] = json!(skip);
+        block
+    }
+
+    #[test]
+    fn a_line_pushed_below_a_caption_in_the_bottom_margin_starts_the_next_page() {
+        let result = layout(vec![
+            caption("square", 65.0, 40.0),
+            paragraph(1, 1, 60.0, json!({})),
+            below_float(2, 30.0, 45.0),
+            paragraph(3, 1, 60.0, json!({})),
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        let [Fragment::Shape(shape), Fragment::Paragraph(photo)] = &result.pages[0].fragments[..]
+        else {
+            panic!("caption and its paragraph stay on the first page")
+        };
+        assert_eq!((shape.y, photo.y), (75.0, 10.0));
+        let [Fragment::Paragraph(moved), Fragment::Paragraph(after)] =
+            &result.pages[1].fragments[..]
+        else {
+            panic!("both later paragraphs share the second page")
+        };
+        assert_eq!((moved.y + 45.0, after.y), (10.0, 40.0));
+    }
+
+    #[test]
+    fn a_line_raised_over_the_page_top_matches_incremental_layout() {
+        let blocks = |last: f64| {
+            vec![
+                caption("square", 65.0, 40.0),
+                paragraph(1, 1, 60.0, json!({})),
+                below_float(2, 30.0, 45.0),
+                paragraph(3, 1, last, json!({})),
+            ]
+        };
+        let retained = assert_incremental_matches_full(blocks(60.0), blocks(50.0), &[3]);
+        assert_eq!(retained.layout.pages.len(), 2);
+    }
+
+    #[test]
+    fn stale_lead_skip_convergence_tracks_a_preceding_float() {
+        let blocks = |offset: f64| {
+            let mut own = caption("square", offset, 20.0);
+            own["block"]["id"] = json!("own");
+            vec![
+                caption("square", 65.0, 40.0),
+                paragraph(1, 1, 60.0, json!({})),
+                own,
+                below_float(2, 30.0, 45.0),
+            ]
+        };
+        assert_incremental_matches_full(blocks(100.0), blocks(0.0), &[2]);
+        assert_incremental_matches_full(blocks(0.0), blocks(100.0), &[2]);
+    }
+
+    #[test]
+    fn stale_lead_skip_convergence_tracks_floats_before_a_page_opening_shape() {
+        for wrap in ["square", "none"] {
+            let blocks = |offset: f64| {
+                let mut own = caption("square", offset, 20.0);
+                own["block"]["id"] = json!("own");
+                let mut opener = caption(wrap, 50.0, 20.0);
+                opener["block"]["id"] = json!("opener");
+                opener["block"]["scene"] = json!({});
+                opener["block"]["innerText"] = json!([paragraph(0, 1, 10.0, json!({}))["block"]]);
+                vec![
+                    paragraph(1, 1, 60.0, json!({})),
+                    own,
+                    opener,
+                    below_float(2, 30.0, 45.0),
+                ]
+            };
+            assert_incremental_matches_full(blocks(100.0), blocks(0.0), &[1]);
+            assert_incremental_matches_full(blocks(0.0), blocks(100.0), &[1]);
+        }
+    }
+
+    #[test]
+    fn stale_lead_skip_is_dropped_after_a_keep_group_advances() {
+        let mut head = below_float(2, 30.0, 45.0);
+        head["block"]["attrs"]["keepNext"] = json!(true);
+        let result = layout(vec![
+            caption("square", 65.0, 40.0),
+            paragraph(1, 1, 60.0, json!({})),
+            head,
+            paragraph(3, 1, 20.0, json!({})),
+            paragraph(4, 1, 50.0, json!({})),
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        let [
+            Fragment::Paragraph(head),
+            Fragment::Paragraph(follower),
+            Fragment::Paragraph(tail),
+        ] = &result.pages[1].fragments[..]
+        else {
+            panic!("the keep group and tail share the second page")
+        };
+        assert_eq!((head.y + 45.0, follower.y, tail.y), (10.0, 40.0, 60.0));
+    }
+
+    #[test]
+    fn stale_lead_skip_does_not_overstate_fresh_keep_group_height() {
+        let mut head = below_float(2, 30.0, 45.0);
+        head["block"]["attrs"]["keepNext"] = json!(true);
+        let result = layout(vec![
+            caption("square", 25.0, 40.0),
+            paragraph(1, 1, 20.0, json!({})),
+            head,
+            paragraph(3, 1, 40.0, json!({})),
+        ]);
+        assert_eq!(result.pages[0].fragments.len(), 2);
+        let [Fragment::Paragraph(head), Fragment::Paragraph(follower)] =
+            &result.pages[1].fragments[..]
+        else {
+            panic!("the keep group shares the second page")
+        };
+        assert_eq!((head.y + 45.0, follower.y), (10.0, 40.0));
+    }
+
+    #[test]
+    fn stale_lead_skip_is_dropped_after_authored_page_breaks() {
+        for standalone in [false, true] {
+            let mut head = below_float(2, 30.0, 45.0);
+            let mut blocks = vec![
+                caption("square", 65.0, 40.0),
+                paragraph(1, 1, 60.0, json!({})),
+            ];
+            if standalone {
+                blocks.push(json!({
+                    "block": {"kind": "pageBreak", "id": "break"},
+                    "measure": {"kind": "pageBreak"},
+                }));
+            } else {
+                head["block"]["attrs"]["pageBreakBefore"] = json!(true);
+            }
+            blocks.extend([head, paragraph(3, 1, 60.0, json!({}))]);
+            let result = layout(blocks);
+            assert_eq!(result.pages.len(), 2);
+            let Fragment::Paragraph(head) = &result.pages[1].fragments[0] else {
+                panic!("paragraph expected")
+            };
+            assert_eq!(head.y + 45.0, 10.0);
+        }
+    }
+
+    #[test]
+    fn stale_lead_skip_does_not_leave_an_empty_reserved_page() {
+        let mut value = input(vec![
+            caption("square", 65.0, 40.0),
+            paragraph(1, 1, 60.0, json!({})),
+            below_float(2, 30.0, 45.0),
+        ]);
+        value.options.footnote_reserved_heights = serde_json::from_value(json!({"2": 80})).unwrap();
+        let result = layout_document(&mut value).unwrap();
+        assert_eq!(result.pages.len(), 2);
+        let [Fragment::Paragraph(head)] = &result.pages[1].fragments[..] else {
+            panic!("the oversized line stays on the reserved page")
+        };
+        assert_eq!(head.y + 45.0, 10.0);
+    }
+
+    #[test]
+    fn stale_lead_skip_does_not_advance_a_paragraph_taller_than_the_page() {
+        let mut kept = paragraph(2, 6, 20.0, json!({"keepLines": true}));
+        kept["measure"]["lines"][0]["floatSkipBefore"] = json!(10.0);
+        kept["measure"]["totalHeight"] = json!(130.0);
+        let result = layout(vec![
+            caption("square", 25.0, 10.0),
+            paragraph(1, 1, 20.0, json!({})),
+            kept,
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        let Some(Fragment::Paragraph(head)) = result.pages[0].fragments.last() else {
+            panic!("the oversized paragraph starts on the first page")
+        };
+        assert_eq!((head.from_line, head.y), (0, 30.0));
+    }
+
+    #[test]
+    fn stale_lead_skip_fits_a_fresh_page_without_the_spacing_the_break_spends() {
+        let mut kept = paragraph(2, 2, 40.0, json!({}));
+        kept["measure"]["lines"][0]["floatSkipBefore"] = json!(45.0);
+        kept["measure"]["totalHeight"] = json!(125.0);
+        let result = layout(vec![
+            caption("square", 65.0, 40.0),
+            paragraph(1, 1, 60.0, json!({"spacing": {"after": 30}})),
+            kept,
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        let [Fragment::Paragraph(moved)] = &result.pages[1].fragments[..] else {
+            panic!("the whole paragraph moves to the second page")
+        };
+        assert_eq!(
+            (moved.y + 45.0, moved.from_line, moved.to_line),
+            (10.0, 0, 2)
+        );
+    }
+
+    #[test]
+    fn a_floating_table_on_the_destination_page_guards_its_lead_skip() {
+        let floating = json!({
+            "block": {
+                "kind": "table", "id": 90, "columnWidths": [140],
+                "rows": [{"id": 91, "height": 30, "heightRule": "exact", "cells": []}],
+                "floating": {
+                    "horzAnchor": "text", "tblpX": 0, "rightFromText": 10, "vertAnchor": "text"
+                }
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [140], "totalWidth": 140, "totalHeight": 30,
+                "rows": [{"height": 30, "cells": []}]
+            }
+        });
+        let result = layout(vec![
+            paragraph(1, 1, 90.0, json!({})),
+            floating,
+            below_float(2, 20.0, 30.0),
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        let [Fragment::Table(table), Fragment::Paragraph(moved)] = &result.pages[1].fragments[..]
+        else {
+            panic!("the floating table and its paragraph share the destination page")
+        };
+        assert_eq!((table.y, moved.y, moved.height), (10.0, 10.0, 50.0));
+    }
+
+    #[test]
+    fn own_float_on_destination_page_guards_its_lead_skip() {
+        let mut own = caption("topAndBottom", 0.0, 20.0);
+        own["block"]["scene"] = json!({});
+        own["block"]["innerText"] = json!([paragraph(0, 1, 10.0, json!({}))["block"]]);
+        let result = layout(vec![
+            paragraph(1, 1, 90.0, json!({})),
+            own,
+            below_float(2, 30.0, 20.0),
+            paragraph(3, 1, 10.0, json!({})),
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        assert_eq!(result.pages[0].fragments.len(), 1);
+        let [
+            Fragment::Shape(shape),
+            Fragment::Paragraph(moved),
+            Fragment::Paragraph(after),
+        ] = &result.pages[1].fragments[..]
+        else {
+            panic!("the own float and its paragraph share the destination page")
+        };
+        assert_eq!(
+            (shape.y, moved.y, moved.height, after.y),
+            (10.0, 10.0, 50.0, 60.0)
+        );
+        assert_eq!(moved.y + 20.0, shape.y + shape.height);
+    }
+
+    #[test]
+    fn retained_space_before_counts_toward_a_float_over_the_first_line() {
+        let mut moved = below_float(2, 20.0, 30.0);
+        moved["block"]["attrs"]["spacing"] = json!({"before": 30});
+        let result = layout(vec![
+            paragraph(1, 1, 20.0, json!({})),
+            json!({
+                "block": {"kind": "sectionBreak", "id": "section", "type": "nextPage"},
+                "measure": {"kind": "sectionBreak"},
+            }),
+            caption("square", 40.0, 20.0),
+            moved,
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        let [Fragment::Shape(shape), Fragment::Paragraph(moved)] = &result.pages[1].fragments[..]
+        else {
+            panic!("the shape and its paragraph share the new section's page")
+        };
+        assert_eq!((shape.y, moved.y, moved.height), (50.0, 40.0, 50.0));
+        assert_eq!(moved.y + 30.0, shape.y + shape.height);
+    }
+
+    #[test]
+    fn anchored_shape_does_not_advance_body_flow() {
+        for (anchored, wrap, overlay) in [
+            (false, "none", false),
+            (true, "none", true),
+            (true, "square", true),
+            (true, "tight", true),
+            (true, "through", true),
+            (true, "topAndBottom", true),
+        ] {
+            let mut shape = json!({
+                "kind": "shape", "id": "shape", "shapeType": "rect",
+                "width": 50, "height": 40, "geometryPath": [], "children": [],
+                "wrapType": wrap
+            });
+            if anchored {
+                shape["position"] = json!({
+                    "horizontal": {"relativeTo": "page", "posOffset": 100},
+                    "vertical": {"relativeTo": "page", "posOffset": 10}
+                });
+            }
+            let mut input: Input = serde_json::from_value(json!({
+                "measured": [
+                    {"block": shape, "measure": {"kind": "shape", "width": 50, "height": 40}},
+                    {"block": {"kind": "image", "id": "body", "src": "", "width": 20, "height": 20},
+                     "measure": {"kind": "image", "width": 20, "height": 20}}
+                ],
+                "options": {"pageSize": {"w": 300, "h": 200}, "margins": {"left": 20, "right": 20, "top": 20, "bottom": 20}}
+            })).unwrap();
+            let layout = layout_document(&mut input).unwrap();
+            assert_eq!(layout.pages.len(), 1);
+            let Fragment::Shape(shape) = &layout.pages[0].fragments[0] else {
+                panic!("shape expected")
+            };
+            let Fragment::Image(body) = &layout.pages[0].fragments[1] else {
+                panic!("image expected")
+            };
+            assert_eq!(body.y, if overlay { 20.0 } else { 60.0 });
+            assert_eq!(
+                (shape.x, shape.y),
+                if overlay { (100.0, 10.0) } else { (20.0, 20.0) }
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_layout_stops_at_converged_page_start() {
+        let measured: Vec<_> = (0..15)
+            .map(|id| paragraph(id, 1, 20.0, json!({})))
+            .collect();
+        let mut previous_input = input(measured.clone());
+        let previous = layout_document_checkpointed(&mut previous_input).unwrap();
+        assert!(previous.checkpoints.len() >= 3);
+
+        let mut incremental_input = input(measured.clone());
+        let previous_fingerprints = vec![1_u64; measured.len()];
+        let mut next_fingerprints = previous_fingerprints.clone();
+        next_fingerprints[0] = 2;
+        let mut previous_layout = previous.layout;
+        let incremental = layout_document_incremental(
+            &mut incremental_input,
+            &mut previous_layout,
+            &previous.checkpoints,
+            &previous_fingerprints,
+            &next_fingerprints,
+            0,
+        )
+        .unwrap();
+
+        let mut full_input = input(measured);
+        let full = layout_document_checkpointed(&mut full_input).unwrap();
+        assert_eq!(
+            serde_json::to_string(&incremental.layout).unwrap(),
+            serde_json::to_string(&full.layout).unwrap()
+        );
+        assert!(incremental.placed_blocks < full.placed_blocks);
+        assert_eq!(incremental.rebuilt_page_start, 0);
+        assert_eq!(incremental.rebuilt_page_end, 1);
+    }
+
+    #[test]
+    fn incremental_resumes_when_note_reservations_change_after_the_checkpoint() {
+        let measured: Vec<_> = (0..30)
+            .map(|id| paragraph(id, 1, 20.0, json!({})))
+            .collect();
+        for (previous_reservations, next_reservations) in [
+            (json!({"4": 20}), json!({"3": 20})),
+            (json!({"3": 20}), json!({"4": 20})),
+            (json!({"4": 20}), json!({"1": 0, "2": 0, "3": 20})),
+            (json!({"1": 0, "2": 0, "3": 20}), json!({"4": 20})),
+        ] {
+            let mut previous_input = input(measured.clone());
+            previous_input.options.footnote_reserved_heights =
+                serde_json::from_value(previous_reservations).unwrap();
+            let previous = layout_document_checkpointed(&mut previous_input).unwrap();
+            let mut next = measured.clone();
+            next[11] = paragraph(11, 1, 40.0, json!({}));
+            let mut next_input = input(next);
+            next_input.options.footnote_reserved_heights =
+                serde_json::from_value(next_reservations).unwrap();
+            let previous_fingerprints = vec![1_u64; measured.len()];
+            let mut next_fingerprints = previous_fingerprints.clone();
+            next_fingerprints[11] = 2;
+            let incremental = layout_document_incremental(
+                &mut next_input.clone(),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &previous_fingerprints,
+                &next_fingerprints,
+                10,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut next_input).unwrap();
+            assert_eq!(incremental.rebuilt_page_start, 1);
+            assert_eq!(incremental.rebuilt_page_end, full.layout.pages.len());
+            assert_eq!(incremental.placed_blocks, measured.len() - 5);
+            assert!(incremental.placed_blocks < full.placed_blocks);
+            assert_eq!(
+                serde_json::to_vec(&incremental.layout).unwrap(),
+                serde_json::to_vec(&full.layout).unwrap()
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints);
+        }
+    }
+
+    #[test]
+    fn incremental_converges_after_changed_note_reservations() {
+        let measured: Vec<_> = (0..28)
+            .map(|id| {
+                paragraph(
+                    id,
+                    1,
+                    20.0,
+                    json!({"pageBreakBefore": id > 0 && id % 4 == 0}),
+                )
+            })
+            .collect();
+        for (previous_reservations, next_reservations) in [
+            (json!({"3": 10}), json!({"4": 10, "5": 0, "40": 0})),
+            (json!({"4": 10, "5": 0, "40": 0}), json!({"3": 10})),
+        ] {
+            let mut previous_input = input(measured.clone());
+            previous_input.options.footnote_reserved_heights =
+                serde_json::from_value(previous_reservations).unwrap();
+            let previous = layout_document_checkpointed(&mut previous_input).unwrap();
+            let mut next = measured.clone();
+            next[9]["block"]["runs"][0]["text"] = json!("y");
+            let mut next_input = input(next);
+            next_input.options.footnote_reserved_heights =
+                serde_json::from_value(next_reservations).unwrap();
+            let previous_fingerprints = vec![1_u64; measured.len()];
+            let mut next_fingerprints = previous_fingerprints.clone();
+            next_fingerprints[9] = 2;
+            let incremental = layout_document_incremental(
+                &mut next_input.clone(),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &previous_fingerprints,
+                &next_fingerprints,
+                8,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut next_input).unwrap();
+            assert_eq!(incremental.rebuilt_page_start, 1);
+            assert_eq!(incremental.rebuilt_page_end, 4);
+            assert!(incremental.placed_blocks < full.placed_blocks);
+            assert_eq!(
+                serde_json::to_vec(&incremental.layout).unwrap(),
+                serde_json::to_vec(&full.layout).unwrap()
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints);
+        }
+    }
+
+    #[test]
+    fn incremental_does_not_converge_before_a_changed_suffix_reservation() {
+        let measured: Vec<_> = (0..28)
+            .map(|id| {
+                paragraph(
+                    id,
+                    1,
+                    20.0,
+                    json!({"pageBreakBefore": id > 0 && id % 4 == 0}),
+                )
+            })
+            .collect();
+        for changed_page in [5_u32, 6] {
+            let mut previous_input = input(measured.clone());
+            previous_input.options.footnote_reserved_heights =
+                serde_json::from_value(json!({"3": 10})).unwrap();
+            let previous = layout_document_checkpointed(&mut previous_input).unwrap();
+            let mut next = measured.clone();
+            next[9]["block"]["runs"][0]["text"] = json!("y");
+            let mut next_input = input(next);
+            next_input.options.footnote_reserved_heights =
+                serde_json::from_value(json!({"4": 10})).unwrap();
+            next_input
+                .options
+                .footnote_reserved_heights
+                .as_mut()
+                .unwrap()
+                .insert(changed_page.to_string(), 10.0);
+            let previous_fingerprints = vec![1_u64; measured.len()];
+            let mut next_fingerprints = previous_fingerprints.clone();
+            next_fingerprints[9] = 2;
+            let incremental = layout_document_incremental(
+                &mut next_input.clone(),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &previous_fingerprints,
+                &next_fingerprints,
+                8,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut next_input).unwrap();
+            assert_eq!(incremental.rebuilt_page_start, 1);
+            assert_eq!(incremental.rebuilt_page_end, changed_page as usize);
+            assert!(incremental.placed_blocks < full.placed_blocks);
+            assert_eq!(
+                serde_json::to_vec(&incremental.layout).unwrap(),
+                serde_json::to_vec(&full.layout).unwrap()
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints);
+        }
+    }
+
+    #[test]
+    fn incremental_refuses_note_reservation_changes_at_or_before_the_checkpoint() {
+        let measured: Vec<_> = (0..30)
+            .map(|id| paragraph(id, 1, 20.0, json!({})))
+            .collect();
+        let mut previous_input = input(measured.clone());
+        previous_input.options.footnote_reserved_heights =
+            serde_json::from_value(json!({"4": 20})).unwrap();
+        let previous = layout_document_checkpointed(&mut previous_input).unwrap();
+        for changed_page in [1_u32, 2] {
+            let mut next = measured.clone();
+            next[11] = paragraph(11, 1, 40.0, json!({}));
+            let mut next_input = input(next);
+            let mut reservations = previous_input.options.footnote_reserved_heights.clone();
+            reservations
+                .as_mut()
+                .unwrap()
+                .insert(changed_page.to_string(), 20.0);
+            next_input.options.footnote_reserved_heights = reservations;
+            let previous_fingerprints = vec![1_u64; measured.len()];
+            let mut next_fingerprints = previous_fingerprints.clone();
+            next_fingerprints[11] = 2;
+            let mut retained = previous.layout.clone();
+            let result = layout_document_incremental(
+                &mut next_input.clone(),
+                &mut retained,
+                &previous.checkpoints,
+                &previous_fingerprints,
+                &next_fingerprints,
+                10,
+            );
+            assert!(matches!(
+                result,
+                Err(LayoutError::Unsupported(message))
+                    if message == "checkpoint note reservations changed"
+            ));
+            assert_eq!(
+                serde_json::to_vec(&retained).unwrap(),
+                serde_json::to_vec(&previous.layout).unwrap()
+            );
+            let incremental = layout_document_incremental(
+                &mut next_input.clone(),
+                &mut retained,
+                &previous.checkpoints,
+                &previous_fingerprints,
+                &next_fingerprints,
+                (changed_page as usize - 1) * 5,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut next_input).unwrap();
+            assert_eq!(incremental.rebuilt_page_start, 0);
+            assert_eq!(
+                serde_json::to_vec(&incremental.layout).unwrap(),
+                serde_json::to_vec(&full.layout).unwrap()
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints);
+        }
+    }
+
+    #[test]
+    fn incremental_restarts_around_split_paragraphs_match_full() {
+        for (preceding, lines, height, widow, keep_lines, slices) in [
+            (95.0, 2, 10.0, false, false, vec![(3, 0, 1), (3, 1, 2)]),
+            (90.0, 2, 10.0, false, false, vec![(2, 0, 1), (3, 1, 2)]),
+            (40.0, 4, 20.0, true, false, vec![(2, 0, 2), (3, 2, 4)]),
+            (70.0, 4, 20.0, true, false, vec![(3, 0, 4)]),
+            (95.0, 2, 10.0, true, false, vec![(3, 0, 2)]),
+            (95.0, 2, 10.0, false, true, vec![(3, 0, 2)]),
+        ] {
+            for after_split in [false, true] {
+                let blocks = |edited: bool| {
+                    let mut blocks = vec![
+                        paragraph(0, 1, 100.0, json!({})),
+                        paragraph(1, 1, 100.0, json!({})),
+                        paragraph(2, 1, preceding, json!({})),
+                        paragraph(
+                            3,
+                            lines,
+                            height,
+                            json!({
+                                "widowControl": widow, "keepLines": keep_lines,
+                            }),
+                        ),
+                    ];
+                    if after_split {
+                        blocks.push(paragraph(4, 1, 100.0, json!({})));
+                    }
+                    blocks.push(paragraph(5, 1, if edited { 20.0 } else { 10.0 }, json!({})));
+                    blocks.extend((6..12).map(|id| paragraph(id, 1, 100.0, json!({}))));
+                    blocks
+                };
+                let mut previous_input = input(blocks(false));
+                let previous = layout_document_checkpointed(&mut previous_input).unwrap();
+                assert_eq!(paragraph_slices(&previous.layout, 3.0), slices);
+                let dirty = if after_split { 5 } else { 4 };
+                let fingerprints = vec![1_u64; previous_input.measured.len()];
+                let mut next_fingerprints = fingerprints.clone();
+                next_fingerprints[dirty] = 2;
+                let next = blocks(true);
+                let incremental = layout_document_incremental(
+                    &mut input(next.clone()),
+                    &mut previous.layout.clone(),
+                    &previous.checkpoints,
+                    &fingerprints,
+                    &next_fingerprints,
+                    dirty,
+                )
+                .unwrap();
+                let full = layout_document_checkpointed(&mut input(next)).unwrap();
+                let restart_page = if after_split {
+                    4
+                } else if slices.len() == 1 {
+                    3
+                } else {
+                    2
+                };
+                assert_eq!(incremental.rebuilt_page_start, restart_page);
+                assert!(incremental.placed_blocks < full.placed_blocks);
+                assert_eq!(
+                    serde_json::to_vec(&incremental.layout).unwrap(),
+                    serde_json::to_vec(&full.layout).unwrap()
+                );
+                assert_eq!(incremental.checkpoints, full.checkpoints);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_resumes_at_pristine_multiple_fragment_paragraphs() {
+        for repetitions in [1, 2] {
+            let blocks = |edited: bool| {
+                let mut blocks = vec![paragraph(0, 1, 10.0, json!({}))];
+                for repeat in 0..repetitions {
+                    let id = blocks.len() as u32;
+                    blocks.push(json!({
+                        "block": {"kind": "pageBreak", "id": id},
+                        "measure": {"kind": "pageBreak"},
+                    }));
+                    blocks.push(paragraph_with_line_heights(
+                        id + 1,
+                        &[20.0, 20.0, 20.0, 90.0],
+                        json!({"widowControl": true}),
+                    ));
+                    blocks.push(paragraph(
+                        id + 2,
+                        1,
+                        if edited && repeat + 1 == repetitions {
+                            20.0
+                        } else {
+                            10.0
+                        },
+                        json!({}),
+                    ));
+                }
+                let id = blocks.len() as u32;
+                blocks.push(json!({
+                    "block": {"kind": "pageBreak", "id": id},
+                    "measure": {"kind": "pageBreak"},
+                }));
+                blocks.push(paragraph(id + 1, 1, 100.0, json!({})));
+                blocks
+            };
+            let mut previous_input = input(blocks(false));
+            let previous = layout_document_checkpointed(&mut previous_input).unwrap();
+            for repeat in 0..repetitions {
+                let opening_page = 1 + repeat * 2;
+                assert_eq!(
+                    paragraph_slices(&previous.layout, (2 + repeat * 3) as f64),
+                    vec![
+                        (opening_page, 0, 2),
+                        (opening_page, 2, 3),
+                        (opening_page + 1, 3, 4),
+                    ]
+                );
+            }
+            let dirty = repetitions * 3;
+            let fingerprints = vec![1_u64; previous_input.measured.len()];
+            let mut next_fingerprints = fingerprints.clone();
+            next_fingerprints[dirty] = 2;
+            let next = blocks(true);
+            let incremental = layout_document_incremental(
+                &mut input(next.clone()),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &fingerprints,
+                &next_fingerprints,
+                dirty,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut input(next)).unwrap();
+            assert_eq!(incremental.rebuilt_page_start, repetitions * 2 - 1);
+            assert!(incremental.placed_blocks < full.placed_blocks);
+            assert_eq!(
+                serde_json::to_vec(&incremental.layout).unwrap(),
+                serde_json::to_vec(&full.layout).unwrap()
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints);
+        }
+    }
+
+    #[test]
+    fn a_paragraph_spanning_pages_can_resume_at_its_clean_opening() {
+        let blocks = |edited: bool| {
+            vec![
+                paragraph(0, 1, 100.0, json!({})),
+                paragraph(1, 1, 100.0, json!({})),
+                json!({"block": {"kind": "pageBreak", "id": 2}, "measure": {"kind": "pageBreak"}}),
+                paragraph(3, 12, 10.0, json!({"widowControl": false})),
+                paragraph(4, 1, if edited { 20.0 } else { 10.0 }, json!({})),
+                paragraph(5, 1, 100.0, json!({})),
+            ]
+        };
+        let previous = layout_document_checkpointed(&mut input(blocks(false))).unwrap();
+        assert_eq!(
+            paragraph_slices(&previous.layout, 3.0),
+            vec![(2, 0, 10), (3, 10, 12)]
+        );
+        let incremental = layout_document_incremental(
+            &mut input(blocks(true)),
+            &mut previous.layout.clone(),
+            &previous.checkpoints,
+            &[1_u64; 6],
+            &[1, 1, 1, 1, 2, 1],
+            4,
+        )
+        .unwrap();
+        let full = layout_document_checkpointed(&mut input(blocks(true))).unwrap();
+        assert_eq!(incremental.rebuilt_page_start, 2);
+        assert!(incremental.placed_blocks < full.placed_blocks);
+        assert_eq!(
+            serde_json::to_vec(&incremental.layout).unwrap(),
+            serde_json::to_vec(&full.layout).unwrap()
+        );
+        assert_eq!(incremental.checkpoints, full.checkpoints);
+    }
+
+    #[test]
+    fn paragraph_checkpoints_reject_multiple_opening_fragments_and_continuations() {
+        for preceding in [95.0, 90.0] {
+            let mut value = input(vec![
+                paragraph(0, 1, 100.0, json!({})),
+                paragraph(1, 1, preceding, json!({})),
+                paragraph(2, 2, 10.0, json!({ "widowControl": false })),
+            ]);
+            let full = layout_document_checkpointed(&mut value).unwrap();
+            assert!(
+                !full.checkpoints.iter().any(|checkpoint| {
+                    checkpoint.block_index == 2 && checkpoint.page_index == 2
+                })
+            );
+            let mut checkpoint = full.checkpoints[1].clone();
+            checkpoint.block_index = 2;
+            checkpoint.page_index = 2;
+            checkpoint.page_number = full.layout.pages[2].number;
+            assert!(!resumable(&checkpoint, &value.measured, &full.layout.pages));
+        }
+    }
+
+    #[test]
+    fn incremental_convergence_matches_the_opening_fragments_fitting_geometry() {
+        let value = |margin: f64| {
+            let mut value = input(vec![
+                paragraph(0, 10, 10.0, json!({})),
+                json!({
+                    "block": {
+                        "kind": "sectionBreak", "id": "section", "type": "continuous",
+                        "margins": { "top": 10, "right": margin, "bottom": 10, "left": margin },
+                    },
+                    "measure": { "kind": "sectionBreak" },
+                }),
+                paragraph(2, 1, 10.0, json!({ "alignment": "center" })),
+                paragraph(3, 1, 10.0, json!({})),
+            ]);
+            value.options.final_margins = serde_json::from_value(json!({
+                "top": 10, "right": 30, "bottom": 10, "left": 30,
+            }))
+            .unwrap();
+            value.options.body_break_type = Some(SectionBreakType::Continuous);
+            value
+        };
+        let previous = layout_document_checkpointed(&mut value(10.0)).unwrap();
+        let Fragment::Paragraph(previous_fragment) = &previous.layout.pages[1].fragments[0] else {
+            panic!("paragraph expected")
+        };
+        assert_eq!(previous_fragment.width, 180.0);
+        let incremental = layout_document_incremental(
+            &mut value(20.0),
+            &mut previous.layout.clone(),
+            &previous.checkpoints,
+            &[1_u64; 4],
+            &[1, 2, 1, 1],
+            1,
+        )
+        .unwrap();
+        let full = layout_document_checkpointed(&mut value(20.0)).unwrap();
+        assert_eq!(full.layout.pages.len(), 2);
+        let Fragment::Paragraph(full_fragment) = &full.layout.pages[1].fragments[0] else {
+            panic!("paragraph expected")
+        };
+        let Fragment::Paragraph(incremental_fragment) = &incremental.layout.pages[1].fragments[0]
+        else {
+            panic!("paragraph expected")
+        };
+        assert_eq!(full_fragment.width, 160.0);
+        assert_eq!(incremental_fragment.width, full_fragment.width);
+        assert_eq!(
+            serde_json::to_vec(&incremental.layout).unwrap(),
+            serde_json::to_vec(&full.layout).unwrap()
+        );
+        assert_eq!(incremental.checkpoints, full.checkpoints);
+    }
+
+    #[test]
+    fn incremental_convergence_matches_fitting_geometry_with_first_page_margins() {
+        let value = |margin: f64| {
+            let mut value = input(vec![
+                paragraph(0, 10, 10.0, json!({})),
+                json!({
+                    "block": {
+                        "kind": "sectionBreak", "id": "section", "type": "continuous",
+                        "margins": { "top": 10, "right": margin, "bottom": 10, "left": margin },
+                    },
+                    "measure": { "kind": "sectionBreak" },
+                }),
+                paragraph(2, 1, 10.0, json!({ "alignment": "center" })),
+                paragraph(3, 1, 10.0, json!({})),
+            ]);
+            value.options.final_margins = serde_json::from_value(json!({
+                "top": 10, "right": 30, "bottom": 10, "left": 30,
+            }))
+            .unwrap();
+            value.options.body_break_type = Some(SectionBreakType::Continuous);
+            value.options.section_page_margins = Some(
+                serde_json::from_value(json!([
+                    { "first": { "top": 10, "right": 10, "bottom": 10, "left": 10 } },
+                    {},
+                ]))
+                .unwrap(),
+            );
+            value
+        };
+        let previous = layout_document_checkpointed(&mut value(10.0)).unwrap();
+        let Fragment::Paragraph(previous_fragment) = &previous.layout.pages[1].fragments[0] else {
+            panic!("paragraph expected")
+        };
+        assert_eq!(previous_fragment.width, 180.0);
+        let incremental = layout_document_incremental(
+            &mut value(20.0),
+            &mut previous.layout.clone(),
+            &previous.checkpoints,
+            &[1_u64; 4],
+            &[1, 2, 1, 1],
+            1,
+        )
+        .unwrap();
+        let mut full_input = value(20.0);
+        let full = layout_document_checkpointed(&mut full_input).unwrap();
+        assert_eq!(full.layout.pages.len(), 2);
+        assert_eq!(
+            previous.layout.pages[0].margins,
+            full.layout.pages[0].margins
+        );
+        assert_ne!(
+            previous.layout.pages[1].opening_fragment_geometry,
+            full.layout.pages[1].opening_fragment_geometry
+        );
+        let Fragment::Paragraph(full_fragment) = &full.layout.pages[1].fragments[0] else {
+            panic!("paragraph expected")
+        };
+        let Fragment::Paragraph(incremental_fragment) = &incremental.layout.pages[1].fragments[0]
+        else {
+            panic!("paragraph expected")
+        };
+        assert_eq!(full_fragment.width, 160.0);
+        assert_eq!(incremental_fragment.width, full_fragment.width);
+        assert_eq!(
+            serde_json::to_vec(&incremental.layout).unwrap(),
+            serde_json::to_vec(&full.layout).unwrap()
+        );
+        assert_eq!(incremental.checkpoints, full.checkpoints);
+        assert_eq!(
+            incremental.layout.pages[1].opening_fragment_geometry,
+            full.layout.pages[1].opening_fragment_geometry
+        );
+        let checkpoint = full
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.block_index == 2 && checkpoint.page_index == 1)
+            .unwrap();
+        assert!(!resumable(
+            checkpoint,
+            &full_input.measured,
+            &full.layout.pages
+        ));
+    }
+
+    #[test]
+    fn incremental_text_edits_keep_the_same_convergence_page() {
+        for page_break_before in [false, true] {
+            let measured: Vec<_> = (0..15)
+                .map(|id| {
+                    paragraph(
+                        id,
+                        1,
+                        20.0,
+                        json!({ "pageBreakBefore": page_break_before && id > 0 && id % 5 == 0 }),
+                    )
+                })
+                .collect();
+            let previous = layout_document_checkpointed(&mut input(measured.clone())).unwrap();
+            let mut next = measured;
+            next[2]["block"]["runs"][0]["text"] = json!("y");
+            let mut next_fingerprints = [1_u64; 15];
+            next_fingerprints[2] = 2;
+            let incremental = layout_document_incremental(
+                &mut input(next.clone()),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &[1_u64; 15],
+                &next_fingerprints,
+                2,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut input(next)).unwrap();
+            assert_eq!(incremental.rebuilt_page_start, 0);
+            assert_eq!(incremental.rebuilt_page_end, 1);
+            assert_eq!(incremental.placed_blocks, 6);
+            assert_eq!(
+                serde_json::to_vec(&incremental.layout).unwrap(),
+                serde_json::to_vec(&full.layout).unwrap()
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints);
+        }
+    }
+
+    #[test]
+    fn incremental_text_edits_restore_continuous_side_margins() {
+        let mut measured: Vec<_> = (0..24)
+            .map(|id| paragraph(id, 1, 20.0, json!({})))
+            .collect();
+        measured.insert(
+            7,
+            json!({
+                "block": {
+                    "kind": "sectionBreak", "id": "section", "type": "continuous",
+                    "margins": { "top": 10, "right": 10, "bottom": 10, "left": 10 },
+                },
+                "measure": { "kind": "sectionBreak" },
+            }),
+        );
+        let value = |measured| {
+            let mut value = input(measured);
+            value.options.final_margins = serde_json::from_value(json!({
+                "top": 20, "right": 30, "bottom": 20, "left": 30,
+            }))
+            .unwrap();
+            value.options.body_break_type = Some(SectionBreakType::Continuous);
+            value
+        };
+        let previous = layout_document_checkpointed(&mut value(measured.clone())).unwrap();
+        let shared_page = &previous.layout.pages[1];
+        assert_eq!(shared_page.margins.left, 10.0);
+        let Fragment::Paragraph(first_new) = &shared_page.fragments[2] else {
+            panic!("paragraph expected")
+        };
+        assert_eq!(
+            (first_new.x, first_new.y, first_new.width),
+            (30.0, 50.0, 140.0)
+        );
+        for page in &previous.layout.pages[2..] {
+            assert_eq!((page.margins.left, page.margins.right), (30.0, 30.0));
+            assert_eq!((page.margins.top, page.margins.bottom), (20.0, 20.0));
+        }
+        assert!(previous.checkpoints.iter().any(|checkpoint| {
+            checkpoint.section_index == 1
+                && checkpoint.page_index > 1
+                && checkpoint.flow.margins.left == 30.0
+                && checkpoint.flow.margins.right == 30.0
+        }));
+
+        for dirty in [9, 17] {
+            let mut next = measured.clone();
+            next[dirty]["block"]["runs"][0]["text"] = json!("y");
+            let mut fingerprints = [1_u64; 25];
+            fingerprints[dirty] = 2;
+            let incremental = layout_document_incremental(
+                &mut value(next.clone()),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &[1_u64; 25],
+                &fingerprints,
+                dirty,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut value(next)).unwrap();
+            if dirty == 9 {
+                assert_eq!(incremental.rebuilt_page_start, 1);
+            } else {
+                assert!(incremental.rebuilt_page_start > 1);
+            }
+            assert_eq!(
+                serde_json::to_vec(&incremental.layout).unwrap(),
+                serde_json::to_vec(&full.layout).unwrap()
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints);
+        }
+    }
+
+    #[test]
+    fn incremental_text_edits_converge_across_sections_with_the_same_geometry() {
+        for (break_type, placed_blocks) in [("continuous", 7), ("nextPage", 6)] {
+            let mut measured: Vec<_> = (0..15)
+                .map(|id| paragraph(id, 1, 20.0, json!({})))
+                .collect();
+            measured.insert(
+                5,
+                json!({
+                    "block": {
+                        "kind": "sectionBreak", "id": "section", "type": break_type,
+                        "margins": { "top": 10, "right": 10, "bottom": 10, "left": 10 },
+                    },
+                    "measure": { "kind": "sectionBreak" },
+                }),
+            );
+            let typed = |measured: Vec<serde_json::Value>| {
+                let mut value = input(measured);
+                value.options.body_break_type = serde_json::from_value(json!(break_type)).unwrap();
+                value
+            };
+            let previous = layout_document_checkpointed(&mut typed(measured.clone())).unwrap();
+            assert_eq!(previous.layout.pages.len(), 3);
+            assert_eq!(
+                (
+                    previous.checkpoints[1].block_index,
+                    previous.checkpoints[1].section_index,
+                    previous.checkpoints[1].page_index,
+                ),
+                (6, 1, 1)
+            );
+            let mut next = measured;
+            next[2]["block"]["runs"][0]["text"] = json!("y");
+            let mut next_fingerprints = [1_u64; 16];
+            next_fingerprints[2] = 2;
+            let incremental = layout_document_incremental(
+                &mut typed(next.clone()),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &[1_u64; 16],
+                &next_fingerprints,
+                2,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut typed(next)).unwrap();
+            assert_eq!(incremental.rebuilt_page_start, 0);
+            assert_eq!(incremental.rebuilt_page_end, 1);
+            assert_eq!(incremental.placed_blocks, placed_blocks);
+            assert_eq!(
+                serde_json::to_vec(&incremental.layout).unwrap(),
+                serde_json::to_vec(&full.layout).unwrap()
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints);
+        }
+    }
+
+    #[test]
+    fn incremental_layout_skips_the_clean_pages_between_changes() {
+        let keep_next = 41;
+        let measured = |lines: &[usize]| -> Vec<serde_json::Value> {
+            lines
+                .iter()
+                .enumerate()
+                .map(|(id, &count)| {
+                    let attrs = if id == keep_next {
+                        json!({ "keepNext": true })
+                    } else {
+                        json!({})
+                    };
+                    paragraph(id as u32, count, 20.0, attrs)
+                })
+                .collect()
+        };
+        let base: Vec<usize> = (0..60).map(|id| if id == 12 { 2 } else { 1 }).collect();
+        let mut previous_input = input(measured(&base));
+        let previous = layout_document_checkpointed(&mut previous_input).unwrap();
+        let previous_fingerprints = vec![1_u64; base.len()];
+
+        // Each change is a block and its new line count; a same count changes only text.
+        let cases: [&[(usize, usize)]; 5] = [
+            &[(7, 1), (42, 1)],
+            &[(7, 1), (42, 2)],
+            &[(7, 2), (42, 1)],
+            &[(7, 2), (12, 1), (42, 1), (50, 1)],
+            &[(3, 1), (20, 2), (26, 1), (41, 2), (57, 1)],
+        ];
+        for changes in cases {
+            let mut lines = base.clone();
+            let mut next_fingerprints = previous_fingerprints.clone();
+            for &(index, count) in changes {
+                lines[index] = count;
+                next_fingerprints[index] = 2;
+            }
+            let mut previous_layout = previous.layout.clone();
+            let mut incremental_input = input(measured(&lines));
+            let incremental = layout_document_incremental(
+                &mut incremental_input,
+                &mut previous_layout,
+                &previous.checkpoints,
+                &previous_fingerprints,
+                &next_fingerprints,
+                changes[0].0,
+            )
+            .unwrap();
+            let mut full_input = input(measured(&lines));
+            let full = layout_document_checkpointed(&mut full_input).unwrap();
+            assert_eq!(
+                serde_json::to_string(&incremental.layout).unwrap(),
+                serde_json::to_string(&full.layout).unwrap(),
+                "{changes:?}"
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints, "{changes:?}");
+        }
+
+        let mut previous_layout = previous.layout.clone();
+        let mut next_fingerprints = previous_fingerprints.clone();
+        next_fingerprints[7] = 2;
+        next_fingerprints[42] = 2;
+        let IncrementalLayout {
+            checkpointed: incremental,
+            rebuilt_page_ranges,
+        } = layout_document_incremental_ranges(
+            &mut input(measured(&base)),
+            &mut previous_layout,
+            &previous.checkpoints,
+            &previous_fingerprints,
+            &next_fingerprints,
+            7,
+        )
+        .unwrap();
+        assert_eq!(rebuilt_page_ranges, vec![1..2, 8..9]);
+        assert_eq!(
+            (incremental.rebuilt_page_start, incremental.rebuilt_page_end),
+            (1, 9)
+        );
+        assert!(incremental.placed_blocks * 4 < base.len());
+    }
+
+    /// `count` blocks carrying document positions: two-line paragraphs of text,
+    /// tab, break and image runs, tables, images, shapes, paragraphs of one
+    /// character per line that split across pages and, with `inline_shapes`,
+    /// paragraphs holding an inline shape. Each paragraph in `edits` has
+    /// `extra` more characters.
+    fn positioned_document(
+        count: usize,
+        edits: &[usize],
+        extra: usize,
+        inline_shapes: bool,
+    ) -> Vec<serde_json::Value> {
+        let line = |head: (usize, usize), tail: (usize, usize)| {
+            json!({
+                "headRun": head.0, "headChar": head.1, "tailRun": tail.0, "tailChar": tail.1,
+                "width": 10, "ascent": 16, "descent": 4, "lineHeight": 20,
+            })
+        };
+        let mut position = 0;
+        (0..count)
+            .map(|index| {
+                let start = position;
+                let len = 4 + if edits.contains(&index) { extra } else { 0 };
+                let text = |at: usize| {
+                    json!({"kind": "text", "text": "x".repeat(len), "pmStart": at, "pmEnd": at + len})
+                };
+                let paragraph = |runs: Vec<serde_json::Value>, lines: Vec<serde_json::Value>| {
+                    let end = runs.last().map_or(start + 1, |run| {
+                        run["pmEnd"].as_u64().unwrap() as usize
+                    }) + 1;
+                    let height = lines.len() * 20;
+                    (
+                        json!({"kind": "paragraph", "id": index, "runs": runs, "pmStart": start, "pmEnd": end}),
+                        json!({"kind": "paragraph", "lines": lines, "totalHeight": height}),
+                        end - start,
+                    )
+                };
+                let (block, measure, size) = match index % 8 {
+                    2 if inline_shapes => paragraph(
+                        vec![
+                            text(start + 1),
+                            json!({
+                                "kind": "image", "src": "", "width": 10, "height": 10,
+                                "pmStart": start + 1 + len, "pmEnd": start + 2 + len,
+                                "inlineShape": {
+                                    "id": format!("shape-{index}"), "shapeType": "rect",
+                                    "width": 10, "height": 10, "geometryPath": [], "children": [],
+                                    "pmStart": start + 1 + len, "pmEnd": start + 2 + len,
+                                    "docStart": start + 1 + len, "docEnd": start + 2 + len,
+                                },
+                            }),
+                        ],
+                        vec![line((0, 0), (1, 1))],
+                    ),
+                    3 => (
+                        json!({
+                            "kind": "table", "id": index, "columnWidths": [50],
+                            "rows": [{"id": 1000 + index, "cells": [{"id": 2000 + index, "blocks": []}]}],
+                            "pmStart": start, "pmEnd": start + 6,
+                        }),
+                        json!({
+                            "kind": "table", "columnWidths": [50], "totalWidth": 50, "totalHeight": 20,
+                            "rows": [{"height": 20, "cells": [{"width": 50, "height": 20, "blocks": []}]}],
+                        }),
+                        6,
+                    ),
+                    5 => (
+                        json!({
+                            "kind": "image", "id": index, "src": "", "width": 20, "height": 20,
+                            "pmStart": start, "pmEnd": start + 1,
+                        }),
+                        json!({"kind": "image", "width": 20, "height": 20}),
+                        1,
+                    ),
+                    6 => (
+                        json!({
+                            "kind": "shape", "id": index, "shapeType": "rect", "width": 20,
+                            "height": 20, "geometryPath": [], "children": [],
+                            "pmStart": start, "pmEnd": start + 1,
+                            "docStart": start, "docEnd": start + 1,
+                        }),
+                        json!({"kind": "shape", "width": 20, "height": 20}),
+                        1,
+                    ),
+                    7 => paragraph(
+                        vec![text(start + 1)],
+                        (0..len).map(|offset| line((0, offset), (0, offset + 1))).collect(),
+                    ),
+                    _ => paragraph(
+                        vec![
+                            text(start + 1),
+                            json!({"kind": "tab", "pmStart": start + 1 + len, "pmEnd": start + 2 + len}),
+                            json!({"kind": "lineBreak", "pmStart": start + 2 + len, "pmEnd": start + 3 + len}),
+                            json!({
+                                "kind": "image", "src": "", "width": 10, "height": 10,
+                                "pmStart": start + 3 + len, "pmEnd": start + 4 + len,
+                            }),
+                            json!({"kind": "text", "text": "yz", "pmStart": start + 4 + len, "pmEnd": start + 6 + len}),
+                        ],
+                        vec![line((0, 0), (2, 0)), line((3, 0), (4, 2))],
+                    ),
+                };
+                position += size;
+                json!({"block": block, "measure": measure})
+            })
+            .collect()
+    }
+
+    #[test]
+    fn incremental_layout_refreshes_retained_pages_as_a_full_pass_lays_them_out() {
+        let count = 64;
+        let previous =
+            layout_document_checkpointed(&mut input(positioned_document(count, &[], 0, true)))
+                .unwrap();
+        let cases: [&[usize]; 6] = [&[1], &[2], &[7], &[1, 33], &[9, 26, 50], &[23, 41]];
+        for edits in cases {
+            let next = positioned_document(count, edits, 3, true);
+            let previous_fingerprints = vec![1_u64; count];
+            let mut next_fingerprints = previous_fingerprints.clone();
+            for &index in edits {
+                next_fingerprints[index] = 2;
+            }
+            let incremental = layout_document_incremental(
+                &mut input(next.clone()),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &previous_fingerprints,
+                &next_fingerprints,
+                edits[0],
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut input(next)).unwrap();
+            assert_eq!(
+                serde_json::to_string(&incremental.layout).unwrap(),
+                serde_json::to_string(&full.layout).unwrap(),
+                "{edits:?}"
+            );
+            assert_eq!(incremental.checkpoints, full.checkpoints, "{edits:?}");
+        }
+    }
+
+    #[test]
+    fn incremental_layout_resolves_only_the_lines_it_places() {
+        let resolved = |count: usize| {
+            let previous =
+                layout_document_checkpointed(&mut input(positioned_document(count, &[], 0, false)))
+                    .unwrap();
+            let mut next = input(positioned_document(count, &[1], 3, false));
+            let previous_fingerprints = vec![1_u64; count];
+            let mut next_fingerprints = previous_fingerprints.clone();
+            next_fingerprints[1] = 2;
+            let mut previous_layout = previous.layout.clone();
+            crate::work_counters::take();
+            let incremental = layout_document_incremental(
+                &mut next,
+                &mut previous_layout,
+                &previous.checkpoints,
+                &previous_fingerprints,
+                &next_fingerprints,
+                1,
+            )
+            .unwrap();
+            (
+                crate::work_counters::take().resolved_lines,
+                incremental.rebuilt_page_end,
+            )
+        };
+        assert_eq!(resolved(24), resolved(240));
+    }
+
+    /// Each later paragraph's one run is whole on its line, and the cases drop
+    /// or add its end while paragraph 0 grows.
+    #[test]
+    fn retained_text_runs_take_the_positions_a_full_pass_resolves() {
+        let document = |extra: usize, ends: &dyn Fn(usize) -> bool| {
+            let mut position = 0;
+            (0..12)
+                .map(|index| {
+                    let len = 1 + if index == 0 { extra } else { 0 };
+                    let start = position;
+                    position += len + 2;
+                    let mut run =
+                        json!({"kind": "text", "text": "a".repeat(len), "pmStart": start + 1});
+                    if ends(index) {
+                        run["pmEnd"] = json!(start + 1 + len);
+                    }
+                    json!({
+                        "block": {
+                            "kind": "paragraph", "id": index, "runs": [run],
+                            "pmStart": start, "pmEnd": start + len + 2,
+                        },
+                        "measure": {
+                            "kind": "paragraph", "totalHeight": 40,
+                            "lines": [{
+                                "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": len,
+                                "width": 10, "ascent": 32, "descent": 8, "lineHeight": 40,
+                            }],
+                        },
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let all = |_: usize| true;
+        let none = |_: usize| false;
+        let some = |index: usize| index % 2 == 0;
+        let cases: [(&dyn Fn(usize) -> bool, &dyn Fn(usize) -> bool); 4] =
+            [(&none, &all), (&all, &none), (&some, &all), (&all, &some)];
+        for (case, (before, after)) in cases.into_iter().enumerate() {
+            let previous = layout_document_checkpointed(&mut input(document(0, before))).unwrap();
+            let mut next_fingerprints = vec![1_u64; 12];
+            next_fingerprints[0] = 2;
+            let incremental = layout_document_incremental(
+                &mut input(document(1, after)),
+                &mut previous.layout.clone(),
+                &previous.checkpoints,
+                &[1_u64; 12],
+                &next_fingerprints,
+                0,
+            )
+            .unwrap();
+            let full = layout_document_checkpointed(&mut input(document(1, after))).unwrap();
+            assert!(
+                incremental.placed_blocks < full.placed_blocks,
+                "case {case}"
+            );
+            assert_eq!(
+                serde_json::to_string(&incremental.layout).unwrap(),
+                serde_json::to_string(&full.layout).unwrap(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_after_a_floating_table_keeps_the_spacing_its_page_starts_with() {
+        let floating_table = json!({
+            "block": {
+                "kind": "table", "id": 90,
+                "rows": [{ "id": 91, "cells": [{ "id": 92, "blocks": [] }] }],
+                "columnWidths": [50],
+                "floating": {},
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [50],
+                "totalWidth": 50, "totalHeight": 20,
+                "rows": [{ "height": 20, "cells": [
+                    { "width": 50, "height": 20, "blocks": [] }
+                ] }],
+            },
+        });
+        // The table overflows onto the second page, whose automatic break spends
+        // the following paragraph's space before.
+        let measured = || {
+            vec![
+                paragraph(0, 9, 10.0, json!({})),
+                floating_table.clone(),
+                paragraph(1, 1, 10.0, json!({ "spacing": { "before": 20 } })),
+            ]
+        };
+        let previous = layout_document_checkpointed(&mut input(measured())).unwrap();
+        let table_page = previous
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.block_index == 1)
+            .unwrap();
+        assert_eq!(table_page.page_index, 1);
+        assert_eq!(table_page.flow.leading_spacing_spent, f64::INFINITY);
+        let mut previous_layout = previous.layout.clone();
+        let incremental = layout_document_incremental(
+            &mut input(measured()),
+            &mut previous_layout,
+            &previous.checkpoints,
+            &[1, 1, 1],
+            &[1, 1, 2],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&incremental.layout).unwrap(),
+            serde_json::to_string(&previous.layout).unwrap()
+        );
+    }
+
+    /// Lays `previous` out in full, then `next` incrementally with the blocks
+    /// `dirty` changed, and checks it against a full pass over `next`.
+    #[test]
+    fn a_page_break_a_keep_with_next_follower_gains_relays_out_the_run_head() {
+        let blocks = |page_break_before: bool| {
+            vec![
+                paragraph(0, 1, 90.0, json!({})),
+                paragraph(1, 1, 10.0, json!({ "keepNext": true })),
+                paragraph(2, 1, 10.0, json!({ "pageBreakBefore": page_break_before })),
+            ]
+        };
+        let layout = assert_incremental_matches_full(blocks(false), blocks(true), &[2]);
+        assert_eq!(layout.layout.pages.len(), 2);
+        assert_incremental_matches_full(blocks(true), blocks(false), &[2]);
+
+        let interior = |page_break_before: bool| {
+            vec![
+                paragraph(0, 1, 80.0, json!({})),
+                paragraph(1, 1, 10.0, json!({ "keepNext": true })),
+                paragraph(
+                    2,
+                    1,
+                    10.0,
+                    json!({ "keepNext": true, "pageBreakBefore": page_break_before }),
+                ),
+                paragraph(3, 1, 10.0, json!({})),
+            ]
+        };
+        assert_incremental_matches_full(interior(false), interior(true), &[2]);
+        assert_incremental_matches_full(interior(true), interior(false), &[2]);
+    }
+
+    #[test]
+    fn keepnext_trailing_slice_does_not_subtract_an_excluded_lead_skip() {
+        let mut kept = paragraph(1, 4, 10.0, json!({ "keepNext": true }));
+        kept["measure"]["lines"][0]["floatSkipBefore"] = json!(30.0);
+        kept["measure"]["totalHeight"] = json!(70.0);
+        let result = layout(vec![
+            kept,
+            paragraph(2, 9, 10.0, json!({ "keepLines": true })),
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        assert_eq!(paragraph_slices(&result, 1.0), [(0, 0, 4)]);
+        assert_eq!(paragraph_slices(&result, 2.0), [(1, 0, 9)]);
+    }
+
+    #[test]
+    fn a_keepnext_continuation_can_leave_one_line_before_its_reserved_tail() {
+        let mut value = input(vec![
+            paragraph(0, 2, 10.0, json!({})),
+            paragraph(1, 5, 10.0, json!({ "keepNext": true })),
+            paragraph(2, 2, 10.0, json!({ "keepLines": true })),
+        ]);
+        value.options.page_size.as_mut().unwrap().h = 60.0;
+        let mut result = layout_document(&mut value.clone()).unwrap();
+        let mut paginator = Paginator::new(
+            value.options.page_size.clone().unwrap(),
+            resolve_page_margins(value.options.margins.as_ref()),
+            default_columns(),
+            None,
+        )
+        .unwrap();
+        for (index, measured) in value.measured.iter().enumerate() {
+            let MeasuredBlock {
+                block: LayoutBlock::Paragraph(block),
+                measure: BlockExtent::Paragraph(measure),
+            } = measured
+            else {
+                panic!("expected paragraph");
+            };
+            layout_paragraph(
+                block,
+                measure,
+                &mut paginator,
+                false,
+                0.0,
+                (index == 1).then_some((20.0, 0.0)),
+            )
+            .unwrap();
+        }
+        result.pages = paginator.pages;
+        assert_eq!(
+            paragraph_slices(&result, 1.0),
+            [(0, 0, 2), (1, 2, 3), (2, 3, 5)]
+        );
+        assert_eq!(paragraph_slices(&result, 2.0), [(2, 0, 2)]);
+    }
+
+    #[test]
+    fn incremental_placement_inside_an_oversized_keepnext_chain_matches_full() {
+        let value = input(vec![
+            paragraph(0, 10, 10.0, json!({ "keepNext": true, "keepLines": true })),
+            paragraph(1, 10, 10.0, json!({ "keepNext": true })),
+            paragraph(2, 1, 10.0, json!({})),
+        ]);
+        let full = layout_document_checkpointed(&mut value.clone()).unwrap();
+        let config = SectionLayoutConfig {
+            page_size: value.options.page_size.clone().unwrap(),
+            margins: resolve_page_margins(value.options.margins.as_ref()),
+            columns: value.options.columns.clone(),
+        };
+        let plan = prescan(
+            &value.measured,
+            &config,
+            config.clone(),
+            value.options.body_break_type,
+        )
+        .unwrap();
+        let mut paginator = origin_paginator(&config, &plan, &value.options).unwrap();
+        let MeasuredBlock {
+            block: LayoutBlock::Paragraph(block),
+            measure: BlockExtent::Paragraph(measure),
+        } = &value.measured[0]
+        else {
+            panic!("expected paragraph");
+        };
+        layout_paragraph(block, measure, &mut paginator, false, 0.0, None).unwrap();
+        let resumed = place::<u64>(
+            &value.measured,
+            &plan,
+            &mut paginator,
+            &config,
+            1,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resumed.placed_blocks, 2);
+        assert_eq!(
+            serde_json::to_value(&paginator.pages).unwrap(),
+            serde_json::to_value(&full.layout.pages).unwrap()
+        );
+        assert_eq!(paragraph_slices(&full.layout, 1.0), [(1, 0, 8), (2, 8, 10)]);
+    }
+
+    fn assert_incremental_matches_full(
+        previous: Vec<serde_json::Value>,
+        next: Vec<serde_json::Value>,
+        dirty: &[usize],
+    ) -> CheckpointedLayout {
+        assert_incremental_matches_full_with(json!({}), previous, next, dirty)
+    }
+
+    /// [`assert_incremental_matches_full`] with `options` over the test page's.
+    fn assert_incremental_matches_full_with(
+        options: serde_json::Value,
+        previous: Vec<serde_json::Value>,
+        next: Vec<serde_json::Value>,
+        dirty: &[usize],
+    ) -> CheckpointedLayout {
+        let input = |measured: Vec<serde_json::Value>| {
+            let mut value = input(measured);
+            let mut merged = serde_json::to_value(&value.options).unwrap();
+            for (key, option) in options.as_object().unwrap() {
+                merged[key] = option.clone();
+            }
+            value.options = serde_json::from_value(merged).unwrap();
+            value
+        };
+        let retained = layout_document_checkpointed(&mut input(previous)).unwrap();
+        let previous_fingerprints = vec![1_u64; next.len()];
+        let mut next_fingerprints = previous_fingerprints.clone();
+        for &index in dirty {
+            next_fingerprints[index] = 2;
+        }
+        let mut previous_layout = retained.layout.clone();
+        let incremental = layout_document_incremental(
+            &mut input(next.clone()),
+            &mut previous_layout,
+            &retained.checkpoints,
+            &previous_fingerprints,
+            &next_fingerprints,
+            dirty[0],
+        )
+        .unwrap();
+        let full = layout_document_checkpointed(&mut input(next)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&incremental.layout).unwrap(),
+            serde_json::to_string(&full.layout).unwrap()
+        );
+        assert_eq!(incremental.checkpoints, full.checkpoints);
+        retained
+    }
+
+    #[test]
+    fn placement_across_a_continuous_section_on_a_fresh_page_matches_a_full_pass() {
+        let blocks = || {
+            vec![
+                paragraph(0, 1, 10.0, json!({})),
+                paragraph(1, 1, 10.0, json!({ "pageBreakBefore": true })),
+                json!({"block":{"kind":"pageBreak","id":"page"},"measure":{"kind":"pageBreak"}}),
+                json!({
+                    "block": {
+                        "kind": "sectionBreak", "id": "section", "type": "continuous",
+                        "margins": { "top": 20, "right": 10, "bottom": 10, "left": 10 },
+                    },
+                    "measure": { "kind": "sectionBreak" },
+                }),
+                paragraph(2, 1, 10.0, json!({})),
+                paragraph(3, 1, 10.0, json!({})),
+            ]
+        };
+        assert_incremental_matches_full(blocks(), blocks(), &[0, 5]);
+    }
+
+    #[test]
+    fn placement_does_not_resume_at_a_table_whose_row_moved_to_its_page() {
+        let lines = 8;
+        let table = json!({
+            "block": {
+                "kind": "table", "id": 90,
+                "rows": [{ "id": 91, "cells": [{ "id": 92, "blocks": [paragraph(93, lines, 20.0, json!({ "keepLines": true }))["block"]] }] }],
+                "columnWidths": [180],
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [180],
+                "totalWidth": 180, "totalHeight": lines as f64 * 20.0,
+                "rows": [{ "height": lines as f64 * 20.0, "cells": [{
+                    "width": 180, "height": lines as f64 * 20.0,
+                    "blocks": [paragraph(93, lines, 20.0, json!({ "keepLines": true }))["measure"]],
+                }] }],
+            },
+        });
+        let blocks = || {
+            let mut blocks: Vec<_> = (0..24)
+                .map(|id| paragraph(id, 1, 20.0, json!({})))
+                .collect();
+            blocks.push(paragraph(24, 1, 15.0, json!({})));
+            blocks.push(table.clone());
+            blocks.push(paragraph(25, 3, 20.0, json!({})));
+            blocks
+        };
+        let full = layout_document_checkpointed(&mut input(blocks())).unwrap();
+        assert!(
+            full.checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.block_index == 25)
+        );
+        assert_incremental_matches_full(blocks(), blocks(), &[0, 26]);
+        assert_incremental_matches_full(blocks(), blocks(), &[26]);
+    }
+
+    #[test]
+    fn placement_restarts_from_the_origin_without_a_resumable_checkpoint() {
+        let blocks = || vec![text_anchored_table(), paragraph(0, 1, 10.0, json!({}))];
+        let retained = assert_incremental_matches_full(blocks(), blocks(), &[1]);
+        assert_eq!(retained.layout.pages.len(), 2);
+    }
+
+    #[test]
+    fn placement_does_not_resume_where_a_page_takes_new_section_geometry() {
+        let blocks = || {
+            vec![
+                paragraph(0, 1, 10.0, json!({})),
+                paragraph(1, 1, 10.0, json!({ "pageBreakBefore": true })),
+                json!({
+                    "block": {
+                        "kind": "sectionBreak", "id": "section", "type": "continuous",
+                        "margins": { "top": 10, "right": 10, "bottom": 10, "left": 10 },
+                    },
+                    "measure": { "kind": "sectionBreak" },
+                }),
+                paragraph(2, 9, 10.0, json!({})),
+                paragraph(3, 1, 10.0, json!({ "alignment": "center" })),
+                paragraph(4, 1, 10.0, json!({})),
+            ]
+        };
+        let final_margins =
+            json!({ "finalMargins": { "top": 10, "right": 20, "bottom": 10, "left": 20 } });
+        let retained =
+            assert_incremental_matches_full_with(final_margins, blocks(), blocks(), &[0, 5]);
+        assert!(
+            retained
+                .layout
+                .pages
+                .windows(2)
+                .any(|pair| pair[0].margins != pair[1].margins)
+        );
+    }
+
+    #[test]
+    fn a_changed_first_section_lays_out_from_the_origin() {
+        let blocks = |top: f64| {
+            vec![
+                paragraph(0, 1, 10.0, json!({})),
+                json!({
+                    "block": {
+                        "kind": "sectionBreak", "id": "section", "type": "nextPage",
+                        "margins": { "top": top, "right": 10, "bottom": 10, "left": 10 },
+                    },
+                    "measure": { "kind": "sectionBreak" },
+                }),
+                paragraph(1, 1, 10.0, json!({})),
+            ]
+        };
+        assert_incremental_matches_full(blocks(10.0), blocks(20.0), &[0, 1]);
+    }
+
+    #[test]
+    fn incremental_placement_in_multi_column_sections_matches_a_full_pass() {
+        let section = |columns: u32| {
+            json!({
+                "block": {
+                    "kind": "sectionBreak", "id": format!("section{columns}"), "type": "nextPage",
+                    "columns": { "count": columns, "gap": 20 },
+                },
+                "measure": { "kind": "sectionBreak" },
+            })
+        };
+        for (blocks, dirty) in [
+            (
+                vec![
+                    paragraph(0, 1, 10.0, json!({})),
+                    section(1),
+                    paragraph(1, 1, 10.0, json!({})),
+                    paragraph(2, 1, 10.0, json!({})),
+                    section(2),
+                    paragraph(3, 1, 10.0, json!({})),
+                ],
+                &[3][..],
+            ),
+            (
+                vec![
+                    paragraph(0, 1, 10.0, json!({})),
+                    section(2),
+                    paragraph(1, 1, 10.0, json!({})),
+                    paragraph(2, 1, 10.0, json!({})),
+                ],
+                &[3],
+            ),
+            (
+                vec![
+                    paragraph(0, 1, 10.0, json!({})),
+                    paragraph(1, 1, 10.0, json!({ "pageBreakBefore": true })),
+                    section(1),
+                    paragraph(2, 1, 10.0, json!({})),
+                    paragraph(3, 1, 10.0, json!({})),
+                    section(2),
+                    paragraph(4, 1, 10.0, json!({})),
+                ],
+                &[0, 6],
+            ),
+        ] {
+            assert_incremental_matches_full(blocks.clone(), blocks, dirty);
+        }
+    }
+
+    fn text_anchored_table() -> serde_json::Value {
+        json!({
+            "block": {
+                "kind": "table", "id": 90,
+                "rows": [{ "id": 91, "cantSplit": true, "cells": [{ "id": 92, "blocks": [] }] }],
+                "columnWidths": [180],
+                "floating": {
+                    "vertAnchor": "text", "tblpY": 95,
+                    "topFromText": 0, "bottomFromText": 0, "leftFromText": 0, "rightFromText": 0,
+                },
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [180],
+                "totalWidth": 180, "totalHeight": 20,
+                "rows": [{ "height": 20, "cells": [
+                    { "width": 180, "height": 20, "blocks": [] }
+                ] }],
+            },
+        })
+    }
+
+    #[test]
+    fn a_split_side_wrapped_float_and_its_anchor_match_incremental_layout() {
+        let blocks = |height: f64, offset: f64, anchor_before: f64| {
+            let floating = json!({
+                "block": {
+                    "kind": "table", "id": 90, "columnWidths": [60],
+                    "rows": [
+                        {"id": 91, "height": 30, "heightRule": "exact", "cells": []},
+                        {"id": 92, "height": 30, "heightRule": "exact", "cells": []}
+                    ],
+                    "floating": {
+                        "horzAnchor": "text", "vertAnchor": "text",
+                        "tblpXSpec": "right", "tblpY": offset,
+                        "leftFromText": 10, "rightFromText": 10
+                    }
+                },
+                "measure": {
+                    "kind": "table", "columnWidths": [60], "totalWidth": 60, "totalHeight": 60,
+                    "rows": [{"height": 30, "cells": []}, {"height": 30, "cells": []}]
+                }
+            });
+            let mut anchor = paragraph(2, 3, 10.0, json!({"spacing": {"before": anchor_before}}));
+            for line in anchor["measure"]["lines"].as_array_mut().unwrap() {
+                line["rightOffset"] = json!(70);
+            }
+            vec![
+                paragraph(0, 1, 10.0, json!({})),
+                paragraph(
+                    1,
+                    1,
+                    height,
+                    json!({"pageBreakBefore": true, "spacing": {"after": 12}}),
+                ),
+                floating,
+                anchor,
+            ]
+        };
+        let split = blocks(40.0, 10.0, 0.0);
+        let spaced = blocks(40.0, 10.0, 12.0);
+        assert_incremental_matches_full(split.clone(), spaced.clone(), &[3]);
+        let retained = assert_incremental_matches_full(spaced, split.clone(), &[3]);
+        assert_eq!(retained.layout.pages.len(), 3);
+        let Some(Fragment::Table(first)) = retained.layout.pages[1].fragments.last() else {
+            panic!("first table fragment expected");
+        };
+        assert_eq!((first.y, first.row_start, first.row_end), (60.0, 0, 1));
+        assert_eq!(first.carried_to_next, Some(true));
+        let [Fragment::Table(table), Fragment::Paragraph(anchor)] =
+            retained.layout.pages[2].fragments.as_slice()
+        else {
+            panic!("table and anchor expected");
+        };
+        assert_eq!(
+            (table.x, table.y, table.row_start, table.row_end),
+            (130.0, 10.0, 1, 2)
+        );
+        assert_eq!((anchor.y, anchor.from_line), (10.0, 0));
+        let fitting = blocks(10.0, 10.0, 0.0);
+        assert_incremental_matches_full(split.clone(), fitting.clone(), &[1]);
+        assert_incremental_matches_full(fitting, split.clone(), &[1]);
+        assert_incremental_matches_full(split, blocks(40.0, 45.0, 0.0), &[2]);
+    }
+
+    #[test]
+    fn a_float_taller_than_the_page_keeps_its_offset_and_splits_like_word() {
+        // Word 16.114, floattable-vertoffset.docx: tblpY 1135 puts row one 56.75pt down.
+        let table = |vert_anchor: &str| {
+            json!({
+                "block": {
+                    "kind": "table", "id": 90, "columnWidths": [60],
+                    "rows": [
+                        {"id": 91, "height": 60, "heightRule": "exact", "cells": []},
+                        {"id": 92, "height": 60, "heightRule": "exact", "cells": []}
+                    ],
+                    "floating": {"vertAnchor": vert_anchor, "horzAnchor": "margin", "tblpX": 20, "tblpY": 25}
+                },
+                "measure": {
+                    "kind": "table", "columnWidths": [60], "totalWidth": 60, "totalHeight": 120,
+                    "rows": [{"height": 60, "cells": []}, {"height": 60, "cells": []}]
+                }
+            })
+        };
+        for (anchor, top) in [("text", 35.0), ("page", 25.0)] {
+            let result = layout(vec![table(anchor)]);
+            let tables: Vec<_> = result
+                .pages
+                .iter()
+                .enumerate()
+                .flat_map(|(page, p)| {
+                    p.fragments.iter().filter_map(move |f| match f {
+                        Fragment::Table(t) => Some((page, t.x, t.y, t.row_start)),
+                        _ => None,
+                    })
+                })
+                .collect();
+            assert_eq!(
+                tables,
+                vec![(0, 30.0, top, 0), (1, 30.0, 10.0, 1)],
+                "{anchor}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_does_not_resume_at_a_floating_table_that_opened_its_page() {
+        let blocks = |page_break: bool| {
+            vec![
+                paragraph(0, 1, 10.0, json!({})),
+                paragraph(1, 1, 10.0, json!({ "pageBreakBefore": true })),
+                if page_break {
+                    json!({"block":{"kind":"pageBreak","id":"page"},"measure":{"kind":"pageBreak"}})
+                } else {
+                    json!({"block":{"kind":"columnBreak","id":"column"},"measure":{"kind":"columnBreak"}})
+                },
+                text_anchored_table(),
+                paragraph(2, 1, 10.0, json!({})),
+            ]
+        };
+        let retained = assert_incremental_matches_full(blocks(true), blocks(true), &[0, 4]);
+        assert_eq!(retained.layout.pages.len(), 4);
+        assert_incremental_matches_full(blocks(true), blocks(false), &[2]);
+    }
+
+    #[test]
+    fn incremental_checkpoints_match_a_full_pass_on_a_page_with_several() {
+        let page_break =
+            || json!({"block":{"kind":"pageBreak","id":"page"},"measure":{"kind":"pageBreak"}});
+        let measured = || {
+            let mut blocks = vec![paragraph(0, 1, 10.0, json!({})), page_break(), page_break()];
+            blocks.extend((1..40).map(|id| paragraph(id, 1, 10.0, json!({}))));
+            blocks
+        };
+        let previous = layout_document_checkpointed(&mut input(measured())).unwrap();
+        // The second break opens no page: its checkpoint and the next paragraph's share one.
+        assert!(
+            previous
+                .checkpoints
+                .windows(2)
+                .any(|pair| pair[0].page_index == pair[1].page_index)
+        );
+        let previous_fingerprints = vec![1_u64; measured().len()];
+        let mut next_fingerprints = previous_fingerprints.clone();
+        next_fingerprints[2] = 2;
+        next_fingerprints[35] = 2;
+        let mut previous_layout = previous.layout.clone();
+        let incremental = layout_document_incremental(
+            &mut input(measured()),
+            &mut previous_layout,
+            &previous.checkpoints,
+            &previous_fingerprints,
+            &next_fingerprints,
+            2,
+        )
+        .unwrap();
+        assert_eq!(incremental.checkpoints, previous.checkpoints);
+        assert_eq!(
+            serde_json::to_string(&incremental.layout).unwrap(),
+            serde_json::to_string(&previous.layout).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_heading_above_a_table_on_a_page_with_float_bands_keeps_the_whole_row_witness() {
+        let cell_paragraph = json!({
+            "kind": "paragraph", "id": 10,
+            "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+        });
+        let lines: Vec<_> = [25.0, 25.0, 20.0, 20.0].into_iter().map(line).collect();
+        let table = json!({
+            "block": {
+                "kind": "table", "id": 3,
+                "rows": [{ "id": 20, "cells": [{ "id": 30, "blocks": [cell_paragraph] }] }],
+                "columnWidths": [100],
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [100], "totalWidth": 100, "totalHeight": 90,
+                "rows": [{ "height": 90, "cells": [{ "width": 100, "height": 90, "blocks": [
+                    { "kind": "paragraph", "lines": lines, "totalHeight": 90 }
+                ] }] }],
+            },
+        });
+        let mut value = input(vec![
+            paragraph(1, 1, 5.0, json!({})),
+            paragraph(2, 1, 15.0, json!({ "keepNext": true })),
+            table,
+        ]);
+        value.options.section_page_float_bands = Some(
+            serde_json::from_value(json!([{"default": [{"top": 60, "bottom": 65}]}])).unwrap(),
+        );
+        let result = layout_document(&mut value).unwrap();
+        assert_eq!(result.pages.len(), 2);
+        assert!(result.pages[0].fragments.iter().any(|fragment| matches!(
+            fragment,
+            Fragment::Paragraph(p)
+                if matches!(p.block_id, crate::types::BlockId::Num(value) if value == 2.0)
+        )));
+    }
+
+    fn oversized_cant_split_table() -> serde_json::Value {
+        let paragraph_block = json!({
+            "kind": "paragraph", "id": 10,
+            "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+        });
+        let paragraph_extent = json!({
+            "kind": "paragraph",
+            "lines": vec![line(20.0); 10],
+            "totalHeight": 200,
+        });
+        json!({
+            "block": {
+                "kind": "table", "id": 2,
+                "rows": [{ "id": 20, "cantSplit": true, "cells": [
+                    { "id": 30, "blocks": [paragraph_block] }
+                ] }],
+                "columnWidths": [100],
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [100],
+                "totalWidth": 100, "totalHeight": 200,
+                "rows": [{ "height": 200, "cells": [
+                    { "width": 100, "height": 200, "blocks": [paragraph_extent] }
+                ] }],
+            },
+        })
+    }
+
+    fn positioned_floating_table() -> serde_json::Value {
+        json!({
+            "block": {
+                "kind": "table", "id": 3,
+                "rows": [{ "id": 1, "cells": [{ "id": 2, "blocks": [] }] }],
+                "columnWidths": [50],
+                "floating": {
+                    "horzAnchor": "page", "tblpXSpec": "right",
+                    "vertAnchor": "page", "tblpY": 5,
+                },
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [50],
+                "totalWidth": 50, "totalHeight": 40,
+                "rows": [{ "height": 40, "cells": [
+                    { "width": 50, "height": 40, "blocks": [] }
+                ] }],
+            },
+        })
+    }
+
+    fn positioned_image() -> serde_json::Value {
+        json!({
+            "block": {
+                "kind": "image", "id": 4, "src": "embedded", "width": 50, "height": 20,
+                "anchor": {
+                    "isAnchored": true,
+                    "position": {
+                        "horizontal": { "relativeTo": "page", "align": "center" },
+                        "vertical": { "relativeTo": "page", "posOffset": 5 }
+                    }
+                }
+            },
+            "measure": { "kind": "image", "width": 50, "height": 20 }
+        })
+    }
+
+    #[test]
+    fn oversized_keep_lines_terminates_and_remains_visible() {
+        let result = layout(vec![paragraph(1, 10, 40.0, json!({ "keepLines": true }))]);
+        assert!(!result.pages.is_empty());
+        let fragments = result
+            .pages
+            .iter()
+            .flat_map(|page| page.fragments.iter())
+            .count();
+        assert_eq!(fragments, 5);
+    }
+
+    #[test]
+    fn widow_control_advances_a_single_bottom_line_and_keeps_two_at_each_side() {
+        let result = layout(vec![
+            paragraph(1, 1, 70.0, json!({})),
+            paragraph(2, 4, 20.0, json!({})),
+        ]);
+        assert_eq!(result.pages.len(), 2);
+        let second_page_lines: Vec<(usize, usize)> = result.pages[1]
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Paragraph(p)
+                    if matches!(p.block_id, crate::types::BlockId::Num(value) if value == 2.0) =>
+                {
+                    Some((p.from_line, p.to_line))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(second_page_lines, vec![(0, 4)]);
+    }
+
+    #[test]
+    fn widow_control_carries_the_pushed_line_to_the_next_page() {
+        for (preceding_height, lines, expected) in [
+            (40.0, 4, vec![(0, 0, 2), (1, 2, 4)]),
+            (20.0, 5, vec![(0, 0, 3), (1, 3, 5)]),
+        ] {
+            let result = layout(vec![
+                paragraph(1, 1, preceding_height, json!({})),
+                paragraph(2, lines, 20.0, json!({})),
+            ]);
+            assert_eq!(paragraph_slices(&result, 2.0), expected);
+        }
+    }
+
+    #[test]
+    fn widow_control_keeps_the_pushed_line_when_the_last_two_cannot_share_a_page() {
+        let mut block = paragraph(1, 4, 20.0, json!({}));
+        block["measure"]["lines"][3]["lineHeight"] = json!(90.0);
+        block["measure"]["lines"][3]["ascent"] = json!(72.0);
+        block["measure"]["lines"][3]["descent"] = json!(18.0);
+        let result = layout(vec![block]);
+        assert_eq!(result.pages.len(), 2);
+    }
+
+    #[test]
+    fn widow_control_keeps_the_pushed_line_above_a_float_band_on_its_page() {
+        let mut value = input(vec![paragraph(1, 4, 20.0, json!({}))]);
+        value.options.page_size = Some(crate::types::Size { w: 200.0, h: 220.0 });
+        value.options.section_page_float_bands = Some(
+            serde_json::from_value(json!([{"default": [{"top": 70, "bottom": 90}]}])).unwrap(),
+        );
+        let result = layout_document(&mut value).unwrap();
+        assert_eq!(result.pages.len(), 1);
+    }
+
+    #[test]
+    fn widow_control_in_balanced_columns_keeps_the_section_on_one_page() {
+        let mut value = input(vec![
+            paragraph(1, 4, 20.0, json!({})),
+            paragraph(2, 5, 20.0, json!({})),
+            paragraph(3, 4, 20.0, json!({})),
+            paragraph(4, 5, 20.0, json!({})),
+        ]);
+        value.options.page_size = Some(crate::types::Size { w: 500.0, h: 320.0 });
+        value.options.columns =
+            Some(serde_json::from_value(json!({"count": 3, "gap": 20})).unwrap());
+        let result = layout_document(&mut value).unwrap();
+        assert_eq!(result.pages.len(), 1);
+    }
+
+    fn paragraph_slices(layout: &Layout, id: f64) -> Vec<(usize, usize, usize)> {
+        layout
+            .pages
+            .iter()
+            .enumerate()
+            .flat_map(|(page_index, page)| {
+                page.fragments.iter().filter_map(move |fragment| match fragment {
+                    Fragment::Paragraph(p)
+                        if matches!(p.block_id, crate::types::BlockId::Num(value) if value == id) =>
+                    {
+                        Some((page_index, p.from_line, p.to_line))
+                    }
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn widow_control_keeps_short_paragraphs_together() {
+        for (lines, preceding_height) in [(2, 70.0), (3, 50.0), (3, 70.0)] {
+            let result = layout(vec![
+                paragraph(1, 1, preceding_height, json!({})),
+                paragraph(2, lines, 20.0, json!({})),
+            ]);
+            assert_eq!(paragraph_slices(&result, 2.0), vec![(1, 0, lines)]);
+        }
+    }
+
+    #[test]
+    fn short_paragraphs_still_split_when_widow_control_is_disabled() {
+        for (lines, preceding_height, split) in [(2, 70.0, 1), (3, 50.0, 2), (3, 70.0, 1)] {
+            let result = layout(vec![
+                paragraph(1, 1, preceding_height, json!({})),
+                paragraph(2, lines, 20.0, json!({ "widowControl": false })),
+            ]);
+            assert_eq!(
+                paragraph_slices(&result, 2.0),
+                vec![(0, 0, split), (1, split, lines)]
+            );
+        }
+    }
+
+    #[test]
+    fn widow_control_preserves_short_paragraphs_that_fit_exactly() {
+        for lines in [2, 3] {
+            let result = layout(vec![
+                paragraph(1, 1, 100.0 - lines as f64 * 20.0, json!({})),
+                paragraph(2, lines, 20.0, json!({})),
+            ]);
+            assert_eq!(paragraph_slices(&result, 2.0), vec![(0, 0, lines)]);
+        }
+    }
+
+    #[test]
+    fn widow_control_discards_boundary_spacing_when_moving_short_paragraphs() {
+        let result = layout(vec![
+            paragraph(1, 1, 30.0, json!({ "spacing": { "after": 60 } })),
+            paragraph(2, 3, 20.0, json!({ "spacing": { "before": 50 } })),
+        ]);
+        assert_eq!(paragraph_slices(&result, 2.0), vec![(1, 0, 3)]);
+        let Fragment::Paragraph(fragment) = &result.pages[1].fragments[0] else {
+            panic!()
+        };
+        assert_eq!(fragment.y, 10.0);
+    }
+
+    #[test]
+    fn oversized_short_paragraphs_still_terminate_with_every_line_visible() {
+        for (lines, height, expected) in [
+            (2, 60.0, vec![(0, 0, 1), (1, 1, 2)]),
+            (3, 60.0, vec![(0, 0, 1), (1, 1, 2), (2, 2, 3)]),
+            (3, 40.0, vec![(0, 0, 2), (1, 2, 3)]),
+        ] {
+            let result = layout(vec![paragraph(1, lines, height, json!({}))]);
+            assert_eq!(paragraph_slices(&result, 1.0), expected);
+        }
+    }
+
+    #[test]
+    fn authored_widow_control_off_splits_where_the_default_moves_the_paragraph_on() {
+        let default = layout(vec![
+            paragraph(1, 1, 70.0, json!({})),
+            paragraph(2, 4, 20.0, json!({})),
+        ]);
+        let disabled = layout(vec![
+            paragraph(1, 1, 70.0, json!({})),
+            paragraph(2, 4, 20.0, json!({ "widowControl": false })),
+        ]);
+
+        assert_eq!(paragraph_slices(&default, 2.0), vec![(1, 0, 4)]);
+        assert_eq!(paragraph_slices(&disabled, 2.0), vec![(0, 0, 1), (1, 1, 4)]);
+    }
+
+    #[test]
+    fn authored_widow_control_off_saves_the_page_the_default_costs() {
+        let default = layout(vec![
+            paragraph(1, 1, 70.0, json!({})),
+            paragraph(2, 4, 20.0, json!({})),
+            paragraph(3, 2, 20.0, json!({})),
+        ]);
+        let disabled = layout(vec![
+            paragraph(1, 1, 70.0, json!({})),
+            paragraph(2, 4, 20.0, json!({ "widowControl": false })),
+            paragraph(3, 2, 20.0, json!({})),
+        ]);
+
+        assert_eq!(default.pages.len(), 3);
+        assert_eq!(paragraph_slices(&default, 3.0), vec![(2, 0, 2)]);
+        assert_eq!(disabled.pages.len(), 2);
+        assert_eq!(paragraph_slices(&disabled, 3.0), vec![(1, 0, 2)]);
+    }
+
+    #[test]
+    fn unavoidable_oversized_cant_split_row_terminates_as_visible_safe_slices() {
+        let result = layout(vec![oversized_cant_split_table()]);
+        assert_eq!(result.pages.len(), 2);
+        let fragments: Vec<&crate::types::TableFragment> = result
+            .pages
+            .iter()
+            .flat_map(|page| page.fragments.iter())
+            .filter_map(|fragment| match fragment {
+                Fragment::Table(table) => Some(table),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].clip_bottom, Some(100.0));
+        assert_eq!(fragments[1].clip_top, Some(100.0));
+    }
+
+    #[test]
+    fn floating_tables_and_anchored_images_share_page_relative_placement_semantics() {
+        let result = layout(vec![positioned_floating_table(), positioned_image()]);
+        let page = &result.pages[0];
+        let table = page
+            .fragments
+            .iter()
+            .find_map(|fragment| match fragment {
+                Fragment::Table(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (table.x, table.y, table.is_floating),
+            (150.0, 5.0, Some(true))
+        );
+        let image = page
+            .fragments
+            .iter()
+            .find_map(|fragment| match fragment {
+                Fragment::Image(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!((image.x, image.y), (75.0, 5.0));
+    }
+
+    fn section_break(id: &str, break_type: Option<&str>) -> serde_json::Value {
+        let mut block = json!({ "kind": "sectionBreak", "id": id });
+        if let Some(break_type) = break_type {
+            block["type"] = json!(break_type);
+        }
+        json!({ "block": block, "measure": { "kind": "sectionBreak" } })
+    }
+
+    fn page_paragraphs(result: &Layout) -> Vec<Vec<u32>> {
+        result
+            .pages
+            .iter()
+            .map(|page| {
+                page.fragments
+                    .iter()
+                    .filter_map(|fragment| match fragment {
+                        Fragment::Paragraph(ParagraphFragment {
+                            block_id: crate::types::BlockId::Num(id),
+                            ..
+                        }) => Some(*id as u32),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn three_sections(middle: &str, body: Option<SectionBreakType>) -> Layout {
+        let mut value = input(vec![
+            paragraph(1, 1, 20.0, json!({})),
+            section_break("first", None),
+            paragraph(2, 1, 20.0, json!({})),
+            section_break("second", Some(middle)),
+            paragraph(3, 1, 20.0, json!({})),
+        ]);
+        value.options.body_break_type = body;
+        layout_document(&mut value).unwrap()
+    }
+
+    #[test]
+    fn an_untyped_section_after_a_continuous_one_starts_a_new_page() {
+        assert_eq!(
+            page_paragraphs(&three_sections("continuous", None)),
+            [vec![1, 2], vec![3]]
+        );
+        assert_eq!(
+            page_paragraphs(&three_sections(
+                "continuous",
+                Some(SectionBreakType::Continuous)
+            )),
+            [vec![1, 2, 3]]
+        );
+    }
+
+    #[test]
+    fn an_untyped_section_after_an_odd_page_one_starts_the_next_page() {
+        let result = three_sections("oddPage", None);
+        assert_eq!(
+            page_paragraphs(&result),
+            [vec![1], vec![], vec![2], vec![3]]
+        );
+        assert_eq!(
+            result
+                .pages
+                .iter()
+                .map(|page| page.parity_filler == Some(true))
+                .collect::<Vec<_>>(),
+            [false, true, false, false]
+        );
+    }
+
+    #[test]
+    fn an_untyped_first_section_lets_the_next_section_choose_its_start() {
+        for (body, pages) in [
+            (None, vec![vec![1], vec![2]]),
+            (Some(SectionBreakType::Continuous), vec![vec![1, 2]]),
+        ] {
+            let mut value = input(vec![
+                paragraph(1, 1, 20.0, json!({})),
+                section_break("first", None),
+                paragraph(2, 1, 20.0, json!({})),
+            ]);
+            value.options.body_break_type = body;
+            assert_eq!(
+                page_paragraphs(&layout_document(&mut value).unwrap()),
+                pages
+            );
+        }
+    }
+}

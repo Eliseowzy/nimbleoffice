@@ -1,0 +1,40 @@
+[package]
+name = "nimbleoffice-docx-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Safe DOCX XML parsing, typed relationship models, and the versioned canonical document contract."
+readme = "README.md"
+keywords = ["docx", "word", "ooxml", "wordprocessingml"]
+categories = ["parser-implementations", "encoding"]
+
+[lib]
+name = "docx_parse"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen"]
+wasm-layout = ["wasm", "dep:docx-layout"]
+tiff = ["ooxml-drawingml/tiff"]
+test-support = []
+metafile = ["dep:ooxml-metafile"]
+
+[dependencies]
+base64 = "0.22"
+docx-layout = { workspace = true, optional = true }
+ooxml-opc.workspace = true
+indexmap = { version = "2", features = ["serde"] }
+libm.workspace = true
+memchr = "2"
+ooxml-drawingml = { workspace = true, features = ["chart"] }
+ooxml-metafile = { workspace = true, features = ["svg"], optional = true }
+quick-xml = { version = "0.41", features = ["encoding"] }
+ryu-js = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+thiserror = "2"
+wasm-bindgen = { version = "0.2", optional = true }

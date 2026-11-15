@@ -1,0 +1,194 @@
+# @nimbleoffice/fonts
+
+Open fonts and a lazy loader for the NimbleOffice layout engines: metric-compatible substitutes for
+the Microsoft core fonts, common presentation families, and Hebrew and Arabic coverage. The DOCX
+engine loads them through `configureDefaultFonts`; for the PPTX editor's `fonts` prop,
+`loadBundledFontBytes` returns the bytes of any bundled face. The CJK faces
+ship separately in [`@nimbleoffice/fonts-cjk`](https://www.npmjs.com/package/@nimbleoffice/fonts-cjk).
+Additional international scripts ship in [`@nimbleoffice/fonts-intl`](https://www.npmjs.com/package/@nimbleoffice/fonts-intl).
+
+The substitutes share the advance widths of Calibri, Cambria, Arial, Times New Roman and Courier
+New, so line breaks and pagination match Word. Across 813 real-world documents, configuring this
+package raised exact page-count agreement with Word from 46.5% to 61.9%.
+
+## Install
+
+```bash
+bun add @nimbleoffice/fonts
+# for Chinese, Japanese or Korean text:
+bun add @nimbleoffice/fonts-cjk
+# for additional international scripts:
+bun add @nimbleoffice/fonts-intl
+```
+
+## Usage
+
+Configure the DOCX engine once, before any editor mounts:
+
+```ts
+import { configureDefaultFonts } from '@nimbleoffice/docx/layout';
+import * as fonts from '@nimbleoffice/fonts';
+
+configureDefaultFonts({ fonts });
+```
+
+To keep the package in its own chunk, pass `load` instead:
+
+```ts
+configureDefaultFonts({ load: () => import('@nimbleoffice/fonts') });
+```
+
+`configureDefaultFonts` is process-global. Call it at module initialization; for per-editor or
+per-tenant URLs, pass a provider to `DocxEditor` as `measurementFontProvider` instead.
+
+Importing the package does not fetch or register anything. Each face is fetched the first time it is
+needed, from the package's own assets (same origin), so bundlers such as Vite emit the files next to
+the module.
+
+## Serving the faces from a CDN
+
+The `@nimbleoffice/fonts/cdn` entry keeps the font binaries and the optional add-ons out of your bundle. It
+fetches faces from jsDelivr URLs pinned to the installed package versions:
+
+```ts
+import { configureDefaultFonts } from '@nimbleoffice/docx/layout';
+
+configureDefaultFonts({ load: () => import('@nimbleoffice/fonts/cdn') });
+```
+
+In browsers, packed faces also load a decoder pinned to the installed `@nimbleoffice/fonts` version.
+
+To use your own CDN, create a provider and pass it to `DocxEditor` as `measurementFontProvider`:
+
+```ts
+import { createFontProvider } from '@nimbleoffice/fonts/cdn';
+
+const measurementFontProvider = createFontProvider({
+  baseUrl: 'https://cdn.example.com/fonts/latin/',
+  cjkBaseUrl: 'https://cdn.example.com/fonts/cjk/',
+});
+```
+
+Or keep the bundled entry and move only the binaries:
+
+```ts
+import { configureDefaultFonts } from '@nimbleoffice/docx/layout';
+import * as fonts from '@nimbleoffice/fonts';
+
+configureDefaultFonts({ fonts, baseUrl: 'https://cdn.example.com/nimbleoffice-fonts/' });
+```
+
+- Serve the original filenames from the packages' `assets/` directories, with CORS enabled and the
+  origin allowed in your `connect-src` policy.
+- With a single `baseUrl`, every face, including optional add-on faces, loads from that directory. Copy the `assets/`
+  of the installed font packages into it; the filenames do not collide.
+- A relative `baseUrl` resolves against the current page; outside a browser it must be absolute.
+- Packed faces are checked against the manifest's lengths and SHA-256 hashes. A CDN can see which
+  faces a document requests.
+- Latin, RTL and intl assets use `.ttf.zst` files decoded by the manager; keep those filenames when hosting them.
+- CJK assets use `.otf.zst` files decoded by the manager; keep those filenames when hosting them.
+- With a custom `baseUrl` in either entry, copying the font `assets/` is enough. Packed faces use
+  `<baseUrl>/decoder/fontpack.wasm` when it is served (as `application/wasm`) and otherwise the decoder the package ships in
+  `dist/decoder/`, which bundlers emit next to the entry. When neither loads, decoding fails with
+  `Font decoder wasm not found` and both URLs.
+
+## Bundlers
+
+With rollup, esbuild or a Vite build that inlines the package, mark the font packages as external
+so their asset URLs survive, or configure a `baseUrl`:
+
+```bash
+esbuild app.js --bundle --external:@nimbleoffice/fonts --external:@nimbleoffice/fonts-cjk --external:@nimbleoffice/fonts-intl --external:@nimbleoffice/fonts-latin
+```
+
+```js
+// rollup.config.js
+export default {
+  external: ['@nimbleoffice/fonts', '@nimbleoffice/fonts-cjk', '@nimbleoffice/fonts-intl', '@nimbleoffice/fonts-latin'],
+};
+```
+
+To inline the manager with esbuild, use `baseUrl` and add the pack's `.zst` files and
+the manager's `dist/decoder/fontpack.wasm` as explicit entry points with
+`loader: { '.zst': 'copy', '.wasm': 'copy' }`. Preserve the face filenames under
+the asset root and place the decoder at `decoder/fontpack.wasm`. Keep the pack
+packages external. Esbuild does not emit assets referenced only by
+`new URL(..., import.meta.url)`.
+
+Latin and RTL assets ship in the regular dependency `@nimbleoffice/fonts-latin`.
+The manager loads compressed faces on demand and returns decoded, independently
+owned sfnt buffers. `BundledFontFace.file` names the `.ttf.zst` or `.otf.zst` asset. For a custom
+`baseUrl`, copy the Latin pack assets alongside international assets. An inlined manager has no decoder next to it, so
+serve `@nimbleoffice/fonts/dist/decoder/fontpack.wasm` at `<baseUrl>/decoder/fontpack.wasm`.
+
+## Bundled faces
+
+| Bundled family   | Metric-compatible with | Aliases also resolved | License | Version |
+| ---------------- | ---------------------- | --------------------- | ------- | ------- |
+| Carlito          | Calibri                | none                  | OFL 1.1 | 1.104   |
+| Selawik          | Segoe UI, Light, Semilight, Semibold | none | OFL 1.1 | |
+| Caladea          | Cambria                | none                  | OFL 1.1 | 1.001   |
+| Liberation Sans  | Arial                  | Helvetica             | OFL 1.1 | 2.1.5   |
+| Liberation Serif | Times New Roman        | Times                 | OFL 1.1 | 2.1.5   |
+| Liberation Mono  | Courier New            | Courier               | OFL 1.1 | 2.1.5   |
+
+Gelasio 1.008 is metric-compatible with Georgia and Comic Relief 1.200 with Comic Sans MS (both OFL
+1.1). The presentation families Inter, Roboto, Source Sans 3 (for Source Sans Pro), DM Sans, DM Serif
+Display, Open Sans, Montserrat, Poppins, Oswald and Heebo are the fonts themselves. Unknown families
+resolve to a related monospace, serif or sans face. Selawik ships Regular, Bold, Light, Semilight
+and Semibold upright faces. Italic Segoe UI requests keep the last-resort chain, whose italic is a
+real italic face.
+
+| Bundled family    | Coverage | Script bucket | License | Version |
+| ----------------- | -------- | ------------- | ------- | ------- |
+| Noto Sans Hebrew | Hebrew coverage | `hebrew` | OFL 1.1 | 3.001 |
+| Noto Sans Arabic | Arabic coverage | `arabic` | OFL 1.1 | 2.013 |
+| Noto Naskh Arabic | serif Arabic face | `arabic` | OFL 1.1 | 2.021 |
+
+Measurement never consults fonts installed on the machine: embedded document fonts come first, then
+the bundled substitutes, then a last-resort face, so a document measures the same everywhere.
+DOCX loads `BASE_LATIN_FAMILY` from package assets only for text those sources do not cover.
+Native raster consumers embed these faces.
+
+## API
+
+Most hosts only need `configureDefaultFonts`. The package also exports the pieces for custom byte
+sources and other consumers:
+
+| export | description |
+| --- | --- |
+| `createFontProvider({ baseUrl? })` | The provider the measurement engine consumes. |
+| `BUNDLED_FONTS` | The face manifest. |
+| `resolveMetricCompatFamily`, `resolveMetricCompatFace` | Map a Word family (and style) to its bundled substitute. |
+| `resolveBundledFamilyFace` | Bundled face for a family and style, or `undefined`; missing italics use browser synthesis. |
+| `resolveScriptFallbackFace` | Coverage face for a script bucket such as `cjk-sc` or `arabic`. |
+| `resolveGlyphFallbackFace`, `createFontProvider().resolveGlyphFallback` | Coverage metadata and lazy bytes for characters absent from Selawik; optional `office` defaults to `powerpoint`, with `word` selecting Word's fallback. |
+| `resolveLastResortFace` | The always-available fallback face. |
+| `resolveDigitAdvance`, `maxDigitWidth` | Widest digit advance, recorded or measured. |
+| `loadBundledFontBytes(face, { baseUrl? })` | Fetches a face's bytes, cached per face and base URL. |
+| `registerBundledFontFace(face)` | Registers a face with the browser `FontFace` API; no-op outside the DOM. |
+| `ProgressiveFontFace`, `SliceLocation` (types) | A CJK face opened from its slices: layout tables complete at once, outlines loaded by glyph id (`ensureGlyphs`) or predicted from text (`prefetch`). A sliced face's loader carries an optional `slices` location, which `openSlicedFace` from `@nimbleoffice/fonts/progressive` opens. Calling the loader itself still returns the whole face. |
+
+## Documentation
+
+- Packages and fonts
+- [`@nimbleoffice/fonts-cjk`](https://www.npmjs.com/package/@nimbleoffice/fonts-cjk)
+- [`@nimbleoffice/fonts-intl`](https://www.npmjs.com/package/@nimbleoffice/fonts-intl)
+- [`@nimbleoffice/fonts-latin`](https://www.npmjs.com/package/@nimbleoffice/fonts-latin)
+- [`@nimbleoffice/docx`](https://www.npmjs.com/package/@nimbleoffice/docx)
+
+## Licensing
+
+The loader code is Apache-2.0 (see `LICENSE`). The font binaries are licensed under the SIL Open Font License 1.1; the full license texts with per-family copyright notices are in `LICENSES/`:
+
+- `LICENSES/OFL-Carlito.txt`: Copyright 2013 The Carlito Project Authors, Reserved Font Name "Carlito". Vendored from [google/fonts `ofl/carlito`](https://github.com/google/fonts/tree/main/ofl/carlito) (upstream: [googlefonts/carlito](https://github.com/googlefonts/carlito)).
+- `LICENSES/OFL-Selawik.txt`: Copyright 2015 Microsoft Corporation, Reserved Font Name "Selawik". Vendored unmodified from [microsoft/Selawik](https://github.com/microsoft/Selawik).
+- `LICENSES/OFL-Caladea.txt`: Copyright 2012 The Caladea Project Authors. Vendored from [google/fonts `ofl/caladea`](https://github.com/google/fonts/tree/main/ofl/caladea) (upstream: [huertatipografica/Caladea](https://github.com/huertatipografica/Caladea)).
+- `LICENSES/OFL-Liberation.txt`: Digitized data copyright (c) 2010 Google Corporation; Copyright (c) 2012 Red Hat, Inc., Reserved Font Name Liberation. Vendored unmodified from the [Liberation Fonts 2.1.5 release](https://github.com/liberationfonts/liberation-fonts/releases/tag/2.1.5).
+- `LICENSES/OFL-NotoSansHebrew.txt`: Copyright 2022 The Noto Project Authors. Hinted statics vendored from [notofonts/notofonts.github.io](https://github.com/notofonts/notofonts.github.io) at commit `cd06befda260d2abb6e5db96cf5530f80ea5180d` (`fonts/NotoSansHebrew/hinted/ttf/`); upstream project [notofonts/hebrew](https://github.com/notofonts/hebrew).
+- `LICENSES/OFL-NotoArabic.txt`: Copyright 2022 The Noto Project Authors; covers Noto Sans Arabic and Noto Naskh Arabic. Hinted statics vendored from [notofonts/notofonts.github.io](https://github.com/notofonts/notofonts.github.io) at commit `cd06befda260d2abb6e5db96cf5530f80ea5180d` (`fonts/NotoSansArabic/hinted/ttf/`, `fonts/NotoNaskhArabic/hinted/ttf/`); upstream project [notofonts/arabic](https://github.com/notofonts/arabic).
+- `LICENSES/OFL-Gelasio.txt`, `OFL-ComicRelief.txt`, `OFL-Inter.txt`, `OFL-Roboto.txt`, `OFL-SourceSans3.txt`, `OFL-DMSans.txt`, `OFL-DMSerifDisplay.txt`, `OFL-OpenSans.txt`, `OFL-Montserrat.txt`, `OFL-Poppins.txt`, `OFL-Oswald.txt`, `OFL-Heebo.txt`: one per family, each with that family's copyright notice.
+
+International binaries and their OFL license text ship in [`@nimbleoffice/fonts-intl`](https://www.npmjs.com/package/@nimbleoffice/fonts-intl).
+
+The CJK binaries and their `OFL-NotoCJK.txt` license text ship in [`@nimbleoffice/fonts-cjk`](https://www.npmjs.com/package/@nimbleoffice/fonts-cjk).

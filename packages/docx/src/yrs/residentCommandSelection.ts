@@ -1,0 +1,506 @@
+import { retainedFramePageById, type RetainedFrame } from '../layout/render/frameDelta';
+import { canvasPageStack } from '../layout/render/canvasPageMetrics';
+import type { DisplayList, DisplayPage } from '../layout/render/displayList';
+import { createDisplayListQueries, type DisplayListQueries, type DisplayListRect, type DisplayListVisualLine } from '../layout/render/displayListQueries';
+import { loadedRustDisplayListQueryEngine } from '../layout/render/rustDisplayList';
+import { findWordBoundaries } from '../utils/textSelection';
+import { DisplayPositionIndex } from './displayPositionIndex';
+import { displayPositionToYrsLoc } from './inputPositionMap';
+import { commandSelectionRange, readCommandSelection, resolveCommandSelection } from './residentCommandAnchors';
+import { cellSelectionHeadPosition, resolvePointerCellRange, resolveShiftArrowCellRange } from './residentCommandTableSelection';
+import type { YrsLoc, YrsStoryRange, YrsTableRange } from './index';
+import type {
+  DocxCommandApplyContext,
+  DocxCommandIntent,
+  DocxCommandSelection,
+  DocxWorkerCommandEngine,
+  DocxWorkerCommandState,
+} from './residentCommandProtocol';
+
+/** @internal */
+export type DocxSelectionCommandIntent = Extract<
+  DocxCommandIntent, { kind: 'navigate' | 'selectPoint' | 'extendSelection' }
+>;
+
+/** @internal Layout read after the predecessor command has resolved. */
+export interface DocxCommandSelectionLayout {
+  frame: RetainedFrame;
+  layoutRevision: number;
+  /** The canvas backing scale page boxes are snapped to. */
+  rasterScale?: number;
+}
+
+/** @internal */
+export interface ResolveDocxSelectionIntentInput {
+  engine: DocxWorkerCommandEngine;
+  state: DocxWorkerCommandState;
+  command: DocxSelectionCommandIntent;
+  context: DocxCommandApplyContext;
+  readLayout?: () => DocxCommandSelectionLayout;
+}
+
+/** @internal Stale pointers always resolve or clamp; they cannot refuse a dependency. */
+export type ResolveDocxSelectionIntentResult = {
+  status: 'resolved' | 'clamped';
+  selection: DocxCommandSelection;
+  range: YrsStoryRange;
+  goalX?: number;
+  cells?: YrsTableRange | null;
+};
+
+interface SelectionReads {
+  version: string;
+  indexes: Map<string, DisplayPositionIndex>;
+  positions: Map<string, Array<{ from: number; to: number; at: YrsLoc; length: number }>>;
+  roots: Map<string, string>;
+  parts: Map<string, number>;
+  paragraphs: Map<string, {
+    spans: ReturnType<DocxWorkerCommandEngine['geometryReader']['paragraphSpans']>;
+    indices: Map<string, number>;
+  }>;
+  frame?: RetainedFrame;
+  frameEpoch?: number;
+  queries: Map<string, DisplayListQueries>;
+}
+
+const selectionReads = new WeakMap<DocxWorkerCommandEngine, SelectionReads>();
+
+export function releaseResidentSelectionReads(engine: DocxWorkerCommandEngine): void {
+  for (const queries of selectionReads.get(engine)?.queries.values() ?? []) queries.dispose();
+  selectionReads.delete(engine);
+}
+
+function readsFor(engine: DocxWorkerCommandEngine): SelectionReads {
+  const reader = engine.geometryReader;
+  const version = reader.version();
+  let reads = selectionReads.get(engine);
+  if (reads?.version !== version) {
+    for (const queries of reads?.queries.values() ?? []) queries.dispose();
+    reads = {
+      version, indexes: new Map(), positions: new Map(),
+      roots: new Map(), parts: reads?.parts ?? new Map(), paragraphs: new Map(), queries: new Map(),
+    };
+    selectionReads.set(engine, reads);
+  }
+  return reads;
+}
+
+function indexFor(reads: SelectionReads, engine: DocxWorkerCommandEngine, root: string): DisplayPositionIndex {
+  let index = reads.indexes.get(root);
+  if (!index) {
+    if (reads.indexes.size >= 4) {
+      const oldest = reads.indexes.keys().next().value!;
+      reads.indexes.delete(oldest);
+      reads.positions.delete(oldest);
+    }
+    index = new DisplayPositionIndex({
+      ...engine.geometryReader, selectionText: engine.selectionText, resolveComment: engine.resolveComment,
+    });
+    reads.indexes.set(root, index);
+  }
+  return index;
+}
+
+function paragraphsFor(reads: SelectionReads, engine: DocxWorkerCommandEngine, story: string) {
+  let paragraphs = reads.paragraphs.get(story);
+  if (!paragraphs) {
+    const spans = engine.geometryReader.paragraphSpans(story);
+    paragraphs = { spans, indices: new Map(spans.map(({ paraId }, ordinal) => [paraId, ordinal])) };
+    reads.paragraphs.set(story, paragraphs);
+  }
+  return paragraphs;
+}
+
+function paragraphText(reads: SelectionReads, engine: DocxWorkerCommandEngine, at: YrsLoc): string {
+  const ordinal = paragraphsFor(reads, engine, at.story).indices.get(at.paraId);
+  if (ordinal === undefined) throw new Error('Selection lacks paragraph');
+  return (engine.paragraphSegments(at.story, [ordinal])[0] ?? []).map((segment) =>
+    segment.kind === 'text' ? segment.text : segment.kind === 'embed' ? '\uFFFC' : ''
+  ).join('');
+}
+
+function locationAt(reads: SelectionReads, engine: DocxWorkerCommandEngine, root: string, position: number): YrsLoc | null {
+  const index = indexFor(reads, engine, root);
+  const projection = index.projection(root);
+  if (!projection) return null;
+  const bounded = Math.max(0, Math.min(position, projection.size));
+  const boundary = projection.blockBoundaryAt(bounded);
+  if (boundary) return boundary;
+  let positions = reads.positions.get(root);
+  if (!positions) {
+    positions = [];
+    for (let from = 0; from <= projection.size;) {
+      const node = projection.nodeAt(from);
+      if (node?.kind === 'paragraph') {
+        const paraId = String(node.attrs.paraId);
+        const paragraphs = paragraphsFor(reads, engine, node.story);
+        const ordinal = paragraphs.indices.get(paraId);
+        if (ordinal === undefined) throw new Error('Projected selection lacks paragraph');
+        const length = node.nodeSize - 2;
+        const leading = paragraphs.spans[ordinal]!.length - length;
+        positions.push({ from, to: from, at: { story: node.story, paraId, offset: Math.max(0, leading - 1) }, length: 0 });
+        positions.push({ from: from + 1, to: from + node.nodeSize - 1, at: { story: node.story, paraId, offset: leading }, length });
+        reads.roots.set(node.story, root);
+        from += node.nodeSize;
+      } else {
+        const target = projection.targetAt(from);
+        const map = index.inputMap(target.story);
+        const at = map ? displayPositionToYrsLoc(map, target.displayPosition) : null;
+        if (at) positions.push({ from, to: from, at, length: 0 });
+        from++;
+      }
+    }
+    reads.positions.set(root, positions);
+  }
+  let low = 0;
+  let high = positions.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (positions[middle]!.from <= bounded) low = middle + 1;
+    else high = middle;
+  }
+  const entry = positions[low - 1];
+  return entry && bounded <= entry.to
+    ? { ...entry.at, offset: entry.at.offset + Math.min(entry.length, bounded - entry.from) } : null;
+}
+
+function scopedList(list: DisplayList, root: string, pageIndex?: number): DisplayList {
+  if (root === 'body') return list;
+  const noteKind = root.startsWith('fn:') ? 'footnote' : 'endnote';
+  return {
+    ...list,
+    pages: (root.startsWith('hf:')
+      ? [list.pages.find((page) => !page.unbuilt && page.pageIndex === pageIndex &&
+          [page.header, page.footer].some((region) => region?.rId === root.slice(3)))
+        ?? list.pages.find((page) => !page.unbuilt &&
+          [page.header, page.footer].some((region) => region?.rId === root.slice(3)))].filter((page): page is DisplayPage => page !== undefined)
+      : list.pages).map((page) => ({
+      ...page,
+      primitives: root.startsWith('hf:')
+        ? [page.header, page.footer].find((region) => region?.rId === root.slice(3))?.primitives ?? []
+        : (page.noteAreas ?? []).filter((area) => (area.kind ?? 'footnote') === noteKind)
+          .flatMap((area) => area.primitives ?? [])
+          .filter((primitive) => primitive.groupId === `${noteKind}-${root.slice(3)}`),
+      header: undefined, footer: undefined, noteAreas: undefined, positionSpan: undefined,
+    })),
+  };
+}
+
+function queriesFor(reads: SelectionReads, frame: RetainedFrame, root = 'body'): DisplayListQueries {
+  if (reads.frame !== frame || reads.frameEpoch !== frame.frameEpoch) {
+    for (const queries of reads.queries.values()) queries.dispose();
+    reads.queries.clear();
+    reads.frame = frame;
+    reads.frameEpoch = frame.frameEpoch;
+  }
+  let queries = reads.queries.get(root);
+  if (!queries) {
+    if (reads.queries.size >= 4) {
+      const oldest = reads.queries.keys().next().value!;
+      reads.queries.get(oldest)!.dispose();
+      reads.queries.delete(oldest);
+    }
+    queries = createDisplayListQueries(scopedList(frame.displayList, root, reads.parts.get(root)), loadedRustDisplayListQueryEngine() ?? undefined);
+    reads.queries.set(root, queries);
+  }
+  return queries;
+}
+
+function rootFor(reads: SelectionReads, engine: DocxWorkerCommandEngine, at: YrsLoc): string {
+  const cached = reads.roots.get(at.story);
+  if (cached) return cached;
+  const roots = /^(body|(?:hf|fn|en):[^:]+)$/u.test(at.story)
+    ? [at.story] : ['body', ...engine.geometryReader.storyIds().filter((story) => /^(hf|fn|en):/u.test(story))];
+  for (const story of roots) {
+    if (indexFor(reads, engine, story).projection(story)?.positionForLoc(at) != null) {
+      if (reads.roots.size >= 32) reads.roots.clear();
+      reads.roots.set(at.story, story);
+      return story;
+    }
+  }
+  return at.story;
+}
+
+function selectPartPage(reads: SelectionReads, root: string, pageIndex: number): void {
+  if (reads.parts.get(root) === pageIndex) return;
+  reads.parts.set(root, pageIndex);
+  reads.queries.get(root)?.dispose();
+  reads.queries.delete(root);
+}
+
+export function selectResidentPartPage(engine: DocxWorkerCommandEngine, story: string, pageIndex: number): void {
+  if (story.startsWith('hf:')) selectPartPage(readsFor(engine), story, pageIndex);
+}
+
+export function readDocxSelectionFocus(
+  engine: DocxWorkerCommandEngine, selection: DocxCommandSelection, layout: DocxCommandSelectionLayout
+): DisplayListRect | null {
+  const reads = readsFor(engine);
+  const root = rootFor(reads, engine, selection.focus);
+  const position = indexFor(reads, engine, root).positionOf(selection.focus, root);
+  if (position === null) return null;
+  const queries = queriesFor(reads, layout.frame, root);
+  const rect = caretAt(queries, position);
+  return rect && { ...rect, pageIndex: queries.displayList.pages[rect.pageIndex]?.pageIndex ?? rect.pageIndex };
+}
+
+function caretAt(queries: DisplayListQueries, position: number): DisplayListRect | null {
+  const caret = queries.caretRect(position);
+  if (caret && caret.height > 0) return caret;
+  const forward = queries.rangeRects(position, position + 1)[0];
+  if (forward && forward.height > 0) return { ...forward, width: 0 };
+  const previous = position > 0 ? queries.rangeRects(position - 1, position).at(-1) : undefined;
+  return previous && previous.height > 0 ? { ...previous, x: previous.x + previous.width, width: 0 } : null;
+}
+
+function lineAt(queries: DisplayListQueries, position: number): DisplayListVisualLine | null {
+  const caret = queries.caretRect(position);
+  if (!caret) return null;
+  const center = caret.y + caret.height / 2;
+  const distance = (line: DisplayListVisualLine) => Math.abs(line.y + line.height / 2 - center);
+  let best: DisplayListVisualLine | null = null;
+  for (const line of queries.visualLinesOnPage(caret.pageIndex)) {
+    if (position < line.from || position > line.to) continue;
+    if (!best || distance(line) < distance(best)) best = line;
+  }
+  return best;
+}
+
+function pageMove(queries: DisplayListQueries, position: number, direction: 'up' | 'down', goalX: number, distance: number,
+  documentWidth: number, rootSize: number, rasterScale = 1): number | null {
+  const caret = caretAt(queries, position);
+  if (!caret) return null;
+  const boxes = canvasPageStack(queries.displayList.pages, { scale: { rasterScale, unitScale: rasterScale } });
+  const pages = queries.displayList.pages.map((page, index) => ({ page, index, top: boxes[index]!.top }));
+  const current = pages[caret.pageIndex];
+  if (!current) return null;
+  const origin = current.top + caret.y + caret.height / 2;
+  const target = origin + (direction === 'down' ? distance : -distance);
+  const lines = new Map<number, readonly DisplayListVisualLine[]>();
+  const linesFor = (pageIndex: number) => {
+    let pageLines = lines.get(pageIndex);
+    if (!pageLines) {
+      const page = pages[pageIndex]!.page;
+      pageLines = [...queries.visualLinesOnPage(pageIndex).map(line => ({ ...line, pageIndex })), ...page.primitives.flatMap<DisplayListVisualLine>(primitive =>
+        primitive.kind === 'image' && primitive.docStart !== undefined && primitive.docEnd !== undefined
+          ? [{ pageIndex, x: primitive.x, y: primitive.y, width: primitive.w, height: primitive.h,
+            baseline: primitive.y + primitive.h, from: primitive.docStart, to: primitive.docEnd }] : [])]
+        .sort((a, b) => a.y - b.y || a.x - b.x);
+      lines.set(pageIndex, pageLines);
+    }
+    return pageLines;
+  };
+  const firstPage = pages.find(({ page, index }) => !page.unbuilt && linesFor(index).length);
+  const lastPage = [...pages].reverse().find(({ page, index }) => !page.unbuilt && linesFor(index).length);
+  if (!firstPage || !lastPage) return null;
+  const first = linesFor(firstPage.index)[0]!;
+  const last = linesFor(lastPage.index).at(-1)!;
+  if (target < firstPage.top + first.y && !pages.some(({ page, index }) => index < first.pageIndex && page.unbuilt)) return 0;
+  if (target > lastPage.top + last.y + last.height && !pages.some(({ page, index }) => index > last.pageIndex && page.unbuilt)) return rootSize;
+  const pageDistance = (entry: typeof pages[number]) => Math.max(entry.top - target, 0, target - entry.top - entry.page.height);
+  let nearest: DisplayListVisualLine | undefined;
+  let best = Infinity;
+  for (const entry of [...pages].sort((a, b) => pageDistance(a) - pageDistance(b))) {
+    if (pageDistance(entry) > best) break;
+    if (entry.page.unbuilt) continue;
+    for (const line of linesFor(entry.index)) {
+      const center = entry.top + line.y + line.height / 2;
+      if (line.pageIndex === caret.pageIndex && line.from <= position && position <= line.to &&
+        Math.abs(center - origin) < Math.max(line.height, caret.height)) continue;
+      if (direction === 'down' ? center <= origin : center >= origin) continue;
+      const gap = Math.abs(center - target);
+      if (gap < best) { nearest = line; best = gap; }
+    }
+  }
+  if (!nearest) return direction === 'down' ? rootSize : 0;
+  const page = pages[nearest.pageIndex]!.page;
+  const x = goalX - (documentWidth - page.width) / 2;
+  return queries.hitTestRegions(nearest.pageIndex, x, nearest.y + nearest.height / 2)?.pos ??
+    (x > nearest.x + nearest.width / 2 ? nearest.to : nearest.from);
+}
+
+/** @internal */
+export function resolveDocxSelectionIntent(
+  input: ResolveDocxSelectionIntentInput
+): ResolveDocxSelectionIntentResult {
+  const { engine, state, command, context } = input;
+  const reader = engine.geometryReader;
+  const previous = command.kind === 'navigate'
+    ? resolveCommandSelection(engine, state, command, context)
+    : readCommandSelection(engine, state, context.predecessorSelection ?? state.selection);
+  const fallback = (): YrsLoc => {
+    const story = reader.hasStory('body') ? 'body' : reader.storyIds().find((story) => reader.paragraphSpans(story).length);
+    const first = story ? reader.paragraphSpans(story)[0] : undefined;
+    if (!story || !first) throw new Error('Document has no valid caret');
+    return { story, paraId: first.paraId, offset: 0 };
+  };
+  const base = previous.ok ? previous.selection : { anchor: fallback(), focus: fallback() };
+  const preserve = (): ResolveDocxSelectionIntentResult => {
+    const range = previous.ok ? previous.range : commandSelectionRange(engine, base);
+    if (!range) throw new Error('Document has no valid selection');
+    return { status: 'clamped', selection: base, range };
+  };
+  const reads = readsFor(engine);
+  const atDisplay = (root: string, position: number): YrsLoc | null => {
+    return locationAt(reads, engine, root, position);
+  };
+  let clamped = !previous.ok;
+  let goalX: number | undefined;
+  let anchor: YrsLoc = base.anchor;
+  let focus: YrsLoc = base.focus;
+  let cells: YrsTableRange | null | undefined;
+  if (command.kind === 'navigate') {
+    const navigation = command.payload;
+    const backward = navigation.direction === 'backward' || navigation.direction === 'up';
+    const paragraphs = paragraphsFor(reads, engine, focus.story);
+    const { spans, indices } = paragraphs;
+    let paragraph = indices.get(focus.paraId) ?? -1;
+    if (paragraph < 0) throw new Error('Navigation selection lacks paragraph');
+    const range = commandSelectionRange(engine, base)!;
+    const collapsed = range.start.paraId === range.end.paraId && range.start.offset === range.end.offset;
+    if (!navigation.extend && !collapsed && (navigation.unit === 'character' || navigation.unit === 'word')) {
+      focus = { story: range.story, ...(backward ? range.start : range.end) };
+    } else if (navigation.unit === 'document-boundary') {
+      const edge = backward ? spans[0]! : spans.at(-1)!;
+      focus = { story: focus.story, paraId: edge.paraId, offset: backward ? 0 : edge.length };
+    } else if ((navigation.unit === 'line' || navigation.unit === 'page') && input.readLayout) {
+      const layout = input.readLayout();
+      const origin = navigation.unit === 'page' ? cellSelectionHeadPosition(engine, focus) ?? focus : focus;
+      const root = rootFor(reads, engine, origin);
+      const queries = queriesFor(reads, layout.frame, root);
+      const position = indexFor(reads, engine, root).positionOf(origin, root);
+      if (position !== null && queries.isReady()) {
+        if (navigation.direction === 'up' || navigation.direction === 'down') {
+          const movement = navigation.unit === 'page'
+            ? { position: pageMove(queries, position, navigation.direction, navigation.goalX, navigation.distance,
+              layout.frame.pages.reduce((width, { page }) => Math.max(width, page.width), 0),
+              indexFor(reads, engine, root).projection(root)!.size, layout.rasterScale) ?? position, goalX: navigation.goalX }
+            : queries.verticalMove(position, navigation.direction, navigation.goalX);
+          if (movement) {
+            focus = atDisplay(root, movement.position) ?? focus;
+            goalX = movement.goalX;
+          }
+        } else {
+          const line = lineAt(queries, position);
+          if (line) focus = atDisplay(root, backward ? line.from : line.to) ?? focus;
+        }
+      }
+    } else if (navigation.unit === 'page') {
+      goalX = navigation.goalX;
+    } else if (navigation.unit === 'line' || navigation.unit === 'paragraph') {
+      if (navigation.direction === 'up' || navigation.direction === 'down') {
+        paragraph = Math.max(0, Math.min(spans.length - 1, paragraph + (backward ? -1 : 1)));
+        focus = { story: focus.story, paraId: spans[paragraph]!.paraId, offset: Math.min(focus.offset, spans[paragraph]!.length) };
+        goalX = navigation.goalX;
+      } else {
+        focus = { story: focus.story, paraId: focus.paraId, offset: backward ? 0 : spans[paragraph]!.length };
+      }
+    } else {
+      const text = paragraphText(reads, engine, focus);
+      let offset = focus.offset;
+      if (backward && offset === 0 && paragraph > 0) {
+        paragraph--;
+        offset = spans[paragraph]!.length;
+      } else if (!backward && offset === spans[paragraph]!.length && paragraph + 1 < spans.length) {
+        paragraph++;
+        offset = 0;
+      } else if (navigation.unit === 'word') {
+        if (backward) {
+          while (offset > 0 && /\s/u.test(text[offset - 1]!)) offset--;
+          while (offset > 0 && !/\s/u.test(text[offset - 1]!)) offset--;
+        } else {
+          while (offset < text.length && !/\s/u.test(text[offset]!)) offset++;
+          while (offset < text.length && /\s/u.test(text[offset]!)) offset++;
+        }
+      } else if (backward && offset > 0) {
+        offset--;
+        if (offset > 0 && /[\uDC00-\uDFFF]/u.test(text[offset]!) && /[\uD800-\uDBFF]/u.test(text[offset - 1]!)) offset--;
+      } else if (!backward && offset < text.length) {
+        offset += text.codePointAt(offset)! > 0xffff ? 2 : 1;
+      }
+      focus = { story: focus.story, paraId: spans[paragraph]!.paraId, offset };
+    }
+    if (navigation.extend) {
+      const stepped = resolveShiftArrowCellRange(engine, base, focus, navigation.unit, navigation.direction,
+        'goalX' in navigation ? navigation.goalX : undefined);
+      if (stepped) {
+        anchor = stepped.selection.anchor;
+        focus = stepped.selection.focus;
+        cells = stepped.cells;
+        if (stepped.goalX !== undefined) goalX = stepped.goalX;
+      } else if (anchor.story !== focus.story) {
+        focus = base.focus;
+        clamped = true;
+      }
+    }
+    if (!navigation.extend) anchor = focus;
+  } else {
+    const point = command.payload;
+    const layout = input.readLayout?.();
+    const pages = layout?.frame.pages ?? [];
+    const exact = layout && /^\d+$/u.test(point.page.pageId)
+      ? retainedFramePageById(layout.frame, BigInt(point.page.pageId)) : undefined;
+    const page = exact ?? pages[Math.max(0, Math.min(pages.length - 1, Math.trunc(point.page.pageIndex)))];
+    clamped = !exact || (point.story !== undefined && !reader.hasStory(point.story));
+    if (!page || !layout || page.page.unbuilt) return preserve();
+    const queries = queriesFor(reads, layout.frame);
+    if (!queries.isReady()) return preserve();
+    const x = Math.max(0, Math.min(point.x, page.page.width));
+    const y = !exact && point.page.pageIndex >= pages.length ? page.page.height : Math.max(0, Math.min(point.y, page.page.height));
+    const hit = queries.hitTestRegions(page.pageIndex, x, y);
+    const hitRoot = hit?.region === 'header' || hit?.region === 'footer' ? hit.rId ? `hf:${hit.rId}` : null
+      : hit?.region === 'footnote' || hit?.region === 'endnote' ? hit.noteId === undefined ? null
+        : `${hit.region === 'footnote' ? 'fn' : 'en'}:${hit.noteId}` : 'body';
+    const projection = hitRoot ? indexFor(reads, engine, hitRoot).projection(hitRoot) : null;
+    const at = hitRoot && projection && hit?.pos != null && Number.isFinite(hit.pos) && hit.pos >= 0 && hit.pos <= projection.size
+      ? atDisplay(hitRoot, hit.pos) : null;
+    if (at) {
+      focus = at;
+      if (hitRoot?.startsWith('hf:')) selectPartPage(reads, hitRoot, page.pageIndex);
+    } else {
+      clamped = true;
+      const lines = queries.visualLinesOnPage(page.pageIndex);
+      if (exact && lines.length === 0) return preserve();
+      const nearest = lines.reduce<typeof lines[number] | undefined>((best, line) => {
+        const distance = (entry: typeof line) => Math.max(entry.y - y, 0, y - entry.y - entry.height);
+        return !best || distance(line) < distance(best) ? line : best;
+      }, undefined);
+      const body = reader.hasStory('body') ? reader.paragraphSpans('body') : [];
+      const edge = point.page.pageIndex >= pages.length ? body.at(-1) : body[0];
+      focus = nearest ? atDisplay('body', x > nearest.x + nearest.width / 2 ? nearest.to : nearest.from) ?? fallback()
+        : edge ? { story: 'body', paraId: edge.paraId, offset: point.page.pageIndex >= pages.length ? edge.length : 0 } : fallback();
+    }
+    if (command.kind === 'extendSelection' || point.modifiers.shift) {
+      if (anchor.story !== focus.story) {
+        const pointer = resolvePointerCellRange(engine, base.anchor, focus);
+        if (pointer) {
+          anchor = pointer.textAnchor;
+          focus = pointer.textAnchor;
+          cells = pointer.cells;
+        } else {
+          focus = base.focus;
+          clamped = true;
+        }
+      }
+    } else {
+      anchor = focus;
+      if (point.clickCount >= 2) {
+        const text = paragraphText(reads, engine, focus);
+        const [start, end] = point.clickCount >= 3 ? [0, text.length] : findWordBoundaries(text, focus.offset);
+        anchor = { story: focus.story, paraId: focus.paraId, offset: start };
+        focus = { story: focus.story, paraId: focus.paraId, offset: end };
+      }
+    }
+  }
+  let selection: DocxCommandSelection = { anchor, focus };
+  let range = commandSelectionRange(engine, selection);
+  if (!range) {
+    focus = fallback();
+    selection = { anchor: focus, focus };
+    range = commandSelectionRange(engine, selection);
+    clamped = true;
+  }
+  if (!range) throw new Error('Document has no valid selection');
+  return { status: clamped ? 'clamped' : 'resolved', selection, range,
+    ...(goalX === undefined ? {} : { goalX }), ...(cells === undefined ? {} : { cells }) };
+}

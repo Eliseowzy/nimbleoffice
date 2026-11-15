@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nimbleoffice-vsdx"
+dynamic = ["version"]
+description = "Read Visio VSDX diagrams on the NimbleOffice Rust engine."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "licenses/BSD-3-Clause-Zstandard.txt", "licenses/MIT-wuff.txt"]
+requires-python = ">=3.9"
+authors = [{ name = "NimbleOffice" }]
+classifiers = ["License :: OSI Approved :: Apache Software License", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Rust", "Typing :: Typed"]
+
+[project.urls]
+Source = "https://github.com/Eliseowzy/nimbleoffice"
+
+[tool.maturin]
+module-name = "nimbleoffice_vsdx._nimbleoffice_vsdx"
+python-source = "python"
+features = ["pyo3/extension-module"]
+strip = true
+exclude = ["**/__pycache__/**", "**/*.pyc", "**/*.so"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

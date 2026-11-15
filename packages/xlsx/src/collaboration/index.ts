@@ -1,0 +1,53 @@
+export { CollaborationProvider } from './provider';
+/** @internal */
+export { attachCollaborationPipe, collaborationPipeFor } from './asyncReplica';
+/** @experimental */
+export { createAsyncCollaborationReplica } from './asyncReplica';
+/** @experimental */
+export type { AsyncCollaborationReplica } from './asyncReplica';
+/** @experimental */
+export type { AsyncReplicaAdapter } from './asyncReplica';
+export {
+  AWARENESS_BROADCAST_INTERVAL_MS,
+  AWARENESS_COLORS,
+  AWARENESS_HEARTBEAT_INTERVAL_MS,
+  AWARENESS_LABEL_DURATION_MS,
+  AWARENESS_PEER_TIMEOUT_MS,
+  MAX_TRACKED_AWARENESS_PEERS,
+  XLSX_MAX_COLUMNS,
+  XLSX_MAX_ROWS,
+  awarenessPeers,
+  applyAwarenessUpdates,
+  colorForClientId,
+  expireAwarenessPeers,
+  normalizeAwarenessColor,
+  normalizeCollaborationUser,
+  resolveAwarenessCursor,
+  type ApplyAwarenessUpdateOptions,
+  type AwarenessPeerEntry,
+  type AwarenessPeerStore,
+  type ResolvedAwarenessCursor,
+} from './awareness';
+export {
+  CollaborationError,
+  type AwarenessCell,
+  type AwarenessCursor,
+  type AwarenessListener,
+  type AwarenessPayload,
+  type AwarenessPeer,
+  type AwarenessState,
+  type AwarenessUpdate,
+  type CollaborationAwareness,
+  type CollaborationErrorCode,
+  type CollaborationErrorListener,
+  type CollaborationProviderOptions,
+  type CollaborationReplica,
+  type CollaborationStatus,
+  type CollaborationStatusChange,
+  type CollaborationStatusListener,
+  type CollaborationTransport,
+  type CollaborationTransportEvent,
+  type CollaborationUpdateOrigin,
+  type CollaborationUser,
+  type CollaborationUserOptions,
+} from './types';

@@ -1,0 +1,98 @@
+{
+  "alone-short": [
+    {
+      "index": 0,
+      "height": 841.92,
+      "lines": [
+        {
+          "y": 68.88,
+          "text": "TOP"
+        },
+        {
+          "y": 115.68,
+          "text": "AFTER"
+        }
+      ],
+      "images": [
+        [
+          76.1,
+          99.7
+        ]
+      ]
+    }
+  ],
+  "alone-tall": [
+    {
+      "index": 0,
+      "height": 841.92,
+      "lines": [
+        {
+          "y": 68.88,
+          "text": "TOP"
+        },
+        {
+          "y": 131.28,
+          "text": "AFTER"
+        }
+      ],
+      "images": [
+        [
+          73.15,
+          118.25
+        ]
+      ]
+    }
+  ],
+  "text-short": [
+    {
+      "index": 0,
+      "height": 841.92,
+      "lines": [
+        {
+          "y": 68.88,
+          "text": "TOP"
+        },
+        {
+          "y": 98.4,
+          "text": "DOT"
+        },
+        {
+          "y": 115.68,
+          "text": "AFTER"
+        }
+      ],
+      "images": [
+        [
+          74.8,
+          98.4
+        ]
+      ]
+    }
+  ],
+  "text-tall": [
+    {
+      "index": 0,
+      "height": 841.92,
+      "lines": [
+        {
+          "y": 68.88,
+          "text": "TOP"
+        },
+        {
+          "y": 124.8,
+          "text": "DOT"
+        },
+        {
+          "y": 146.88,
+          "text": "AFTER"
+        }
+      ],
+      "images": [
+        [
+          79.65,
+          124.75
+        ]
+      ]
+    }
+  ]
+}

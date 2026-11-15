@@ -1,0 +1,21 @@
+{
+  "name": "@nimbleoffice/redact-worker",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "bun scripts/build-wasm.ts",
+    "predeploy": "bun run build:wasm",
+    "deploy": "wrangler deploy",
+    "dev": "bun run build:wasm && wrangler dev",
+    "pretest": "bun run build:wasm",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260708.1",
+    "@types/bun": "^1.4.2",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.106.0"
+  }
+}

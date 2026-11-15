@@ -1,0 +1,8 @@
+{
+  "name": "@nimbleoffice/python-pptx",
+  "version": "0.2.2",
+  "private": true,
+  "scripts": {
+    "typecheck": "true"
+  }
+}

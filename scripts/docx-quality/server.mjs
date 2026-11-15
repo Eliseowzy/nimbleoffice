@@ -1,0 +1,115 @@
+import { createServer } from 'vite';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+const packageRoot = process.env.QUALITY_PACKAGE_ROOT;
+const reactRoot = process.env.QUALITY_REACT_ROOT;
+const format = process.env.QUALITY_FORMAT ?? 'docx';
+if (format !== 'docx') throw new Error('Invalid format');
+const aliases = [];
+for (const [name, override] of [
+  [format, packageRoot],
+  ['docx-react', reactRoot],
+]) {
+  if (!override) continue;
+  const manifest = JSON.parse(readFileSync(resolve(override, 'package.json')));
+  for (const [key, value] of Object.entries(manifest.exports)) {
+    const target = typeof value === 'string' ? value : value.import ?? value.default;
+    if (typeof target !== 'string') continue;
+    aliases.push({
+      find: new RegExp(`^@nimbleoffice/${name}${key === '.' ? '' : key.slice(1)}$`),
+      replacement: resolve(override, target),
+    });
+  }
+}
+// Fonts this checkout has not published yet cannot come from the pinned CDN,
+// so an explicit assets directory is served from the viewer's own origin.
+const fontAssets = process.env.QUALITY_FONT_ASSETS?.trim() ||
+  (process.env.QUALITY_LOCAL_ONLY === '1' ? 'packages/fonts-latin/assets' : undefined);
+const latinFiles = Object.fromEntries(JSON.parse(readFileSync(
+  resolve('packages/fonts-latin/assets/manifest.json'), 'utf8',
+)).faces.map((face) => [face.file, true]));
+const intlAssets = resolve(process.env.QUALITY_FONT_ASSETS_INTL ?? 'packages/fonts-intl/assets');
+const server = await createServer({
+  configFile: false,
+  define: {
+    __QUALITY_FONT_BASE__: JSON.stringify(
+      fontAssets ? `/@fs${resolve(fontAssets)}/` : null
+    ),
+    __QUALITY_FONT_BASE_CJK__: JSON.stringify(
+      fontAssets
+        ? `/@fs${resolve(process.env.QUALITY_FONT_ASSETS_CJK ?? 'packages/fonts-cjk/assets')}/`
+        : null
+    ),
+  },
+  plugins: [
+    ...(fontAssets ? [{
+      name: 'quality-intl-font-assets',
+      configureServer(server) {
+        const prefix = `/@fs${resolve(fontAssets)}/`;
+        server.middlewares.use((request, _response, next) => {
+          const file = request.url?.startsWith(prefix) ? request.url.slice(prefix.length) : '';
+          if (/^[A-Za-z0-9-]+\.ttf\.zst$/.test(file) &&
+              !Object.hasOwn(latinFiles, file)) {
+            request.url = `/@fs${intlAssets}/${file}`;
+          } else if (file === 'decoder/fontpack.wasm') {
+            request.url = `/@fs${resolve('packages/fonts/dist/decoder/fontpack.wasm')}`;
+          }
+          next();
+        });
+      },
+    }] : []),
+  ],
+  cacheDir: resolve(
+    `.source/docx-quality/vite-cache-${process.env.QUALITY_PORT ?? 4178}`
+  ),
+  root: resolve('scripts/docx-quality'),
+  resolve: {
+    alias: aliases,
+    dedupe: [
+      'react',
+      'react-dom',
+      'clsx',
+      'sonner',
+      '@radix-ui/react-select',
+      '@nimbleoffice/docx-i18n',
+    ],
+  },
+  server: {
+    host: '127.0.0.1',
+    port: Number(process.env.QUALITY_PORT ?? 4178),
+    strictPort: true,
+    watch: null,
+    hmr: false,
+    fs: {
+      allow: [
+        process.cwd(),
+        ...(packageRoot ? [packageRoot] : []),
+        ...(reactRoot ? [reactRoot] : []),
+      ],
+    },
+  },
+  optimizeDeps: {
+    noDiscovery: true,
+    include: [
+      'react',
+      'react-dom',
+      'react-dom/client',
+      'react/jsx-runtime',
+      'react/jsx-dev-runtime',
+      'clsx',
+      'sonner',
+      '@radix-ui/react-select',
+    ],
+    exclude: [
+      '@nimbleoffice/docx',
+      '@nimbleoffice/docx-react',
+      '@nimbleoffice/pptx',
+      '@nimbleoffice/xlsx',
+      '@nimbleoffice/vsdx',
+    ],
+  },
+  esbuild: { jsx: 'automatic' },
+});
+await server.listen();
+console.log(server.resolvedUrls.local[0]);

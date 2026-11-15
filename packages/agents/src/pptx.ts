@@ -1,0 +1,783 @@
+import { imageSize } from 'image-size';
+import { pptxBatchSchema, pptxProposalEditSchema, type PptxAgentBatch, type PptxAgentEdit, type PptxProposalEdit } from './pptx-schema';
+import { loadPptxFonts, pptxFontFaces, pptxThemeFonts, renderPptxSlide, type PptxThemeFonts } from './pptx-render';
+import { initWasm, openPresentation, type CommentSnapshot, type PptxEditStep, type PptxStoryText, type PptxStoryTarget, type ProposalEdit, type Proposal, type PresentationHandle, type ShapeSnapshot, type SlideSnapshot, type ShapeRect, type StorySnapshot, type TextStyle } from '@nimbleoffice/pptx';
+import { DocumentToolError, unknownMatchError, type GrepOptions, type TextEdit, type RenderedPage } from './types';
+import { initialize, integer, plainText, PrototypeDocument, textWindow, unwrap, type PrototypeOptions, type AgentProposal } from './prototype';
+
+export interface SlideTextChange { ref: string; slide: number; story: string; start: number; oldText: string; newText: string; kind?: 'content' | 'inserted' | 'deleted' | 'moved'; slideId?: string; beforeIndex?: number | null; afterIndex?: number | null }
+interface Paragraph { ref: string; paragraphId: string; slide: number; story: PptxStoryText; start: number; end: number; editable: boolean }
+interface HeldMatch { ref: string; slide: number; target: PptxStoryTarget; start: number; paragraphStart: number; text: string; version: string }
+
+const SAVE_FONT_STYLES = 192;
+
+export class PptxAgentPresentation extends PrototypeDocument<SlideTextChange, PptxEditStep> {
+  readonly format = 'pptx' as const;
+  private readonly refs = new Map<string, string>();
+  private readonly matches = new Map<string, HeldMatch>();
+  private readonly slideProposals = new Map<string, {
+    engineId: string;
+    value: AgentProposal<SlideTextChange>;
+    edits: ProposalEdit[];
+  }>();
+  private nextMatch = 1;
+  private nextRef = 1;
+  private cachedLayouts?: ReturnType<PresentationHandle['layouts']>;
+
+  /** The version of a deck this document opened, before any edit. */
+  private readonly sourceVersion?: string;
+
+  private constructor(
+    private readonly handle: PresentationHandle,
+    readonly name = 'presentation.pptx',
+    private readonly owned = true,
+    private readonly themeFonts?: PptxThemeFonts,
+    maxEdits?: number,
+  ) {
+    super(maxEdits);
+    if (owned) this.sourceVersion = handle.version();
+  }
+
+  static async open(bytes: Uint8Array, options: PrototypeOptions & { maxEdits?: number } = {}) {
+    await initialize('pptx', initWasm, options.wasm);
+    if (bytes.length > 64 * 1024 * 1024) throw new DocumentToolError('FILE_TOO_LARGE', 'Open a PPTX file up to 64 MiB.');
+    const source = bytes.slice();
+    return new PptxAgentPresentation(openPresentation(source), options.name, true, pptxThemeFonts(source), options.maxEdits);
+  }
+
+  static attach(handle: PresentationHandle, options: { name?: string; maxEdits?: number } = {}) {
+    const required = ['fork', 'layouts', 'snapshot', 'save', 'applyUpdate', 'encodeStateVector', 'version'] as const;
+    if (!handle || required.some(method => typeof handle[method] !== 'function')) throw new DocumentToolError('UNSUPPORTED_SESSION', 'attachPptx requires a PresentationHandle from openPresentation. Worker editor access does not expose state forking or update application.');
+    return new PptxAgentPresentation(handle, options.name, false, undefined, options.maxEdits);
+  }
+
+  overview() {
+    const read = this.content();
+    return { name: this.name, format: this.format, version: read.version, slides: read.slides.length, paragraphs: this.paragraphs(read).length, capabilities: { outline: true, readSlide: true, atomicEdits: true, render: true, export: true, attachment: 'PresentationHandle', proposals: 'paragraph-local text replacements and slide structure; shape edits and whole-story paragraph rewrites with bullets, alignment and styled runs; slide layout and background proposals with @ref targets; table row and column insertion and deletion proposals', prototype: false }, workflow: 'Use pptx_outline for slide/shape/layout IDs, pptx_read_slide for paragraphs, runs and notes, office_outline with story comments for discussion IDs and office_read for full comment text, pptx_edit with the current version for atomic edits including add_comment/reply_comment/resolve_comment, pptx_preview to verify visually, then office_export. Coordinates for edits are points. Attached handles remain owned by the editor.' };
+  }
+
+  list(options: { story?: string; offset?: number; limit?: number; headingsOnly?: boolean } = {}) {
+    if (options.headingsOnly) throw new DocumentToolError('UNSUPPORTED', 'PPTX outline lists slide paragraphs; omit headingsOnly.');
+    if (options.story === 'comments') {
+      const deck = this.snapshot();
+      const comments = deck.comments ?? [];
+      const offset = integer(options.offset ?? 0, 0, Number.MAX_SAFE_INTEGER, 'offset');
+      const limit = integer(options.limit ?? 30, 1, 100, 'limit');
+      const items = this.bounded(comments.slice(offset, offset + limit).map(comment => ({
+        ...this.commentSummary(comment, deck), ...textWindow(comment.text, { length: 120 }),
+      })), 24000);
+      return { version: this.handle.version(), flavor: deck.commentFlavor ?? 'legacy', items, total: comments.length, nextOffset: offset + items.length < comments.length ? offset + items.length : null };
+    }
+    const read = this.content();
+    this.checkStory(options.story, read.stories);
+    const offset = integer(options.offset ?? 0, 0, Number.MAX_SAFE_INTEGER, 'offset');
+    const limit = integer(options.limit ?? 30, 1, 100, 'limit');
+    const items = this.paragraphs(read).filter(p => !options.story || p.story.storyId === options.story);
+    return { version: read.version, items: items.slice(offset, offset + limit).map(p => ({ ...this.reference(p), text: p.story.text.slice(p.start, Math.min(p.end, p.start + 120)), length: p.end - p.start, editable: p.editable })), total: items.length, nextOffset: offset + limit < items.length ? offset + limit : null };
+  }
+
+  grep(options: GrepOptions) {
+    this.checkQuery(options);
+    const read = this.content();
+    this.checkStory(options.story, read.stories);
+    const pattern = new RegExp(options.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), options.caseSensitive ? 'gu' : 'giu');
+    const hits: Array<{ paragraph: Paragraph; start: number; text: string }> = [];
+    outer: for (const p of this.paragraphs(read)) {
+      if (options.story && options.story !== p.story.storyId) continue;
+      const text = p.story.text.slice(p.start, p.end);
+      pattern.lastIndex = 0;
+      for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+        hits.push({ paragraph: p, start: p.start + match.index, text: match[0] });
+        if (hits.length > 10000) break outer;
+      }
+    }
+    const clipped = hits.length > 10000;
+    const page = this.searchPage(options, hits.slice(0, 10000).map(hit => ({ ...this.reference(hit.paragraph), start: hit.start - hit.paragraph.start, text: hit.text, context: hit.paragraph.story.text.slice(Math.max(hit.paragraph.start, hit.start - 80), Math.min(hit.paragraph.end, hit.start + hit.text.length + 80)) })), clipped);
+    return { ...page, matches: page.matches.map(hit => {
+      const p = hits.find(item => item.paragraph.ref === hit.ref && item.start - item.paragraph.start === hit.start)!.paragraph;
+      const match = `${this.prefix}:match${this.nextMatch++}`;
+      if (this.matches.size >= 1024) this.matches.delete(this.matches.keys().next().value!);
+      this.matches.set(match, { ref: p.ref, slide: p.slide, target: { slideId: p.story.slideId, shapeId: p.story.shapeId, storyId: p.story.storyId }, start: p.start + hit.start, paragraphStart: p.start, text: hit.text, version: read.version });
+      return { ...hit, text: hit.text.replaceAll('\n', '\v'), context: hit.context.replaceAll('\n', '\v'), match };
+    }) };
+  }
+
+  read(ref: string, options: { start?: number; length?: number } = {}) {
+    const deck = this.snapshot();
+    const comment = deck.comments?.find(comment => comment.id === ref);
+    if (comment) return { version: this.handle.version(), ...this.commentSummary(comment, deck), ...textWindow(comment.text, options) };
+    const read = this.content();
+    const p = this.paragraphs(read).find(p => p.ref === ref || p.paragraphId === ref);
+    if (!p) throw new DocumentToolError('UNKNOWN_REF', 'Use a ref from outline or grep.');
+    return { ...this.reference(p), version: read.version, ...textWindow(p.story.text.slice(p.start, p.end), options), editable: p.editable };
+  }
+
+  propose(input: { author: string; note?: string; edits: (TextEdit | PptxProposalEdit)[] }) {
+    this.alive();
+    if (!Array.isArray(input.edits) || input.edits.length < 1 || input.edits.length > this.maxEdits) throw new DocumentToolError('INVALID_ARGUMENT', `Supply 1 to ${this.maxEdits} proposal edits.`);
+    const version = this.currentVersion();
+    const changes: SlideTextChange[] = [];
+    const steps: PptxEditStep[] = [];
+    const typed = input.edits.some(edit => 'type' in edit);
+    const proposalEdits: ProposalEdit[] = [];
+    const matchIndices = new Set<number>();
+    for (const edit of input.edits) {
+      if ('type' in edit) {
+        const parsed = pptxProposalEditSchema.safeParse(edit);
+        if (!parsed.success) throw new DocumentToolError('INVALID_ARGUMENT', 'Invalid presentation proposal edit.', { issues: parsed.error.issues });
+        proposalEdits.push(parsed.data);
+        continue;
+      }
+      if (!('match' in edit)) throw new DocumentToolError('UNSUPPORTED', 'PPTX replacements require a match ID from grep.');
+      const hit = this.matches.get(edit.match);
+      if (!hit) throw unknownMatchError(edit.match, `${this.prefix}:match1`, /^[^:\s]+:match\d+$/u, 'Match expired or belongs to another deck. Grep again.');
+      if (hit.version !== version) throw new DocumentToolError('STALE_TARGET', 'Presentation changed. Grep for fresh matches.');
+      plainText(edit.newText);
+      if (/[\r\n\ufffc]/u.test(edit.newText) || edit.newText.length > 16000) throw new DocumentToolError('INVALID_ARGUMENT', 'Replacement must be plain text in one paragraph, up to 16000 UTF-16 units.');
+      matchIndices.add(proposalEdits.length);
+      proposalEdits.push({ type: 'replaceText', storyId: hit.target.storyId, start: hit.start, end: hit.start + hit.text.length, text: edit.newText });
+      changes.push({ ref: hit.ref, slide: hit.slide, story: hit.target.storyId, start: hit.start - hit.paragraphStart, oldText: hit.text, newText: edit.newText });
+      steps.push({ op: 'replaceText', target: { kind: 'range', ...hit.target, start: hit.start, end: hit.start + hit.text.length }, text: edit.newText, expect: { text: hit.text } });
+    }
+    if (typed) {
+      if (steps.length) this.validate(steps, version);
+      const ranges = new Map<number, { storyId: string; start: number; end: number }>();
+      for (const [index, edit] of proposalEdits.entries()) {
+        if (!matchIndices.has(index) || edit.type !== 'replaceText') continue;
+        ranges.set(index, { storyId: edit.storyId, start: edit.start, end: edit.end });
+      }
+      const ordered = proposalEdits.map((edit, index) => {
+        if (edit.type !== 'replaceText') return edit;
+        const match = ranges.get(index);
+        const replacement = match ? { ...edit, start: match.start, end: match.end } : edit;
+        for (const [other, range] of ranges) {
+          if (other === index || range.storyId !== replacement.storyId) continue;
+          const overlaps = range.start === range.end
+            ? replacement.start <= range.start && replacement.end > range.start
+            : replacement.start === replacement.end
+              ? replacement.start > range.start && replacement.start < range.end
+              : replacement.start < range.end && replacement.end > range.start;
+          if (!match && overlaps) throw new DocumentToolError('OVERLAPPING_EDITS', 'Typed text edits and grep replacements must have separate ranges.', { storyId: replacement.storyId });
+          if (replacement.end <= range.start) {
+            const delta = replacement.text.length - (replacement.end - replacement.start);
+            range.start += delta;
+            range.end += delta;
+          }
+        }
+        if (match) {
+          match.start = replacement.start;
+          match.end = replacement.start + replacement.text.length;
+        }
+        return replacement;
+      });
+      return this.stageSlideProposal(input, ordered, version);
+    }
+    return this.stage(input, changes, steps, version);
+  }
+
+  private slideChanges(proposal: Proposal): SlideTextChange[] {
+    const slides = new Map(this.handle.proposalSlideStrip(proposal.id).map(entry =>
+      [entry.slideId, (entry.previewIndex ?? entry.liveIndex ?? 0) + 1] as const));
+    return proposal.changes.map(change => ({
+      ref: change.shapeId ?? change.slideId, slide: change.shapeId ? slides.get(change.slideId) ?? 1 : (change.afterIndex ?? change.beforeIndex ?? 0) + 1,
+      story: '', start: 0, oldText: change.oldText, newText: change.newText,
+      kind: change.kind, slideId: change.slideId, beforeIndex: change.beforeIndex, afterIndex: change.afterIndex,
+    }));
+  }
+
+  private stageSlideProposal(input: { author: string; note?: string }, edits: ProposalEdit[], version: string): AgentProposal<SlideTextChange> {
+    if (!input.author || input.author.length > 200 || (input.note?.length ?? 0) > 2000) {
+      throw new DocumentToolError('INVALID_ARGUMENT', 'Supply an author (1 to 200 characters) and note up to 2000 characters.');
+    }
+    const listed = this.listProposals();
+    if (listed.length >= 64) {
+      const closed = listed.find(proposal => proposal.status !== 'pending');
+      if (!closed) throw new DocumentToolError('PROPOSAL_LIMIT', 'Reject or discard a proposal before staging more than 64.');
+      this.discard(closed.id);
+    }
+    const proposal = this.handle.propose(input.author, input.note ?? null, edits);
+    const value: AgentProposal<SlideTextChange> = {
+      id: `slide:${proposal.id}`, author: input.author, note: input.note ?? '', status: 'pending', version,
+      changes: this.slideChanges(proposal), stale: false,
+    };
+    this.slideProposals.set(value.id, { engineId: proposal.id, value, edits: structuredClone(edits) });
+    return structuredClone(value);
+  }
+
+  override review(id: string): AgentProposal<SlideTextChange> {
+    this.alive();
+    const held = this.slideProposals.get(id);
+    if (!held) return super.review(id);
+    const live = this.handle.listProposals().find(proposal => proposal.id === held.engineId);
+    if (held.value.status === 'pending' && !live) throw new DocumentToolError('PROPOSAL_CLOSED', 'Proposal was accepted or rejected in the editor.');
+    return structuredClone({ ...held.value, stale: Boolean(live?.staleTargets.length) });
+  }
+
+  override listProposals() {
+    const listed = super.listProposals();
+    const live = this.handle.listProposals();
+    const liveIds = new Set(live.map(proposal => proposal.id));
+    for (const [id, held] of this.slideProposals) {
+      if (!liveIds.has(held.engineId)) this.slideProposals.delete(id);
+    }
+    return [...listed, ...[...this.slideProposals.values()].map(({ value, engineId }) => ({
+      id: value.id, author: value.author, note: value.note.slice(0, 120), status: value.status,
+      changes: value.changes.length, stale: Boolean(live.find(proposal => proposal.id === engineId)?.staleTargets.length),
+    }))];
+  }
+
+  override async accept(id: string, options: { tracked?: boolean; date?: string } = {}) {
+    this.alive();
+    const held = this.slideProposals.get(id);
+    if (!held) return super.accept(id, options);
+    if (options.tracked || options.date) throw new DocumentToolError('UNSUPPORTED', 'Tracked acceptance is available for DOCX only.');
+    if (held.value.status !== 'pending') throw new DocumentToolError('PROPOSAL_CLOSED', `Proposal is ${held.value.status}.`);
+    const result = this.handle.acceptProposal(held.engineId);
+    held.value.status = 'accepted';
+    return { id, status: 'accepted' as const, receipt: { applied: result.applied, version: this.handle.version(),
+      changedSlides: held.value.changes.length, changedStories: 0 } };
+  }
+
+  override reject(id: string) {
+    this.alive();
+    const held = this.slideProposals.get(id);
+    if (!held) return super.reject(id);
+    if (held.value.status !== 'pending') throw new DocumentToolError('PROPOSAL_CLOSED', `Proposal is ${held.value.status}.`);
+    this.handle.rejectProposal(held.engineId);
+    held.value.status = 'rejected';
+    return { id, status: 'rejected' as const };
+  }
+
+  override discard(id: string) {
+    this.alive();
+    const held = this.slideProposals.get(id);
+    if (!held) return super.discard(id);
+    if (held.value.status === 'pending') this.handle.rejectProposal(held.engineId);
+    this.slideProposals.delete(id);
+  }
+
+  override async export(id?: string): Promise<Uint8Array> {
+    this.alive();
+    const held = id ? this.slideProposals.get(id) : undefined;
+    if (!held) return super.export(id);
+    if (this.review(id!).status !== 'pending') throw new DocumentToolError('PROPOSAL_CLOSED', `Proposal is ${held.value.status}.`);
+    if (this.review(id!).stale) throw new DocumentToolError('STALE_TARGET', 'Proposal targets changed.');
+    const replica = this.handle.fork();
+    try {
+      const proposal = replica.propose(held.value.author, held.value.note, held.edits);
+      replica.acceptProposal(proposal.id);
+      return this.owned ? await this.saveFitted(replica) : replica.save();
+    } finally { replica.dispose(); }
+  }
+
+  outline(options: { offset?: number; limit?: number; shapeOffset?: number; shapeLimit?: number; layoutOffset?: number; layoutPlaceholderOffset?: number } = {}) {
+    const deck = this.snapshot();
+    const offset = integer(options.offset ?? 0, 0, deck.slides.length, 'offset');
+    const limit = integer(options.limit ?? 10, 1, 100, 'limit');
+    const shapeOffset = integer(options.shapeOffset ?? 0, 0, Number.MAX_SAFE_INTEGER, 'shapeOffset');
+    const shapeLimit = integer(options.shapeLimit ?? 10, 1, 100, 'shapeLimit');
+    const layoutOffset = integer(options.layoutOffset ?? 0, 0, this.layouts.length, 'layoutOffset');
+    const placeholderOffset = integer(options.layoutPlaceholderOffset ?? 0, 0, Number.MAX_SAFE_INTEGER, 'layoutPlaceholderOffset');
+    const layouts = [];
+    let layoutSize = 0;
+    for (const layout of this.layouts.slice(layoutOffset, layoutOffset + 30)) {
+      const placeholders = this.bounded(layout.placeholders.slice(placeholderOffset, placeholderOffset + 30).map(placeholder => ({ ...placeholder, name: placeholder.name.slice(0, 200), nameTruncated: placeholder.name.length > 200, type: placeholder.type?.slice(0, 64) ?? null })), 2000);
+      const item = { ...layout, name: layout.name?.slice(0, 200) ?? null, nameTruncated: (layout.name?.length ?? 0) > 200, type: layout.type?.slice(0, 64) ?? null, placeholders, placeholderCount: layout.placeholders.length, nextPlaceholderOffset: placeholderOffset + placeholders.length < layout.placeholders.length ? placeholderOffset + placeholders.length : null };
+      const cost = JSON.stringify(item).length;
+      if (layouts.length && layoutSize + cost > 8000) break;
+      layouts.push(item); layoutSize += cost;
+    }
+    const items = [];
+    let size = 0;
+    for (const slide of deck.slides.slice(offset, offset + limit)) {
+      const shapes = this.flatten(slide.shapes);
+      const selected = this.bounded(shapes.slice(shapeOffset, shapeOffset + shapeLimit).map(node => this.shapeSummary(node.shape, node.parentId, node.depth)), 12000);
+      const item = { ...this.slideSummary(slide, deck.slides.indexOf(slide)), shapes: selected, shapeCount: shapes.length, nextShapeOffset: shapeOffset + selected.length < shapes.length ? shapeOffset + selected.length : null };
+      const cost = JSON.stringify(item).length;
+      if (items.length && size + cost > 24000) break;
+      items.push(item); size += cost;
+    }
+    return { version: this.handle.version(), size: this.rect({ x: 0, y: 0, width: deck.widthEmu, height: deck.heightEmu }), slides: items, total: deck.slides.length, nextOffset: offset + items.length < deck.slides.length ? offset + items.length : null, layouts, nextLayoutOffset: layoutOffset + layouts.length < this.layouts.length ? layoutOffset + layouts.length : null, ids: 'Opened slide IDs use slide:<0-based index>:<source ID>; the middle number is the original 0-based index. Shape and slide IDs remain stable during this session, including after moves. Table structure edits refresh cell story IDs and refs. Opened exports receive fresh IDs.' };
+  }
+
+  readSlide(options: { slide?: string | number; shape?: string; story?: string; offset?: number; limit?: number; storyOffset?: number; paragraphOffset?: number; runOffset?: number; textStart?: number; textLength?: number; notesStart?: number } ) {
+    const deck = this.snapshot();
+    const slide = options.shape ? this.shapeSlide(this.handle, options.shape, options.slide) : this.slide(this.handle, options.slide);
+    const all = this.flatten(slide.shapes);
+    const shape = options.shape ? this.shape(slide, options.shape) : undefined;
+    const selectedIds = shape ? new Set(this.flatten([shape]).map(node => node.shape.id)) : undefined;
+    const nodes = selectedIds ? all.filter(node => selectedIds.has(node.shape.id)) : all;
+    if (options.story && !nodes.some(node => node.shape.textStories.some(story => story.id === options.story))) throw new DocumentToolError('UNKNOWN_STORY', 'Copy a story ID from pptx_read_slide.', { validStories: nodes.flatMap(node => node.shape.textStories.map(story => story.id)).slice(0, 20) });
+    const offset = integer(options.offset ?? 0, 0, nodes.length, 'offset');
+    const limit = integer(options.limit ?? 10, 1, 100, 'limit');
+    const storyOffset = integer(options.storyOffset ?? 0, 0, Number.MAX_SAFE_INTEGER, 'storyOffset');
+    const paragraphOffset = integer(options.paragraphOffset ?? 0, 0, Number.MAX_SAFE_INTEGER, 'paragraphOffset');
+    const runOffset = integer(options.runOffset ?? 0, 0, Number.MAX_SAFE_INTEGER, 'runOffset');
+    const textLength = integer(options.textLength ?? 1000, 1, 4000, 'textLength');
+    const textStart = integer(options.textStart ?? 0, 0, Number.MAX_SAFE_INTEGER, 'textStart');
+    const shapes = [];
+    let size = 0;
+    for (const node of nodes.slice(offset, offset + limit)) {
+      const stories = node.shape.textStories.filter(story => !options.story || story.id === options.story);
+      const selected = stories.slice(storyOffset, storyOffset + 1).map(story => {
+        const fullText = story.paragraphs.map(p => p.runs.map(r => r.text.replaceAll('\n', '\v')).join('')).join('\n');
+        const window = textWindow(fullText, { start: Math.min(textStart, fullText.length), length: textLength });
+        let position = 0;
+        const paragraphs = story.paragraphs.map(paragraph => {
+          const start = position;
+          const runs = paragraph.runs.map(run => {
+            const start = position;
+            position += run.text.length;
+            return { start, end: position, text: run.text.replaceAll('\n', '\v').slice(Math.max(0, window.start - start), Math.max(0, Math.min(run.text.length, window.end - start))), formatting: { ...run.style, fontFamily: run.style.fontFamily?.slice(0, 200) ?? null, underline: run.style.underline?.slice(0, 32) ?? null } };
+          });
+          const end = position++;
+          const visible = runs.filter(run => run.end > window.start && run.start < window.end);
+          const page = visible.slice(runOffset, runOffset + 8);
+          return { id: paragraph.id, start, end, alignment: paragraph.alignment, level: paragraph.level, bullet: paragraph.bulletJson?.slice(0, 256) ?? null, runs: page, runCount: paragraph.runs.length, nextRunOffset: runOffset + page.length < visible.length ? runOffset + page.length : null };
+        }).filter(p => p.end >= window.start && p.start <= window.end);
+        const selected = paragraphs.slice(paragraphOffset, paragraphOffset + 4);
+        return { id: story.id, ...window, paragraphs: selected, paragraphCount: paragraphs.length, nextParagraphOffset: paragraphOffset + selected.length < paragraphs.length ? paragraphOffset + selected.length : null };
+      });
+      const item = { ...this.shapeSummary(node.shape, node.parentId, node.depth), rotationDeg: node.shape.rotationDeg, flipH: node.shape.flipH, flipV: node.shape.flipV, hidden: node.shape.hidden ?? false, fill: node.shape.resolvedFillColor, outline: node.shape.resolvedOutlineColor, mediaPartPath: node.shape.mediaPartPath, stories: selected, storyCount: stories.length, nextStoryOffset: storyOffset + selected.length < stories.length ? storyOffset + selected.length : null };
+      const cost = JSON.stringify(item).length;
+      if (shapes.length && size + cost > 24000) break;
+      shapes.push(item); size += cost;
+    }
+    return { version: this.handle.version(), ...this.slideSummary(slide, deck.slides.findIndex(s => s.id === slide.id)), shapes, shapeCount: nodes.length, nextOffset: offset + shapes.length < nodes.length ? offset + shapes.length : null, notes: textWindow(slide.notes ?? '', { start: options.notesStart, length: 4000 }) };
+  }
+
+  edit(input: PptxAgentBatch) {
+    this.alive();
+    const parsed = pptxBatchSchema.safeParse(input);
+    if (!parsed.success) throw new DocumentToolError('INVALID_ARGUMENT', 'Use the pptx_edit schema: version and 1–32 edits.', { issues: parsed.error.issues.map(issue => ({ path: issue.path, message: issue.message })) });
+    const version = this.handle.version();
+    if (input.version !== version) throw new DocumentToolError('STALE_TARGET', 'Deck changed. Read pptx_outline or pptx_read_slide again and copy its version.');
+    const imageBytes = parsed.data.edits.reduce((sum, edit) => sum + (edit.op === 'add_image' ? edit.base64.length : 0), 0);
+    const textBytes = JSON.stringify(parsed.data.edits.map(edit => edit.op === 'add_image' ? { ...edit, base64: '' } : edit)).length;
+    if (imageBytes > 11200000 || textBytes > 64000) throw new DocumentToolError('EDIT_LIMIT', 'Batch allows at most 8 MiB of images and 64000 characters of other input. Split the batch.');
+    const draft = this.handle.fork();
+    const vector = this.handle.encodeStateVector();
+    const results: Array<Record<string, unknown>> = [];
+    let stepIndex = 0;
+    try {
+      for (const edit of parsed.data.edits) {
+        results.push({ index: stepIndex, op: edit.op, ...this.applyOperation(draft, edit, Math.floor(8000 / parsed.data.edits.length)) });
+        stepIndex++;
+      }
+      draft.save();
+      if (this.handle.version() !== version) throw new DocumentToolError('STALE_TARGET', 'Deck changed during the batch. Read fresh IDs and version, then retry.');
+      this.handle.applyUpdate(draft.encodeStateAsUpdate(vector));
+      return { applied: true, version: this.handle.version(), results };
+    } catch (error) {
+      const failure = error instanceof DocumentToolError ? error : new DocumentToolError('INVALID_EDIT', error instanceof Error ? error.message : String(error));
+      throw new DocumentToolError(failure.code, `${failure.message} No batch edits were applied.`, { ...failure.details, failedIndex: Math.min(stepIndex, input.edits.length - 1), results: input.edits.map((edit, index) => ({ index, op: edit.op, applied: false, status: index < stepIndex ? 'rolled_back' : index === stepIndex ? 'failed' : 'not_applied' })) });
+    } finally { draft.dispose(); }
+  }
+
+  async preview(slideId: string | number, options: { scale?: number } = {}) {
+    const deck = this.snapshot();
+    const slide = this.slide(this.handle, slideId);
+    return renderPptxSlide(this.handle, deck.slides.findIndex(s => s.id === slide.id) + 1, options.scale, undefined, this.themeFonts);
+  }
+
+  override async render(page?: number, proposal?: string): Promise<RenderedPage> {
+    this.alive();
+    if (page === undefined) throw new DocumentToolError('UNSUPPORTED', 'Use pptx_preview with a slide ID, or render(1) with a one-based slide index.');
+    if (!proposal) return renderPptxSlide(this.handle, page, undefined, undefined, this.themeFonts);
+    const draft = openPresentation(await this.export(proposal));
+    try { return await renderPptxSlide(draft, page, undefined, undefined, this.themeFonts); }
+    finally { draft.dispose(); }
+  }
+
+  private applyOperation(handle: PresentationHandle, edit: PptxAgentEdit, changeBudget: number): Record<string, unknown> {
+    if (edit.op === 'add_slide') {
+      const deck = handle.snapshot();
+      const index = integer(edit.index ?? deck.slides.length + 1, 1, deck.slides.length + 1, 'index');
+      const layout = edit.layout ?? this.layouts[0]?.id;
+      if (layout && !this.layouts.some(l => l.id === layout)) throw new DocumentToolError('UNKNOWN_LAYOUT', 'Copy a layout ID from pptx_outline.', { validLayouts: this.layouts.slice(0, 20).map(({ id, name }) => ({ id, name: name?.slice(0, 200) ?? null })) });
+      const receipt = handle.insertSlide(index - 1, layout);
+      return { changed: true, slideId: receipt.slideId, index, layout: layout ?? null };
+    }
+    if (edit.op === 'find_replace') {
+      plainText(edit.query.replaceAll('\v', ' ')); plainText(edit.replacement.replaceAll('\v', ' '));
+      if (/[\r\n]/u.test(edit.query + edit.replacement)) throw new DocumentToolError('INVALID_ARGUMENT', 'find_replace stays within paragraphs; use \\u000b for a soft line break. Use set_paragraphs to replace multiple paragraphs.');
+      const query = edit.query.replaceAll('\v', '\n');
+      const replacement = edit.replacement.replaceAll('\v', '\n');
+      const softBreak = query !== edit.query || replacement !== edit.replacement;
+      const scope = edit.shape ? this.shapeSlide(handle, edit.shape, edit.slide) : edit.slide !== undefined ? this.slide(handle, edit.slide) : undefined;
+      const read = unwrap(handle.readContent(scope ? { slideIds: [scope.id] } : undefined));
+      const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), edit.caseSensitive ? 'gu' : 'giu');
+      const changes = new Map<string, { slideId: string; shapeId: string; replacements: number }>();
+      const stories = read.stories.filter(story => !edit.shape || story.shapeId === edit.shape);
+      if (edit.shape && !stories.length) {
+        const children = this.flatten(this.shape(scope!, edit.shape).children).map(node => node.shape.id).slice(0, 20);
+        throw new DocumentToolError('INVALID_ARGUMENT', `Shape ${edit.shape} has no text.${children.length ? ` Target one of its child shapes: ${children.join(', ')}.` : ''} Or omit shape to search the slide.`, { shapeId: edit.shape, childShapes: children });
+      }
+      const found: Array<{ story: (typeof stories)[number]; paragraph: (typeof stories)[number]['paragraphs'][number]; start: number; end: number; text: string }> = [];
+      for (const story of stories) for (const paragraph of story.paragraphs) {
+        pattern.lastIndex = 0;
+        const text = story.text.slice(paragraph.start, paragraph.end);
+        for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+          if (found.length === 128) throw new DocumentToolError('EDIT_LIMIT', 'More than 128 occurrences. Narrow query or supply a slide ID, then retry.');
+          found.push({ story, paragraph, start: match.index, end: match.index + match[0].length, text: match[0] });
+          const change = changes.get(story.shapeId) ?? { slideId: story.slideId, shapeId: story.shapeId, replacements: 0 };
+          change.replacements++; changes.set(story.shapeId, change);
+        }
+      }
+      if (!found.length) return { changed: false, replacements: 0, changes: [] };
+      const changed = this.bounded([...changes.values()], changeBudget);
+      if (!softBreak) {
+        const steps: PptxEditStep[] = found.map(hit => ({ op: 'replaceText', target: { kind: 'range', slideId: hit.story.slideId, shapeId: hit.story.shapeId, storyId: hit.story.storyId, start: hit.paragraph.start + hit.start, end: hit.paragraph.start + hit.end }, text: replacement, expect: { text: hit.text } }));
+        const receipt = unwrap(handle.applyEdits({ expectVersion: read.version, steps, source: 'agent' }));
+        return { changed: receipt.applied, replacements: steps.length, changedShapes: changes.size, changes: changed, changesTruncated: changed.length < changes.size };
+      }
+      if (found.some(hit => hit.paragraph.fields.length || !hit.paragraph.editable)) throw new DocumentToolError('UNSUPPORTED_TARGET', 'find_replace cannot change soft line breaks in a paragraph with text fields.');
+      const snapshotStories = new Map(handle.snapshot().slides.flatMap(slide => this.flatten(slide.shapes)).flatMap(node => node.shape.textStories.map(story => [story.id, story] as const)));
+      const styleOf = (run: StorySnapshot['paragraphs'][number]['runs'][number]) => Object.fromEntries(Object.entries(run.style).filter(([, value]) => value !== null)) as TextStyle;
+      const edits = found.filter(hit => hit.text !== replacement).map(hit => {
+        const paragraph = snapshotStories.get(hit.story.storyId)?.paragraphs.find(paragraph => paragraph.id === hit.paragraph.paragraphId);
+        if (!paragraph) throw new DocumentToolError('UNKNOWN_REF', 'Copy a paragraph ID from pptx_read_slide.');
+        let position = 0;
+        const run = paragraph.runs.find(run => { position += run.text.length; return hit.start < position; });
+        if (!run) throw new DocumentToolError('INVALID_EDIT', 'Match is outside its paragraph. Read fresh text and retry.');
+        return { type: 'replaceText' as const, storyId: hit.story.storyId, start: hit.paragraph.start + hit.start, end: hit.paragraph.start + hit.end, text: replacement, style: styleOf(run) };
+      }).reverse();
+      let applied = false;
+      if (edits.length) {
+        const proposal = handle.propose('agent', null, edits);
+        try { applied = handle.acceptProposal(proposal.id).applied; }
+        finally { handle.rejectProposal(proposal.id); }
+      }
+      return { changed: applied, replacements: found.length, changedShapes: changes.size, changes: changed, changesTruncated: changed.length < changes.size };
+    }
+    if (edit.op === 'insert_table_row' || edit.op === 'delete_table_row' || edit.op === 'insert_table_column' || edit.op === 'delete_table_column') {
+      if (handle.isCollaborative()) throw new DocumentToolError('UNSUPPORTED', 'Table row and column edits are unavailable while the deck is in a collaborative session. Edit cell text instead.');
+      const rows = edit.op === 'insert_table_row' || edit.op === 'delete_table_row';
+      const anchor = 'row' in edit ? edit.row : 'column' in edit ? edit.column : undefined;
+      const ref = edit.ref ?? (typeof anchor === 'string' ? anchor : undefined);
+      if (edit.ref && typeof anchor === 'string' && edit.ref !== anchor) throw new DocumentToolError('INVALID_ARGUMENT', 'Supply one cell ref in ref or the row/column field.');
+      const deck = handle.snapshot();
+      const targets = deck.slides.flatMap(slide => this.flatten(slide.shapes).map(({ shape }) => ({ slide, shape })));
+      const matches = ref ? targets.flatMap(target => target.shape.textStories.flatMap((story, index) => story.paragraphs
+        .filter(paragraph => paragraph.id === ref || this.refs.get(JSON.stringify([story.id, paragraph.id])) === ref)
+        .map(() => ({ ...target, cell: index })))) : [];
+      if (ref && matches.length !== 1) throw new DocumentToolError('UNKNOWN_REF', 'ref is not a current table cell paragraph. Read office_outline or office_grep for fresh refs.');
+      const target = matches[0] ?? targets.find(target => target.shape.id === edit.shape);
+      if (!target) throw new DocumentToolError('UNKNOWN_SHAPE', 'shape must be a table shape ID, or supply ref for a current cell paragraph.');
+      if (edit.shape && edit.shape !== target.shape.id) throw new DocumentToolError('INVALID_ARGUMENT', 'shape and ref must identify the same table.');
+      if (edit.slide !== undefined) this.shapeSlide(handle, target.shape.id, edit.slide);
+      const graphic = target.shape.graphic as { type?: string; grid?: number[]; rows?: unknown[] } | null;
+      if (graphic?.type !== 'table' || !graphic.grid?.length || !graphic.rows?.length) throw new DocumentToolError('UNSUPPORTED_TARGET', 'shape/ref must identify a table with a column grid.');
+      const count = rows ? graphic.rows.length : graphic.grid.length;
+      const inferred = matches[0] ? rows ? Math.floor(matches[0].cell / graphic.grid.length) : matches[0].cell % graphic.grid.length : undefined;
+      const index = typeof anchor === 'number' ? anchor : inferred;
+      const field = rows ? 'row' : 'column';
+      if (index === undefined) throw new DocumentToolError('INVALID_ARGUMENT', `${field} is required with shape; use a zero-based index in 0..${count - 1}, or supply ref.`);
+      integer(index, 0, count - 1, field);
+      if (inferred !== undefined && inferred !== index) throw new DocumentToolError('INVALID_ARGUMENT', `${field} and ref identify different anchors.`);
+      if ('cells' in edit) for (const text of edit.cells ?? []) {
+        plainText(text);
+        if (/[\r\n]/u.test(text)) throw new DocumentToolError('INVALID_ARGUMENT', 'cells entries must be one line each; set extra cell paragraphs with set_paragraphs after the insert.');
+      }
+      const args = [target.slide.id, target.shape.id, index] as const;
+      const receipt = edit.op === 'insert_table_row' ? handle.insertTableRow(...args, edit.position, edit.cells)
+        : edit.op === 'insert_table_column' ? handle.insertTableColumn(...args, edit.position, edit.cells, edit.width)
+        : edit.op === 'delete_table_row' ? handle.deleteTableRow(...args) : handle.deleteTableColumn(...args);
+      return { changed: true, ...receipt };
+    }
+    if (edit.op === 'reply_comment' || edit.op === 'resolve_comment') {
+      const deck = handle.snapshot();
+      const comments = deck.comments ?? [];
+      const target = comments.find(comment => comment.id === edit.comment);
+      if (!target) throw new DocumentToolError('UNKNOWN_REF', "comment must be an ID from office_outline story 'comments'. Choose one of validComments.", { validComments: comments.slice(0, 20).map(({ id, slideId }) => ({ id, slideId })) });
+      const root = comments.find(comment => comment.id === target.parentId) ?? target;
+      if (edit.op === 'resolve_comment') {
+        if (deck.commentFlavor !== 'modern') throw new DocumentToolError('UNSUPPORTED_TARGET', 'resolved cannot be represented by legacy comments. Use a deck with modern comments to resolve or reopen a thread.');
+        if (edit.resolved !== undefined && edit.done !== undefined && edit.resolved !== edit.done) throw new DocumentToolError('INVALID_ARGUMENT', 'resolved and done disagree. Supply one of them.');
+        const resolved = edit.resolved ?? edit.done ?? true;
+        if (root.resolved === resolved) return { changed: false, comment: root.id, parentId: null, slideId: root.slideId, resolved };
+        const receipt = handle.setCommentStatus(root.id, resolved);
+        return { changed: true, comment: receipt.commentId, parentId: null, slideId: receipt.slideId, resolved };
+      }
+      plainText(edit.author); plainText(edit.initials ?? ''); plainText(edit.text);
+      const receipt = handle.replyToComment(root.id, { author: edit.author, initials: edit.initials, text: edit.text, created: edit.date ?? new Date().toISOString() });
+      return { changed: true, comment: receipt.commentId, parentId: root.id, slideId: receipt.slideId, resolved: false };
+    }
+    const slide = 'shape' in edit ? this.shapeSlide(handle, edit.shape, edit.slide) : this.slide(handle, edit.slide);
+    if (edit.op === 'add_comment') {
+      plainText(edit.author); plainText(edit.initials ?? ''); plainText(edit.text);
+      const receipt = handle.addComment(slide.id, { author: edit.author, initials: edit.initials, text: edit.text, created: edit.date ?? new Date().toISOString(), xEmu: Math.round((edit.position?.x ?? 0) * 12700), yEmu: Math.round((edit.position?.y ?? 0) * 12700) });
+      return { changed: true, comment: receipt.commentId, parentId: null, slideId: receipt.slideId, resolved: false };
+    }
+    if (edit.op === 'replace_text' || edit.op === 'set_paragraphs') {
+      const shape = this.shape(slide, edit.shape);
+      const story = edit.story ? shape.textStories.find(story => story.id === edit.story) : shape.textStories.length === 1 ? shape.textStories[0] : undefined;
+      if (!story) throw new DocumentToolError('UNKNOWN_STORY', 'Shape must have one text story, or supply a story ID from pptx_read_slide.', { validStories: shape.textStories.map(story => story.id).slice(0, 20) });
+      const content = unwrap(handle.readContent({ slideIds: [slide.id] })).stories.find(item => item.storyId === story.id)!;
+      if (content.paragraphs.some(p => p.fields.length || !p.editable)) throw new DocumentToolError('UNSUPPORTED_TARGET', 'Shape contains text fields. Use find_replace for plain text outside the fields.');
+      const paragraphs = edit.op === 'replace_text' ? edit.text.replace(/\r\n?/g, '\n').split('\n').map(text => ({ runs: [{ text }], alignment: undefined, bullet: undefined })) : edit.paragraphs;
+      const text = paragraphs.map(p => p.runs.map(r => r.text).join('')).join('\n');
+      plainText(text.replaceAll('\v', '\n'));
+      if (text.length > 16000) throw new DocumentToolError('EDIT_LIMIT', 'Shape text must fit in 16000 characters.');
+      const unchanged = paragraphs.length === story.paragraphs.length && paragraphs.every((paragraph, index) =>
+        paragraph.runs.map(run => run.text).join('').replaceAll('\v', '\n') === story.paragraphs[index].runs.map(run => run.text).join(''));
+      if (edit.op === 'replace_text' && unchanged) return { changed: false, slideId: slide.id, shapeId: shape.id, storyId: story.id };
+      const formatted = paragraphs.map((paragraph, index) => ({
+        bullet: paragraph.bullet,
+        alignment: paragraph.alignment ?? null,
+        runs: paragraph.runs.flatMap(run => {
+          const { text, ...style } = run;
+          if ('fontFamily' in style && style.fontFamily) plainText(style.fontFamily);
+          if (/[\r\n]/u.test(text)) throw new DocumentToolError('INVALID_ARGUMENT', 'Each run must stay in one paragraph. Add another paragraphs item for a paragraph break; use \\u000b for a soft line break.');
+          const normalized = text.replaceAll('\v', '\n');
+          return edit.op === 'replace_text' ? this.replacementRuns(story, index, normalized) : [{ text: normalized, style }];
+        }),
+      }));
+      handle.setStoryParagraphs(story.id, formatted);
+      return { changed: true, slideId: slide.id, shapeId: shape.id, storyId: story.id, before: this.summary(content.text), after: this.summary(text), paragraphs: paragraphs.length };
+    }
+    if (edit.op === 'set_slide_layout') {
+      const layout = this.layouts.find(layout => layout.id === edit.layout)
+        ?? this.exactName(this.layouts, edit.layout, 'UNKNOWN_LAYOUT');
+      if (!layout) throw new DocumentToolError('UNKNOWN_LAYOUT', 'Copy a layout ID or exact name from pptx_outline.', { validLayouts: this.layouts.slice(0, 20).map(({ id, name }) => ({ id, name: name?.slice(0, 200) ?? null })) });
+      const mapping = (edit.placeholders ?? []).map(item => {
+        const shape = this.shape(slide, item.shape);
+        const target = layout.placeholders.find(target => target.id === item.layoutPlaceholder)
+          ?? this.exactName(layout.placeholders, item.layoutPlaceholder, 'UNKNOWN_SHAPE');
+        if (!target) throw new DocumentToolError('UNKNOWN_SHAPE', 'Copy a placeholder ID or exact name from the target layout in pptx_outline.', { layoutId: layout.id, validPlaceholders: layout.placeholders.slice(0, 20).map(({ id, name }) => ({ id, name: name.slice(0, 200) })) });
+        return { shape: shape.id, layoutPlaceholder: target.id };
+      });
+      const version = handle.version();
+      handle.setSlideLayout(slide.id, layout.id, mapping.map((item): [string, string] => [item.shape, item.layoutPlaceholder]));
+      return { changed: handle.version() !== version, slideId: slide.id, layoutId: layout.id, layoutName: layout.name?.slice(0, 200) ?? null, placeholders: mapping };
+    }
+    if (edit.op === 'duplicate_slide') {
+      if (edit.after !== undefined && edit.index !== undefined) throw new DocumentToolError('INVALID_ARGUMENT', 'Supply either after or index for duplicate_slide, not both.');
+      const slides = handle.snapshot().slides;
+      const after = edit.after === undefined ? slide : this.slide(handle, edit.after);
+      const index = integer(edit.index ?? slides.findIndex(s => s.id === after.id) + 2, 1, slides.length + 1, 'index');
+      const receipt = handle.duplicateSlide(slide.id, index - 1);
+      return { changed: true, sourceSlideId: slide.id, slideId: receipt.slideId, index };
+    }
+    if (edit.op === 'delete_slide') {
+      if (handle.snapshot().slides.length === 1) throw new DocumentToolError('LAST_SLIDE', 'Add a slide before deleting the last slide.');
+      const receipt = handle.deleteSlide(slide.id);
+      return { changed: true, slideId: slide.id, oldIndex: receipt.fromIndex! + 1 };
+    }
+    if (edit.op === 'move_slide') {
+      const slides = handle.snapshot().slides;
+      const anchorId = edit.after ?? edit.before;
+      if ([edit.index, edit.after, edit.before].filter(value => value !== undefined).length !== 1) throw new DocumentToolError('INVALID_ARGUMENT', 'move_slide takes exactly one of index, after or before.');
+      let index: number;
+      if (anchorId === undefined) index = integer(edit.index!, 1, slides.length, 'index');
+      else {
+        const anchor = this.slide(handle, anchorId);
+        if (anchor.id === slide.id) throw new DocumentToolError('INVALID_ARGUMENT', 'Choose a different slide as the after or before anchor.');
+        const at = slides.findIndex(s => s.id === anchor.id);
+        index = (edit.after !== undefined ? at + 2 : at + 1) - (at > slides.findIndex(s => s.id === slide.id) ? 1 : 0);
+      }
+      const receipt = handle.moveSlide(slide.id, index - 1);
+      return { changed: receipt.fromIndex !== receipt.toIndex, slideId: slide.id, oldIndex: receipt.fromIndex! + 1, index };
+    }
+    if (edit.op === 'set_notes') {
+      plainText(edit.text);
+      const before = slide.notes ?? '';
+      if (before !== edit.text) handle.setSlideNotes(slide.id, edit.text);
+      return { changed: before !== edit.text, slideId: slide.id, before: this.summary(before), after: this.summary(edit.text) };
+    }
+    plainText(edit.name);
+    const rect = Object.fromEntries(Object.entries(edit.rect).map(([key, value]) => [key, Math.round(value * 12700)])) as unknown as ShapeRect;
+    let receipt;
+    if (edit.op === 'add_text_box') {
+      plainText(edit.text);
+      if (edit.style?.fontFamily) plainText(edit.style.fontFamily);
+      if (/[\r\n]/u.test(edit.text)) throw new DocumentToolError('INVALID_ARGUMENT', 'add_text_box takes one paragraph. Use set_paragraphs on its returned shape ID for multiple paragraphs.');
+      receipt = handle.addTextBox(slide.id, { name: edit.name, rect, text: edit.text, style: edit.style ?? {} });
+    } else if (edit.op === 'add_shape') {
+      receipt = handle.addShape(slide.id, { name: edit.name, rect, geometry: edit.geometry, fill: edit.fill });
+    } else {
+      const bytes = this.imageBytes(edit.base64, edit.contentType);
+      receipt = handle.addPicture(slide.id, { name: edit.name, rect, contentType: edit.contentType, mediaBase64: Buffer.from(bytes).toString('base64') });
+    }
+    return { changed: true, slideId: slide.id, shapeId: receipt.shapeId, index: receipt.index + 1, rect: this.rect(rect) };
+  }
+
+  private replacementRuns(story: StorySnapshot, index: number, text: string) {
+    const runs = (story.paragraphs[index] ?? story.paragraphs.at(-1))?.runs ?? [];
+    if (!text) return [];
+    if (!runs.length) return [{ text, style: {} }];
+    const source = runs.map(run => run.text).join('');
+    const firstStyle = Object.fromEntries(Object.entries(runs[0].style).filter(([, value]) => value !== null)) as TextStyle;
+    if (!source.startsWith(text) || !/^\n*$/u.test(source.slice(text.length))) return [{ text, style: firstStyle }];
+    let remaining = text.length;
+    const result: Array<{ text: string; style: TextStyle }> = [];
+    for (const run of runs) {
+      const part = run.text.slice(0, remaining);
+      remaining -= part.length;
+      if (!part) continue;
+      const style = Object.fromEntries(Object.entries(run.style).filter(([, value]) => value !== null)) as TextStyle;
+      const previous = result.at(-1);
+      if (previous && JSON.stringify(previous.style) === JSON.stringify(style)) previous.text += part;
+      else result.push({ text: part, style });
+    }
+    if (result.length > 64) throw new DocumentToolError('EDIT_LIMIT', 'Matching paragraph has more than 64 formatted runs. Use find_replace or office_propose for a partial edit.');
+    return result;
+  }
+
+  private imageBytes(base64: string, contentType: string) {
+    if (base64.length % 4 !== 0 || /[^A-Za-z0-9+/=]/u.test(base64)) throw new DocumentToolError('INVALID_IMAGE', 'Supply canonical base64 image bytes, without a data URL prefix.');
+    const bytes = Buffer.from(base64, 'base64');
+    if (!bytes.length || bytes.length > 8 * 1024 * 1024 || bytes.toString('base64') !== base64) throw new DocumentToolError('INVALID_IMAGE', 'Supply a canonical base64 image up to 8 MiB.');
+    let info;
+    try { info = imageSize(bytes); }
+    catch { throw new DocumentToolError('INVALID_IMAGE', 'Image cannot be read. Supply PNG, JPEG, GIF, or WebP bytes.'); }
+    const mime = { png: 'image/png', jpg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+    if (mime[info.type as keyof typeof mime] !== contentType) throw new DocumentToolError('INVALID_IMAGE', 'contentType must match the encoded image format.');
+    if (![info.width, info.height].every(value => Number.isSafeInteger(value) && value > 0) || !Number.isSafeInteger(info.width * info.height) || info.width * info.height > 16000000) throw new DocumentToolError('INVALID_IMAGE', 'Image must fit in 16 megapixels. Resize it before adding.');
+    return bytes;
+  }
+  private exactName<T extends { name: string | null }>(items: T[], name: string, code: 'UNKNOWN_LAYOUT' | 'UNKNOWN_SHAPE') {
+    const matches = items.filter(item => item.name === name);
+    if (matches.length > 1) throw new DocumentToolError(code, 'Name is ambiguous. Copy an ID from pptx_outline.');
+    return matches[0];
+  }
+  private get layouts() { return this.cachedLayouts ??= this.handle.layouts(); }
+  private snapshot() { this.alive(); return this.handle.snapshot(); }
+  private bounded<T>(items: T[], budget: number) {
+    const result: T[] = [];
+    let size = 0;
+    for (const item of items) {
+      const cost = JSON.stringify(item).length;
+      if (result.length && size + cost > budget) break;
+      result.push(item); size += cost;
+    }
+    return result;
+  }
+  private summary(text: string) { return { text: text ? textWindow(text, { length: 160 }).text : '', length: text.length, truncated: text.length > 160 }; }
+  private rect(rect: ShapeRect) { return { emu: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, points: { x: rect.x / 12700, y: rect.y / 12700, width: rect.width / 12700, height: rect.height / 12700 } }; }
+  private flatten(shapes: ShapeSnapshot[], parentId: string | null = null, depth = 0): Array<{ shape: ShapeSnapshot; parentId: string | null; depth: number }> {
+    return shapes.flatMap(shape => [{ shape, parentId, depth }, ...this.flatten(shape.children, shape.id, depth + 1)]);
+  }
+  private shapeSummary(shape: ShapeSnapshot, parentId: string | null, depth: number) {
+    const text = shape.textStories.map(story => story.paragraphs.map(p => p.runs.map(r => r.text.replaceAll('\n', '\v')).join('')).join('\n')).join('\n');
+    const graphic = shape.graphic as { type?: string; grid?: unknown[]; rows?: unknown[] } | null;
+    const table = graphic?.type === 'table' ? { rows: graphic.rows?.length ?? 0, columns: graphic.grid?.length ?? 0 } : undefined;
+    return { id: shape.id, type: shape.kind, table, name: shape.name.slice(0, 200), nameTruncated: shape.name.length > 200, geometry: shape.geometry.slice(0, 100), parentId, depth, childCount: shape.children.length, placeholder: shape.placeholder, position: this.rect(shape.inherited ?? shape), coordinateSpace: parentId ? 'group' : 'slide', text: this.summary(text) };
+  }
+  private commentSummary(comment: CommentSnapshot, deck: ReturnType<PresentationHandle['snapshot']>) {
+    const root = deck.comments?.find(root => root.id === comment.parentId) ?? comment;
+    return { id: comment.id, ref: comment.id, story: 'comments', author: comment.author, initials: comment.initials, date: comment.created, parentId: comment.parentId, resolved: comment.resolved, status: deck.commentFlavor === 'modern' ? comment.resolved ? 'resolved' : 'active' : null, position: { x: root.xEmu / 12700, y: root.yEmu / 12700 }, slideId: comment.slideId, slide: deck.slides.findIndex(slide => slide.id === comment.slideId) + 1, editable: false };
+  }
+  private slideSummary(slide: SlideSnapshot, index: number) {
+    const shapes = this.flatten(slide.shapes).map(node => node.shape);
+    const titleShape = shapes.find(shape => ['title', 'ctrTitle'].includes((shape.placeholder as { placeholderType?: string } | null)?.placeholderType ?? '')) ?? shapes.find(shape => shape.textStories.some(s => s.paragraphs.some(p => p.runs.some(r => r.text.trim()))));
+    const title = titleShape?.textStories[0]?.paragraphs[0]?.runs.map(run => run.text.replaceAll('\n', '\v')).join('') ?? '';
+    return { index: index + 1, id: slide.id, layoutId: slide.layoutPartPath, layoutName: this.layouts.find(layout => layout.id === slide.layoutPartPath)?.name?.slice(0, 200) ?? null, title: title.slice(0, 160), titleTruncated: title.length > 160 };
+  }
+  private slide(handle: PresentationHandle, id: string | number | undefined) {
+    const slides = handle.snapshot().slides;
+    if (id === undefined) throw new DocumentToolError('INVALID_ARGUMENT', 'Supply a slide ID from pptx_outline, or a shape ID to infer its slide.');
+    const validSlides = slides.slice(0, 20).map((slide, index) => ({ id: slide.id, index: index + 1 }));
+    if (typeof id === 'number' || /^[+-]?\d+$/.test(id)) {
+      const number = Number(id);
+      const zeroBased = slides[number]?.id ?? 'no matching slide';
+      const oneBased = slides[number - 1]?.id ?? 'no matching slide';
+      const sourceId = slides.find(slide => slide.id.endsWith(`:${id}`))?.id ?? 'no matching slide';
+      throw new DocumentToolError('INVALID_ARGUMENT', `Numeric slide ${JSON.stringify(id)} is ambiguous. Use slide:<0-based index>:<source ID>; the middle number is the original 0-based index. Readings: current 0-based position ${number}: ${zeroBased}; 1-based slide number ${number}: ${oneBased}; source ID ${id}: ${sourceId}. Copy the desired ID from pptx_outline.`, { zeroBased, oneBased, sourceId, validSlides });
+    }
+    const found = slides.find(slide => slide.id === id);
+    if (!found) throw new DocumentToolError('UNKNOWN_SLIDE', 'Copy a slide ID from pptx_outline.', { validSlides });
+    return found;
+  }
+  private shapeSlide(handle: PresentationHandle, shapeId: string, slideId?: string | number) {
+    const supplied = slideId === undefined ? undefined : this.slide(handle, slideId);
+    const owner = handle.snapshot().slides.find(slide => this.flatten(slide.shapes).some(node => node.shape.id === shapeId));
+    if (supplied && owner && supplied.id !== owner.id) throw new DocumentToolError('INVALID_ARGUMENT', `slide and shape disagree: shape ${shapeId} belongs to ${owner.id}, but slide is ${supplied.id}. Omit slide or use ${owner.id}.`, { shapeId, slideId: supplied.id, shapeSlideId: owner.id });
+    if (supplied) { this.shape(supplied, shapeId); return supplied; }
+    if (!owner) throw new DocumentToolError('UNKNOWN_SHAPE', 'Cannot infer slide from shape. Copy a shape ID from pptx_outline or pptx_read_slide.');
+    return owner;
+  }
+  private shape(slide: SlideSnapshot, id: string) {
+    const shapes = this.flatten(slide.shapes).map(node => node.shape);
+    const found = shapes.find(shape => shape.id === id);
+    if (!found) throw new DocumentToolError('UNKNOWN_SHAPE', 'Copy a shape ID from pptx_outline or pptx_read_slide for this slide.', { slideId: slide.id, nearestShapeIds: shapes.sort((a, b) => this.distance(a.id, id) - this.distance(b.id, id)).slice(0, 5).map(shape => ({ id: shape.id, name: shape.name.slice(0, 100) })) });
+    return found;
+  }
+  private distance(a: string, b: string) {
+    let prefix = 0;
+    while (prefix < Math.min(a.length, b.length) && a[prefix] === b[prefix]) prefix++;
+    return a.length + b.length - 2 * prefix;
+  }
+
+  protected currentVersion() { return this.handle.version(); }
+  protected validate(steps: PptxEditStep[], version: string) { unwrap(this.handle.validateEdits({ expectVersion: version, steps, source: 'agent' })); }
+  protected apply(steps: PptxEditStep[], version: string) {
+    const result = unwrap(this.handle.applyEdits({ expectVersion: version, steps, source: 'agent' }));
+    return { applied: result.applied, version: result.version, changedSlides: result.changedSlides.length, changedStories: result.changedStories.length };
+  }
+  protected async save(steps?: PptxEditStep[]) {
+    if (!steps) return this.owned ? this.saveFitted(this.handle) : this.handle.save();
+    const draft = this.handle.fork();
+    try {
+      unwrap(draft.applyEdits({ expectVersion: draft.version(), steps, source: 'agent' }));
+      return this.owned ? await this.saveFitted(draft) : draft.save();
+    } finally { draft.dispose(); }
+  }
+
+  /**
+   * Saves an unedited deck as it is, and otherwise with the bundled faces of
+   * every slide so edited autofit text is fitted. The faces are loaded for the
+   * version that is saved: an edit made while they load loads them again, and
+   * a document closed meanwhile is not saved.
+   */
+  private async saveFitted(handle: PresentationHandle) {
+    for (;;) {
+      const version = handle.version();
+      if (version === this.sourceVersion) return handle.save();
+      const fonts = await loadPptxFonts(pptxFontFaces(handle.snapshot().slides, this.themeFonts, SAVE_FONT_STYLES));
+      this.alive();
+      if (handle.version() !== version) continue;
+      try { return handle.save(fonts); }
+      catch (error) {
+        if (error instanceof Error && /^(?:could not write PPTX: )?render resource limit exceeded(?::|$)/u.test(error.message)) return handle.save({ fonts: [] });
+        throw error;
+      }
+    }
+  }
+  protected reopen(bytes: Uint8Array) { const reopened = openPresentation(bytes); reopened.dispose(); }
+  protected dispose() {
+    for (const held of this.slideProposals.values()) {
+      if (held.value.status === 'pending') this.handle.rejectProposal(held.engineId);
+    }
+    this.slideProposals.clear();
+    this.refs.clear(); this.matches.clear(); if (this.owned) this.handle.dispose(); }
+
+  private content() { this.alive(); return unwrap(this.handle.readContent()); }
+  private reference(p: Paragraph) { return { ref: p.ref, slide: p.slide, slideId: p.story.slideId, shapeId: p.story.shapeId, story: p.story.storyId }; }
+  private checkStory(story: string | undefined, stories: PptxStoryText[]) {
+    if (story && !stories.some(s => s.storyId === story)) throw new DocumentToolError('UNKNOWN_STORY', 'Use a story from outline.');
+  }
+  private paragraphs(read: ReturnType<PptxAgentPresentation['content']>) {
+    const active = new Set<string>();
+    const result: Paragraph[] = [];
+    for (const story of read.stories) {
+      for (const paragraph of story.paragraphs) {
+        const key = JSON.stringify([story.storyId, paragraph.paragraphId]);
+        active.add(key);
+        let ref = this.refs.get(key);
+        if (!ref) { ref = `p${this.nextRef++}`; this.refs.set(key, ref); }
+        result.push({ ref, paragraphId: paragraph.paragraphId, slide: read.slides.findIndex(slide => slide.id === story.slideId) + 1, story, start: paragraph.start, end: paragraph.end, editable: paragraph.editable });
+      }
+    }
+    for (const key of this.refs.keys()) if (!active.has(key)) this.refs.delete(key);
+    return result;
+  }
+}
+
+export async function openPptx(bytes: Uint8Array, options: PrototypeOptions & { maxEdits?: number } = {}) {
+  return PptxAgentPresentation.open(bytes, options);
+}
+
+export function attachPptx(handle: PresentationHandle, options: { name?: string; maxEdits?: number } = {}) {
+  return PptxAgentPresentation.attach(handle, options);
+}

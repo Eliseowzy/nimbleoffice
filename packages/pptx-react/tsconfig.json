@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "ES2022.Intl", "ES2022.Object", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "ignoreDeprecations": "6.0",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "declaration": true,
+    "declarationMap": true,
+    "types": ["bun"],
+    "paths": {
+      "#session-worker": ["../pptx/src/session/sessionWorker.node.ts"],
+      "@nimbleoffice/pptx": ["../pptx/src/index.ts"],
+      "@nimbleoffice/pptx-i18n": ["../pptx-i18n/src/index.ts"],
+      "@nimbleoffice/pptx-i18n/editor": ["../pptx-i18n/src/editor.ts"],
+      "@nimbleoffice/pptx-i18n/proposals": ["../pptx-i18n/src/proposals.ts"],
+      "@nimbleoffice/pptx/*": ["../pptx/src/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}

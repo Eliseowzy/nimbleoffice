@@ -1,0 +1,251 @@
+# Third-party notices
+
+This file records third-party software included in, or from which substantial
+portions of, this repository derive, together with the applicable licenses.
+Entries are appended as new third-party material is incorporated.
+
+---
+
+## eigenpal docx editor
+
+The API design and portions of the TypeScript packages in this repository
+derive from the eigenpal docx editor (upstream repository:
+https://github.com/eigenpal/docx-editor, mirrored at
+https://github.com/sorenlouv/docx-editor), published on npm as the following
+packages (last release: 1.9.0):
+
+- `@eigenpal/docx-editor-core`
+- `@eigenpal/docx-editor-react`
+- `@eigenpal/docx-editor-vue`
+- `@eigenpal/docx-editor-i18n`
+- `@eigenpal/docx-editor-agents`
+- `@eigenpal/nuxt-docx-editor`
+
+License: Apache License, Version 2.0 (per the `license` field of the published
+package metadata and the `LICENSE` file shipped in the packages).
+Copyright 2026 EigenPal Inc.
+
+The license terms are identical to this repository's root `LICENSE`; that
+file serves as the copy of the license for this derivation.
+
+---
+
+## Carlito (metric-compatible with Calibri)
+
+`crates/xlsx-raster/assets/Carlito-Regular.ttf` is vendored unmodified from
+the google/fonts repository, `ofl/carlito` (https://github.com/google/fonts);
+upstream project https://github.com/googlefonts/carlito. The bytes are
+compiled into the `nimbleoffice-xlsx-raster` crate via `include_bytes!`, and
+shared unmodified by the `nimbleoffice-vsdx-raster` crate through the same path.
+
+Copyright 2013 The Carlito Project Authors, with Reserved Font Name "Carlito".
+
+License: SIL Open Font License, Version 1.1
+(`crates/xlsx-raster/assets/OFL.txt`).
+
+---
+
+## Bundled font binaries (`packages/fonts`, `packages/fonts-latin`, `packages/fonts-cjk`, `packages/fonts-intl`)
+
+Font binaries are vendored and redistributed in the published
+`@nimbleoffice/fonts-latin`, `@nimbleoffice/fonts-cjk`, and `@nimbleoffice/fonts-intl` packages. All are licensed
+under the SIL Open Font License, Version 1.1. Each package ships the applicable
+license texts, with the copyright notices they cover, under its `LICENSES/`
+directory; those files are the authoritative copies for redistribution.
+
+`packages/fonts/assets` sources and `packages/fonts-latin/assets` pack - 70 faces:
+
+- **Carlito** (4 faces) — Copyright 2013 The Carlito Project Authors, with
+  Reserved Font Name "Carlito". From google/fonts `ofl/carlito`; upstream
+  https://github.com/googlefonts/carlito. `LICENSES/OFL-Carlito.txt`.
+- **Caladea** (4 faces) — Copyright 2012 The Caladea Project Authors. From
+  google/fonts `ofl/caladea`; upstream
+  https://github.com/huertatipografica/Caladea. `LICENSES/OFL-Caladea.txt`.
+- **Liberation Sans / Serif / Mono** (12 faces) — Digitized data copyright (c)
+  2010 Google Corporation; Copyright (c) 2012 Red Hat, Inc., with Reserved Font
+  Name "Liberation". From the Liberation Fonts 2.1.5 release,
+  https://github.com/liberationfonts/liberation-fonts.
+  `LICENSES/OFL-Liberation.txt`.
+- **Noto Sans Arabic, Noto Naskh Arabic** (3 faces) — Copyright 2022 The Noto
+  Project Authors. From https://github.com/notofonts/notofonts.github.io;
+  upstream https://github.com/notofonts/arabic. `LICENSES/OFL-NotoArabic.txt`.
+- **Noto Sans Hebrew** (2 faces) — Copyright 2022 The Noto Project Authors.
+  From https://github.com/notofonts/notofonts.github.io; upstream
+  https://github.com/notofonts/hebrew. `LICENSES/OFL-NotoSansHebrew.txt`. The
+  regular face is also compiled into the `nimbleoffice-vsdx-raster` tests via
+  `include_bytes!`.
+- **Gelasio** (4 faces): Copyright 2022 The Gelasio Project Authors,
+  https://github.com/SorkinType/Gelasio. `LICENSES/OFL-Gelasio.txt`.
+- **Comic Relief** (2 faces): Copyright 2013 The Comic Relief Project Authors,
+  https://github.com/loudifier/Comic-Relief. `LICENSES/OFL-ComicRelief.txt`.
+- **Inter** (4 faces): Copyright 2020 The Inter Project Authors,
+  https://github.com/rsms/inter. `LICENSES/OFL-Inter.txt`.
+- **Roboto** (4 faces): Copyright 2011 The Roboto Project Authors,
+  https://github.com/googlefonts/roboto-classic. `LICENSES/OFL-Roboto.txt`.
+- **Source Sans 3** (4 faces): Copyright 2010-2020 Adobe, with Reserved Font
+  Name "Source". `LICENSES/OFL-SourceSans3.txt`.
+- **DM Sans** (4 faces): Copyright 2014 The DM Sans Project Authors,
+  https://github.com/googlefonts/dm-fonts. `LICENSES/OFL-DMSans.txt`.
+- **DM Serif Display** (2 faces): Copyright 2014-2018 Adobe, with Reserved Font
+  Name "Source"; Copyright 2019 Google LLC. `LICENSES/OFL-DMSerifDisplay.txt`.
+- **Open Sans** (4 faces): Copyright 2020 The Open Sans Project Authors,
+  https://github.com/googlefonts/opensans. `LICENSES/OFL-OpenSans.txt`.
+- **Selawik** (5 faces): Copyright 2015 Microsoft Corporation, with Reserved
+  Font Name "Selawik". Vendored unmodified from https://github.com/microsoft/Selawik.
+  `LICENSES/OFL-Selawik.txt`.
+- **Montserrat** (4 faces): Copyright 2024 The Montserrat.Git Project Authors,
+  https://github.com/JulietaUla/Montserrat. `LICENSES/OFL-Montserrat.txt`.
+- **Poppins** (4 faces): Copyright 2020 The Poppins Project Authors,
+  https://github.com/itfoundry/Poppins. `LICENSES/OFL-Poppins.txt`.
+- **Oswald** (2 faces): Copyright 2016 The Oswald Project Authors,
+  https://github.com/googlefonts/OswaldFont. `LICENSES/OFL-Oswald.txt`.
+- **Heebo** (2 faces): Copyright 2014 The Heebo Project Authors,
+  https://github.com/OdedEzer/heebo. `LICENSES/OFL-Heebo.txt`.
+
+`packages/fonts-cjk/assets` — 5 faces:
+
+- **Noto Sans SC / TC / JP / KR** (4 faces) — Copyright 2014-2021 Adobe, with
+  Reserved Font Name "Source".
+- **Noto Serif SC** (1 face) — Copyright 2017-2024 Adobe, with Reserved Font
+  Name "Source".
+
+Both are static `SubsetOTF` Regulars from
+https://github.com/notofonts/noto-cjk. `LICENSES/OFL-NotoCJK.txt`.
+
+`packages/fonts-intl/assets` contains hinted static Noto coverage faces for
+international scripts, stored with lossless Zstandard compression. Sources:
+https://github.com/notofonts/notofonts.github.io. The decoded fonts retain
+their copyright notices. `LICENSES/OFL-Noto.txt` contains the OFL 1.1 text.
+
+---
+
+## yrs (vendored copy for the macOS app)
+
+`apps/native-viewer/vendor/yrs` is the `yrs` 0.27.3 crate from crates.io
+(upstream https://github.com/y-crdt/y-crdt), byte-identical apart from three
+call sites that replace `from_utf8_unchecked` with checked decoding (see issue
+#224). `apps/native-viewer` substitutes it for the registry crate via
+`[patch.crates-io]`, so it is compiled into the macOS app only.
+
+Copyright (c) 2020 Bartosz Sypytkowski, Kevin Jahns.
+
+License: MIT (`apps/native-viewer/vendor/yrs/LICENSE`).
+
+---
+
+## Lucide icons (check, x)
+
+`packages/docx-react/src/components/sidebar/reviewIcons.tsx` inlines the SVG
+path data of the `check` and `x` icons from `lucide-static` 1.61.0
+(upstream https://github.com/lucide-icons/lucide), Copyright (c) 2026 Lucide
+Icons and Contributors, License: ISC. Both icons derive from the Feather
+project, Copyright (c) 2013-present Cole Bemis, License: MIT. The full notices
+ship with `@nimbleoffice/docx-react` in `packages/docx-react/THIRD-PARTY-NOTICES.md`.
+
+---
+
+## Microsoft Office Online test tools (WOPI proof-key test data)
+
+`apps/wopi/src/fixtures/microsoft-proof-keys.json` copies the proof-key test
+data (discovery keys, access tokens, URLs, timestamps and signatures) from
+`samples/python/proof_keys/tests.py` in
+https://github.com/microsoft/Office-Online-Test-Tools-and-Documentation.
+It is used only by tests.
+
+    The MIT License (MIT)
+
+    Copyright (c) 2015 Microsoft
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+---
+
+## Zstandard decoder
+
+`crates/nimbleoffice-fonts/vendor/zstd/zstddeclib.c` is the decompression-only amalgamation generated from
+`facebook/zstd` v1.5.7, https://github.com/facebook/zstd/releases/tag/v1.5.7.
+It is compiled into the `nimbleoffice-fonts` crate for native targets, so the
+native engines, the native npm bindings and the Python wheels link it; wasm
+builds decode zstd with `ruzstd` instead.
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+License: BSD-3-Clause (`crates/nimbleoffice-fonts/vendor/zstd/LICENSE`). The same
+upstream notice is included under `packages/fonts/LICENSES/BSD-3-Clause-Zstandard.txt`,
+in each native platform package and in each Python wheel.
+
+---
+
+## ruzstd and twox-hash
+
+Wasm builds of the font decoder, the standalone `fontpack.wasm` and the docx,
+pptx, xlsx and vsdx wasm engines, link `ruzstd` 0.9.1, a zstd decoder in Rust,
+https://github.com/KillingSpark/zstd-rs, and `twox-hash` 2 for its frame
+checksums, https://github.com/shepmaster/twox-hash.
+
+Copyright (c) 2019 Moritz Borcherding
+Copyright (c) 2015 Jake Goulding
+
+License: MIT. The unmodified upstream licences are included under
+`packages/fonts/LICENSES/MIT-ruzstd.txt` and
+`packages/fonts/LICENSES/MIT-twox-hash.txt`, and in the docx, pptx, xlsx and vsdx
+packages, for decoder redistribution.
+
+---
+
+## lol_alloc
+
+The standalone font decoder links `lol_alloc` 0.4.1's single-threaded freelist
+allocator, https://github.com/Craig-Macomber/lol_alloc.
+
+Copyright (c) 2022 Craig
+
+License: MIT. The unmodified upstream licence is included under
+`packages/fonts/LICENSES/MIT-lol_alloc.txt` for decoder redistribution.
+
+---
+
+## wuff
+
+The internal font decoder links `wuff` 0.2.9 for WOFF2 reconstruction,
+https://github.com/nicoburns/wuff. Its wasm feature set excludes brotli and
+flate2. The native pack builder enables brotli for reference verification.
+
+Copyright (c) 2013-2017 by the WOFF2 Authors.
+Copyright (c) 2025 by Nico Burns.
+
+License: MIT. The unmodified upstream licence is included under
+`packages/fonts/LICENSES/MIT-wuff.txt`, in the docx, pptx, xlsx and vsdx packages,
+in each native platform package and in each Python wheel, which link it through
+`nimbleoffice-fonts`.
+
+---
+
+## mimalloc
+
+The `@nimbleoffice/docx-native` and `@nimbleoffice/pptx-native` binaries
+statically link mimalloc 2.3.2 as their memory allocator,
+https://github.com/microsoft/mimalloc, through the `mimalloc` 0.1.52 and
+`libmimalloc-sys` 0.1.49 Rust crates, https://github.com/purpleprotocol/mimalloc_rust.
+
+Copyright (c) 2018-2025 Microsoft Corporation, Daan Leijen.
+Copyright 2019 Octavian Oncescu.
+
+License: MIT. Both unmodified upstream licences are included as
+`MIT-mimalloc.txt` in each docx-native and pptx-native platform package.

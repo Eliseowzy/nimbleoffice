@@ -1,0 +1,643 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # run_id, not ref: a shared group still drops a queued run between two
+  # quick main pushes even with cancel-in-progress false.
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The router fills the account's free GitHub-hosted runners first; a job that does not fit, or every job when
+  # the router cannot count, runs on a fresh self-hosted runner of the leanest class that fits. The router itself
+  # runs GitHub-hosted, so it never queues behind the self-hosted job cap, and does not count itself as busy. The
+  # two shortest (Security audit, Native gate) stay GitHub-hosted. Fork pull requests stay GitHub-hosted,
+  # BO_CI_RUNNER pins every job to one label, BO_CI_SPILL=off keeps them self-hosted, and
+  # BO_CI_GH_LIMIT/BO_CI_GH_RESERVE size the GitHub share.
+  route:
+    name: Route runners
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.BO_CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      packages: ${{ steps.route.outputs.packages }}
+      python: ${{ steps.route.outputs.python }}
+      package_tests: ${{ steps.route.outputs.package_tests }}
+      rust: ${{ steps.route.outputs.rust }}
+      native_viewer: ${{ steps.route.outputs.native_viewer }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        continue-on-error: true
+        with:
+          sparse-checkout: scripts/ci-route.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Route the jobs
+        id: route
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROUTE_GROUPS: packages python package_tests:2 rust native_viewer
+          ROUTE_PEER_SLOTS: 5
+          BO_CI_GH_LIMIT: ${{ vars.BO_CI_GH_LIMIT }}
+          BO_CI_GH_RESERVE: ${{ vars.BO_CI_GH_RESERVE }}
+          BO_CI_SPILL: ${{ vars.BO_CI_SPILL }}
+          BO_CI_RUNNER: ${{ vars.BO_CI_RUNNER }}
+        run: node scripts/ci-route.mjs
+
+  packages:
+    name: Package gate
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.BO_CI_RUNNER || vars.BO_CI_SPILL != 'off' && needs.route.outputs.packages || 'kyora-4x8' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.3"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+
+      - uses: ./.github/actions/wasm-toolchain
+
+      # Reads `wasm-opt --version`, so it has to follow the toolchain step.
+      - name: Fingerprint the wasm inputs
+        id: wasm
+        run: echo "key=$(bun scripts/wasm-cache-key.ts)" >> "$GITHUB_OUTPUT"
+
+      # rust-cache prunes the workspace's own artifacts, and wasm-opt costs minutes per module.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/wasm-pack
+          key: wasm-pack-${{ steps.wasm.outputs.key }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check the lockfile is current
+        run: |
+          bun install --lockfile-only
+          git diff --exit-code -- bun.lock
+
+      - name: Check embedded fonts
+        run: |
+          bun scripts/check-embedded-fonts.mjs
+          bun test scripts/check-embedded-fonts.test.ts
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Check reproducible base fonts
+        run: |
+          python3 -m pip install -r scripts/base-latin/requirements.txt
+          bash scripts/base-latin/check.sh
+
+      - name: Check UI strings and locale parity
+        run: bun test scripts/hardcoded-ui-strings.test.ts packages/docx-i18n packages/xlsx-i18n packages/pptx-i18n shared/i18n-glossary
+
+      - name: Type check
+        run: |
+          bun run typecheck:shared
+          bun run typecheck:packages
+          bun run --filter '@nimbleoffice/collaboration-relay' typecheck
+
+      - name: Check API surface
+        run: |
+          bun scripts/api-surface.ts --check xlsx
+          bun scripts/api-surface.ts --check pptx
+          bun scripts/api-surface.ts --check xlsx-native
+          bun scripts/api-surface.ts --check pptx-native
+
+      # What `bun run test` builds; the tests themselves run in the package-tests shards.
+      - name: Build the Wasm modules
+        run: |
+          bun run build:wasm
+          bun run build:fonts
+
+      - name: Check generated Wasm declarations
+        run: git diff --exit-code -- 'packages/*/src/wasm/generated/*'
+
+      - name: Check Wasm memory limits
+        env:
+          NIMBLEOFFICE_REQUIRE_WASM: "1"
+        run: bun test scripts/wasm-memory.test.ts
+
+      - name: Check exact JSON number parsing in every artifact
+        run: bun test scripts/serde-json-exact.test.ts
+
+      - name: Check Wasm artifacts carry no rasterizer and renderPng keeps one shape
+        run: bun test scripts/wasm-no-raster.test.ts scripts/render-png-shape.test.ts
+
+      - name: Check demo assets
+        run: |
+          bun scripts/create-demo-deck.ts
+          bun scripts/create-demo-workbook.ts
+          bun scripts/create-demo-diagram.ts
+          bun scripts/check-collaboration-seeds.ts
+          git diff --exit-code -- fixtures/demo/nimbleoffice-demo.pptx fixtures/demo/showcase.xlsx fixtures/demo/nimbleoffice-demo.vsdx
+
+      - name: Check minimal Wasm features
+        run: |
+          cargo check -p xlsx-wasm --target wasm32-unknown-unknown --no-default-features
+          cargo check -p nimbleoffice-docx --target wasm32-unknown-unknown --no-default-features --features fonts,fonts-latin,fonts-intl,fonts-cjk
+          cargo check -p nimbleoffice-docx --target wasm32-unknown-unknown --no-default-features
+          cargo check -p nimbleoffice-docx --target wasm32-unknown-unknown --no-default-features --features fonts,fonts-latin,fonts-intl,fonts-cjk --test fonts
+          cargo check -p nimbleoffice-pptx --target wasm32-unknown-unknown --no-default-features --features fonts,fonts-latin,fonts-intl,fonts-cjk
+          cargo check -p nimbleoffice-pptx --target wasm32-unknown-unknown --no-default-features
+          cargo check -p nimbleoffice-xlsx --target wasm32-unknown-unknown
+          cargo check -p nimbleoffice-xlsx --target wasm32-unknown-unknown --no-default-features --features raster
+          cargo check -p nimbleoffice-vsdx --target wasm32-unknown-unknown
+          cargo check -p nimbleoffice-vsdx --target wasm32-unknown-unknown --no-default-features --features raster
+          cargo check -p pptx-wasm --target wasm32-unknown-unknown
+          cargo check -p pptx-wasm --target wasm32-unknown-unknown --no-default-features
+          cargo check -p vsdx-wasm --target wasm32-unknown-unknown --no-default-features
+
+      - name: Build
+        run: bun run build:packages
+
+      - name: Check plugin declarations against the built packages
+        env:
+          NIMBLEOFFICE_PACKAGE_DECLARATIONS: prebuilt
+        run: bun test scripts/docx-plugin-declarations.test.ts scripts/xlsx-plugin-declarations.test.ts scripts/pptx-plugin-declarations.test.ts
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Import every package entry in plain Node
+        run: node scripts/check-node-import.mjs
+
+      - name: Resolve every package entry with webpack
+        run: node scripts/check-webpack-exports.mjs
+
+      - name: Build a webpack consumer app
+        timeout-minutes: 15
+        run: node scripts/next-webpack-consumer.mjs
+
+  package-tests:
+    name: Package tests (${{ matrix.shard }}/2)
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.BO_CI_RUNNER || vars.BO_CI_SPILL != 'off' && needs.route.outputs.package_tests || 'kyora-8x8' }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.3"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+
+      - uses: ./.github/actions/wasm-toolchain
+
+      - name: Fingerprint the wasm inputs
+        id: wasm
+        run: echo "key=$(bun scripts/wasm-cache-key.ts)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/wasm-pack
+          key: wasm-pack-${{ steps.wasm.outputs.key }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test
+        env:
+          NIMBLEOFFICE_PACKAGE_DECLARATIONS: skip
+        run: bun run test --shard=${{ matrix.shard }}/2
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.3"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Report all advisories
+        run: bun audit
+        continue-on-error: true
+
+      # GHSA-vfj7-8cjw-p6xm reaches braces only through build and dev
+      # tooling, and no patched release exists. See SECURITY.md.
+      - name: Fail on high or critical advisories
+        run: bun audit --audit-level=high --ignore=GHSA-vfj7-8cjw-p6xm
+
+  rust:
+    name: Rust gate
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.BO_CI_RUNNER || vars.BO_CI_SPILL != 'off' && needs.route.outputs.rust || 'kyora-8x16' }}
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--compress-debug-sections=zlib
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # A GitHub-hosted runner has too little free disk for the workspace's test binaries.
+      - name: Free disk space
+        if: runner.environment == 'github-hosted'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+
+      - name: Detect Rust workspace
+        id: ws
+        run: echo "present=$([ -f Cargo.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.ws.outputs.present == 'true'
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.ws.outputs.present == 'true'
+
+      - name: Format check
+        if: steps.ws.outputs.present == 'true'
+        run: cargo fmt --check
+
+      - name: Clippy
+        if: steps.ws.outputs.present == 'true'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy optional features
+        if: steps.ws.outputs.present == 'true'
+        run: |
+          cargo clippy -p nimbleoffice-drawingml --all-targets --all-features -- -D warnings
+          cargo clippy -p nimbleoffice-metafile --all-targets --all-features -- -D warnings
+          cargo clippy -p nimbleoffice-docx-parse --all-targets --features tiff,metafile -- -D warnings
+          cargo clippy -p nimbleoffice-docx-edit --all-targets --features wasm -- -D warnings
+          cargo clippy -p nimbleoffice-docx --all-targets --all-features -- -D warnings
+          cargo clippy -p nimbleoffice-pptx --all-targets --all-features -- -D warnings
+          cargo clippy -p nimbleoffice-vsdx-edit --all-targets --all-features -- -D warnings
+          cargo clippy -p nimbleoffice-fonts --all-targets --features build -- -D warnings
+          cargo clippy -p nimbleoffice-fonts --all-targets --features manager -- -D warnings
+          cargo clippy -p nimbleoffice-fonts --all-targets --features manager,fonts-latin,fonts-intl,fonts-cjk -- -D warnings
+
+      - name: Lint standalone Rust bindings
+        if: steps.ws.outputs.present == 'true'
+        run: |
+          cargo fmt --check --all --manifest-path bindings/Cargo.toml
+          cargo clippy --locked --manifest-path bindings/Cargo.toml --workspace --all-targets -- -D warnings
+
+      # Running a fuzz target needs nightly; checking that the package still builds does not.
+      - name: Lint the standalone fuzz package
+        if: steps.ws.outputs.present == 'true'
+        run: |
+          cargo fmt --check --all --manifest-path fuzz/Cargo.toml
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test
+        if: steps.ws.outputs.present == 'true'
+        run: cargo test
+
+      - name: Remove the workspace test binaries
+        if: steps.ws.outputs.present == 'true'
+        run: find target/debug/deps -maxdepth 1 -type f -executable ! -name '*.so' -delete
+
+      # Optional features are only unified into `cargo test` while some other
+      # workspace member enables them.
+      - name: Test optional features
+        if: steps.ws.outputs.present == 'true'
+        run: |
+          cargo test -p nimbleoffice-drawingml --all-features
+          cargo test -p nimbleoffice-metafile --all-features
+          cargo test -p nimbleoffice-docx-parse --features tiff,metafile
+          cargo test -p nimbleoffice-docx --all-features
+          cargo test -p nimbleoffice-pptx --all-features
+          cargo test -p nimbleoffice-vsdx-edit --features wasm
+          cargo test -p nimbleoffice-docx-edit --features wasm
+          cargo test -p nimbleoffice-docx-layout --no-default-features --test without_base_latin
+          cargo test -p nimbleoffice-docx-layout --features base-latin --test base_latin
+          cargo test -p nimbleoffice-docx-edit --features base-latin --test base_latin
+          cargo test -p nimbleoffice-fonts --features build
+          cargo test -p nimbleoffice-fonts --features manager
+          cargo test -p nimbleoffice-fonts --features manager,fonts-latin,fonts-intl,fonts-cjk
+
+      # cargo-deny-action runs in Docker, which kyora VMs lack; this is the cargo-deny its v2.1.1 runs.
+      - uses: taiki-e/install-action@v2
+        if: steps.ws.outputs.present == 'true'
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: License and advisory gate
+        if: steps.ws.outputs.present == 'true'
+        run: cargo deny --log-level warn --all-features check bans licenses advisories sources
+
+      - name: License and advisory gate for the fuzz package
+        if: steps.ws.outputs.present == 'true'
+        run: cargo deny --log-level warn --manifest-path fuzz/Cargo.toml --all-features --config deny.toml check bans licenses advisories sources
+
+      - name: Disk usage
+        if: always() && steps.ws.outputs.present == 'true'
+        run: |
+          df -h .
+          du -sh target
+
+  native-viewer:
+    name: Native viewer lint
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.BO_CI_RUNNER || vars.BO_CI_SPILL != 'off' && needs.route.outputs.native_viewer || 'kyora-8x16' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Detect native viewer changes
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = pull_request ] && git diff --quiet HEAD^1 HEAD -- apps/native-viewer crates Cargo.lock .github/workflows/ci.yml; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Free disk space
+        if: steps.changes.outputs.run == 'true' && runner.environment == 'github-hosted'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.changes.outputs.run == 'true'
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changes.outputs.run == 'true'
+        with:
+          workspaces: apps/native-viewer -> target
+
+      - name: Format check
+        if: steps.changes.outputs.run == 'true'
+        run: cargo fmt --check --manifest-path apps/native-viewer/Cargo.toml
+
+      - name: Clippy
+        if: steps.changes.outputs.run == 'true'
+        run: cargo clippy --locked --manifest-path apps/native-viewer/Cargo.toml --all-targets -- -D warnings
+
+  python:
+    name: Python gate
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.BO_CI_RUNNER || vars.BO_CI_SPILL != 'off' && needs.route.outputs.python || 'kyora-4x8' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings
+
+      - name: Build and install the extensions
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -I scripts/python_font_packs.py --out "$RUNNER_TEMP/font-packs"
+          python -m pip install "$RUNNER_TEMP"/font-packs/*.whl
+          for binding in $(node scripts/python-bindings.mjs --paths); do
+            python -m pip install --find-links "$RUNNER_TEMP/font-packs" -e "$binding"
+          done
+
+      - name: Test
+        run: |
+          for binding in $(node scripts/python-bindings.mjs --paths); do
+            (cd "$binding" && pytest -q)
+          done
+
+  native:
+    name: Native gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.3"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            bindings
+          key: native
+
+      - uses: ./.github/actions/wasm-toolchain
+
+      - name: Fingerprint the wasm inputs
+        id: wasm
+        run: echo "key=$(bun scripts/wasm-cache-key.ts)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/wasm-pack
+          key: wasm-pack-${{ steps.wasm.outputs.key }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "24"
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: "v2.9.0"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build wasm for parity
+        run: |
+          bun run --filter @nimbleoffice/xlsx build:wasm
+          bun run --filter @nimbleoffice/pptx build:wasm
+          bun run --filter @nimbleoffice/docx build:wasm
+
+      - name: Build and test
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          bun run --filter '@nimbleoffice/fonts-latin' --filter '@nimbleoffice/fonts-intl' --filter '@nimbleoffice/fonts-cjk' build
+          (cd packages/fonts && bunx tsup)
+          for package in $(node scripts/native-bindings.mjs --paths); do
+            bunx napi build --cwd "$package" --platform --release -- --locked
+            bun run --cwd "$package" --if-present build:js
+            bun test "$package/index.test.ts"
+          done
+
+      - name: Check native declarations
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          (cd packages/xlsx && bunx tsup)
+          ls packages/xlsx/dist/*.d.ts | sed 's#.*/##' > "$RUNNER_TEMP/wasm-declarations"
+          ls bindings/xlsx-native/dist/*.d.ts | sed 's#.*/##' | diff "$RUNNER_TEMP/wasm-declarations" -
+          while read -r file; do cmp "packages/xlsx/dist/$file" "bindings/xlsx-native/dist/$file"; done < "$RUNNER_TEMP/wasm-declarations"
+          (cd packages/pptx && bunx tsup)
+          ls packages/pptx/dist/*.d.ts | sed 's#.*/##' > "$RUNNER_TEMP/pptx-wasm-declarations"
+          ls bindings/pptx-native/dist/*.d.ts | sed 's#.*/##' | diff "$RUNNER_TEMP/pptx-wasm-declarations" -
+          while read -r file; do cmp "packages/pptx/dist/$file" "bindings/pptx-native/dist/$file"; done < "$RUNNER_TEMP/pptx-wasm-declarations"
+          (cd packages/docx && bunx tsup)
+          for asset in edit/docx_edit parse/docx_parse query/docx_query opc/ooxml_opc preflight/docx_preflight; do
+            asset_chunks=$(grep -rlF --include='*.mjs' "./generated/${asset}_bg.wasm" packages/docx/dist)
+            test -n "$asset_chunks"
+            while IFS= read -r chunk; do
+              test "$(dirname "$chunk")" = packages/docx/dist
+            done <<< "$asset_chunks"
+          done
+          for package in packages/docx bindings/docx-native; do
+            (cd "$package/dist" && find . -type f \( -name '*.d.ts' -o -name '*.d.mts' \) | LC_ALL=C sort) > "$RUNNER_TEMP/$(basename "$package")-declarations.txt"
+          done
+          test -s "$RUNNER_TEMP/docx-declarations.txt"
+          cmp "$RUNNER_TEMP/docx-declarations.txt" "$RUNNER_TEMP/docx-native-declarations.txt"
+          while IFS= read -r declaration; do
+            cmp "packages/docx/dist/$declaration" "bindings/docx-native/dist/$declaration"
+          done < "$RUNNER_TEMP/docx-declarations.txt"
+
+      - name: Test the xlsx packages on the native engine
+        run: |
+          bun run build:docx-wasm
+          bun run build:fonts
+          bun test --isolate --preload ./scripts/native-engine-preload.ts packages/xlsx scripts/parity/parity.test.ts scripts/native-engine.test.ts
+          bun test --isolate --preload ./scripts/native-engine-preload.ts packages/agents/test/cli-env.test.ts packages/agents/test/defined-names.test.ts packages/agents/test/xlsx-auto-filter.test.ts packages/agents/test/xlsx-charts.test.ts packages/agents/test/xlsx-conditional-formats.test.ts packages/agents/test/xlsx-mcp.test.ts packages/agents/test/xlsx-protected-writes.test.ts packages/agents/test/xlsx.test.ts
+
+      - name: Check engine surface
+        run: |
+          bun scripts/check-engine-surface.ts xlsx
+          bun scripts/check-engine-surface.ts pptx
+          bun scripts/check-engine-surface.ts docx
+          bun scripts/check-engine-surface.ts docx-parse
+          bun scripts/check-engine-surface.ts docx-query
+          bun scripts/check-engine-surface.ts docx-opc
+          bun scripts/check-engine-surface.ts docx-preflight
+
+      - name: Test the pptx packages on the native engine
+        run: |
+          bun test --isolate --preload ./scripts/native-engine-preload.ts packages/pptx/
+          bun test --isolate --preload ./scripts/native-engine-preload.ts packages/agents/test/pptx-mcp.test.ts packages/agents/test/pptx-render.test.ts packages/agents/test/pptx-table.test.ts packages/agents/test/pptx-text-fidelity.test.ts packages/agents/test/pptx.test.ts
+
+      - name: Test the docx packages on the native engine
+        run: bun test --isolate --preload ./scripts/native-engine-preload.ts packages/docx/ packages/docx-react/
+
+      - name: Check native and wasm parity
+        run: bun test bindings/xlsx-native/parity.test.ts bindings/pptx-native/parity.test.ts bindings/xlsx-native/engine.test.ts bindings/pptx-native/engine.test.ts bindings/docx-native/parity.test.ts bindings/docx-native/engine.test.ts
+
+      - name: Check generated declarations
+        run: git diff --exit-code -- 'bindings/*-native/index.d.ts'
+
+      - name: Check runtimes
+        run: |
+          export NIMBLEOFFICE_EXPORT_KEYS="$RUNNER_TEMP/native-export-keys.json"
+          bun scripts/native-export-keys.ts > "$NIMBLEOFFICE_EXPORT_KEYS"
+          node scripts/native-bindings-smoke.mjs
+          (cd packages/docx && bun scripts/copy-assets.ts)
+          node scripts/node-worker-sessions-smoke.mjs
+          node scripts/node-worker-sessions-smoke.mjs --keep-alive
+          timeout 300 bun scripts/node-worker-sessions-smoke.mjs
+          timeout 300 deno run --no-config --node-modules-dir=manual --allow-read --allow-env --allow-ffi scripts/node-worker-sessions-smoke.mjs
+          bun scripts/worker-bundling-smoke.mjs
+          node scripts/check-webpack-exports.mjs --node-import $(node scripts/native-bindings.mjs --paths)
+          bun scripts/native-bindings-smoke.mjs
+          smoke_dir=$(mktemp -d)
+          trap 'rm -rf "$smoke_dir"' EXIT
+          for package in $(node scripts/native-bindings.mjs --paths); do
+            format=${package#bindings/}
+            package_dir="$smoke_dir/node_modules/@nimbleoffice/$format"
+            mkdir -p "$package_dir"
+            cp "$package/package.json" "$package/index.js" "$package/index.d.ts" "$package/"*.node "$package_dir/"
+            if [ -d "$package/dist" ]; then cp -R "$package/dist" "$package_dir/"; fi
+          done
+          cp scripts/native-bindings-smoke.mjs "$smoke_dir/smoke.mjs"
+          deno run --no-config --node-modules-dir=manual --allow-read --allow-env --allow-ffi "$smoke_dir/smoke.mjs" "$PWD"
+
+  native-hooks:
+    name: Native panic hooks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.3"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings
+          key: native-hooks
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test panics through the test hooks
+        env:
+          NIMBLEOFFICE_NATIVE_TEST_HOOKS: "1"
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          for package in $(node scripts/native-bindings.mjs --paths); do
+            bunx napi build --cwd "$package" --platform --profile hooks --features test-hooks -- --locked
+            bun test "$package/panic.test.ts"
+          done

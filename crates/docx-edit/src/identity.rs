@@ -1,0 +1,6831 @@
+//! Paragraph identities: session keys, Word paragraph IDs and anchors.
+//!
+//! A pilcrow's `paraId` is the opaque session key every op addresses; it is
+//! never saved. A paragraph's Word paragraph ID (`w14:paraId`) is its
+//! `ooxmlParaId` binding when the session allocated one, else the immutable
+//! `sourceParaId` seeding recorded from the source package. Identity moves
+//! with the paragraph: a split's first half keeps it and the second half is
+//! allocated a fresh one, a plain merge keeps the earlier paragraph's and a
+//! tracked join the later one's. Editor-only paragraphs carry
+//! `paraOrigin: synthetic` until authoring promotes them.
+//!
+//! Allocated IDs are recorded as claims `{id}/{owner}` in the replicated
+//! [`PARAGRAPH_IDS`] map and published once a save wrote them; a claim keeps
+//! its ID reserved after the paragraph is deleted. Source paragraphs outside
+//! the stories (separators, comments, retained XML) take IDs by occurrence in
+//! [`SOURCE_PARAGRAPH_IDS`]. Duplicates are repaired by ownership: source and
+//! published claims keep their IDs over unpublished ones and copies, and only
+//! an explicit persistence repairs duplicated source IDs.
+
+mod unit_matches;
+
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use docx_parse::paragraph_identity::{
+    ParagraphOccurrence, allocate_paragraph_id_where, format_paragraph_id, parse_paragraph_id,
+};
+use docx_parse::paragraph_patch::{LegacyParagraphV1, ParagraphPatchV1};
+use docx_parse::serializer::S13TablePatch;
+use ooxml_opc::PackageBytes;
+use yrs::branch::Branch;
+use yrs::types::text::YChange;
+use yrs::types::{Delta, EntryChange, Event};
+use yrs::{
+    Any, BranchID, DeepObservable, Doc, Map, MapRef, Observable, Out, ReadTxn, Subscription, Text,
+    TextRef, Transact, Transaction, TransactionMut,
+};
+
+use crate::bridge::run_size_provenance::ParagraphSizes;
+use crate::{
+    EditCtx, EditResult, EditingDoc, KIND_KEY, PARA_ID, ParagraphId, STORIES, StoryId, map_string,
+    pilcrows, story_ref,
+};
+
+/// Pilcrow key: a Word paragraph ID the session allocated.
+pub(crate) const OOXML_PARA_ID: &str = "ooxmlParaId";
+/// Pilcrow key: the source paragraph ID seeding recorded.
+pub(crate) const SOURCE_PARA_ID: &str = "sourceParaId";
+/// Pilcrow key: `synthetic` for a paragraph the editor added.
+pub(crate) const PARA_ORIGIN: &str = "paraOrigin";
+pub(crate) const SYNTHETIC: &str = "synthetic";
+/// Root map of allocation claims.
+pub(crate) const PARAGRAPH_IDS: &str = "paragraphIds";
+/// Root map of IDs assigned to source paragraphs outside the stories.
+pub(crate) const SOURCE_PARAGRAPH_IDS: &str = "sourceParagraphIds";
+/// Root map holding the opening generation.
+pub(crate) const SESSION: &str = "session";
+const GENERATION: &str = "generation";
+
+/// A new opening generation: 128 bits, unique per call.
+fn fresh_generation() -> String {
+    let [high, low] = entropy();
+    format!("{high:016x}{low:016x}")
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub(crate) fn entropy() -> [u64; 2] {
+    let draw = || (js_sys::Math::random() * 9_007_199_254_740_992.0) as u64;
+    [draw() ^ ((js_sys::Date::now() as u64) << 11), draw()]
+}
+
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
+pub(crate) fn entropy() -> [u64; 2] {
+    use std::hash::{BuildHasher, Hasher};
+    static OPENINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let opening = OPENINGS.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    [0u64, 1].map(|lane| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(lane);
+        hasher.write_u128(nanos);
+        hasher.write_u64(opening);
+        hasher.finish()
+    })
+}
+
+/// Kind of Word story a source part holds.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum SourceStoryKind {
+    Body,
+    Header,
+    Footer,
+    Footnote,
+    Endnote,
+    Comment,
+}
+
+/// A Word story qualified by the package part it is read from.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceStory {
+    /// The OPC part name, such as `/word/document.xml`.
+    pub part_uri: String,
+    pub kind: SourceStoryKind,
+    /// The note or comment ID, for the stories that share a part.
+    #[serde(deserialize_with = "crate::peer_bootstrap::required_option")]
+    pub item_id: Option<String>,
+}
+
+/// A paragraph occurrence in the exact source package.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SourceParagraphRef {
+    pub package_sha256: String,
+    pub part_uri: String,
+    /// Zero-based among the part's `w:p` elements in document order.
+    pub paragraph_ordinal: u32,
+}
+
+/// Where a paragraph came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParagraphOrigin {
+    Source,
+    Authored,
+    /// Added by the editor; it saves without an ID until content is authored into it.
+    Synthetic,
+}
+
+/// Where a paragraph's Word paragraph ID comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParagraphIdOrigin {
+    /// Present in the source package.
+    Source,
+    /// Allocated when the paragraph was authored.
+    Authored,
+    /// Allocated by [`EditingDoc::persist_paragraph_ids`].
+    Persisted,
+    /// Allocated to replace a duplicate.
+    Repaired,
+}
+
+impl ParagraphIdOrigin {
+    /// The lowercase wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Authored => "authored",
+            Self::Persisted => "persisted",
+            Self::Repaired => "repaired",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "persisted" => Self::Persisted,
+            "repaired" => Self::Repaired,
+            _ => Self::Authored,
+        }
+    }
+}
+
+/// Addresses one paragraph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParagraphAnchor {
+    /// A session key in one story of one collaborative document session.
+    Session {
+        session_id: String,
+        story: StoryId,
+        para_id: ParagraphId,
+    },
+    /// A paragraph occurrence in the exact source package.
+    Source(SourceParagraphRef),
+    /// A saved Word paragraph ID within its source story.
+    Persisted { story: SourceStory, para_id: String },
+}
+
+/// The paragraph an anchor, assignment or diagnostic names.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ParagraphRef {
+    Session {
+        story: StoryId,
+        para_id: ParagraphId,
+    },
+    /// A source paragraph outside the session stories.
+    Source(SourceParagraphRef),
+}
+
+/// One paragraph's identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParagraphIdentity {
+    pub paragraph: ParagraphRef,
+    pub origin: ParagraphOrigin,
+    /// The Word paragraph ID the paragraph saves with.
+    pub ooxml_para_id: Option<String>,
+    pub id_origin: Option<ParagraphIdOrigin>,
+    /// The story its persisted anchor is qualified by.
+    pub source_story: Option<SourceStory>,
+    /// Its occurrence in the retained source package.
+    pub source: Option<SourceParagraphRef>,
+}
+
+/// Every paragraph's identities: session paragraphs with stories sorted and in
+/// document order, then source paragraphs outside the stories in package order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParagraphIdentities {
+    pub session_id: String,
+    pub package_sha256: Option<String>,
+    pub paragraphs: Vec<ParagraphIdentity>,
+}
+
+/// Why an anchor cannot be resolved here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AnchorUnsupported {
+    ForeignSession,
+    ForeignPackage,
+    NoSourcePackage,
+}
+
+/// Result of [`EditingDoc::resolve_paragraph_anchor`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AnchorResolution {
+    Found(ParagraphRef),
+    Missing,
+    Ambiguous(Vec<ParagraphRef>),
+    Unsupported(AnchorUnsupported),
+}
+
+/// A paragraph [`EditingDoc::persist_paragraph_ids`] gave a Word paragraph ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParagraphIdAssignment {
+    pub paragraph: ParagraphRef,
+    /// The duplicated session key the paragraph carried before repair.
+    pub replaced_para_id: Option<ParagraphId>,
+    /// The duplicated Word paragraph ID it replaces.
+    pub previous_ooxml_para_id: Option<String>,
+    pub ooxml_para_id: String,
+    pub origin: ParagraphIdOrigin,
+    /// The story its persisted anchor is qualified by.
+    pub source_story: Option<SourceStory>,
+}
+
+/// A condition persistence reports without failing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ParagraphIdDiagnostic {
+    /// Saved claims to one ID conflict; the paragraphs keep it and resolve as ambiguous.
+    ConflictingSavedIds {
+        ooxml_para_id: String,
+        paragraphs: Vec<ParagraphRef>,
+    },
+    /// No retained source package, so source paragraphs outside the stories were not covered.
+    NoSourcePackage,
+}
+
+/// What [`EditingDoc::persist_paragraph_ids`] applied.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PersistedParagraphIds {
+    pub assignments: Vec<ParagraphIdAssignment>,
+    pub diagnostics: Vec<ParagraphIdDiagnostic>,
+}
+
+/// Why [`EditingDoc::persist_paragraph_ids`] changed nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ParagraphIdRefusal {
+    /// A duplicated comment paragraph ID needs repair, but the comment
+    /// companion parts reference it, so which comment they mean is ambiguous.
+    AmbiguousCommentReference {
+        ooxml_para_id: String,
+        comment_ids: Vec<String>,
+    },
+}
+
+/// Paragraph IDs a save applies: IDs for source paragraphs outside the
+/// stories, by part and occurrence, and the story parts unchanged since
+/// seeding, which it writes as their source bytes with IDs patched in.
+/// Story parts that still hold the paragraphs they were seeded with, in
+/// order, are spliced: written as their source bytes with only the
+/// paragraphs that changed re-serialized.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ParagraphSavePlan {
+    /// `(part path, ordinal, ID)`.
+    pub assignments: Vec<(String, u32, String)>,
+    /// `(part path, [(ordinal, ID)])`.
+    pub patched_parts: Vec<(String, Vec<(u32, String)>)>,
+    pub spliced_parts: Vec<SplicedPart>,
+    pub section_spliced_parts: Vec<SplicedPart>,
+}
+
+/// A story part whose stories hold the paragraphs seeded from it that they still hold in the
+/// same order, with paragraphs the source lacks only next to one seeded from it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SplicedPart {
+    pub part: String,
+    /// Lowercase hex SHA-256 of the source part.
+    pub sha256: String,
+    /// `(ordinal, session key)` of every paragraph seeded from the part that the stories hold.
+    pub paragraphs: Vec<(u32, String)>,
+    /// The ordinals of those whose segments changed since seeding.
+    pub changed: Vec<u32>,
+    pub section_only: Vec<u32>,
+    /// Where each paragraph the source lacks goes, in document order.
+    pub inserted: Vec<SpliceAnchor>,
+    /// The ordinals of the paragraphs seeded from the part that the stories no longer hold.
+    pub removed: Vec<u32>,
+    pub paragraph_patches: Vec<ParagraphPatchV1>,
+    pub legacy_paragraphs: Vec<LegacyParagraphV1>,
+    pub table_patches: Vec<S13TablePatch>,
+}
+
+impl Eq for SplicedPart {}
+
+/// Where a spliced part takes a paragraph its source lacks: next to a source paragraph of the
+/// same story, with no table or block content control between them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpliceAnchor {
+    /// Right before the source paragraph with this ordinal.
+    Before(u32),
+    /// Right after the source paragraph with this ordinal.
+    After(u32),
+}
+
+impl SpliceAnchor {
+    /// Orders anchors as the positions they name.
+    pub fn position(self) -> (u32, bool) {
+        match self {
+            Self::Before(ordinal) => (ordinal, false),
+            Self::After(ordinal) => (ordinal, true),
+        }
+    }
+}
+
+/// One paragraph as the seeder lowers it, in document order.
+pub(crate) struct SeededParagraph {
+    pub(crate) root: String,
+    pub(crate) key: String,
+    pub(crate) source_para_id: Option<String>,
+    /// The paragraph's `w:p` occurrence in its part.
+    pub(crate) ordinal: Option<u32>,
+    /// `false` for the paragraphs seeding adds.
+    pub(crate) source: bool,
+}
+
+/// One story part: its path, kind, XML and the root stories seeded from it.
+pub(crate) struct SourcePartInput {
+    pub(crate) path: String,
+    pub(crate) kind: SourceStoryKind,
+    pub(crate) xml: String,
+    /// `(root story, note ID)`.
+    pub(crate) roots: Vec<(String, Option<String>)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePart {
+    uri: String,
+    /// Lowercase hex SHA-256 of the part's XML.
+    sha256: String,
+    /// Whether the parser reads the part's XML exactly as written, so its bytes can be kept.
+    as_written: bool,
+    kind: SourceStoryKind,
+    #[serde(with = "crate::peer_bootstrap::occurrences")]
+    occurrences: Vec<ParagraphOccurrence>,
+    /// Occurrence ordinal to the session keys seeded from it: one per root
+    /// story sharing the part, each a view of the same paragraph, first seeded first.
+    #[serde(with = "crate::peer_bootstrap::sorted_map")]
+    backed: HashMap<u32, Vec<String>>,
+    roots: Vec<String>,
+    #[serde(skip)]
+    simple_tables: OnceLock<BTreeSet<u32>>,
+}
+
+impl SourcePart {
+    fn story(&self, item_id: Option<&str>) -> SourceStory {
+        let itemized = matches!(
+            self.kind,
+            SourceStoryKind::Footnote | SourceStoryKind::Endnote | SourceStoryKind::Comment
+        );
+        SourceStory {
+            part_uri: self.uri.clone(),
+            kind: self.kind,
+            item_id: item_id.filter(|_| itemized).map(str::to_owned),
+        }
+    }
+
+    fn path(&self) -> &str {
+        &self.uri[1..]
+    }
+
+    fn occurrence(&self, ordinal: u32) -> Option<&ParagraphOccurrence> {
+        self.occurrences.get(ordinal as usize)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Seeded {
+    root: String,
+    #[serde(deserialize_with = "crate::peer_bootstrap::required_option")]
+    part: Option<usize>,
+    #[serde(deserialize_with = "crate::peer_bootstrap::required_option")]
+    ordinal: Option<u32>,
+    #[serde(deserialize_with = "crate::peer_bootstrap::required_option")]
+    source_para_id: Option<String>,
+}
+
+/// Identity index of the retained source package, reconstructible from its bytes.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceIndex {
+    package_sha256: String,
+    #[serde(skip, default = "empty_package_bytes")]
+    bytes: PackageBytes,
+    occupied: BTreeSet<u32>,
+    /// Story parts in package order.
+    parts: Vec<SourcePart>,
+    #[serde(with = "crate::peer_bootstrap::sorted_map")]
+    roots: HashMap<String, SourceStory>,
+    #[serde(with = "crate::peer_bootstrap::sorted_map")]
+    seeded: HashMap<String, Seeded>,
+    /// IDs the comment companion parts reference.
+    comment_references: BTreeSet<u32>,
+    #[serde(skip)]
+    seed_states: OnceLock<SeedStates>,
+    #[cfg(test)]
+    #[serde(skip)]
+    reseed_calls: std::sync::atomic::AtomicUsize,
+    #[serde(skip)]
+    own_digest: OnceLock<bool>,
+    #[serde(skip)]
+    group_pictures: OnceLock<crate::bridge::GroupPictureSources>,
+    #[serde(skip)]
+    render_theme: OnceLock<docx_parse::Theme>,
+    #[serde(skip)]
+    render_styles: OnceLock<crate::bridge::ShapeStyles>,
+    #[serde(skip)]
+    run_size_sources: Mutex<BTreeMap<String, Option<Arc<ParagraphSizes>>>>,
+    #[serde(skip)]
+    run_size_paragraphs: Mutex<BTreeMap<usize, BTreeMap<u32, docx_parse::xml::XmlElement>>>,
+    #[serde(skip)]
+    run_size_seeded: OnceLock<SeededUnitDigests>,
+    /// Seeded digests of paragraphs read from the session while it was unchanged since seeding,
+    /// keyed like [`Self::run_size_seeded`].
+    #[serde(skip)]
+    run_size_unchanged: Mutex<BTreeMap<String, (String, [u8; 32])>>,
+}
+
+type SeededUnitDigests = BTreeMap<String, Option<(String, [u8; 32])>>;
+
+#[derive(Default)]
+struct SeedStates {
+    stories: HashMap<String, Arc<StoryState>>,
+    patch_table_styles: crate::seed::PatchTableStyles,
+}
+
+fn empty_package_bytes() -> PackageBytes {
+    Vec::new().into()
+}
+
+impl SourceIndex {
+    pub(crate) fn attach_peer_source(&mut self, bytes: PackageBytes) -> Result<(), String> {
+        for (part_index, part) in self.parts.iter().enumerate() {
+            if !part.uri.starts_with('/') || part.uri.len() == 1 {
+                return Err("invalid source part URI".to_owned());
+            }
+            for (ordinal, occurrence) in part.occurrences.iter().enumerate() {
+                if occurrence.ordinal as usize != ordinal
+                    || occurrence.tag.start >= occurrence.tag.end
+                {
+                    return Err("invalid source paragraph occurrence".to_owned());
+                }
+            }
+            for (ordinal, views) in &part.backed {
+                if *ordinal as usize >= part.occurrences.len() || views.is_empty() {
+                    return Err("invalid source paragraph views".to_owned());
+                }
+                let mut roots = HashSet::new();
+                for key in views {
+                    let seed = self
+                        .seeded
+                        .get(key)
+                        .ok_or("invalid source paragraph view")?;
+                    if seed.part != Some(part_index)
+                        || seed.ordinal != Some(*ordinal)
+                        || !roots.insert(&seed.root)
+                    {
+                        return Err("inconsistent source paragraph view".to_owned());
+                    }
+                }
+            }
+        }
+        for (key, seed) in &self.seeded {
+            if let Some(part) = seed.part {
+                let part = self.parts.get(part).ok_or("invalid seeded part")?;
+                if seed
+                    .ordinal
+                    .is_some_and(|ordinal| ordinal as usize >= part.occurrences.len())
+                {
+                    return Err("invalid seeded paragraph ordinal".to_owned());
+                }
+                if let Some(ordinal) = seed.ordinal
+                    && !part
+                        .backed
+                        .get(&ordinal)
+                        .is_some_and(|views| views.contains(key))
+                {
+                    return Err("seeded paragraph missing its source view".to_owned());
+                }
+            } else if seed.ordinal.is_some() {
+                return Err("seeded paragraph ordinal without a part".to_owned());
+            }
+        }
+        self.bytes = bytes;
+        self.render_theme = OnceLock::new();
+        self.render_styles = OnceLock::new();
+        Ok(())
+    }
+
+    pub(crate) fn package_digest(&self) -> &str {
+        &self.package_sha256
+    }
+
+    pub(crate) fn seed_states_initialized(&self) -> bool {
+        self.seed_states.get().is_some()
+    }
+
+    pub(crate) fn group_picture_sources(&self) -> crate::bridge::GroupPictureSources {
+        self.group_pictures
+            .get_or_init(|| crate::bridge::group_pictures::source_shapes(self.bytes(), &self.roots))
+            .clone()
+    }
+
+    pub(crate) fn render_styles(&self) -> crate::bridge::ShapeStyles {
+        self.render_styles
+            .get_or_init(|| {
+                let parts = ooxml_opc::unzip_parts_where(
+                    &self.bytes(),
+                    ooxml_opc::MAX_TOTAL_UNCOMPRESSED_BYTES,
+                    |name| {
+                        matches!(
+                            name,
+                            "word/styles.xml" | "word/theme/theme1.xml" | "word/settings.xml"
+                        )
+                    },
+                )
+                .ok();
+                crate::bridge::ShapeStyles::new(
+                    parts.and_then(|parts| crate::seed::StyleResolver::from_parts(&parts).ok()),
+                )
+            })
+            .clone()
+    }
+
+    pub(crate) fn render_theme(&self) -> &docx_parse::Theme {
+        self.render_theme.get_or_init(|| {
+            ooxml_opc::RetainedPackage::from_bytes(self.bytes())
+                .ok()
+                .as_ref()
+                .and_then(crate::bridge::package_font_theme)
+                .unwrap_or_default()
+        })
+    }
+
+    pub(crate) fn bytes(&self) -> PackageBytes {
+        self.bytes.clone()
+    }
+
+    /// Whether any of `ordinals` in `part` is a paragraph [`rewriting_loses_source_runs`]; an
+    /// unreadable part or paragraph counts as one.
+    fn rewrite_loses_source_runs(
+        &self,
+        part: &SourcePart,
+        ordinals: &[u32],
+        loses: fn(&str) -> bool,
+    ) -> bool {
+        if ordinals.is_empty() {
+            return false;
+        }
+        let read = || -> Option<String> {
+            let package = ooxml_opc::RetainedPackage::from_bytes(self.bytes()).ok()?;
+            let position = package.parts().position(|(path, _)| path == part.path())?;
+            String::from_utf8(package.read(position).ok()?).ok()
+        };
+        let Some(xml) = read() else {
+            return true;
+        };
+        ordinals.iter().any(|&ordinal| {
+            let Some(start) = part
+                .occurrence(ordinal)
+                .map(|occurrence| occurrence.tag.start)
+            else {
+                return true;
+            };
+            docx_parse::serializer::element_span(&xml[start..], &[])
+                .is_none_or(|span| loses(&xml[start..][span]))
+        })
+    }
+
+    fn paragraph_xml(&self, part: &SourcePart, ordinal: u32) -> Option<String> {
+        let package = ooxml_opc::RetainedPackage::from_bytes(self.bytes()).ok()?;
+        let position = package.parts().position(|(path, _)| path == part.path())?;
+        let xml = String::from_utf8(package.read(position).ok()?).ok()?;
+        let start = part.occurrence(ordinal)?.tag.start;
+        let paragraph = &xml[start..];
+        let span = docx_parse::serializer::element_span(paragraph, &[])?;
+        Some(paragraph[span].to_owned())
+    }
+
+    pub(crate) fn run_size_source(&self, key: &str, story: &str) -> Option<Arc<ParagraphSizes>> {
+        if self.seeded.get(key)?.root != crate::structured::source::story_root(story) {
+            return None;
+        }
+        self.view_of(key)?;
+        let unchanged = self.run_size_unchanged.lock().unwrap().get(key).cloned();
+        let (seed_story, fingerprint) = match unchanged {
+            Some(seeded) => seeded,
+            None => {
+                let seeded = self.run_size_seeded.get_or_init(|| {
+                    #[cfg(test)]
+                    RUN_SIZE_SEEDED_SNAPSHOTS.with(|count| count.set(count.get() + 1));
+                    let mut units = BTreeMap::new();
+                    for (story, state) in self.seed_states() {
+                        for unit in &state.units {
+                            if let Some(key) = &unit.key {
+                                match units.entry(key.clone()) {
+                                    std::collections::btree_map::Entry::Vacant(entry) => {
+                                        entry.insert(Some((story.clone(), unit.digest)));
+                                    }
+                                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                        entry.insert(None);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    units
+                });
+                seeded.get(key)?.clone()?
+            }
+        };
+        if seed_story != story {
+            return None;
+        }
+        let mut cache = self.run_size_sources.lock().unwrap();
+        cache
+            .entry(key.to_owned())
+            .or_insert_with(|| self.collect_run_sizes(key, fingerprint).map(Arc::new))
+            .clone()
+    }
+
+    /// Whether a paragraph read from the session now is what seeding recorded: no commit has
+    /// landed since seeding, seed states are not yet known, and the package was opened under
+    /// its own digest, so the session's stories are those a reseed would give.
+    pub(crate) fn reads_as_seeded(&self, doc: &EditingDoc) -> bool {
+        doc.unchanged_since_seeded()
+            && !self.seed_states_initialized()
+            && self.opened_under_own_digest()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reseed_for_tests(&self) {
+        self.seed_states();
+    }
+
+    /// Records the seeded digest of the paragraph `key` closes in `story`, read from a session
+    /// for which [`Self::reads_as_seeded`] holds, where `key` closes no other paragraph, so a
+    /// run size proof for it needs no seed states.
+    pub(crate) fn note_seeded_run_size(&self, key: &str, story: &str, fingerprint: [u8; 32]) {
+        self.run_size_unchanged
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_insert_with(|| (story.to_owned(), fingerprint));
+    }
+
+    fn collect_run_sizes(&self, key: &str, fingerprint: [u8; 32]) -> Option<ParagraphSizes> {
+        use docx_parse::xml::{ParseBudget, ParseLimits, XmlElement, parse_xml};
+
+        fn paragraphs(node: &XmlElement, output: &mut BTreeMap<u32, XmlElement>) {
+            if node.local_name() == "p"
+                && let Some(ordinal) = node.paragraph_ordinal
+            {
+                output.insert(ordinal, node.clone());
+            }
+            for child in node.child_elements() {
+                paragraphs(child, output);
+            }
+        }
+
+        let ((part_index, ordinal), _) = self.view_of(key)?;
+        let path = self.parts.get(part_index)?.path();
+        let limits = ParseLimits::default();
+        let mut budget = ParseBudget::new(&limits);
+        budget.record_source_ordinals();
+        let mut cache = self.run_size_paragraphs.lock().unwrap();
+        let nodes = cache.entry(part_index).or_insert_with(|| {
+            #[cfg(test)]
+            RUN_SIZE_SOURCE_PARTS.with(|count| count.set(count.get() + 1));
+            let mut nodes = BTreeMap::new();
+            let Ok(package) = ooxml_opc::RetainedPackage::from_bytes(self.bytes()) else {
+                return nodes;
+            };
+            let Some(index) = package.parts().position(|(name, _)| name == path) else {
+                return nodes;
+            };
+            if let Ok(bytes) = package.read(index)
+                && let Ok(document) = parse_xml(&bytes, path, &mut budget)
+                && let Some(root) = document.root()
+            {
+                paragraphs(root, &mut nodes);
+            }
+            nodes
+        });
+        crate::bridge::run_size_provenance::paragraph_sizes(nodes.get(&ordinal)?, fingerprint)
+    }
+
+    pub(crate) fn new(
+        package_sha256: String,
+        bytes: PackageBytes,
+        occupied: BTreeSet<u32>,
+        inputs: Vec<SourcePartInput>,
+        comment_references: BTreeSet<u32>,
+        lowered: Vec<SeededParagraph>,
+    ) -> Self {
+        let mut parts = Vec::new();
+        let mut roots = HashMap::new();
+        let mut part_of_root = HashMap::new();
+        for input in inputs {
+            let part = SourcePart {
+                uri: format!("/{}", input.path),
+                sha256: {
+                    use sha2::{Digest, Sha256};
+                    format!("{:x}", Sha256::digest(input.xml.as_bytes()))
+                },
+                as_written: docx_parse::xml::reads_as_written(input.xml.as_bytes()),
+                kind: input.kind,
+                occurrences: docx_parse::paragraph_identity::paragraph_occurrences(&input.xml)
+                    .unwrap_or_default(),
+                backed: HashMap::new(),
+                roots: input.roots.iter().map(|(root, _)| root.clone()).collect(),
+                simple_tables: OnceLock::new(),
+            };
+            for (root, item_id) in &input.roots {
+                roots.insert(root.clone(), part.story(item_id.as_deref()));
+                part_of_root.insert(root.clone(), parts.len());
+            }
+            parts.push(part);
+        }
+        let mut seeded = HashMap::new();
+        for paragraph in lowered.into_iter().filter(|paragraph| paragraph.source) {
+            let part = part_of_root.get(&paragraph.root).copied();
+            let mut ordinal = None;
+            if let (Some(index), Some(candidate)) = (part, paragraph.ordinal) {
+                let views = parts[index].backed.entry(candidate).or_default();
+                let viewed = |key: &String| {
+                    seeded
+                        .get(key)
+                        .is_some_and(|seed: &Seeded| seed.root == paragraph.root)
+                };
+                if !views.iter().any(viewed) {
+                    views.push(paragraph.key.clone());
+                    ordinal = Some(candidate);
+                }
+            }
+            seeded.insert(
+                paragraph.key,
+                Seeded {
+                    root: paragraph.root,
+                    part,
+                    ordinal,
+                    source_para_id: paragraph.source_para_id,
+                },
+            );
+        }
+        Self {
+            package_sha256,
+            bytes,
+            occupied,
+            parts,
+            roots,
+            seeded,
+            comment_references,
+            seed_states: OnceLock::new(),
+            #[cfg(test)]
+            reseed_calls: std::sync::atomic::AtomicUsize::new(0),
+            own_digest: OnceLock::new(),
+            group_pictures: OnceLock::new(),
+            render_theme: OnceLock::new(),
+            render_styles: OnceLock::new(),
+            run_size_sources: Mutex::new(BTreeMap::new()),
+            run_size_paragraphs: Mutex::new(BTreeMap::new()),
+            run_size_seeded: OnceLock::new(),
+            run_size_unchanged: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn part(&self, uri: &str) -> Option<&SourcePart> {
+        self.parts.iter().find(|part| part.uri == uri)
+    }
+
+    fn simple_table(&self, index: usize, ordinal: u32) -> bool {
+        let part = &self.parts[index];
+        part.simple_tables
+            .get_or_init(|| self.simple_table_paragraphs(part).unwrap_or_default())
+            .contains(&ordinal)
+    }
+
+    fn simple_table_paragraphs(&self, part: &SourcePart) -> Option<BTreeSet<u32>> {
+        let package = ooxml_opc::RetainedPackage::from_bytes(self.bytes()).ok()?;
+        let position = package.parts().position(|(path, _)| path == part.path())?;
+        let xml = String::from_utf8(package.read(position).ok()?).ok()?;
+        let spans = docx_parse::paragraph_identity::simple_table_spans(&xml)?;
+        Some(
+            part.occurrences
+                .iter()
+                .filter(|occurrence| {
+                    spans
+                        .iter()
+                        .any(|span| span.contains(&occurrence.tag.start))
+                })
+                .map(|occurrence| occurrence.ordinal)
+                .collect(),
+        )
+    }
+
+    fn reference(&self, part: &SourcePart, ordinal: u32) -> SourceParagraphRef {
+        SourceParagraphRef {
+            package_sha256: self.package_sha256.clone(),
+            part_uri: part.uri.clone(),
+            paragraph_ordinal: ordinal,
+        }
+    }
+
+    /// Source paragraphs no seeded story holds, in package order.
+    fn unbacked(&self) -> impl Iterator<Item = (usize, &ParagraphOccurrence)> {
+        self.parts.iter().enumerate().flat_map(|(index, part)| {
+            part.occurrences
+                .iter()
+                .filter(move |occurrence| !part.backed.contains_key(&occurrence.ordinal))
+                .map(move |occurrence| (index, occurrence))
+        })
+    }
+
+    /// The part and occurrence `key` was seeded from, and the rank of its
+    /// view among the stories sharing the part, the first seeded first.
+    fn view_of(&self, key: &str) -> Option<((usize, u32), usize)> {
+        let seed = self.seeded.get(key)?;
+        let (part, ordinal) = seed.part.zip(seed.ordinal)?;
+        let rank = self.parts[part]
+            .backed
+            .get(&ordinal)?
+            .iter()
+            .position(|view| view == key)?;
+        Some(((part, ordinal), rank))
+    }
+
+    /// Keeps, of the paragraphs that view one occurrence, the first-ranked.
+    fn first_views<'a>(&self, pilcrows: impl Iterator<Item = &'a Pilcrow>) -> Vec<&'a Pilcrow> {
+        let mut kept: Vec<&Pilcrow> = Vec::new();
+        let mut viewed: HashMap<(usize, u32), (usize, usize)> = HashMap::new();
+        for pilcrow in pilcrows {
+            if let Some((occurrence, rank)) = self.view_of(&pilcrow.key) {
+                match viewed.entry(occurrence) {
+                    Entry::Occupied(mut entry) => {
+                        let (best, at) = *entry.get();
+                        if rank < best {
+                            kept[at] = pilcrow;
+                            entry.insert((rank, at));
+                        }
+                        continue;
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert((rank, kept.len()));
+                    }
+                }
+            }
+            kept.push(pilcrow);
+        }
+        kept
+    }
+
+    /// Whether `key` names the paragraph seeded from this package, rather than a copy.
+    fn seeds(&self, key: &str, id: u32) -> bool {
+        self.seeded
+            .get(key)
+            .and_then(|seed| seed.source_para_id.as_deref())
+            .and_then(parse_paragraph_id)
+            == Some(id)
+    }
+
+    /// Every story as seeded; see [`StoryState`].
+    fn seed_states(&self) -> &HashMap<String, Arc<StoryState>> {
+        self.seed_states_or(|| self.reseeded())
+    }
+
+    /// [`Self::seed_states`], taken from `seeded` when not yet known: what a session's stories
+    /// hold while unchanged since it seeded them from this package, which seeding a scratch
+    /// document again would only repeat.
+    fn seed_states_or(
+        &self,
+        seeded: impl FnOnce() -> SeedStates,
+    ) -> &HashMap<String, Arc<StoryState>> {
+        if let Some(seeded) = self.seed_states.get() {
+            return &seeded.stories;
+        }
+        let seeded = seeded();
+        &self.seed_states.get_or_init(|| seeded).stories
+    }
+
+    /// Whether the package was opened under its own digest, the one seeding it again derives
+    /// paragraph IDs from.
+    fn opened_under_own_digest(&self) -> bool {
+        *self
+            .own_digest
+            .get_or_init(|| crate::seed::package_digest(&self.bytes) == self.package_sha256)
+    }
+
+    fn reseeded(&self) -> SeedStates {
+        #[cfg(test)]
+        self.reseed_calls.fetch_add(1, Ordering::Relaxed);
+        let scratch = EditingDoc::new(0);
+        if crate::seed::seed_stories(&scratch, &self.bytes).is_err() {
+            return SeedStates::default();
+        }
+        let txn = scratch.yrs_doc().transact();
+        SeedStates {
+            stories: story_states_within(&scratch, &txn, None).unwrap_or_default(),
+            patch_table_styles: scratch
+                .source_metadata()
+                .map(|metadata| metadata.patch_table_styles().clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn patch_table_styles(&self) -> &crate::seed::PatchTableStyles {
+        self.seed_states();
+        &self
+            .seed_states
+            .get()
+            .expect("seed states initialized")
+            .patch_table_styles
+    }
+}
+
+/// The retained source package: its bytes, and their digest when known,
+/// until an identity read needs the index.
+pub(crate) enum SourcePackage {
+    Pending(PackageBytes, Option<String>),
+    Ready(Arc<SourceIndex>),
+}
+
+pub(crate) fn source_index(source: &Mutex<Option<SourcePackage>>) -> Option<Arc<SourceIndex>> {
+    let mut source = source.lock().unwrap();
+    let index = match source.as_ref()? {
+        SourcePackage::Ready(index) => return Some(Arc::clone(index)),
+        SourcePackage::Pending(bytes, digest) => {
+            crate::seed::source_index(bytes.clone(), digest.clone())
+                .ok()
+                .map(Arc::new)
+        }
+    };
+    *source = index.clone().map(SourcePackage::Ready);
+    index
+}
+
+/// What a save projects from one story, compared with the story as seeded
+/// to decide whether its part saves as its source bytes.
+#[derive(Debug, PartialEq)]
+struct StoryState {
+    root: String,
+    /// Digest of every segment the projection reads: see [`story_fingerprint`].
+    fingerprint: [u8; 32],
+    /// The story's paragraphs, each with the segments up to and including its pilcrow.
+    units: Vec<UnitState>,
+    /// Where each comment anchored in the story starts and ends, carets and
+    /// ranges over embeds included: the projection's comment markers.
+    comments: BTreeMap<String, Vec<(u32, u32)>>,
+}
+
+impl StoryState {
+    fn same_projection(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.fingerprint == other.fingerprint
+            && self.comments == other.comments
+            && self.units.len() == other.units.len()
+            && self
+                .units
+                .iter()
+                .zip(&other.units)
+                .all(|(unit, other)| unit.same_projection(other))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct StoryStateCache {
+    generation: u64,
+    media: Option<Arc<docx_parse::media::MediaTable>>,
+    entries: HashMap<String, CachedStoryState>,
+}
+
+struct CachedStoryState {
+    revision: u64,
+    state: Arc<StoryState>,
+    pending_trim: bool,
+}
+
+impl StoryStateCache {
+    pub(crate) fn clear(&mut self) {
+        *self = Self {
+            generation: self.generation.wrapping_add(1),
+            ..Self::default()
+        };
+    }
+
+    fn has_media(&self, media: &Option<Arc<docx_parse::media::MediaTable>>) -> bool {
+        match (&self.media, media) {
+            (Some(before), Some(now)) => Arc::ptr_eq(before, now),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn retain_patch_segments(
+        &mut self,
+        seeded: &HashMap<String, Arc<StoryState>>,
+        by_key: &UnitIndex<'_>,
+    ) {
+        if !self.entries.values().any(|cached| cached.pending_trim) {
+            return;
+        }
+        if !by_key.unique {
+            return;
+        }
+        for (story, cached) in &mut self.entries {
+            if !cached.pending_trim {
+                continue;
+            }
+            if let Some(seed) = seeded.get(story) {
+                if Arc::ptr_eq(&cached.state, seed) {
+                    cached.pending_trim = false;
+                    continue;
+                }
+                if cached.state.same_projection(seed) {
+                    cached.state = Arc::clone(seed);
+                    cached.pending_trim = false;
+                    continue;
+                }
+            }
+            let Some(state) = Arc::get_mut(&mut cached.state) else {
+                continue;
+            };
+            for unit in &mut state.units {
+                if let Some((_, seed)) = unit.key.as_deref().and_then(|key| by_key.get(key))
+                    && unit.digest == seed.digest
+                    && unit.content_digest == seed.content_digest
+                {
+                    if unit.same_projection(seed) {
+                        unit.projection = Arc::clone(&seed.projection);
+                    }
+                    unit.segments = None;
+                }
+            }
+            cached.pending_trim = false;
+        }
+    }
+
+    pub(crate) fn evict_root_changes(
+        cache: &Mutex<Self>,
+        txn: &TransactionMut<'_>,
+        events: &yrs::types::Events,
+    ) {
+        for event in events.iter() {
+            if let Event::Map(event) = event
+                && event.path().is_empty()
+            {
+                let mut cache = cache.lock().unwrap();
+                for story in event.keys(txn).keys() {
+                    cache.entries.remove(story.as_ref());
+                }
+            }
+        }
+    }
+}
+
+/// One paragraph's segments in a story, or the segments after its last pilcrow.
+#[derive(Clone, Debug, PartialEq)]
+struct UnitState {
+    projection: Arc<UnitProjection>,
+    segments: Option<Vec<crate::StorySegment>>,
+}
+
+#[derive(Debug, PartialEq)]
+struct UnitProjection {
+    /// The session key of the pilcrow closing the unit.
+    key: Option<String>,
+    /// Digest of all the unit's segments.
+    digest: [u8; 32],
+    /// Digest of its table and block content control embeds, which open their own blocks.
+    blocks: [u8; 32],
+    block_content: Vec<serde_json::Value>,
+    content_digest: [u8; 32],
+    section_digest: [u8; 32],
+    /// Whether the unit holds anything besides those embeds and its pilcrow.
+    inline: bool,
+    markers: Vec<(u32, String, bool)>,
+}
+
+impl std::ops::Deref for UnitState {
+    type Target = UnitProjection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.projection
+    }
+}
+
+impl UnitState {
+    fn same_projection(&self, other: &Self) -> bool {
+        self.projection.same_projection(&other.projection)
+    }
+
+    fn from_projection(
+        projection: UnitProjection,
+        segments: Vec<crate::StorySegment>,
+        seeded: Option<&UnitIndex<'_>>,
+    ) -> Self {
+        let seed = seeded
+            .and_then(|seeded| projection.key.as_deref().and_then(|key| seeded.get(key)))
+            .map(|(_, unit)| *unit);
+        let segments = if seed.is_some_and(|seed| {
+            projection.digest == seed.digest && projection.content_digest == seed.content_digest
+        }) {
+            None
+        } else {
+            Some(segments)
+        };
+        let projection = match seed {
+            Some(seed) if projection.same_projection(&seed.projection) => {
+                Arc::clone(&seed.projection)
+            }
+            _ => {
+                #[cfg(test)]
+                UNIT_PROJECTIONS.with(|count| count.set(count.get() + 1));
+                Arc::new(projection)
+            }
+        };
+        Self {
+            projection,
+            segments,
+        }
+    }
+
+    fn has_blocks(&self) -> bool {
+        use sha2::{Digest, Sha256};
+        self.blocks != <[u8; 32]>::from(Sha256::new().finalize())
+    }
+}
+
+impl UnitProjection {
+    fn same_projection(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.digest == other.digest
+            && self.blocks == other.blocks
+            && self.content_digest == other.content_digest
+            && self.section_digest == other.section_digest
+            && self.inline == other.inline
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SaveSeeds<'a> {
+    stories: &'a HashMap<String, Arc<StoryState>>,
+    units: &'a UnitIndex<'a>,
+}
+
+#[cfg(test)]
+fn story_states(doc: &EditingDoc) -> HashMap<String, Arc<StoryState>> {
+    let txn = doc.yrs_doc().transact();
+    story_states_in(doc, &txn, None)
+}
+
+fn story_states_in(
+    doc: &EditingDoc,
+    txn: &Transaction<'_>,
+    seeded: Option<SaveSeeds<'_>>,
+) -> HashMap<String, Arc<StoryState>> {
+    #[cfg(test)]
+    if doc.save_story_cache_disabled.load(Ordering::Relaxed) {
+        return story_states_within(doc, txn, None).unwrap_or_default();
+    }
+    let compacted = seeded.is_some_and(|seeded| seeded.units.unique);
+    let scan = doc.committed_scan(txn);
+    let revisions: Vec<_> = {
+        let revisions = doc.story_revisions.lock().unwrap();
+        scan.stories
+            .iter()
+            .map(|story| revisions.stamped.get(story.as_str()).copied())
+            .collect()
+    };
+    let media = doc.media_table();
+    let comments = scan
+        .stories
+        .iter()
+        .map(|story| crate::canonical::story_comment_anchors(txn, story));
+    let inputs: Vec<_> = scan.stories.iter().zip(revisions).zip(comments).collect();
+    let mut states = HashMap::new();
+    let mut missing = Vec::new();
+    let generation = {
+        let mut cache = doc.save_story_states.lock().unwrap();
+        if !cache.has_media(&media) {
+            cache.clear();
+            cache.media = media.clone();
+        }
+        cache
+            .entries
+            .retain(|story, _| scan.stories.binary_search(story).is_ok());
+        for ((story, revision), comments) in inputs {
+            if let Some(cached) = cache.entries.get(story)
+                && revision == Some(cached.revision)
+                && cached.state.root == scan.root(story)
+                && cached.state.comments == comments
+            {
+                states.insert(story.clone(), Arc::clone(&cached.state));
+            } else {
+                cache.entries.remove(story);
+                missing.push((story, revision, comments));
+            }
+        }
+        cache.generation
+    };
+    let mut computed = Vec::new();
+    for (story, revision, comments) in missing {
+        let Some((fingerprint, units, same_seed)) =
+            story_fingerprint_for_save(doc, txn, story, &comments, &mut None, seeded)
+        else {
+            continue;
+        };
+        let seed = seeded.and_then(|seeded| seeded.stories.get(story));
+        let state = match seed {
+            Some(seed)
+                if same_seed
+                    && fingerprint == seed.fingerprint
+                    && seed.root == scan.root(story)
+                    && seed.comments == comments =>
+            {
+                Arc::clone(seed)
+            }
+            _ => Arc::new(StoryState {
+                root: scan.root(story).to_owned(),
+                fingerprint,
+                units,
+                comments,
+            }),
+        };
+        if let Some(revision) = revision {
+            computed.push((story, revision));
+        }
+        states.insert(story.clone(), state);
+    }
+    if computed.is_empty() {
+        return states;
+    }
+    let current_scan = doc.committed_scan(txn);
+    let current_media = doc.media_table();
+    let current_revisions: Vec<_> = {
+        let revisions = doc.story_revisions.lock().unwrap();
+        computed
+            .iter()
+            .map(|(story, _)| revisions.stamped.get(story.as_str()).copied())
+            .collect()
+    };
+    let validated: Vec<_> = computed
+        .into_iter()
+        .zip(current_revisions)
+        .filter_map(|((story, revision), current)| {
+            let state = &states[story];
+            (current == Some(revision)
+                && current_scan.stories.binary_search(story).is_ok()
+                && state.root == current_scan.root(story)
+                && crate::canonical::story_comment_anchors(txn, story) == state.comments)
+                .then_some((story, revision))
+        })
+        .collect();
+    let mut cache = doc.save_story_states.lock().unwrap();
+    if cache.generation != generation
+        || !cache.has_media(&media)
+        || !cache.has_media(&current_media)
+    {
+        return states;
+    }
+    for (story, revision) in validated {
+        let state = &states[story];
+        if let Some(cached) = cache.entries.get(story)
+            && cached.revision == revision
+            && cached.state.root == state.root
+            && cached.state.comments == state.comments
+        {
+            states.insert(story.clone(), Arc::clone(&cached.state));
+        } else {
+            cache.entries.insert(
+                story.clone(),
+                CachedStoryState {
+                    revision,
+                    state: Arc::clone(state),
+                    pending_trim: !compacted,
+                },
+            );
+        }
+    }
+    states
+}
+
+/// [`story_states_in`] within `budget` bytes, when given one, of media URLs
+/// written and of segment text held, each counted at every use; `None` once
+/// it runs out.
+fn story_states_within(
+    doc: &EditingDoc,
+    txn: &Transaction<'_>,
+    mut budget: Option<usize>,
+) -> Option<HashMap<String, Arc<StoryState>>> {
+    let (scan, mut comments) = {
+        let scan = doc.committed_scan(txn);
+        let comments: HashMap<String, BTreeMap<String, Vec<(u32, u32)>>> = scan
+            .stories
+            .iter()
+            .map(|story| {
+                let anchors = crate::canonical::story_comment_anchors(txn, story);
+                (story.clone(), anchors)
+            })
+            .collect();
+        (scan, comments)
+    };
+    let mut states = HashMap::new();
+    for story in &scan.stories {
+        let comments = comments.remove(story).unwrap_or_default();
+        let fingerprint = story_fingerprint_within(doc, txn, story, &comments, &mut budget);
+        if budget == Some(0) {
+            return None;
+        }
+        let Some((fingerprint, units)) = fingerprint else {
+            continue;
+        };
+        let root = scan.root(story).to_owned();
+        let state = Arc::new(StoryState {
+            root,
+            fingerprint,
+            units,
+            comments,
+        });
+        states.insert(story.clone(), state);
+    }
+    Some(states)
+}
+
+fn ordered(value: &Any) -> serde_json::Value {
+    match value {
+        Any::Map(map) => ordered_map(map.iter()),
+        Any::Array(values) => serde_json::Value::Array(values.iter().map(ordered).collect()),
+        value => serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+fn ordered_map<'a>(entries: impl Iterator<Item = (&'a String, &'a Any)>) -> serde_json::Value {
+    let sorted: BTreeMap<&String, serde_json::Value> =
+        entries.map(|(key, value)| (key, ordered(value))).collect();
+    serde_json::Value::Object(
+        sorted
+            .into_iter()
+            .map(|(key, value)| (key.clone(), value))
+            .collect(),
+    )
+}
+
+/// `segment` as the `[content, attributes]` value a unit keeps for a block embed, map keys sorted.
+fn segment_value(segment: &crate::StorySegment) -> serde_json::Value {
+    let content = match &segment.content {
+        crate::SegmentContent::Text(text) => serde_json::json!({ "text": text }),
+        crate::SegmentContent::Pilcrow(properties) => {
+            serde_json::json!({ "pilcrow": ordered_map(properties.values.iter()) })
+        }
+        crate::SegmentContent::OtherEmbed { kind, payload } => {
+            serde_json::json!({ "embed": kind, "payload": ordered_map(payload.iter()) })
+        }
+    };
+    serde_json::json!([content, ordered_map(segment.attributes.iter())])
+}
+
+/// Writes into `entry` the JSON of [`segment_value`], and into `section` the JSON of that value
+/// with its pilcrow's section properties left out, or with a null pilcrow when it has none,
+/// byte for byte as `serde_json` writes them, without building either value.
+/// The bytes of text and strings `segment` holds, each counted at every use:
+/// about what [`segment_canonical`] copies of it.
+fn segment_text_len(segment: &crate::StorySegment) -> usize {
+    let content = match &segment.content {
+        crate::SegmentContent::Text(text) => text.len(),
+        crate::SegmentContent::Pilcrow(properties) => entries_text_len(&properties.values),
+        crate::SegmentContent::OtherEmbed { payload, .. } => entries_text_len(payload),
+    };
+    content.saturating_add(entries_text_len(&segment.attributes))
+}
+
+fn entries_text_len<'a>(entries: impl IntoIterator<Item = (&'a String, &'a Any)>) -> usize {
+    entries.into_iter().fold(0, |total, (key, value)| {
+        total
+            .saturating_add(key.len())
+            .saturating_add(any_text_len(value))
+    })
+}
+
+fn any_text_len(value: &Any) -> usize {
+    match value {
+        Any::String(text) => text.len(),
+        Any::Buffer(bytes) => bytes.len(),
+        Any::Array(items) => items
+            .iter()
+            .fold(0, |total, item| total.saturating_add(any_text_len(item))),
+        Any::Map(map) => entries_text_len(map.iter()),
+        _ => 8,
+    }
+}
+
+fn segment_canonical(segment: &crate::StorySegment, entry: &mut Vec<u8>, section: &mut Vec<u8>) {
+    entry.clear();
+    section.clear();
+    match &segment.content {
+        crate::SegmentContent::Text(text) => {
+            entry.extend_from_slice(b"[{\"text\":");
+            write_canonical_str(entry, text);
+            entry.push(b'}');
+            write_canonical_attributes(entry, segment);
+            section.extend_from_slice(b"[{\"pilcrow\":null,");
+            section.extend_from_slice(&entry[2..]);
+        }
+        crate::SegmentContent::OtherEmbed { kind, payload } => {
+            entry.extend_from_slice(b"[{\"embed\":");
+            write_canonical_str(entry, kind);
+            entry.extend_from_slice(b",\"payload\":");
+            write_canonical_map(entry, payload.iter(), &[]);
+            let end = entry.len();
+            entry.push(b'}');
+            write_canonical_attributes(entry, segment);
+            section.extend_from_slice(&entry[..end]);
+            section.extend_from_slice(b",\"pilcrow\":null");
+            section.extend_from_slice(&entry[end..]);
+        }
+        crate::SegmentContent::Pilcrow(properties) => {
+            entry.extend_from_slice(b"[{\"pilcrow\":");
+            write_canonical_map(entry, properties.values.iter(), &[]);
+            let end = entry.len();
+            entry.push(b'}');
+            write_canonical_attributes(entry, segment);
+            section.extend_from_slice(b"[{\"pilcrow\":");
+            write_canonical_map(
+                section,
+                properties.values.iter(),
+                &["sectPr", "_sectionProperties", "sectionBreakType"],
+            );
+            section.extend_from_slice(&entry[end..]);
+        }
+    }
+}
+
+fn write_canonical_attributes(out: &mut Vec<u8>, segment: &crate::StorySegment) {
+    out.push(b',');
+    write_canonical_map(out, segment.attributes.iter(), &[]);
+    out.push(b']');
+}
+
+fn write_canonical_str(out: &mut Vec<u8>, value: &str) {
+    serde_json::to_writer(&mut *out, value).expect("JSON writes to a Vec");
+}
+
+/// Writes `entries` but those in `skip` as a JSON object, in key order.
+fn write_canonical_map<'a>(
+    out: &mut Vec<u8>,
+    entries: impl Iterator<Item = (&'a String, &'a Any)>,
+    skip: &[&str],
+) {
+    let mut sorted: Vec<_> = entries
+        .filter(|(key, _)| !skip.contains(&key.as_str()))
+        .collect();
+    sorted.sort_unstable_by_key(|(key, _)| *key);
+    out.push(b'{');
+    for (index, (key, value)) in sorted.into_iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        write_canonical_str(out, key);
+        out.push(b':');
+        write_canonical(out, value);
+    }
+    out.push(b'}');
+}
+
+/// Writes the JSON of [`ordered`] of `value`.
+fn write_canonical(out: &mut Vec<u8>, value: &Any) {
+    match value {
+        Any::Map(map) => write_canonical_map(out, map.iter(), &[]),
+        Any::Array(values) => {
+            out.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_canonical(out, value);
+            }
+            out.push(b']');
+        }
+        value => serde_json::to_writer(&mut *out, value).expect("JSON writes to a Vec"),
+    }
+}
+
+/// Embed payload keys, per embed kind, that only steer display. Saves never write them, so they
+/// never mark a paragraph changed.
+const DISPLAY_ONLY_KEYS: &[(&str, &[&str])] = &[
+    ("image", &["horizontalRule"]),
+    ("opaqueDrawing", &["preview", "previews", "textBoxJson"]),
+];
+
+fn display_only_keys(kind: &str) -> &'static [&'static str] {
+    DISPLAY_ONLY_KEYS
+        .iter()
+        .find(|(listed, _)| *listed == kind)
+        .map_or(&[], |(_, keys)| keys)
+}
+
+/// The embed kind of the payload held under `key` in a map: an item's `payload` takes the item's
+/// `embedKind` or `kind`, and an opaque drawing's `preview` / `previews` are pictures.
+fn nested_kind<'a>(parent: Option<&str>, key: &str, item_kind: Option<&'a str>) -> Option<&'a str> {
+    match key {
+        "payload" => item_kind,
+        "preview" | "previews" if parent == Some("opaqueDrawing") => Some("image"),
+        _ => None,
+    }
+}
+
+/// `value`, the payload of a `kind` embed when `kind` is set, without its [`DISPLAY_ONLY_KEYS`]
+/// at any depth; `None` when it holds none. Payloads inside JSON strings are not inspected.
+fn without_display_only_keys(kind: Option<&str>, value: &Any) -> Option<Any> {
+    match value {
+        Any::Array(items) => {
+            let stripped: Vec<_> = items
+                .iter()
+                .map(|item| without_display_only_keys(kind, item))
+                .collect();
+            stripped.iter().any(Option::is_some).then(|| {
+                Any::Array(
+                    items
+                        .iter()
+                        .zip(stripped)
+                        .map(|(item, stripped)| stripped.unwrap_or_else(|| item.clone()))
+                        .collect(),
+                )
+            })
+        }
+        Any::Map(map) => {
+            let mut stripped: Option<HashMap<String, Any>> = None;
+            let removed = kind.map_or(&[][..], display_only_keys);
+            for key in removed {
+                if map.contains_key(*key) {
+                    stripped.get_or_insert_with(|| (**map).clone()).remove(*key);
+                }
+            }
+            let item_kind = ["embedKind", "kind"]
+                .iter()
+                .find_map(|key| match map.get(*key) {
+                    Some(Any::String(kind)) => Some(&**kind),
+                    _ => None,
+                });
+            for (key, child) in map
+                .iter()
+                .filter(|(key, _)| !removed.contains(&key.as_str()))
+            {
+                if let Some(child) =
+                    without_display_only_keys(nested_kind(kind, key, item_kind), child)
+                {
+                    stripped
+                        .get_or_insert_with(|| (**map).clone())
+                        .insert(key.clone(), child);
+                }
+            }
+            stripped.map(|map| Any::Map(Arc::new(map)))
+        }
+        _ => None,
+    }
+}
+
+/// Removes [`DISPLAY_ONLY_KEYS`] from every embed payload, including the embeds nested in content
+/// control content, field result projections and opaque drawing previews, before hashing.
+fn strip_display_only_keys(segments: &mut [crate::StorySegment]) {
+    for segment in segments {
+        let crate::SegmentContent::OtherEmbed { kind, payload } = &mut segment.content else {
+            continue;
+        };
+        for key in display_only_keys(kind) {
+            payload.remove(*key);
+        }
+        for (key, value) in payload.iter_mut() {
+            if let Some(stripped) =
+                without_display_only_keys(nested_kind(Some(kind.as_str()), key, None), value)
+            {
+                *value = stripped;
+            }
+        }
+    }
+}
+
+/// Each paragraph's [`UnitState`], hashing its save segments with media tokens expanded, map
+/// keys sorted and nulls kept, and the starts and ends of the `comments` anchored in it relative
+/// to its first segment; and the SHA-256 of those digests in order.
+/// [`EditingDoc::story_segments`] already excludes paragraph identities.
+#[cfg(test)]
+fn story_fingerprint(
+    doc: &EditingDoc,
+    story: &str,
+    comments: &BTreeMap<String, Vec<(u32, u32)>>,
+) -> Option<([u8; 32], Vec<UnitState>)> {
+    let txn = doc.yrs_doc().transact();
+    story_fingerprint_within(doc, &txn, story, comments, &mut None)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STORY_FINGERPRINTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static UNIT_PROJECTIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(crate) static RUN_SIZE_FINGERPRINTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(crate) static RUN_SIZE_SOURCE_PARTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(crate) static RUN_SIZE_SEEDED_SNAPSHOTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[derive(Default)]
+struct UnitDigest(sha2::Sha256);
+
+impl UnitDigest {
+    fn segment(&mut self, bytes: &[u8]) {
+        use sha2::Digest;
+        self.0.update(bytes);
+        self.0.update(b"\n");
+    }
+
+    fn marker(&mut self, relative: u32, key: &str, end: bool) -> Option<Vec<u8>> {
+        use sha2::Digest;
+        let bytes = serde_json::to_vec(&(relative, key, end)).ok()?;
+        self.0.update(&bytes);
+        Some(bytes)
+    }
+
+    fn finish(self) -> [u8; 32] {
+        use sha2::Digest;
+        self.0.finalize().into()
+    }
+}
+
+fn run_size_media(value: &Any) -> bool {
+    match value {
+        Any::String(value) => value.contains("media:"),
+        Any::Array(values) => values.iter().any(run_size_media),
+        Any::Map(values) => values.values().any(run_size_media),
+        _ => false,
+    }
+}
+
+pub(crate) fn run_size_fingerprint<'a>(
+    segments: impl Iterator<Item = crate::StorySegment>,
+    markers: impl Iterator<Item = (u32, &'a str, bool)>,
+) -> Option<[u8; 32]> {
+    #[cfg(test)]
+    RUN_SIZE_FINGERPRINTS.with(|count| count.set(count.get() + 1));
+    let mut segments: Vec<_> = segments.collect();
+    strip_display_only_keys(&mut segments);
+    let mut digest = UnitDigest::default();
+    let mut bytes = Vec::new();
+    let mut section = Vec::new();
+    let mut closed = false;
+    for segment in segments {
+        if closed || segment.attributes.values().any(run_size_media) {
+            return None;
+        }
+        match &segment.content {
+            crate::SegmentContent::Pilcrow(properties) => {
+                if properties.values.values().any(run_size_media) {
+                    return None;
+                }
+                closed = true;
+            }
+            crate::SegmentContent::OtherEmbed { kind, payload } => {
+                if kind != "field" || payload.values().any(run_size_media) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        segment_canonical(&segment, &mut bytes, &mut section);
+        digest.segment(&bytes);
+    }
+    if !closed {
+        return None;
+    }
+    for (relative, key, end) in markers {
+        digest.marker(relative, key, end)?;
+    }
+    Some(digest.finish())
+}
+
+/// Each paragraph's [`UnitState`] and the SHA-256 of their digests in order,
+/// hashing the story's save segments with media tokens expanded; takes the
+/// media URLs it writes and the segment text it hashes off `budget` when
+/// given one, which it leaves at `Some(0)` once spent.
+fn story_fingerprint_within(
+    doc: &EditingDoc,
+    txn: &Transaction<'_>,
+    story: &str,
+    comments: &BTreeMap<String, Vec<(u32, u32)>>,
+    budget: &mut Option<usize>,
+) -> Option<([u8; 32], Vec<UnitState>)> {
+    story_fingerprint_for_save(doc, txn, story, comments, budget, None)
+        .map(|(fingerprint, units, _)| (fingerprint, units))
+}
+
+fn story_fingerprint_for_save(
+    doc: &EditingDoc,
+    txn: &Transaction<'_>,
+    story: &str,
+    comments: &BTreeMap<String, Vec<(u32, u32)>>,
+    budget: &mut Option<usize>,
+    seeded: Option<SaveSeeds<'_>>,
+) -> Option<([u8; 32], Vec<UnitState>, bool)> {
+    let mut fingerprint = StoryFingerprint::start(doc, txn, story, comments, budget, seeded)?;
+    fingerprint.advance(budget, usize::MAX)?;
+    fingerprint.finish()
+}
+
+/// What a [`EditingDoc::prime_save_seed_states_slice`] call left: seed states known, more
+/// slices to go, or a prime this session declines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimeSlice {
+    Known,
+    Pending,
+    Declined,
+}
+
+/// Stories of more segments than this are read in a slice of their own before any is digested.
+const PRIME_SLICE_SEGMENTS: usize = 512;
+/// What reading and closing a story, and taking each segment apart, count against a slice's
+/// `max_bytes`, beside the canonical bytes digested.
+const PRIME_STORY_COST: usize = 1024;
+const PRIME_SEGMENT_COST: usize = 64;
+
+/// A save seed state prime between slices: the stories still to digest, the one under way and
+/// the states of those done, as of the commit epoch it started at.
+pub(crate) struct PrimeProgress {
+    epoch: u64,
+    budget: Option<usize>,
+    stories: std::collections::VecDeque<String>,
+    roots: HashMap<String, String>,
+    comments: HashMap<String, BTreeMap<String, Vec<(u32, u32)>>>,
+    states: HashMap<String, Arc<StoryState>>,
+    current: Option<(String, StoryFingerprint<'static>)>,
+}
+
+/// A story's [`story_fingerprint_for_save`], taken a few segments at a time.
+struct StoryFingerprint<'a> {
+    story: String,
+    seeded: Option<SaveSeeds<'a>>,
+    segments: std::vec::IntoIter<crate::StorySegment>,
+    boundaries: std::iter::Peekable<std::vec::IntoIter<(u32, String, bool)>>,
+    units: Vec<UnitState>,
+    unit: UnitDigest,
+    blocks: sha2::Sha256,
+    block_content: Vec<serde_json::Value>,
+    inline_content: sha2::Sha256,
+    section_content: sha2::Sha256,
+    inline: bool,
+    unit_segments: Vec<crate::StorySegment>,
+    markers: Vec<(u32, String, bool)>,
+    block_positions: Vec<u32>,
+    start: u32,
+    position: u32,
+    bytes: Vec<u8>,
+    section_bytes: Vec<u8>,
+}
+
+impl<'a> StoryFingerprint<'a> {
+    fn start(
+        doc: &EditingDoc,
+        txn: &Transaction<'_>,
+        story: &str,
+        comments: &BTreeMap<String, Vec<(u32, u32)>>,
+        budget: &mut Option<usize>,
+        seeded: Option<SaveSeeds<'a>>,
+    ) -> Option<Self> {
+        use sha2::Digest;
+        #[cfg(test)]
+        STORY_FINGERPRINTS.with(|count| count.set(count.get() + 1));
+        let mut segments = doc.story_segments_in(txn, story).ok()?;
+        strip_display_only_keys(&mut segments);
+        if let Some(media) = doc.media_table() {
+            match budget.as_mut() {
+                None => crate::media::write_segment_data_urls(&mut segments, &media).ok()?,
+                Some(budget) => {
+                    let written =
+                        crate::media::write_segment_data_urls_within(&mut segments, &media, budget);
+                    if !written.ok()? {
+                        *budget = 0;
+                        return None;
+                    }
+                }
+            }
+        }
+        let mut boundaries: Vec<(u32, String, bool)> = comments
+            .iter()
+            .flat_map(|(key, anchors)| {
+                anchors.iter().flat_map(move |(start, end)| {
+                    [(*start, key.clone(), false), (*end, key.clone(), true)]
+                })
+            })
+            .collect();
+        boundaries.sort_unstable();
+        Some(Self {
+            story: story.to_owned(),
+            seeded,
+            segments: segments.into_iter(),
+            boundaries: boundaries.into_iter().peekable(),
+            units: Vec::new(),
+            unit: UnitDigest::default(),
+            blocks: sha2::Sha256::new(),
+            block_content: Vec::new(),
+            inline_content: sha2::Sha256::new(),
+            section_content: sha2::Sha256::new(),
+            inline: false,
+            unit_segments: Vec::new(),
+            markers: Vec::new(),
+            block_positions: Vec::new(),
+            start: 0,
+            position: 0,
+            bytes: Vec::new(),
+            section_bytes: Vec::new(),
+        })
+    }
+
+    /// Digests segments until about `max_bytes` canonical bytes went in, answering whether every
+    /// segment did and how many bytes this call digested; `None` where the whole story yields
+    /// none.
+    fn advance(&mut self, budget: &mut Option<usize>, max_bytes: usize) -> Option<(bool, usize)> {
+        use sha2::Digest;
+        let seeded_units = self
+            .seeded
+            .map(|seeded| seeded.units)
+            .filter(|units| units.unique);
+        let mut digested = 0usize;
+        for segment in self.segments.by_ref() {
+            if let Some(budget) = budget.as_mut() {
+                let Some(rest) = budget.checked_sub(segment_text_len(&segment)) else {
+                    *budget = 0;
+                    return None;
+                };
+                *budget = rest;
+            }
+            segment_canonical(&segment, &mut self.bytes, &mut self.section_bytes);
+            digested = digested.saturating_add(self.bytes.len() + PRIME_SEGMENT_COST);
+            self.unit.segment(&self.bytes);
+            self.section_content.update(&self.section_bytes);
+            self.section_content.update(b"\n");
+            let block = matches!(&segment.content, crate::SegmentContent::OtherEmbed { kind, .. }
+                if matches!(kind.as_str(), "table" | "blockSdt"));
+            if !block {
+                self.inline_content.update(&self.bytes);
+                self.inline_content.update(b"\n");
+            }
+            self.position += match &segment.content {
+                crate::SegmentContent::Text(text) => {
+                    u32::try_from(text.encode_utf16().count()).ok()?
+                }
+                _ => 1,
+            };
+            if block {
+                self.block_positions.push(self.position - self.start - 1);
+            } else {
+                self.unit_segments.push(segment.clone());
+            }
+            match &segment.content {
+                crate::SegmentContent::Pilcrow(properties) => {
+                    let position = self.position;
+                    while let Some((at, key, end)) =
+                        self.boundaries.next_if(|(at, ..)| *at < position)
+                    {
+                        let marker = self.unit.marker(at - self.start, &key, end)?;
+                        let relative = at - self.start;
+                        let excluded =
+                            self.block_positions.partition_point(|&at| at < relative) as u32;
+                        self.markers.push((relative - excluded, key, end));
+                        self.section_content.update(&marker);
+                        self.inline_content.update(&marker);
+                    }
+                    self.start = self.position;
+                    self.block_positions.clear();
+                    self.units.push(UnitState::from_projection(
+                        UnitProjection {
+                            key: Some(properties.para_id.clone()),
+                            digest: std::mem::take(&mut self.unit).finish(),
+                            blocks: std::mem::take(&mut self.blocks).finalize().into(),
+                            block_content: std::mem::take(&mut self.block_content),
+                            content_digest: std::mem::take(&mut self.inline_content)
+                                .finalize()
+                                .into(),
+                            section_digest: std::mem::take(&mut self.section_content)
+                                .finalize()
+                                .into(),
+                            inline: std::mem::take(&mut self.inline),
+                            markers: std::mem::take(&mut self.markers),
+                        },
+                        std::mem::take(&mut self.unit_segments),
+                        seeded_units,
+                    ));
+                }
+                crate::SegmentContent::OtherEmbed { kind, .. }
+                    if matches!(kind.as_str(), "table" | "blockSdt") =>
+                {
+                    self.blocks.update(&self.bytes);
+                    self.blocks.update(b"\n");
+                    self.block_content.push(segment_value(&segment));
+                }
+                _ => self.inline = true,
+            }
+            if digested >= max_bytes {
+                return Some((self.segments.as_slice().is_empty(), digested));
+            }
+        }
+        Some((true, digested))
+    }
+
+    fn finish(mut self) -> Option<([u8; 32], Vec<UnitState>, bool)> {
+        use sha2::{Digest, Sha256};
+        let seeded_units = self
+            .seeded
+            .map(|seeded| seeded.units)
+            .filter(|units| units.unique);
+        for (at, key, end) in self.boundaries.by_ref() {
+            let marker = self.unit.marker(at.saturating_sub(self.start), &key, end)?;
+            let relative = at.saturating_sub(self.start);
+            let excluded = self.block_positions.partition_point(|&at| at < relative) as u32;
+            self.markers
+                .push((relative.saturating_sub(excluded), key, end));
+            self.section_content.update(&marker);
+            self.inline_content.update(&marker);
+        }
+        let trailing = self.unit.finish();
+        let empty: [u8; 32] = Sha256::new().finalize().into();
+        let mut units = self.units;
+        if trailing != empty {
+            units.push(UnitState::from_projection(
+                UnitProjection {
+                    key: None,
+                    digest: trailing,
+                    blocks: self.blocks.finalize().into(),
+                    block_content: self.block_content,
+                    content_digest: self.inline_content.finalize().into(),
+                    section_digest: self.section_content.finalize().into(),
+                    inline: self.inline,
+                    markers: self.markers,
+                },
+                self.unit_segments,
+                seeded_units,
+            ));
+        }
+        let mut hasher = Sha256::new();
+        let seed = self
+            .seeded
+            .and_then(|seeded| seeded.stories.get(&self.story));
+        let mut same_seed = seed.is_some_and(|seed| seed.units.len() == units.len());
+        for (index, unit) in units.iter().enumerate() {
+            hasher.update(unit.digest);
+            same_seed = same_seed
+                && seed.is_some_and(|seed| {
+                    Arc::ptr_eq(&unit.projection, &seed.units[index].projection)
+                });
+        }
+        Some((hasher.finalize().into(), units, same_seed))
+    }
+}
+
+#[cfg(all(test, feature = "wasm"))]
+pub(crate) fn assert_seed_states_match_a_reseed(doc: &EditingDoc, label: &str) {
+    let source = doc.source_index().expect(label);
+    let seeded = source.seed_states();
+    let reseeded = source.reseeded().stories;
+    assert_eq!(seeded.len(), reseeded.len(), "{label}");
+    for (story, was) in &reseeded {
+        let is = &seeded[story];
+        assert!(
+            was.root == is.root
+                && was.fingerprint == is.fingerprint
+                && was.comments == is.comments
+                && was.units == is.units,
+            "{label}: {story}"
+        );
+    }
+}
+
+fn valid(value: Option<String>) -> Option<String> {
+    value.filter(|value| parse_paragraph_id(value).is_some())
+}
+
+/// Base for a repaired session key, derived from its mark's CRDT identity.
+fn derived_key(map: &MapRef) -> String {
+    match AsRef::<Branch>::as_ref(map).id() {
+        BranchID::Nested(id) => format!("{}~{}", id.client, id.clock),
+        BranchID::Root(name) => name.to_string(),
+    }
+}
+
+fn occurrence_owner(part: &SourcePart, ordinal: u32) -> String {
+    format!("{}#{ordinal}", part.uri)
+}
+
+struct Pilcrow {
+    story: String,
+    key: String,
+    map: MapRef,
+    allocated: Option<String>,
+    source: Option<String>,
+    synthetic: bool,
+    /// The paragraph holds text or inline content, not only block embeds.
+    content: bool,
+}
+
+impl Pilcrow {
+    fn read<T: ReadTxn>(story: &str, map: MapRef, txn: &T) -> Self {
+        Self {
+            story: story.to_owned(),
+            key: map_string(&map, txn, PARA_ID).unwrap_or_default(),
+            allocated: valid(map_string(&map, txn, OOXML_PARA_ID)),
+            source: valid(map_string(&map, txn, SOURCE_PARA_ID)),
+            synthetic: map_string(&map, txn, PARA_ORIGIN).as_deref() == Some(SYNTHETIC),
+            content: false,
+            map,
+        }
+    }
+
+    fn session_ref(&self) -> ParagraphRef {
+        ParagraphRef::Session {
+            story: self.story.clone(),
+            para_id: self.key.clone(),
+        }
+    }
+
+    /// The ID it saves with, and whether it is the source ID seeding recorded.
+    fn saved_id(&self, source: Option<&SourceIndex>) -> Option<(String, bool)> {
+        self.allocated
+            .clone()
+            .map(|id| (id, false))
+            .or_else(|| self.source.clone().map(|id| (id, true)))
+            .or_else(|| {
+                valid(source?.seeded.get(&self.key)?.source_para_id.clone()).map(|id| (id, true))
+            })
+    }
+}
+
+/// How many paragraphs each session key closes across every story.
+pub(crate) fn paragraph_key_counts<T: ReadTxn>(txn: &T) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for pilcrow in Scan::new(txn).pilcrows {
+        *counts.entry(pilcrow.key).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Every story and pilcrow, stories in sorted order, plus each nested story's parent.
+pub(crate) struct Scan {
+    stories: Vec<String>,
+    pilcrows: Vec<Pilcrow>,
+    parents: HashMap<String, String>,
+}
+
+impl Scan {
+    fn new<T: ReadTxn>(txn: &T) -> Self {
+        let mut scan = Self {
+            stories: Vec::new(),
+            pilcrows: Vec::new(),
+            parents: HashMap::new(),
+        };
+        let Some(stories) = txn.get_map(STORIES) else {
+            return scan;
+        };
+        let mut texts: Vec<(String, TextRef)> = crate::live_stories(&stories, txn)
+            .filter_map(|(id, value)| match value {
+                Out::YText(text) => Some((id.to_string(), text)),
+                _ => None,
+            })
+            .collect();
+        crate::sort::sort_by(&mut texts, &|left, right| left.0.cmp(&right.0));
+        for (story, text) in texts {
+            let mut content = false;
+            for diff in text.diff(txn, YChange::identity) {
+                ooxml_opc::progress::tick();
+                let Out::YMap(map) = diff.insert else {
+                    content = true;
+                    continue;
+                };
+                match map_string(&map, txn, KIND_KEY).as_deref() {
+                    Some(crate::PILCROW_KIND) => {
+                        let mut pilcrow = Pilcrow::read(&story, map, txn);
+                        pilcrow.content = std::mem::take(&mut content);
+                        scan.pilcrows.push(pilcrow);
+                    }
+                    Some("table") => {
+                        let Some(Out::Any(Any::Array(rows))) = map.get(txn, "rows") else {
+                            continue;
+                        };
+                        for row in rows.iter() {
+                            let Any::Map(row) = row else { continue };
+                            let Some(Any::Array(cells)) = row.get("cells") else {
+                                continue;
+                            };
+                            for cell in cells.iter() {
+                                if let Any::Map(cell) = cell
+                                    && let Some(Any::String(child)) = cell.get("story")
+                                {
+                                    scan.parents.insert(child.to_string(), story.clone());
+                                }
+                            }
+                        }
+                    }
+                    Some("blockSdt") => {
+                        if let Some(child) = map_string(&map, txn, "story") {
+                            scan.parents.insert(child, story.clone());
+                        }
+                    }
+                    _ => content = true,
+                }
+            }
+            scan.stories.push(story);
+        }
+        scan
+    }
+
+    /// The root story a story is nested in, itself when it is a root.
+    fn root<'a>(&'a self, mut story: &'a str) -> &'a str {
+        for _ in 0..=self.parents.len() {
+            match self.parents.get(story) {
+                Some(parent) => story = parent,
+                None => break,
+            }
+        }
+        story
+    }
+}
+
+/// The [`Scan`] of the last committed state read, with the epoch it was read at.
+#[derive(Default)]
+pub(crate) struct ScanCache(Mutex<Option<(u64, Arc<Scan>)>>);
+
+struct Claim {
+    owner: String,
+    origin: ParagraphIdOrigin,
+    published: bool,
+}
+
+fn claims<T: ReadTxn>(txn: &T) -> HashMap<u32, Vec<Claim>> {
+    let mut claims: HashMap<u32, Vec<Claim>> = HashMap::new();
+    let Some(map) = txn.get_map(PARAGRAPH_IDS) else {
+        return claims;
+    };
+    for (key, value) in map.iter(txn) {
+        let Some((id, owner)) = key.split_once('/') else {
+            continue;
+        };
+        let (Some(id), Out::Any(Any::Map(value))) = (parse_paragraph_id(id), value) else {
+            continue;
+        };
+        claims.entry(id).or_default().push(Claim {
+            owner: owner.to_owned(),
+            origin: match value.get("origin") {
+                Some(Any::String(origin)) => ParagraphIdOrigin::parse(origin),
+                _ => ParagraphIdOrigin::Authored,
+            },
+            published: matches!(value.get("published"), Some(Any::Bool(true))),
+        });
+    }
+    claims
+}
+
+fn claim<'a>(claims: &'a HashMap<u32, Vec<Claim>>, id: &str, owner: &str) -> Option<&'a Claim> {
+    claims
+        .get(&parse_paragraph_id(id)?)?
+        .iter()
+        .find(|claim| claim.owner == owner)
+}
+
+/// Claims `id` for `owner` and binds it to `pilcrow`.
+fn attach(
+    txn: &mut TransactionMut<'_>,
+    pilcrow: &MapRef,
+    owner: &str,
+    id: &str,
+    origin: ParagraphIdOrigin,
+) {
+    record_claim(txn, id, owner, origin, false);
+    pilcrow.insert(txn, OOXML_PARA_ID, id);
+}
+
+fn source_assignments<T: ReadTxn>(txn: &T) -> HashMap<String, String> {
+    txn.get_map(SOURCE_PARAGRAPH_IDS)
+        .map(|map| {
+            map.iter(txn)
+                .filter_map(|(key, value)| match value {
+                    Out::Any(Any::String(id)) if parse_paragraph_id(&id).is_some() => {
+                        Some((key.to_owned(), id.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn record_claim(
+    txn: &mut TransactionMut<'_>,
+    id: &str,
+    owner: &str,
+    origin: ParagraphIdOrigin,
+    published: bool,
+) {
+    txn.get_map(PARAGRAPH_IDS)
+        .expect("paragraph IDs root is declared by EditingDoc::new")
+        .insert(
+            txn,
+            format!("{id}/{owner}"),
+            Any::Map(Arc::new(HashMap::from([
+                ("origin".to_owned(), Any::from(origin.as_str())),
+                ("published".to_owned(), Any::Bool(published)),
+            ]))),
+        );
+}
+
+/// Every Word paragraph ID and session key this replica has seen, whether
+/// current, claimed, assigned or since deleted, and every pilcrow seeded as
+/// editor-only. Built on first use and kept current by [`observe_seen`];
+/// entries only accumulate, so a deleted identity stays reserved and a
+/// promotion that undo reverts is found again.
+#[derive(Default)]
+pub(crate) struct Seen {
+    ids: HashSet<u32>,
+    keys: HashSet<String>,
+    /// Pilcrows seeded as editor-only, with their stories.
+    synthetic: Vec<(String, MapRef)>,
+}
+
+pub(crate) type SeenCell = Arc<Mutex<Option<Seen>>>;
+
+impl Seen {
+    pub(crate) fn scan<T: ReadTxn>(txn: &T) -> Self {
+        let mut seen = Self::default();
+        for pilcrow in Scan::new(txn).pilcrows {
+            seen.add(&pilcrow);
+        }
+        for (id, owners) in claims(txn) {
+            seen.ids.insert(id);
+            seen.keys
+                .extend(owners.into_iter().map(|claim| claim.owner));
+        }
+        seen.ids.extend(
+            source_assignments(txn)
+                .values()
+                .filter_map(|id| parse_paragraph_id(id)),
+        );
+        seen
+    }
+
+    /// Adds the keys and Word paragraph IDs another replica has seen.
+    pub(crate) fn inherit(&mut self, other: &Self) {
+        self.ids.extend(&other.ids);
+        self.keys.extend(other.keys.iter().cloned());
+    }
+
+    fn add(&mut self, pilcrow: &Pilcrow) {
+        self.keys.insert(pilcrow.key.clone());
+        for id in [&pilcrow.allocated, &pilcrow.source].into_iter().flatten() {
+            self.ids.extend(parse_paragraph_id(id));
+        }
+        if pilcrow.synthetic && !self.synthetic.iter().any(|(_, map)| *map == pilcrow.map) {
+            self.synthetic
+                .push((pilcrow.story.clone(), pilcrow.map.clone()));
+        }
+    }
+
+    fn add_story<T: ReadTxn>(&mut self, story: &str, text: &TextRef, txn: &T) {
+        for diff in text.diff(txn, YChange::identity) {
+            if let Out::YMap(map) = diff.insert
+                && map_string(&map, txn, KIND_KEY).as_deref() == Some(crate::PILCROW_KIND)
+            {
+                self.add(&Pilcrow::read(story, map, txn));
+            }
+        }
+    }
+}
+
+/// Keeps a replica's [`Seen`] identities current once they are first read:
+/// stories as they are added, and every claim and assignment. A pilcrow
+/// inserted into an existing story or re-keyed carries a copied identity or
+/// one allocated, and so claimed, already.
+pub(crate) fn observe_seen(doc: &Doc, cell: &SeenCell) -> Vec<Subscription> {
+    let (stories, claimed, assigned) = {
+        let txn = doc.transact();
+        (
+            txn.get_map(STORIES),
+            txn.get_map(PARAGRAPH_IDS),
+            txn.get_map(SOURCE_PARAGRAPH_IDS),
+        )
+    };
+    let mut subscriptions = Vec::new();
+    if let Some(stories) = stories {
+        let cell = Arc::clone(cell);
+        subscriptions.push(stories.observe(move |txn, event| {
+            if let Some(seen) = cell.lock().unwrap().as_mut() {
+                for (story, change) in event.keys(txn) {
+                    if let EntryChange::Inserted(Out::YText(text))
+                    | EntryChange::Updated(_, Out::YText(text)) = change
+                    {
+                        seen.add_story(story, text, txn);
+                    }
+                }
+            }
+        }));
+    }
+    if let Some(claimed) = claimed {
+        let cell = Arc::clone(cell);
+        subscriptions.push(claimed.observe(move |txn, event| {
+            if let Some(seen) = cell.lock().unwrap().as_mut() {
+                for key in event.keys(txn).keys() {
+                    if let Some((id, owner)) = key.split_once('/') {
+                        seen.ids.extend(parse_paragraph_id(id));
+                        seen.keys.insert(owner.to_owned());
+                    }
+                }
+            }
+        }));
+    }
+    if let Some(assigned) = assigned {
+        let cell = Arc::clone(cell);
+        subscriptions.push(assigned.observe(move |txn, event| {
+            if let Some(seen) = cell.lock().unwrap().as_mut() {
+                for change in event.keys(txn).values() {
+                    if let EntryChange::Inserted(Out::Any(Any::String(id)))
+                    | EntryChange::Updated(_, Out::Any(Any::String(id))) = change
+                    {
+                        seen.ids.extend(parse_paragraph_id(id));
+                    }
+                }
+            }
+        }));
+    }
+    subscriptions
+}
+
+/// Allocates Word paragraph IDs and session keys that no current, reserved,
+/// assigned or source identity uses.
+pub(crate) struct IdAllocator {
+    seen: SeenCell,
+    source: Option<Arc<SourceIndex>>,
+}
+
+impl IdAllocator {
+    pub(crate) fn new<T: ReadTxn>(doc: &EditingDoc, txn: &T) -> Self {
+        doc.with_seen(txn, |_| ());
+        Self {
+            seen: doc.seen_cell(),
+            source: doc.source_index(),
+        }
+    }
+
+    fn allocate(&mut self, owner: &str) -> String {
+        let mut guard = self.seen.lock().unwrap();
+        let seen = guard
+            .as_mut()
+            .expect("IdAllocator::new builds the seen identities");
+        let source = self.source.as_deref();
+        let id = allocate_paragraph_id_where(owner, |id| {
+            seen.ids.contains(&id) || source.is_some_and(|source| source.occupied.contains(&id))
+        })
+        .expect("the paragraph ID space outnumbers every document's paragraphs");
+        seen.ids.insert(id);
+        format_paragraph_id(id)
+    }
+
+    /// The next `clientId:counter` key no paragraph has carried.
+    pub(crate) fn session_key(&mut self, doc: &EditingDoc) -> String {
+        let mut guard = self.seen.lock().unwrap();
+        let seen = guard
+            .as_mut()
+            .expect("IdAllocator::new builds the seen identities");
+        loop {
+            let key = doc.next_id();
+            if seen.keys.insert(key.clone()) {
+                return key;
+            }
+        }
+    }
+
+    /// Allocates, claims and binds a fresh ID to `pilcrow`.
+    pub(crate) fn bind(
+        &mut self,
+        txn: &mut TransactionMut<'_>,
+        pilcrow: &MapRef,
+        owner: &str,
+        origin: ParagraphIdOrigin,
+    ) -> String {
+        let id = self.allocate(owner);
+        attach(txn, pilcrow, owner, &id, origin);
+        id
+    }
+
+    fn assign_source(
+        &mut self,
+        txn: &mut TransactionMut<'_>,
+        owner: &str,
+        origin: ParagraphIdOrigin,
+    ) -> String {
+        let id = self.allocate(owner);
+        record_claim(txn, &id, owner, origin, false);
+        txn.get_map(SOURCE_PARAGRAPH_IDS)
+            .expect("source paragraph IDs root is declared by EditingDoc::new")
+            .insert(txn, owner, id.as_str());
+        id
+    }
+}
+
+/// Makes an editor-only paragraph authored content in the mutation that
+/// authors into it: it loses the synthetic marker and is allocated its own
+/// Word paragraph ID.
+pub(crate) fn promote(doc: &EditingDoc, txn: &mut TransactionMut<'_>, pilcrow: &MapRef) {
+    if map_string(pilcrow, txn, PARA_ORIGIN).as_deref() != Some(SYNTHETIC) {
+        return;
+    }
+    pilcrow.remove(txn, PARA_ORIGIN);
+    let key = map_string(pilcrow, txn, PARA_ID).unwrap_or_default();
+    IdAllocator::new(doc, txn).bind(txn, pilcrow, &key, ParagraphIdOrigin::Authored);
+}
+
+/// [`promote`] for an edit at story unit `index`. Editor-only paragraphs are
+/// empty and end their story, so only an edit at a story's final unit can
+/// author into one; whether a seeded one still is editor-only is read from
+/// its replicated marker.
+pub(crate) fn promote_at(
+    doc: &EditingDoc,
+    txn: &mut TransactionMut<'_>,
+    story_id: &str,
+    story: &TextRef,
+    index: u32,
+) {
+    if index + 1 == story.len(txn) {
+        promote_story(doc, txn, story_id);
+    }
+}
+
+pub(crate) fn would_promote_at<T: ReadTxn>(
+    doc: &EditingDoc,
+    txn: &T,
+    story_id: &str,
+    story: &TextRef,
+    index: u32,
+) -> bool {
+    index.checked_add(1) == Some(story.len(txn))
+        && doc.with_seen(txn, |seen| {
+            seen.synthetic.iter().any(|(id, pilcrow)| {
+                id == story_id
+                    && map_string(pilcrow, txn, PARA_ORIGIN).as_deref() == Some(SYNTHETIC)
+            })
+        })
+}
+
+/// [`promote`] for an edit that authored into the paragraph ending `story_id`.
+pub(crate) fn promote_story(doc: &EditingDoc, txn: &mut TransactionMut<'_>, story_id: &str) {
+    let seeded: Vec<MapRef> = doc.with_seen(&*txn, |seen| {
+        seen.synthetic
+            .iter()
+            .filter(|(story, _)| story == story_id)
+            .map(|(_, pilcrow)| pilcrow.clone())
+            .collect()
+    });
+    for pilcrow in seeded {
+        promote(doc, txn, &pilcrow);
+    }
+}
+
+/// How a claimant holds the ID it shares with others.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Standing {
+    /// Neither the seeded paragraph nor holding its own claim: a copy.
+    Unowned,
+    /// An unsaved claim no paragraph holds any more: it keeps its ID from copies.
+    Reserved,
+    /// Claimed by its own key, not yet saved.
+    Unpublished,
+    Published,
+    /// Recorded from the source package.
+    Source,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Holder {
+    Pilcrow(usize),
+    Occurrence(usize, u32),
+    /// A source ID or claim no paragraph holds any more: it stays reserved.
+    Retired,
+}
+
+struct Claimant {
+    holder: Holder,
+    id: u32,
+    text: String,
+    owner: String,
+    standing: Standing,
+    /// Other stories' views of the holder's source paragraph, sharing its ID.
+    views: Vec<usize>,
+}
+
+fn claim_standing(claims: &HashMap<u32, Vec<Claim>>, id: &str, owner: &str) -> Standing {
+    match claim(claims, id, owner) {
+        Some(claim) if claim.published => Standing::Published,
+        Some(_) => Standing::Unpublished,
+        None => Standing::Unowned,
+    }
+}
+
+/// How a pilcrow holds the ID it saves with under its own key.
+fn pilcrow_standing(
+    pilcrow: &Pilcrow,
+    source: Option<&SourceIndex>,
+    claims: &HashMap<u32, Vec<Claim>>,
+) -> Standing {
+    let Some((text, from_source)) = pilcrow.saved_id(source) else {
+        return Standing::Unowned;
+    };
+    match (from_source, source) {
+        (true, Some(source)) => match parse_paragraph_id(&text) {
+            Some(id) if source.seeds(&pilcrow.key, id) => Standing::Source,
+            _ => Standing::Unowned,
+        },
+        (true, None) => Standing::Source,
+        (false, _) => claim_standing(claims, &text, &pilcrow.key),
+    }
+}
+
+/// Groups the holders of each shared ID in package order: seeded paragraphs
+/// and source occurrences by part and ordinal, then other paragraphs by story,
+/// then the source IDs and claims no paragraph holds any more, which stay
+/// reserved. Views of one source paragraph in stories sharing its part
+/// are one holder. A `copies` pilcrow holds no identity it carries, and a
+/// `renamed` one gives up its key. Only groups a live holder shares are
+/// returned.
+fn collisions(
+    scan: &Scan,
+    source: Option<&SourceIndex>,
+    claims: &HashMap<u32, Vec<Claim>>,
+    assignments: &HashMap<String, String>,
+    copies: &HashSet<usize>,
+    renamed: &HashMap<usize, &str>,
+) -> Vec<Vec<Claimant>> {
+    let mut ordered: Vec<((usize, u32, usize), Claimant)> = Vec::new();
+    let mut live: HashSet<(String, u32)> = HashSet::new();
+    let mut viewed: HashMap<((usize, u32), u32), (usize, usize)> = HashMap::new();
+    for (index, pilcrow) in scan.pilcrows.iter().enumerate() {
+        let Some((text, _)) = pilcrow.saved_id(source) else {
+            continue;
+        };
+        let Some(id) = parse_paragraph_id(&text) else {
+            continue;
+        };
+        let copy = copies.contains(&index);
+        let rename = renamed.get(&index).copied();
+        let standing = if copy || rename.is_some() {
+            Standing::Unowned
+        } else {
+            pilcrow_standing(pilcrow, source, claims)
+        };
+        let view = source
+            .filter(|_| !copy && rename.is_none())
+            .and_then(|source| Some((source, source.view_of(&pilcrow.key)?)));
+        if !copy {
+            live.insert((pilcrow.key.clone(), id));
+        }
+        if let Some((source, ((part, ordinal), rank))) = view {
+            for key in &source.parts[part].backed[&ordinal] {
+                live.insert((key.clone(), id));
+            }
+            if let Some(&(best, at)) = viewed.get(&((part, ordinal), id)) {
+                let claimant = &mut ordered[at].1;
+                claimant.standing = claimant.standing.max(standing);
+                if rank < best {
+                    if let Holder::Pilcrow(previous) = claimant.holder {
+                        claimant.views.push(previous);
+                    }
+                    claimant.holder = Holder::Pilcrow(index);
+                    claimant.owner = pilcrow.key.clone();
+                    viewed.insert(((part, ordinal), id), (rank, at));
+                } else {
+                    claimant.views.push(index);
+                }
+                continue;
+            }
+            viewed.insert(((part, ordinal), id), (rank, ordered.len()));
+        }
+        let order = match view {
+            Some((_, ((part, ordinal), _))) => (part, ordinal, 0),
+            None => (usize::MAX, 0, index),
+        };
+        ordered.push((
+            order,
+            Claimant {
+                holder: Holder::Pilcrow(index),
+                id,
+                text,
+                owner: rename.unwrap_or(&pilcrow.key).to_owned(),
+                standing,
+                views: Vec::new(),
+            },
+        ));
+    }
+    if let Some(source) = source {
+        for (part_index, occurrence) in source.unbacked() {
+            let part = &source.parts[part_index];
+            let owner = occurrence_owner(part, occurrence.ordinal);
+            let (text, standing) = match assignments.get(&owner) {
+                Some(id) => (id.clone(), claim_standing(claims, id, &owner)),
+                None => match valid(occurrence.para_id.clone()) {
+                    Some(id) => (id, Standing::Source),
+                    None => continue,
+                },
+            };
+            let Some(id) = parse_paragraph_id(&text) else {
+                continue;
+            };
+            live.insert((owner.clone(), id));
+            ordered.push((
+                (part_index, occurrence.ordinal, 0),
+                Claimant {
+                    holder: Holder::Occurrence(part_index, occurrence.ordinal),
+                    id,
+                    text,
+                    owner,
+                    standing,
+                    views: Vec::new(),
+                },
+            ));
+        }
+    }
+    let mut retired = Vec::new();
+    let mut retire = |id: u32, owner: &str, standing: Standing| {
+        if !live.contains(&(owner.to_owned(), id)) {
+            retired.push((
+                (usize::MAX, u32::MAX, usize::MAX),
+                Claimant {
+                    holder: Holder::Retired,
+                    id,
+                    text: format_paragraph_id(id),
+                    owner: owner.to_owned(),
+                    standing,
+                    views: Vec::new(),
+                },
+            ));
+        }
+    };
+    for (id, owners) in claims {
+        for claim in owners {
+            let standing = if claim.published {
+                Standing::Published
+            } else {
+                Standing::Reserved
+            };
+            retire(*id, &claim.owner, standing);
+        }
+    }
+    if let Some(source) = source {
+        for (key, seed) in &source.seeded {
+            if let Some(id) = seed.source_para_id.as_deref().and_then(parse_paragraph_id) {
+                retire(id, key, Standing::Source);
+            }
+        }
+    }
+    crate::sort::sort_by(&mut retired, &|left, right| {
+        (left.1.id, &left.1.owner).cmp(&(right.1.id, &right.1.owner))
+    });
+    crate::sort::sort_by_key(&mut ordered, &|(order, _)| *order);
+    ordered.extend(retired);
+    let mut groups: BTreeMap<u32, Vec<Claimant>> = BTreeMap::new();
+    for (_, claimant) in ordered {
+        groups.entry(claimant.id).or_default().push(claimant);
+    }
+    groups
+        .into_values()
+        .filter(|group| {
+            group.len() > 1
+                && group
+                    .iter()
+                    .any(|claimant| claimant.holder != Holder::Retired)
+        })
+        .collect()
+}
+
+/// Which claimants of one ID take new IDs, and whether saved claims conflict.
+/// Every claimant below the strongest standing loses. Among the strongest,
+/// source duplicates are repaired only when `persist` asks, the first in
+/// package order keeping the ID; unpublished claims and copies keep it for
+/// the smallest owner; reserved and published claims all keep it, and
+/// published ones conflict.
+fn losers(group: &[Claimant], persist: bool) -> (Vec<usize>, bool) {
+    let best = group
+        .iter()
+        .map(|claimant| claimant.standing)
+        .max()
+        .unwrap_or(Standing::Unowned);
+    let top: Vec<usize> = (0..group.len())
+        .filter(|index| group[*index].standing == best)
+        .collect();
+    let mut losers: Vec<usize> = (0..group.len())
+        .filter(|index| group[*index].standing != best)
+        .collect();
+    let keeper = match best {
+        Standing::Source if persist => Some(top[0]),
+        Standing::Unpublished | Standing::Unowned => top
+            .iter()
+            .copied()
+            .min_by(|left, right| group[*left].owner.cmp(&group[*right].owner)),
+        Standing::Reserved | Standing::Published | Standing::Source => None,
+    };
+    if let Some(keeper) = keeper {
+        losers.extend(top.iter().copied().filter(|index| *index != keeper));
+    }
+    losers.sort_unstable();
+    (losers, best == Standing::Published && top.len() > 1)
+}
+
+/// Flags identity-relevant changes while an update integrates.
+pub(crate) struct IdentityWatch {
+    changed: Arc<AtomicBool>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl IdentityWatch {
+    pub(crate) fn new(doc: &Doc) -> Self {
+        let changed = Arc::new(AtomicBool::new(false));
+        let txn = doc.transact();
+        let (stories, assignments) = (txn.get_map(STORIES), txn.get_map(SOURCE_PARAGRAPH_IDS));
+        drop(txn);
+        let mut subscriptions = Vec::new();
+        if let Some(stories) = stories {
+            let flag = Arc::clone(&changed);
+            subscriptions.push(stories.observe_deep(move |txn, events| {
+                let relevant = events.iter().any(|event| match event {
+                    Event::Map(event) => event.keys(txn).iter().any(|(key, change)| {
+                        matches!(key.as_ref(), PARA_ID | OOXML_PARA_ID | SOURCE_PARA_ID)
+                            || matches!(change, EntryChange::Inserted(Out::YText(_)))
+                    }),
+                    Event::Text(event) => event
+                        .delta(txn)
+                        .iter()
+                        .any(|delta| matches!(delta, Delta::Inserted(Out::YMap(_), _))),
+                    _ => false,
+                });
+                if relevant {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }));
+        }
+        if let Some(assignments) = assignments {
+            let flag = Arc::clone(&changed);
+            subscriptions.push(assignments.observe(move |_, _| {
+                flag.store(true, Ordering::Relaxed);
+            }));
+        }
+        Self {
+            changed,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    pub(crate) fn changed(&self) -> bool {
+        self.changed.load(Ordering::Relaxed)
+    }
+}
+
+struct Reassignment {
+    holder: Holder,
+    previous: String,
+    /// The pilcrow carries a source ID that is not its own: a copy's.
+    copied_source: bool,
+    /// Other stories' views of the holder, which take its new ID too.
+    views: Vec<usize>,
+}
+
+struct Repairs {
+    /// `(pilcrow, previous key, new key)`.
+    renamed: Vec<(usize, String, String)>,
+    reassigned: Vec<Reassignment>,
+    conflicts: Vec<(String, Vec<Holder>)>,
+}
+
+impl Repairs {
+    fn is_empty(&self) -> bool {
+        self.renamed.is_empty() && self.reassigned.is_empty()
+    }
+}
+
+pub(crate) struct IdentityRepair {
+    source: Arc<Mutex<Option<SourcePackage>>>,
+    seen: SeenCell,
+}
+
+impl IdentityRepair {
+    fn source_index(&self) -> Option<Arc<SourceIndex>> {
+        source_index(&self.source)
+    }
+
+    fn with_seen<T: ReadTxn, R>(&self, txn: &T, f: impl FnOnce(&mut Seen) -> R) -> R {
+        let mut seen = self.seen.lock().unwrap();
+        f(seen.get_or_insert_with(|| Seen::scan(txn)))
+    }
+
+    pub(crate) fn repair(&self, txn: &mut TransactionMut<'_>) -> Vec<String> {
+        let (scan, plan) = self.plan_repairs(&*txn, false, &|_| false);
+        if plan.is_empty() {
+            return Vec::new();
+        }
+        self.with_seen(&*txn, |_| ());
+        let mut allocator = IdAllocator {
+            seen: Arc::clone(&self.seen),
+            source: self.source_index(),
+        };
+        let mut stories: BTreeSet<String> = plan
+            .renamed
+            .iter()
+            .map(|(index, _, _)| scan.pilcrows[*index].story.clone())
+            .collect();
+        for assignment in EditingDoc::apply_repairs(txn, &scan, &mut allocator, &plan) {
+            if let ParagraphRef::Session { story, .. } = assignment.paragraph {
+                stories.insert(story);
+            }
+        }
+        stories.into_iter().collect()
+    }
+}
+
+impl EditingDoc {
+    /// [`Scan::new`] over the committed state `txn` reads, shared by every
+    /// read-only query until the next committed change.
+    fn committed_scan(&self, txn: &Transaction<'_>) -> Arc<Scan> {
+        // No commit lands while `txn` is open, so this is the epoch of what it reads.
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        let mut cache = self.scan_cache.0.lock().unwrap();
+        if let Some((cached, scan)) = cache.as_ref()
+            && *cached == epoch
+        {
+            return Arc::clone(scan);
+        }
+        let scan = Arc::new(Scan::new(txn));
+        *cache = Some((epoch, Arc::clone(&scan)));
+        scan
+    }
+
+    /// Starts a new opening of this document: writes its generation into
+    /// replicated state, identical on every replica that syncs it, so session
+    /// anchors from any other opening never resolve here, even one seeded
+    /// alike by the same client. Every path that establishes a document
+    /// session calls it; `generation` fixes the value, as a deterministic
+    /// shared seed needs, and is otherwise freshly minted. System-origin and
+    /// outside undo.
+    pub fn begin_opening(&self, generation: Option<&str>) {
+        self.save_story_states.lock().unwrap().clear();
+        let generation = generation.map_or_else(fresh_generation, str::to_owned);
+        let mut txn = self.transact_for(&EditCtx::system(""));
+        txn.get_map(SESSION)
+            .expect("session root is declared by EditingDoc::new")
+            .insert(&mut txn, GENERATION, generation);
+    }
+
+    /// Whether an opening has written this document's generation.
+    pub(crate) fn has_opening(&self) -> bool {
+        let txn = self.yrs_doc().transact();
+        txn.get_map(SESSION)
+            .is_some_and(|session| session.contains_key(&txn, GENERATION))
+    }
+
+    /// The collaborative document session: the opening generation (see
+    /// [`Self::begin_opening`]) and the CRDT identity of the body story. Both
+    /// are replicated, so every replica of one opening shares it, and a fresh
+    /// opening or a replaced body is a new session.
+    pub fn session_id(&self) -> String {
+        let txn = self.yrs_doc().transact();
+        let generation = txn
+            .get_map(SESSION)
+            .and_then(|session| map_string(&session, &txn, GENERATION));
+        let story = txn.get_map(STORIES).and_then(|stories| {
+            story_ref(&txn, "body").ok().map(Out::YText).or_else(|| {
+                let mut names: Vec<String> = crate::live_stories(&stories, &txn)
+                    .map(|(id, _)| id.to_owned())
+                    .collect();
+                crate::sort::sort(&mut names);
+                names.first().and_then(|name| stories.get(&txn, name))
+            })
+        });
+        let story = match story {
+            Some(Out::YText(text)) => match AsRef::<Branch>::as_ref(&text).id() {
+                BranchID::Nested(id) => format!("{}.{}", id.client, id.clock),
+                BranchID::Root(name) => name.to_string(),
+            },
+            _ => String::new(),
+        };
+        match generation {
+            Some(generation) => format!("{generation}.{story}"),
+            None => story,
+        }
+    }
+
+    pub(crate) fn identity_repair(&self) -> IdentityRepair {
+        IdentityRepair {
+            source: Arc::clone(&self.source),
+            seen: self.seen_cell(),
+        }
+    }
+
+    fn plan_repairs<T: ReadTxn>(
+        &self,
+        txn: &T,
+        persist: bool,
+        copy: &dyn Fn(&MapRef) -> bool,
+    ) -> (Scan, Repairs) {
+        self.identity_repair().plan_repairs(txn, persist, copy)
+    }
+}
+
+impl IdentityRepair {
+    /// Plans the repairs of duplicated identities. A pilcrow `copy` accepts
+    /// holds none of the identity it carries: it never keeps a duplicate, nor
+    /// a key or ID a paragraph since deleted held, whatever key it names.
+    fn plan_repairs<T: ReadTxn>(
+        &self,
+        txn: &T,
+        persist: bool,
+        copy: &dyn Fn(&MapRef) -> bool,
+    ) -> (Scan, Repairs) {
+        let source = self.source_index();
+        let scan = Scan::new(txn);
+        let claims = claims(txn);
+        let copies: HashSet<usize> = (0..scan.pilcrows.len())
+            .filter(|index| copy(&scan.pilcrows[*index].map))
+            .collect();
+        let standing = |index: usize| {
+            if copies.contains(&index) {
+                Standing::Unowned
+            } else {
+                pilcrow_standing(&scan.pilcrows[index], source.as_deref(), &claims)
+            }
+        };
+        let claimed: HashSet<&str> = claims
+            .values()
+            .flatten()
+            .map(|claim| claim.owner.as_str())
+            .collect();
+        let reserved = |key: &str| {
+            claimed.contains(key)
+                || source
+                    .as_deref()
+                    .is_some_and(|source| source.seeded.contains_key(key))
+                || self.with_seen(txn, |seen| seen.keys.contains(key))
+        };
+        let mut holders: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (index, pilcrow) in scan.pilcrows.iter().enumerate() {
+            holders.entry(pilcrow.key.as_str()).or_default().push(index);
+        }
+        let mut renamed = Vec::new();
+        let mut repaired_keys = HashSet::new();
+        for (key, indexes) in &holders {
+            if !key.is_empty() && indexes.len() == 1 && !copies.contains(&indexes[0]) {
+                continue;
+            }
+            let keeper = indexes
+                .iter()
+                .copied()
+                .filter(|index| !key.is_empty() && (!copies.contains(index) || !reserved(key)))
+                .max_by_key(|index| {
+                    (
+                        !copies.contains(index),
+                        standing(*index),
+                        std::cmp::Reverse(*index),
+                    )
+                });
+            for index in indexes
+                .iter()
+                .copied()
+                .filter(|index| Some(*index) != keeper)
+            {
+                let pilcrow = &scan.pilcrows[index];
+                let base = derived_key(&pilcrow.map);
+                let mut key = base.clone();
+                let mut suffix = 0u64;
+                while holders.contains_key(key.as_str())
+                    || claimed.contains(key.as_str())
+                    || !repaired_keys.insert(key.clone())
+                {
+                    suffix += 1;
+                    key = format!("{base}~{suffix}");
+                }
+                renamed.push((index, pilcrow.key.clone(), key));
+            }
+        }
+        crate::sort::sort_by_key(&mut renamed, &|(index, _, _)| *index);
+        let renamed_keys: HashMap<usize, &str> = renamed
+            .iter()
+            .map(|(index, _, key)| (*index, key.as_str()))
+            .collect();
+        let mut repairs = Repairs {
+            renamed: Vec::new(),
+            reassigned: Vec::new(),
+            conflicts: Vec::new(),
+        };
+        let groups = collisions(
+            &scan,
+            source.as_deref(),
+            &claims,
+            &source_assignments(txn),
+            &copies,
+            &renamed_keys,
+        );
+        for group in groups {
+            let (losers, conflict) = losers(&group, persist);
+            let saved_live = group.iter().any(|claimant| {
+                claimant.standing == Standing::Published && claimant.holder != Holder::Retired
+            });
+            if conflict && saved_live {
+                repairs.conflicts.push((
+                    format_paragraph_id(group[0].id),
+                    group
+                        .iter()
+                        .filter(|claimant| claimant.standing == Standing::Published)
+                        .map(|claimant| claimant.holder)
+                        .collect(),
+                ));
+            }
+            for loser in losers {
+                let claimant = &group[loser];
+                if claimant.holder == Holder::Retired {
+                    continue;
+                }
+                let copied_source = match claimant.holder {
+                    Holder::Pilcrow(index) => {
+                        let pilcrow = &scan.pilcrows[index];
+                        pilcrow.source.is_some()
+                            && (renamed_keys.contains_key(&index)
+                                || copies.contains(&index)
+                                || source.as_deref().is_some_and(|source| {
+                                    !source.seeded.contains_key(&pilcrow.key)
+                                }))
+                    }
+                    Holder::Occurrence(..) | Holder::Retired => false,
+                };
+                repairs.reassigned.push(Reassignment {
+                    holder: claimant.holder,
+                    previous: claimant.text.clone(),
+                    copied_source,
+                    views: claimant.views.clone(),
+                });
+            }
+        }
+        repairs.renamed = renamed;
+        (scan, repairs)
+    }
+}
+
+impl EditingDoc {
+    /// Deterministically restores unique session keys and Word paragraph IDs
+    /// after divergent replicas merged; see [`Self::persist_paragraph_ids`]
+    /// for the ownership rules. Duplicated source IDs and conflicting saved
+    /// claims are left for an explicit persistence. Writes nothing when
+    /// nothing collides. Returns the `(previous, new)` session keys.
+    pub(crate) fn repair_paragraph_identities(&self) -> Vec<(ParagraphId, ParagraphId)> {
+        let (_, plan) = self.plan_repairs(&self.yrs_doc().transact(), false, &|_| false);
+        if plan.is_empty() {
+            return Vec::new();
+        }
+        let mut txn = self.transact_for(&EditCtx::system(""));
+        let (scan, plan) = self.plan_repairs(&txn, false, &|_| false);
+        let mut allocator = IdAllocator::new(self, &txn);
+        Self::apply_repairs(&mut txn, &scan, &mut allocator, &plan);
+        plan.renamed
+            .into_iter()
+            .map(|(_, previous, key)| (previous, key))
+            .collect()
+    }
+
+    /// Repairs, within the transaction that made them, the duplicates that
+    /// raw ops introduced: a pilcrow they inserted (created by this replica
+    /// from clock `since` on) or re-keyed is the copy, and the paragraph it
+    /// copied keeps its identity. The identity each copy ends with is then
+    /// its own: its ID is claimed for its key, so a save publishes it and a
+    /// deletion leaves it reserved, and its key is never allocated again.
+    pub(crate) fn repair_copies(
+        &self,
+        txn: &mut TransactionMut<'_>,
+        since: u32,
+        rekeyed: &[MapRef],
+    ) {
+        let client = yrs::ClientID::new(self.client_id());
+        let copy = |map: &MapRef| {
+            rekeyed.contains(map)
+                || matches!(
+                    AsRef::<Branch>::as_ref(map).id(),
+                    BranchID::Nested(id) if id.client == client && id.clock >= since
+                )
+        };
+        let (scan, plan) = self.plan_repairs(&*txn, false, &copy);
+        if !plan.is_empty() {
+            let mut allocator = IdAllocator::new(self, &*txn);
+            Self::apply_repairs(txn, &scan, &mut allocator, &plan);
+        }
+        let keys: HashMap<usize, &str> = plan
+            .renamed
+            .iter()
+            .map(|(index, _, key)| (*index, key.as_str()))
+            .collect();
+        let reassigned: HashSet<usize> = plan
+            .reassigned
+            .iter()
+            .filter_map(|reassignment| match reassignment.holder {
+                Holder::Pilcrow(index) => Some(index),
+                Holder::Occurrence(..) | Holder::Retired => None,
+            })
+            .collect();
+        let claims = claims(&*txn);
+        for (index, pilcrow) in scan.pilcrows.iter().enumerate() {
+            if !copy(&pilcrow.map) {
+                continue;
+            }
+            let key = keys.get(&index).copied().unwrap_or(&pilcrow.key);
+            self.with_seen(&*txn, |seen| seen.keys.insert(key.to_owned()));
+            let id = pilcrow.allocated.as_deref().and_then(parse_paragraph_id);
+            if let Some(id) = id.filter(|_| !reassigned.contains(&index))
+                && claim(&claims, &format_paragraph_id(id), key).is_none()
+            {
+                record_claim(
+                    txn,
+                    &format_paragraph_id(id),
+                    key,
+                    ParagraphIdOrigin::Authored,
+                    false,
+                );
+            }
+        }
+    }
+
+    fn source_story_of(
+        scan: &Scan,
+        source: Option<&SourceIndex>,
+        holder: Holder,
+    ) -> Option<SourceStory> {
+        let source = source?;
+        match holder {
+            Holder::Pilcrow(index) => source
+                .roots
+                .get(scan.root(&scan.pilcrows[index].story))
+                .cloned(),
+            Holder::Occurrence(part, ordinal) => {
+                let part = &source.parts[part];
+                Some(part.story(part.occurrence(ordinal)?.item_id.as_deref()))
+            }
+            Holder::Retired => None,
+        }
+    }
+
+    fn apply_repairs(
+        txn: &mut TransactionMut<'_>,
+        scan: &Scan,
+        allocator: &mut IdAllocator,
+        plan: &Repairs,
+    ) -> Vec<ParagraphIdAssignment> {
+        let source = allocator.source.clone();
+        let mut keys: BTreeMap<usize, (&str, &str)> = BTreeMap::new();
+        for (index, previous, key) in &plan.renamed {
+            scan.pilcrows[*index].map.insert(txn, PARA_ID, key.as_str());
+            keys.insert(*index, (previous.as_str(), key.as_str()));
+        }
+        let mut assignments = Vec::new();
+        for reassignment in &plan.reassigned {
+            let source_story = Self::source_story_of(scan, source.as_deref(), reassignment.holder);
+            match reassignment.holder {
+                Holder::Pilcrow(index) => {
+                    let pilcrow = &scan.pilcrows[index];
+                    if reassignment.copied_source {
+                        pilcrow.map.remove(txn, SOURCE_PARA_ID);
+                    }
+                    let (replaced, key) = match keys.remove(&index) {
+                        Some((previous, key)) => (Some(previous.to_owned()), key.to_owned()),
+                        None => (None, pilcrow.key.clone()),
+                    };
+                    let id = allocator.bind(txn, &pilcrow.map, &key, ParagraphIdOrigin::Repaired);
+                    assignments.push(ParagraphIdAssignment {
+                        paragraph: ParagraphRef::Session {
+                            story: pilcrow.story.clone(),
+                            para_id: key,
+                        },
+                        replaced_para_id: replaced,
+                        previous_ooxml_para_id: Some(reassignment.previous.clone()),
+                        ooxml_para_id: id.clone(),
+                        origin: ParagraphIdOrigin::Repaired,
+                        source_story: source_story.clone(),
+                    });
+                    for view in &reassignment.views {
+                        let view = &scan.pilcrows[*view];
+                        attach(txn, &view.map, &view.key, &id, ParagraphIdOrigin::Repaired);
+                        assignments.push(ParagraphIdAssignment {
+                            paragraph: view.session_ref(),
+                            replaced_para_id: None,
+                            previous_ooxml_para_id: Some(reassignment.previous.clone()),
+                            ooxml_para_id: id.clone(),
+                            origin: ParagraphIdOrigin::Repaired,
+                            source_story: source_story.clone(),
+                        });
+                    }
+                }
+                Holder::Retired => {}
+                Holder::Occurrence(part, ordinal) => {
+                    let Some(source) = source.as_deref() else {
+                        continue;
+                    };
+                    let part = &source.parts[part];
+                    let id = allocator.assign_source(
+                        txn,
+                        &occurrence_owner(part, ordinal),
+                        ParagraphIdOrigin::Repaired,
+                    );
+                    assignments.push(ParagraphIdAssignment {
+                        paragraph: ParagraphRef::Source(source.reference(part, ordinal)),
+                        replaced_para_id: None,
+                        previous_ooxml_para_id: Some(reassignment.previous.clone()),
+                        ooxml_para_id: id,
+                        origin: ParagraphIdOrigin::Repaired,
+                        source_story,
+                    });
+                }
+            }
+        }
+        for (index, (previous, key)) in keys {
+            let pilcrow = &scan.pilcrows[index];
+            if let Some((id, _)) = pilcrow.saved_id(source.as_deref()) {
+                assignments.push(ParagraphIdAssignment {
+                    paragraph: ParagraphRef::Session {
+                        story: pilcrow.story.clone(),
+                        para_id: key.to_owned(),
+                    },
+                    replaced_para_id: Some(previous.to_owned()),
+                    previous_ooxml_para_id: None,
+                    ooxml_para_id: id,
+                    origin: ParagraphIdOrigin::Repaired,
+                    source_story: Self::source_story_of(
+                        scan,
+                        source.as_deref(),
+                        Holder::Pilcrow(index),
+                    ),
+                });
+            }
+        }
+        assignments
+    }
+
+    /// Gives every paragraph that saves without a Word paragraph ID a fresh
+    /// one, across the session stories and the retained package's source
+    /// paragraphs outside them; an editor-only paragraph gets one only once
+    /// it holds content. Repairs duplicates by ownership: source IDs and
+    /// saved claims keep their IDs over unsaved claims and copies, and the
+    /// first occurrence in package order keeps a duplicated source ID. Saved
+    /// claims that conflict stay and are reported. A refusal leaves the
+    /// document unchanged. The change is replicated, system-origin and
+    /// outside undo, and later saves keep it.
+    pub fn persist_paragraph_ids(&self) -> Result<PersistedParagraphIds, ParagraphIdRefusal> {
+        let source = self.source_index();
+        let mut txn = self.transact_for(&EditCtx::system(""));
+        let (scan, plan) = self.plan_repairs(&txn, true, &|_| false);
+        if let Some(source) = source.as_deref() {
+            for reassignment in &plan.reassigned {
+                let Holder::Occurrence(part, _) = reassignment.holder else {
+                    continue;
+                };
+                let part = &source.parts[part];
+                let previous = parse_paragraph_id(&reassignment.previous);
+                if part.kind != SourceStoryKind::Comment
+                    || !previous.is_some_and(|id| source.comment_references.contains(&id))
+                {
+                    continue;
+                }
+                let holders: Vec<&ParagraphOccurrence> = part
+                    .occurrences
+                    .iter()
+                    .filter(|occurrence| {
+                        occurrence.para_id.as_deref().and_then(parse_paragraph_id) == previous
+                    })
+                    .collect();
+                if holders.len() > 1 {
+                    let mut comment_ids: Vec<String> = holders
+                        .iter()
+                        .filter_map(|occurrence| occurrence.item_id.clone())
+                        .collect();
+                    comment_ids.dedup();
+                    return Err(ParagraphIdRefusal::AmbiguousCommentReference {
+                        ooxml_para_id: reassignment.previous.clone(),
+                        comment_ids,
+                    });
+                }
+            }
+        }
+        let mut allocator = IdAllocator::new(self, &txn);
+        let mut report = PersistedParagraphIds {
+            assignments: Self::apply_repairs(&mut txn, &scan, &mut allocator, &plan),
+            diagnostics: Vec::new(),
+        };
+        for (id, holders) in &plan.conflicts {
+            report
+                .diagnostics
+                .push(ParagraphIdDiagnostic::ConflictingSavedIds {
+                    ooxml_para_id: id.clone(),
+                    paragraphs: holders
+                        .iter()
+                        .filter_map(|holder| holder_ref(&scan, source.as_deref(), *holder))
+                        .collect(),
+                });
+        }
+        let handled: HashSet<usize> = plan
+            .reassigned
+            .iter()
+            .filter_map(|reassignment| match reassignment.holder {
+                Holder::Pilcrow(index) => Some(index),
+                Holder::Occurrence(..) | Holder::Retired => None,
+            })
+            .chain(plan.renamed.iter().map(|(index, _, _)| *index))
+            .collect();
+        let mut shared: HashMap<(usize, u32), String> = HashMap::new();
+        for (index, pilcrow) in scan.pilcrows.iter().enumerate() {
+            if (pilcrow.synthetic && !pilcrow.content)
+                || handled.contains(&index)
+                || pilcrow.saved_id(source.as_deref()).is_some()
+            {
+                continue;
+            }
+            if pilcrow.synthetic {
+                pilcrow.map.remove(&mut txn, PARA_ORIGIN);
+            }
+            let occurrence = source
+                .as_deref()
+                .and_then(|source| source.view_of(&pilcrow.key))
+                .map(|(occurrence, _)| occurrence);
+            let id = match occurrence.and_then(|occurrence| shared.get(&occurrence)) {
+                Some(id) => {
+                    attach(
+                        &mut txn,
+                        &pilcrow.map,
+                        &pilcrow.key,
+                        id,
+                        ParagraphIdOrigin::Persisted,
+                    );
+                    id.clone()
+                }
+                None => allocator.bind(
+                    &mut txn,
+                    &pilcrow.map,
+                    &pilcrow.key,
+                    ParagraphIdOrigin::Persisted,
+                ),
+            };
+            if let Some(occurrence) = occurrence {
+                shared.entry(occurrence).or_insert_with(|| id.clone());
+            }
+            report.assignments.push(ParagraphIdAssignment {
+                paragraph: pilcrow.session_ref(),
+                replaced_para_id: None,
+                previous_ooxml_para_id: None,
+                ooxml_para_id: id,
+                origin: ParagraphIdOrigin::Persisted,
+                source_story: Self::source_story_of(
+                    &scan,
+                    source.as_deref(),
+                    Holder::Pilcrow(index),
+                ),
+            });
+        }
+        match source.as_deref() {
+            Some(source) => {
+                let assigned = source_assignments(&txn);
+                for (part_index, occurrence) in source.unbacked() {
+                    let part = &source.parts[part_index];
+                    let owner = occurrence_owner(part, occurrence.ordinal);
+                    if assigned.contains_key(&owner) || valid(occurrence.para_id.clone()).is_some()
+                    {
+                        continue;
+                    }
+                    let id =
+                        allocator.assign_source(&mut txn, &owner, ParagraphIdOrigin::Persisted);
+                    report.assignments.push(ParagraphIdAssignment {
+                        paragraph: ParagraphRef::Source(source.reference(part, occurrence.ordinal)),
+                        replaced_para_id: None,
+                        previous_ooxml_para_id: None,
+                        ooxml_para_id: id,
+                        origin: ParagraphIdOrigin::Persisted,
+                        source_story: Some(part.story(occurrence.item_id.as_deref())),
+                    });
+                }
+            }
+            None => report
+                .diagnostics
+                .push(ParagraphIdDiagnostic::NoSourcePackage),
+        }
+        Ok(report)
+    }
+
+    /// Reconciles what a save wrote with the live state and publishes it:
+    /// `saved` holds the `(owner, ID)` pairs the save captured, an owner being
+    /// a session key or a source occurrence's `{partUri}#{ordinal}`. A pair
+    /// whose owner now saves with another ID, or whose ID another paragraph
+    /// took since the capture, is stale: it is returned and not published.
+    /// The rest are marked published, so they keep their IDs against unsaved
+    /// claims from other replicas. Writes nothing when nothing changes.
+    pub fn record_saved_paragraph_ids(&self, saved: &[(String, String)]) -> Vec<(String, String)> {
+        let source = self.source_index();
+        let (stale, unpublished) = {
+            let txn = self.yrs_doc().transact();
+            let claims = claims(&txn);
+            let assignments = source_assignments(&txn);
+            let mut current: HashMap<String, u32> = HashMap::new();
+            for pilcrow in &self.committed_scan(&txn).pilcrows {
+                if let Some(id) = pilcrow
+                    .saved_id(source.as_deref())
+                    .and_then(|(id, _)| parse_paragraph_id(&id))
+                {
+                    current.insert(pilcrow.key.clone(), id);
+                }
+            }
+            if let Some(source) = source.as_deref() {
+                for (part_index, occurrence) in source.unbacked() {
+                    let owner = occurrence_owner(&source.parts[part_index], occurrence.ordinal);
+                    let id = assignments
+                        .get(&owner)
+                        .cloned()
+                        .or_else(|| valid(occurrence.para_id.clone()));
+                    if let Some(id) = id.as_deref().and_then(parse_paragraph_id) {
+                        current.insert(owner, id);
+                    }
+                }
+            }
+            let captured: HashSet<(&str, u32)> = saved
+                .iter()
+                .filter_map(|(owner, id)| Some((owner.as_str(), parse_paragraph_id(id)?)))
+                .collect();
+            let occurrence = |key: &str| {
+                source
+                    .as_deref()
+                    .and_then(|source| source.view_of(key))
+                    .map(|(occurrence, _)| occurrence)
+            };
+            let mut stale = Vec::new();
+            let mut unpublished = Vec::new();
+            for (owner, text) in saved {
+                let Some(id) = parse_paragraph_id(text) else {
+                    continue;
+                };
+                let moved = current.get(owner).is_some_and(|now| *now != id);
+                let viewed = occurrence(owner);
+                let taken = current.iter().any(|(holder, now)| {
+                    *now == id
+                        && !captured.contains(&(holder.as_str(), id))
+                        && (viewed.is_none() || occurrence(holder) != viewed)
+                });
+                if moved || taken {
+                    stale.push((owner.clone(), text.clone()));
+                } else if let Some(found) =
+                    claim(&claims, text, owner).filter(|claim| !claim.published)
+                {
+                    unpublished.push((format_paragraph_id(id), owner.as_str(), found.origin));
+                }
+            }
+            (stale, unpublished)
+        };
+        if !unpublished.is_empty() {
+            let mut txn = self.transact_for(&EditCtx::system(""));
+            for (id, owner, origin) in unpublished {
+                record_claim(&mut txn, &id, owner, origin, true);
+            }
+        }
+        stale
+    }
+
+    /// The Word paragraph ID each paragraph of `story_id` saves with, in
+    /// document order.
+    pub fn story_paragraph_ids(&self, story_id: &str) -> EditResult<Vec<Option<String>>> {
+        let source = self.source_index();
+        let txn = self.yrs_doc().transact();
+        let story = story_ref(&txn, story_id)?;
+        Ok(pilcrows(&story, &txn)
+            .into_iter()
+            .map(|(_, map)| {
+                Pilcrow::read(story_id, map, &txn)
+                    .saved_id(source.as_deref())
+                    .map(|(id, _)| id)
+            })
+            .collect())
+    }
+
+    /// Every paragraph's session key, Word paragraph ID and anchors. Reads only.
+    pub fn paragraph_identities(&self) -> ParagraphIdentities {
+        let source = self.source_index();
+        let txn = self.yrs_doc().transact();
+        let claims = claims(&txn);
+        let assignments = source_assignments(&txn);
+        let scan = self.committed_scan(&txn);
+        let id_origin = |id: &str, owner: &str| {
+            claim(&claims, id, owner).map_or(ParagraphIdOrigin::Source, |claim| claim.origin)
+        };
+        let mut paragraphs: Vec<ParagraphIdentity> = scan
+            .pilcrows
+            .iter()
+            .map(|pilcrow| {
+                ooxml_opc::progress::tick();
+                let saved = pilcrow.saved_id(source.as_deref());
+                let seed = source
+                    .as_deref()
+                    .and_then(|source| source.seeded.get(&pilcrow.key));
+                let root = scan.root(&pilcrow.story);
+                ParagraphIdentity {
+                    paragraph: pilcrow.session_ref(),
+                    origin: if pilcrow.synthetic {
+                        ParagraphOrigin::Synthetic
+                    } else if seed.is_some() || (source.is_none() && pilcrow.source.is_some()) {
+                        ParagraphOrigin::Source
+                    } else {
+                        ParagraphOrigin::Authored
+                    },
+                    id_origin: saved.as_ref().map(|(id, from_source)| {
+                        if *from_source {
+                            ParagraphIdOrigin::Source
+                        } else {
+                            id_origin(id, &pilcrow.key)
+                        }
+                    }),
+                    ooxml_para_id: saved.map(|(id, _)| id),
+                    source_story: source
+                        .as_deref()
+                        .and_then(|source| source.roots.get(root))
+                        .cloned(),
+                    source: source.as_deref().and_then(|source| {
+                        let seed = seed.filter(|seed| seed.root == root)?;
+                        Some(source.reference(&source.parts[seed.part?], seed.ordinal?))
+                    }),
+                }
+            })
+            .collect();
+        if let Some(source) = source.as_deref() {
+            for (part_index, occurrence) in source.unbacked() {
+                let part = &source.parts[part_index];
+                let owner = occurrence_owner(part, occurrence.ordinal);
+                let (id, origin) = match assignments.get(&owner) {
+                    Some(id) => (Some(id.clone()), Some(id_origin(id, &owner))),
+                    None => {
+                        let id = valid(occurrence.para_id.clone());
+                        let origin = id.as_ref().map(|_| ParagraphIdOrigin::Source);
+                        (id, origin)
+                    }
+                };
+                let reference = source.reference(part, occurrence.ordinal);
+                paragraphs.push(ParagraphIdentity {
+                    paragraph: ParagraphRef::Source(reference.clone()),
+                    origin: ParagraphOrigin::Source,
+                    ooxml_para_id: id,
+                    id_origin: origin,
+                    source_story: Some(part.story(occurrence.item_id.as_deref())),
+                    source: Some(reference),
+                });
+            }
+        }
+        drop(txn);
+        ParagraphIdentities {
+            session_id: self.session_id(),
+            package_sha256: source.map(|source| source.package_sha256.clone()),
+            paragraphs,
+        }
+    }
+
+    /// Resolves an anchor to the paragraph that currently holds it: a session
+    /// anchor by its session, story and key; a source anchor by its package,
+    /// part and occurrence; a persisted anchor by its Word paragraph ID in its
+    /// source story, nested tables and content controls included. Reads only.
+    pub fn resolve_paragraph_anchor(&self, anchor: &ParagraphAnchor) -> AnchorResolution {
+        if let ParagraphAnchor::Session { session_id, .. } = anchor
+            && *session_id != self.session_id()
+        {
+            return AnchorResolution::Unsupported(AnchorUnsupported::ForeignSession);
+        }
+        let source = self.source_index();
+        let txn = self.yrs_doc().transact();
+        let scan = self.committed_scan(&txn);
+        let by_key = |key: &str, story: Option<&str>| -> Vec<ParagraphRef> {
+            scan.pilcrows
+                .iter()
+                .filter(|pilcrow| {
+                    pilcrow.key == key && story.is_none_or(|story| pilcrow.story == story)
+                })
+                .map(Pilcrow::session_ref)
+                .collect()
+        };
+        let matches = match anchor {
+            ParagraphAnchor::Session { story, para_id, .. } => by_key(para_id, Some(story)),
+            ParagraphAnchor::Source(reference) => {
+                let Some(source) = source.as_deref() else {
+                    return AnchorResolution::Unsupported(AnchorUnsupported::NoSourcePackage);
+                };
+                if source.package_sha256 != reference.package_sha256 {
+                    return AnchorResolution::Unsupported(AnchorUnsupported::ForeignPackage);
+                }
+                match source.part(&reference.part_uri) {
+                    Some(part) => match part.backed.get(&reference.paragraph_ordinal) {
+                        Some(views) => views
+                            .iter()
+                            .map(|key| by_key(key, None))
+                            .find(|matches| !matches.is_empty())
+                            .unwrap_or_default(),
+                        None if part.occurrence(reference.paragraph_ordinal).is_some() => {
+                            vec![ParagraphRef::Source(reference.clone())]
+                        }
+                        None => Vec::new(),
+                    },
+                    None => Vec::new(),
+                }
+            }
+            ParagraphAnchor::Persisted { story, para_id } => {
+                let Some(source) = source.as_deref() else {
+                    return AnchorResolution::Unsupported(AnchorUnsupported::NoSourcePackage);
+                };
+                let Some(target) = parse_paragraph_id(para_id) else {
+                    return AnchorResolution::Missing;
+                };
+                let mut matches: Vec<ParagraphRef> = source
+                    .first_views(scan.pilcrows.iter().filter(|pilcrow| {
+                        source.roots.get(scan.root(&pilcrow.story)) == Some(story)
+                            && pilcrow
+                                .saved_id(Some(source))
+                                .and_then(|(id, _)| parse_paragraph_id(&id))
+                                == Some(target)
+                    }))
+                    .into_iter()
+                    .map(Pilcrow::session_ref)
+                    .collect();
+                let assignments = source_assignments(&txn);
+                for (part_index, occurrence) in source.unbacked() {
+                    let part = &source.parts[part_index];
+                    if part.story(occurrence.item_id.as_deref()) != *story {
+                        continue;
+                    }
+                    let id = assignments
+                        .get(&occurrence_owner(part, occurrence.ordinal))
+                        .cloned()
+                        .or_else(|| valid(occurrence.para_id.clone()));
+                    if id.as_deref().and_then(parse_paragraph_id) == Some(target) {
+                        matches.push(ParagraphRef::Source(
+                            source.reference(part, occurrence.ordinal),
+                        ));
+                    }
+                }
+                matches
+            }
+        };
+        match <[ParagraphRef; 1]>::try_from(matches) {
+            Ok([paragraph]) => AnchorResolution::Found(paragraph),
+            Err(matches) if matches.is_empty() => AnchorResolution::Missing,
+            Err(matches) => AnchorResolution::Ambiguous(matches),
+        }
+    }
+
+    fn live_save_seed_states(&self, stories: HashMap<String, Arc<StoryState>>) -> SeedStates {
+        SeedStates {
+            stories,
+            patch_table_styles: self
+                .source_metadata()
+                .map(|metadata| metadata.patch_table_styles().clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Caches save seed states without reseeding, declining a document of
+    /// more than `max_paragraphs` paragraphs or a package of more than
+    /// `max_inflated_bytes` bytes, packed or as its parts declare them
+    /// inflated, and stopping once the media URLs and text its stories hold,
+    /// counted at every use, would take more than that; returns whether they
+    /// are known.
+    pub fn prime_save_seed_states(&self, max_paragraphs: u32, max_inflated_bytes: u32) -> bool {
+        self.prime_save_seed_states_slice(max_paragraphs, max_inflated_bytes, u32::MAX)
+            == PrimeSlice::Known
+    }
+
+    /// [`Self::prime_save_seed_states`], a slice at a time: digests stories until about
+    /// `max_bytes` canonical bytes went in, then stops and keeps its progress for the next call.
+    /// A commit between slices drops the progress and declines, as a prime of the edited
+    /// session would.
+    pub fn prime_save_seed_states_slice(
+        &self,
+        max_paragraphs: u32,
+        max_inflated_bytes: u32,
+        max_bytes: u32,
+    ) -> PrimeSlice {
+        let mut progress = self.prime_progress.lock().unwrap();
+        let bytes = match self.source.lock().unwrap().as_ref() {
+            Some(SourcePackage::Ready(index)) if index.seed_states_initialized() => {
+                *progress = None;
+                return PrimeSlice::Known;
+            }
+            Some(SourcePackage::Ready(index)) => index.bytes(),
+            Some(SourcePackage::Pending(bytes, _)) => bytes.clone(),
+            None => {
+                *progress = None;
+                return PrimeSlice::Declined;
+            }
+        };
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        if progress
+            .as_ref()
+            .is_some_and(|progress| progress.epoch != epoch)
+        {
+            *progress = None;
+            return PrimeSlice::Declined;
+        }
+        let txn = self.yrs_doc().transact();
+        if progress.is_none() {
+            if !self.unchanged_since_seeded() || self.media.lock().unwrap().is_none() {
+                return PrimeSlice::Declined;
+            }
+            if bytes.as_ref().len() as u64 > u64::from(max_inflated_bytes) {
+                return PrimeSlice::Declined;
+            }
+            let Ok(package) = ooxml_opc::RetainedPackage::from_bytes(bytes) else {
+                return PrimeSlice::Declined;
+            };
+            let inflated = package.parts().map(|(_, size)| size);
+            if inflated.fold(0u64, u64::saturating_add) > u64::from(max_inflated_bytes) {
+                return PrimeSlice::Declined;
+            }
+            let scan = self.committed_scan(&txn);
+            if scan.pilcrows.len() > max_paragraphs as usize {
+                return PrimeSlice::Declined;
+            }
+            let Some(source) = self.source_index() else {
+                return PrimeSlice::Declined;
+            };
+            if source.seed_states_initialized() {
+                return PrimeSlice::Known;
+            }
+            if !source.opened_under_own_digest() {
+                return PrimeSlice::Declined;
+            }
+            *progress = Some(PrimeProgress {
+                epoch,
+                budget: Some((max_inflated_bytes as usize).max(1)),
+                stories: scan.stories.iter().cloned().collect(),
+                roots: scan
+                    .stories
+                    .iter()
+                    .map(|story| (story.clone(), scan.root(story).to_owned()))
+                    .collect(),
+                comments: scan
+                    .stories
+                    .iter()
+                    .map(|story| {
+                        (
+                            story.clone(),
+                            crate::canonical::story_comment_anchors(&txn, story),
+                        )
+                    })
+                    .collect(),
+                states: HashMap::new(),
+                current: None,
+            });
+        }
+        let Some(state) = progress.as_mut() else {
+            return PrimeSlice::Declined;
+        };
+        let mut left = max_bytes as usize;
+        loop {
+            if state.current.is_none() {
+                let Some(story) = state.stories.pop_front() else {
+                    let stories = std::mem::take(&mut state.states);
+                    *progress = None;
+                    let Some(source) = self.source_index() else {
+                        return PrimeSlice::Declined;
+                    };
+                    source.seed_states_or(|| self.live_save_seed_states(stories));
+                    return PrimeSlice::Known;
+                };
+                let comments = state.comments.get(&story).cloned().unwrap_or_default();
+                left = left.saturating_sub(PRIME_STORY_COST);
+                match StoryFingerprint::start(
+                    self,
+                    &txn,
+                    &story,
+                    &comments,
+                    &mut state.budget,
+                    None,
+                ) {
+                    Some(fingerprint) => {
+                        let large = fingerprint.segments.len() > PRIME_SLICE_SEGMENTS;
+                        state.current = Some((story, fingerprint));
+                        if large && max_bytes != u32::MAX {
+                            return PrimeSlice::Pending;
+                        }
+                    }
+                    None => {
+                        state.comments.remove(&story);
+                        if state.budget == Some(0) {
+                            *progress = None;
+                            return PrimeSlice::Declined;
+                        }
+                        if left == 0 {
+                            return PrimeSlice::Pending;
+                        }
+                        continue;
+                    }
+                }
+            }
+            let Some((_, fingerprint)) = state.current.as_mut() else {
+                continue;
+            };
+            let advanced = fingerprint.advance(&mut state.budget, left.max(1));
+            if let Some((false, _)) = advanced {
+                return PrimeSlice::Pending;
+            }
+            let Some((story, fingerprint)) = state.current.take() else {
+                continue;
+            };
+            let comments = state.comments.remove(&story).unwrap_or_default();
+            if let Some((true, used)) = advanced {
+                left = left.saturating_sub(used);
+                if let Some((fingerprint, units, _)) = fingerprint.finish() {
+                    let root = state.roots.get(&story).cloned().unwrap_or_default();
+                    let story_state = Arc::new(StoryState {
+                        root,
+                        fingerprint,
+                        units,
+                        comments,
+                    });
+                    state.states.insert(story, story_state);
+                }
+            }
+            if state.budget == Some(0) {
+                *progress = None;
+                return PrimeSlice::Declined;
+            }
+            if left == 0 {
+                return PrimeSlice::Pending;
+            }
+        }
+    }
+
+    /// The paragraph IDs a save of this session applies; see
+    /// [`ParagraphSavePlan`]. A part is patched in place only when every
+    /// story seeded from it, nested ones included, gives the save projection
+    /// exactly what it gave as seeded (see [`StoryState`]), so that its source
+    /// bytes are what a save would write, IDs aside.
+    pub fn paragraph_save_plan(&self) -> ParagraphSavePlan {
+        let Some(source) = self.source_index() else {
+            return ParagraphSavePlan::default();
+        };
+        let txn = self.yrs_doc().transact();
+        let assignments = source_assignments(&txn);
+        let scan = self.committed_scan(&txn);
+        let by_key: HashMap<&str, &Pilcrow> = scan
+            .pilcrows
+            .iter()
+            .map(|pilcrow| (pilcrow.key.as_str(), pilcrow))
+            .collect();
+        let unchanged = self.unchanged_since_seeded() && source.opened_under_own_digest();
+        let ready = if unchanged {
+            source.seed_states.get().map(|seeded| &seeded.stories)
+        } else {
+            Some(source.seed_states())
+        };
+        let ready_units = ready.map(units_by_key);
+        let live = if by_key.len() == scan.pilcrows.len() {
+            story_states_in(
+                self,
+                &txn,
+                ready
+                    .zip(ready_units.as_ref())
+                    .map(|(stories, units)| SaveSeeds { stories, units }),
+            )
+        } else {
+            self.save_story_states.lock().unwrap().clear();
+            story_states_within(self, &txn, None).unwrap_or_default()
+        };
+        let mut plan = ParagraphSavePlan {
+            assignments: source
+                .unbacked()
+                .filter_map(|(part_index, occurrence)| {
+                    let part = &source.parts[part_index];
+                    let id = assignments.get(&occurrence_owner(part, occurrence.ordinal))?;
+                    Some((part.path().to_owned(), occurrence.ordinal, id.clone()))
+                })
+                .collect(),
+            patched_parts: Vec::new(),
+            spliced_parts: Vec::new(),
+            section_spliced_parts: Vec::new(),
+        };
+        let metadata = self.source_metadata();
+        let seeded = if let Some(ready) = ready {
+            ready
+        } else {
+            source.seed_states_or(|| self.live_save_seed_states(live.clone()))
+        };
+        let seeded_units = ready_units.unwrap_or_else(|| units_by_key(seeded));
+        let live_units = units_by_key(&live);
+        let stories_of = |states: &HashMap<String, Arc<StoryState>>, part: &SourcePart| {
+            part_stories(states, part)
+                .into_iter()
+                .map(|(story, state)| (story.clone(), (state.fingerprint, state.comments.clone())))
+                .collect::<BTreeMap<_, _>>()
+        };
+        'parts: for (index, part) in source.parts.iter().enumerate() {
+            if seeded.is_empty() {
+                continue;
+            }
+            if let Some(mut spliced) = spliced_part(&source, index, seeded, &live, &by_key) {
+                if part.as_written {
+                    for &ordinal in &spliced.changed {
+                        let key = &part.backed[&ordinal][0];
+                        let (story, was) = seeded_units[key.as_str()];
+                        let (_, now) = live_units[key.as_str()];
+                        if let Some(metadata) = &metadata {
+                            metadata.prepare_patch_table_styles(story, &source);
+                        }
+                        let source_paragraph = || source.paragraph_xml(part, ordinal);
+                        let context = crate::paragraph_patch_plan::PatchContext {
+                            ordinal,
+                            session_key: key,
+                            story,
+                            metadata: metadata.as_deref(),
+                            source_paragraph: Some(&source_paragraph),
+                            source: Some(&source),
+                            seeded_markers: &was.markers,
+                            live_markers: &now.markers,
+                        };
+                        match crate::paragraph_patch_plan::diff_paragraph_v1(
+                            was.segments.as_deref().expect("seeded segments retained"),
+                            now.segments.as_deref().expect("changed segments retained"),
+                            context,
+                        ) {
+                            Ok(patch) => spliced.paragraph_patches.push(patch),
+                            Err(legacy) => spliced.legacy_paragraphs.push(legacy),
+                        }
+                    }
+                    let rewritten: Vec<u32> = spliced
+                        .legacy_paragraphs
+                        .iter()
+                        .map(|legacy| legacy.ordinal)
+                        .collect();
+                    let reformatted: Vec<u32> = spliced
+                        .paragraph_patches
+                        .iter()
+                        .filter(|patch| !patch.run_edits.is_empty())
+                        .map(|patch| patch.ordinal)
+                        .collect();
+                    if !ends_with_inline_tail(seeded, part)
+                        || (!source.rewrite_loses_source_runs(
+                            part,
+                            &rewritten,
+                            rewriting_loses_source_runs,
+                        ) && !source.rewrite_loses_source_runs(
+                            part,
+                            &reformatted,
+                            reformatting_loses_fields,
+                        ))
+                    {
+                        plan.spliced_parts.push(spliced);
+                    }
+                } else if part.kind == SourceStoryKind::Body {
+                    plan.section_spliced_parts.push(spliced);
+                }
+            }
+            if stories_of(seeded, part) != stories_of(&live, part) {
+                continue;
+            }
+            let mut patches = Vec::new();
+            for occurrence in &part.occurrences {
+                ooxml_opc::progress::tick();
+                let desired = match part.backed.get(&occurrence.ordinal) {
+                    Some(views) => match views.iter().find_map(|key| by_key.get(key.as_str())) {
+                        Some(pilcrow) => pilcrow.saved_id(Some(&source)).map(|(id, _)| id),
+                        None => continue 'parts,
+                    },
+                    None => assignments
+                        .get(&occurrence_owner(part, occurrence.ordinal))
+                        .cloned(),
+                };
+                if let Some(desired) = desired
+                    && occurrence.para_id.as_deref() != Some(desired.as_str())
+                {
+                    patches.push((occurrence.ordinal, desired));
+                }
+            }
+            plan.patched_parts.push((part.path().to_owned(), patches));
+        }
+        drop(live_units);
+        drop(live);
+        if self
+            .source_index()
+            .is_some_and(|current| Arc::ptr_eq(&source, &current))
+        {
+            self.save_story_states
+                .lock()
+                .unwrap()
+                .retain_patch_segments(seeded, &seeded_units);
+        }
+        plan
+    }
+}
+
+struct UnitIndex<'a> {
+    by_key: HashMap<&'a str, (&'a str, &'a UnitState)>,
+    unique: bool,
+}
+
+impl<'a> std::ops::Deref for UnitIndex<'a> {
+    type Target = HashMap<&'a str, (&'a str, &'a UnitState)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_key
+    }
+}
+
+fn units_by_key(states: &HashMap<String, Arc<StoryState>>) -> UnitIndex<'_> {
+    let mut by_key = HashMap::new();
+    let mut unique = true;
+    for (story, state) in states {
+        for unit in &state.units {
+            if let Some(key) = unit.key.as_deref()
+                && by_key.insert(key, (story.as_str(), unit)).is_some()
+            {
+                unique = false;
+            }
+        }
+    }
+    UnitIndex { by_key, unique }
+}
+
+/// The stories seeded from `part`, cells and content controls nested in them included.
+fn part_stories<'a>(
+    states: &'a HashMap<String, Arc<StoryState>>,
+    part: &SourcePart,
+) -> BTreeMap<&'a String, &'a StoryState> {
+    let prefix = match part.kind {
+        SourceStoryKind::Footnote => Some("fn:"),
+        SourceStoryKind::Endnote => Some("en:"),
+        _ => None,
+    };
+    states
+        .iter()
+        .filter(|(_, state)| {
+            part.roots.contains(&state.root)
+                || prefix.is_some_and(|prefix| state.root.starts_with(prefix))
+        })
+        .map(|(story, state)| (story, state.as_ref()))
+        .collect()
+}
+
+fn separator_paragraphs(source: &SourceIndex, part: &SourcePart) -> Option<Vec<u32>> {
+    let note_name = match part.kind {
+        SourceStoryKind::Footnote => "w:footnote",
+        SourceStoryKind::Endnote => "w:endnote",
+        _ => return Some(Vec::new()),
+    };
+    let package = ooxml_opc::RetainedPackage::from_bytes(source.bytes()).ok()?;
+    let position = package.parts().position(|(path, _)| path == part.path())?;
+    let xml = String::from_utf8(package.read(position).ok()?).ok()?;
+    let limits = docx_parse::xml::ParseLimits::default();
+    let mut budget = docx_parse::xml::ParseBudget::new(&limits);
+    let document = docx_parse::xml::parse_xml(xml.as_bytes(), part.path(), &mut budget).ok()?;
+    let mut ordinals = Vec::new();
+    for (index, note) in document.root()?.child_elements().enumerate() {
+        if note.name != note_name
+            || docx_parse::notes::parse_note_type(note.attribute(Some("w"), "type")) == "normal"
+        {
+            continue;
+        }
+        let span = docx_parse::serializer::element_span(&xml, &[index as u32])?;
+        ordinals.extend(
+            part.occurrences
+                .iter()
+                .filter(|occurrence| span.contains(&occurrence.tag.start))
+                .map(|occurrence| occurrence.ordinal),
+        );
+    }
+    Some(ordinals)
+}
+
+#[derive(Default)]
+struct RowSplices {
+    inserted: HashMap<String, SpliceAnchor>,
+    removed: HashSet<String>,
+    tables: Vec<S13TablePatch>,
+}
+
+fn simple_table_payload(
+    payload: &serde_json::Value,
+    stories: &BTreeMap<&String, &StoryState>,
+) -> bool {
+    let Some(rows) = payload["rows"].as_array().filter(|rows| !rows.is_empty()) else {
+        return false;
+    };
+    let columns = rows[0]["cells"].as_array().map_or(0, Vec::len);
+    columns > 0
+        && rows.iter().all(|row| {
+            let tr_pr = &row["trPr"];
+            let offsets = [tr_pr, &tr_pr["_originalFormatting"]].iter().any(|attrs| {
+                ["gridBefore", "gridAfter"]
+                    .iter()
+                    .any(|key| attrs.get(*key).is_some_and(|value| !value.is_null()))
+            });
+            !offsets
+                && row["cells"].as_array().is_some_and(|cells| {
+                    cells.len() == columns
+                        && cells.iter().all(|cell| {
+                            let tc_pr = &cell["tcPr"];
+                            let merged =
+                                [tc_pr, &tc_pr["_originalFormatting"]].iter().any(|attrs| {
+                                    attrs.get("vMerge").is_some_and(|value| !value.is_null())
+                                        || ["colspan", "rowspan", "gridSpan"].iter().any(|key| {
+                                            attrs
+                                                .get(*key)
+                                                .and_then(serde_json::Value::as_f64)
+                                                .is_some_and(|value| value > 1.0)
+                                        })
+                                });
+                            !merged
+                                && cell["story"].as_str().is_some_and(|story| {
+                                    stories.get(&story.to_owned()).is_some_and(|state| {
+                                        state.units.iter().all(|unit| !unit.has_blocks())
+                                    })
+                                })
+                        })
+                })
+        })
+}
+
+/// `simple_table_payload` without the merged and offset exclusions: the shape a
+/// merge may produce from a simple table, never a shape it may start from.
+fn shaped_table_payload(
+    payload: &serde_json::Value,
+    stories: &BTreeMap<&String, &StoryState>,
+) -> bool {
+    let Some(rows) = payload["rows"].as_array().filter(|rows| !rows.is_empty()) else {
+        return false;
+    };
+    rows.iter().all(|row| {
+        row["cells"].as_array().is_some_and(|cells| {
+            !cells.is_empty()
+                && cells.iter().all(|cell| {
+                    cell["story"].as_str().is_some_and(|story| {
+                        stories
+                            .get(&story.to_owned())
+                            .is_some_and(|state| state.units.iter().all(|unit| !unit.has_blocks()))
+                    })
+                })
+        })
+    })
+}
+
+fn admit_row_splices(
+    was: &UnitState,
+    now: &UnitState,
+    origin: (&SourceIndex, usize, bool),
+    before: &BTreeMap<&String, &StoryState>,
+    after: &BTreeMap<&String, &StoryState>,
+    edits: &mut RowSplices,
+) -> Option<()> {
+    let (source, index, patch_tables) = origin;
+    if was.blocks == now.blocks {
+        return Some(());
+    }
+    if was.block_content.len() != now.block_content.len() {
+        return None;
+    }
+    fn cells(row: &serde_json::Value) -> Option<Vec<&str>> {
+        row.get("cells")?
+            .as_array()?
+            .iter()
+            .map(|cell| cell.get("story")?.as_str())
+            .collect()
+    }
+    let unit_tables_plain = was.block_content.iter().all(|other| {
+        other[0]["embed"] != "table" || simple_table_payload(&other[0]["payload"], before)
+    });
+    for (was, now) in was.block_content.iter().zip(&now.block_content) {
+        if was == now {
+            continue;
+        }
+        if was[0]["embed"] != "table" || now[0]["embed"] != "table" || was[1] != now[1] {
+            return None;
+        }
+        let mut old_payload = was[0]["payload"].as_object()?.clone();
+        let mut new_payload = now[0]["payload"].as_object()?.clone();
+        let old_rows = old_payload.remove("rows")?;
+        let new_rows = new_payload.remove("rows")?;
+        let old_rows = old_rows.as_array()?;
+        let new_rows = new_rows.as_array()?;
+        let old_keys = old_rows.iter().map(cells).collect::<Option<Vec<_>>>()?;
+        let new_keys = new_rows.iter().map(cells).collect::<Option<Vec<_>>>()?;
+        let simple = patch_tables
+            && old_keys == new_keys
+            && simple_table_payload(&was[0]["payload"], before)
+            && simple_table_payload(&now[0]["payload"], after)
+            && old_keys.iter().flatten().any(|story| {
+                before.get(&story.to_string()).is_some_and(|state| {
+                    state.units.iter().any(|unit| {
+                        unit.key
+                            .as_deref()
+                            .and_then(|key| source.view_of(key))
+                            .is_some_and(|((part, ordinal), _)| {
+                                part == index && source.simple_table(index, ordinal)
+                            })
+                    })
+                })
+            });
+        let row_ordinals = |stories: &[&str]| -> Option<Vec<u32>> {
+            let mut ordinals = Vec::new();
+            for story in stories {
+                for unit in &before.get(&story.to_string())?.units {
+                    let Some(key) = unit.key.as_deref() else {
+                        continue;
+                    };
+                    if let Some(((part_index, ordinal), 0)) = source.view_of(key) {
+                        if part_index != index {
+                            return None;
+                        }
+                        ordinals.push(ordinal);
+                    } else if unit.inline || unit.has_blocks() {
+                        return None;
+                    }
+                }
+            }
+            ordinals.sort_unstable();
+            (!ordinals.is_empty()).then_some(ordinals)
+        };
+        let merged = patch_tables
+            && unit_tables_plain
+            && old_payload == new_payload
+            && old_keys.len() == new_keys.len()
+            && old_keys.iter().zip(&new_keys).all(|(old, new)| {
+                !new.is_empty()
+                    && new.iter().all(|story| old.contains(story))
+                    && new.windows(2).all(|pair| {
+                        old.iter().position(|story| story == &pair[0])
+                            < old.iter().position(|story| story == &pair[1])
+                    })
+            })
+            && simple_table_payload(&was[0]["payload"], before)
+            && shaped_table_payload(&now[0]["payload"], after);
+        if simple || merged {
+            for story in old_keys.iter().flatten() {
+                if !new_keys.iter().flatten().any(|kept| kept == story) {
+                    edits.removed.insert((*story).to_owned());
+                }
+            }
+            let ordinals = row_ordinals(&old_keys.iter().flatten().copied().collect::<Vec<_>>())?;
+            edits.tables.push(S13TablePatch {
+                ordinal: *ordinals.first()?,
+                before: was[0]["payload"].clone(),
+                after: now[0]["payload"].clone(),
+            });
+            continue;
+        }
+        if patch_tables
+            || old_payload != new_payload
+            || old_keys.iter().chain(&new_keys).any(Vec::is_empty)
+        {
+            return None;
+        }
+        let old_map: HashMap<&str, usize> = old_keys
+            .iter()
+            .enumerate()
+            .map(|(at, stories)| (stories[0], at))
+            .collect();
+        let new_map: HashMap<&str, usize> = new_keys
+            .iter()
+            .enumerate()
+            .map(|(at, stories)| (stories[0], at))
+            .collect();
+        if old_map.len() != old_rows.len() || new_map.len() != new_rows.len() {
+            return None;
+        }
+        let kept_old: Vec<&str> = old_keys
+            .iter()
+            .map(|stories| stories[0])
+            .filter(|key| new_map.contains_key(key))
+            .collect();
+        let kept_new: Vec<&str> = new_keys
+            .iter()
+            .map(|stories| stories[0])
+            .filter(|key| old_map.contains_key(key))
+            .collect();
+        if kept_old.is_empty() || kept_old != kept_new {
+            return None;
+        }
+        for (at, stories) in old_keys.iter().enumerate() {
+            if let Some(&new_at) = new_map.get(stories[0]) {
+                if old_rows[at] != new_rows[new_at] {
+                    return None;
+                }
+            } else {
+                for story in stories {
+                    if after.contains_key(&story.to_string())
+                        || !edits.removed.insert((*story).to_owned())
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        for (at, stories) in new_keys.iter().enumerate() {
+            if old_map.contains_key(stories[0]) {
+                continue;
+            }
+            let anchor = if let Some(previous) = new_keys[..at]
+                .iter()
+                .rev()
+                .find(|stories| old_map.contains_key(stories[0]))
+            {
+                SpliceAnchor::After(*row_ordinals(previous)?.last()?)
+            } else {
+                let next = new_keys[at + 1..]
+                    .iter()
+                    .find(|stories| old_map.contains_key(stories[0]))?;
+                SpliceAnchor::Before(*row_ordinals(next)?.first()?)
+            };
+            for story in stories {
+                if before.contains_key(&story.to_string())
+                    || !after.contains_key(&story.to_string())
+                    || edits.inserted.insert((*story).to_owned(), anchor).is_some()
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// `source.parts[index]` as a part a save can splice: one whose stories still hold, in order
+/// and each with the block embeds it was seeded with, the paragraphs seeded from it that they
+/// hold, each the only view of its source paragraph. Removed source paragraphs held no block
+/// embeds, and a paragraph the source lacks holds none and sits next to a source paragraph of
+/// its story with no block embed between them, unless it is an empty editor-only one.
+fn spliced_part(
+    source: &SourceIndex,
+    index: usize,
+    seeded: &HashMap<String, Arc<StoryState>>,
+    live: &HashMap<String, Arc<StoryState>>,
+    by_key: &HashMap<&str, &Pilcrow>,
+) -> Option<SplicedPart> {
+    let part = &source.parts[index];
+    if part.kind == SourceStoryKind::Comment || part.backed.values().any(|views| views.len() != 1) {
+        return None;
+    }
+    let before = part_stories(seeded, part);
+    let after = part_stories(live, part);
+    let admit = |patch_tables| {
+        let mut rows = RowSplices::default();
+        for (story, seed) in &before {
+            let Some(now) = after.get(story) else {
+                continue;
+            };
+            for (was, is) in unit_matches::row_splice_units(&seed.units, &now.units) {
+                admit_row_splices(
+                    was,
+                    is,
+                    (source, index, patch_tables),
+                    &before,
+                    &after,
+                    &mut rows,
+                )?;
+            }
+        }
+        Some(rows)
+    };
+    let rows = admit(true).or_else(|| admit(false))?;
+    let seeded_by_key: HashMap<&str, &UnitState> = before
+        .values()
+        .flat_map(|state| state.units.iter())
+        .filter_map(|unit| unit.key.as_deref().map(|key| (key, unit)))
+        .collect();
+    let seeded_story_by_key: HashMap<&str, &str> = before
+        .iter()
+        .flat_map(|(story, state)| {
+            state
+                .units
+                .iter()
+                .filter_map(move |unit| unit.key.as_deref().map(|key| (key, story.as_str())))
+        })
+        .collect();
+    let live_keys: HashSet<&str> = after
+        .values()
+        .flat_map(|state| state.units.iter())
+        .filter_map(|unit| unit.key.as_deref())
+        .collect();
+    let synthetic = |key: &str| by_key.get(key).is_some_and(|pilcrow| pilcrow.synthetic);
+    let mut paragraphs = Vec::new();
+    let mut changed = Vec::new();
+    let mut section_only = Vec::new();
+    let mut inserted = Vec::new();
+    let mut removed = Vec::new();
+    for (story, seed) in &before {
+        let Some(now) = after.get(story) else {
+            if !rows.removed.contains(story.as_str()) {
+                return None;
+            }
+            for unit in &seed.units {
+                if unit.has_blocks() {
+                    return None;
+                }
+                let key = unit.key.as_deref()?;
+                if live_keys.contains(key) {
+                    continue;
+                }
+                match source.view_of(key) {
+                    Some(((part_index, ordinal), 0)) if part_index == index => {
+                        removed.push(ordinal)
+                    }
+                    None if synthetic(key) && !unit.inline => {}
+                    _ => return None,
+                }
+            }
+            continue;
+        };
+        let (was_units, was_tail) = split_tail(&seed.units);
+        let (is_units, is_tail) = split_tail(&now.units);
+        match (was_tail, is_tail) {
+            (None, None) => {}
+            (Some(was), Some(is))
+                if was.content_digest == is.content_digest
+                    && (!is.inline || was.digest == is.digest) => {}
+            _ => return None,
+        }
+        let was_keys: HashMap<&str, &UnitState> = was_units
+            .iter()
+            .map(|unit| Some((unit.key.as_deref()?, unit)))
+            .collect::<Option<_>>()?;
+        let is_keys: HashSet<&str> = is_units
+            .iter()
+            .map(|unit| unit.key.as_deref())
+            .collect::<Option<_>>()?;
+        if was_tail.is_some_and(|tail| tail.inline)
+            && (was_keys.len() != is_keys.len()
+                || was_keys.keys().any(|key| !is_keys.contains(key)))
+        {
+            return None;
+        }
+        fn kept<'u>(units: &'u [UnitState], keep: impl Fn(&str) -> bool) -> Vec<&'u str> {
+            units
+                .iter()
+                .filter_map(|unit| unit.key.as_deref())
+                .filter(|key| keep(key))
+                .collect()
+        }
+        if kept(was_units, |key| is_keys.contains(key))
+            != kept(is_units, |key| was_keys.contains_key(key))
+        {
+            return None;
+        }
+        for was in was_units {
+            let key = was.key.as_deref()?;
+            if is_keys.contains(key) {
+                continue;
+            }
+            match source.view_of(key) {
+                Some(((part_index, ordinal), 0)) if part_index == index && !was.has_blocks() => {
+                    removed.push(ordinal);
+                }
+                None if !was.inline && !was.has_blocks() => {}
+                _ => return None,
+            }
+        }
+        let mut anchor = None;
+        let mut pending = 0usize;
+        for is in is_units {
+            let key = is.key.as_deref()?;
+            if is.has_blocks() {
+                anchor = None;
+                if pending > 0 {
+                    return None;
+                }
+            }
+            let Some(was) = was_keys.get(key) else {
+                if !is.has_blocks()
+                    && let Some(((part_index, ordinal), 0)) = source.view_of(key)
+                    && part_index == index
+                    && seeded_story_by_key
+                        .get(key)
+                        .is_some_and(|origin| !after.keys().any(|story| story.as_str() == *origin))
+                {
+                    let origin = seeded_by_key.get(key)?;
+                    paragraphs.push((ordinal, key.to_owned()));
+                    if origin.content_digest != is.content_digest {
+                        changed.push(ordinal);
+                        if origin.section_digest == is.section_digest {
+                            section_only.push(ordinal);
+                        }
+                    }
+                    inserted.extend(std::iter::repeat_n(SpliceAnchor::Before(ordinal), pending));
+                    pending = 0;
+                    anchor = Some(ordinal);
+                    continue;
+                }
+                if is.has_blocks() || source.view_of(key).is_some() {
+                    return None;
+                }
+                if synthetic(key) && !is.inline {
+                    continue;
+                }
+                match anchor {
+                    Some(ordinal) => inserted.push(SpliceAnchor::After(ordinal)),
+                    None => pending += 1,
+                }
+                continue;
+            };
+            let same = was.content_digest == is.content_digest;
+            match source.view_of(key) {
+                Some(((part_index, ordinal), 0)) if part_index == index => {
+                    paragraphs.push((ordinal, key.to_owned()));
+                    if !same {
+                        changed.push(ordinal);
+                        if was.section_digest == is.section_digest {
+                            section_only.push(ordinal);
+                        }
+                    }
+                    inserted.extend(std::iter::repeat_n(SpliceAnchor::Before(ordinal), pending));
+                    pending = 0;
+                    anchor = Some(ordinal);
+                }
+                None if was.has_blocks()
+                    && !was.inline
+                    && !source.seeded.contains_key(key)
+                    && was.blocks == is.blocks =>
+                {
+                    let ordinal = last_block_paragraph(was, &before, source, index)?;
+                    if !synthetic(key) || is.inline {
+                        inserted.push(SpliceAnchor::After(ordinal));
+                    }
+                    anchor = Some(ordinal);
+                }
+                None if same && synthetic(key) => {
+                    if is.has_blocks() && was.blocks == is.blocks {
+                        anchor = last_block_paragraph(is, &before, source, index);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if pending > 0 {
+            return None;
+        }
+    }
+    for (story, now) in &after {
+        if before.contains_key(story) {
+            continue;
+        }
+        let anchor = *rows.inserted.get(story.as_str())?;
+        for unit in &now.units {
+            let key = unit.key.as_deref()?;
+            if unit.has_blocks() || source.view_of(key).is_some() {
+                return None;
+            }
+            if !synthetic(key) || unit.inline {
+                inserted.push(anchor);
+            }
+        }
+    }
+    if paragraphs.len() + removed.len() != part.backed.len() {
+        return None;
+    }
+    paragraphs.extend(
+        separator_paragraphs(source, part)?
+            .into_iter()
+            .map(|ordinal| (ordinal, occurrence_owner(part, ordinal))),
+    );
+    paragraphs.sort_unstable();
+    changed.sort_unstable();
+    removed.sort_unstable();
+    crate::sort::sort_by_key(&mut inserted, &|anchor| anchor.position());
+    Some(SplicedPart {
+        part: part.path().to_owned(),
+        sha256: part.sha256.clone(),
+        paragraphs,
+        changed,
+        section_only,
+        inserted,
+        removed,
+        paragraph_patches: Vec::new(),
+        legacy_paragraphs: Vec::new(),
+        table_patches: rows.tables,
+    })
+}
+
+fn last_block_paragraph(
+    unit: &UnitState,
+    stories: &BTreeMap<&String, &StoryState>,
+    source: &SourceIndex,
+    index: usize,
+) -> Option<u32> {
+    fn visit(
+        unit: &UnitState,
+        stories: &BTreeMap<&String, &StoryState>,
+        source: &SourceIndex,
+        index: usize,
+        visited: &mut HashSet<String>,
+        ordinals: &mut Vec<u32>,
+    ) -> Option<()> {
+        for block in &unit.block_content {
+            let payload = &block[0]["payload"];
+            let children = match block[0]["embed"].as_str()? {
+                "table" => payload["rows"]
+                    .as_array()?
+                    .iter()
+                    .flat_map(|row| row["cells"].as_array().into_iter().flatten())
+                    .map(|cell| cell["story"].as_str())
+                    .collect::<Option<Vec<_>>>()?,
+                "blockSdt" => vec![payload["story"].as_str()?],
+                _ => return None,
+            };
+            for story in children {
+                if !visited.insert(story.to_owned()) {
+                    return None;
+                }
+                for child in &stories.get(&story.to_owned())?.units {
+                    if let Some(key) = child.key.as_deref()
+                        && let Some(((part, ordinal), 0)) = source.view_of(key)
+                    {
+                        if part != index {
+                            return None;
+                        }
+                        ordinals.push(ordinal);
+                    }
+                    visit(child, stories, source, index, visited, ordinals)?;
+                }
+            }
+        }
+        Some(())
+    }
+    let mut ordinals = Vec::new();
+    visit(
+        unit,
+        stories,
+        source,
+        index,
+        &mut HashSet::new(),
+        &mut ordinals,
+    )?;
+    ordinals.into_iter().max()
+}
+
+/// Whether a run formatting patch of `xml`, one source paragraph, would drop field characters:
+/// the patch writer flattens a field nested in another field's result and field characters
+/// inside a hyperlink, as in a table of contents entry.
+fn reformatting_loses_fields(xml: &str) -> bool {
+    let mut hyperlinks = 0usize;
+    let mut fields = 0usize;
+    for tag in xml.split('<').skip(1) {
+        let tag = tag.split('>').next().unwrap_or_default();
+        let closing = tag.starts_with('/');
+        let name = tag
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or_default();
+        match name.rsplit_once(':').map_or(name, |(_, local)| local) {
+            "hyperlink" if !tag.ends_with('/') => {
+                if closing {
+                    hyperlinks = hyperlinks.saturating_sub(1)
+                } else {
+                    hyperlinks += 1
+                }
+            }
+            "fldChar" if !closing => {
+                if hyperlinks > 0 {
+                    return true;
+                }
+                if tag.contains("\"begin\"") {
+                    fields += 1;
+                    if fields > 1 {
+                        return true;
+                    }
+                } else if tag.contains("\"end\"") {
+                    fields = fields.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether rewriting `xml`, one source paragraph, from the model would lose run content the
+/// model does not round-trip: alternate content with its fallback, a page or column break (also
+/// one inside a tracked insertion), a bookmark or permission anchor inside a hyperlink, a
+/// field nested in another field's result, or a hyperlink holding field characters. A part where
+/// such a paragraph would be rewritten from the model (a legacy paragraph) is written whole, as
+/// a part that cannot splice is.
+fn rewriting_loses_source_runs(xml: &str) -> bool {
+    let mut hyperlinks = 0usize;
+    let mut fields = 0usize;
+    let mut rest = xml;
+    'scan: while let Some(at) = rest.find('<') {
+        rest = &rest[at..];
+        for (open, close) in [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")] {
+            if rest.starts_with(open) {
+                let Some(end) = rest.find(close) else {
+                    return true;
+                };
+                rest = &rest[end + close.len()..];
+                continue 'scan;
+            }
+        }
+        let Some(end) = rest.find('>') else {
+            return true;
+        };
+        let tag = &rest[1..end];
+        rest = &rest[end + 1..];
+        let closing = tag.starts_with('/');
+        let empty = tag.ends_with('/');
+        let name = tag
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or_default();
+        let local = name.rsplit_once(':').map_or(name, |(_, local)| local);
+        match local {
+            "AlternateContent" => return true,
+            "br" if tag.contains("\"page\"") || tag.contains("\"column\"") => return true,
+            "hyperlink" if !empty => {
+                if closing {
+                    hyperlinks = hyperlinks.saturating_sub(1);
+                } else {
+                    hyperlinks += 1;
+                }
+            }
+            "bookmarkStart" | "bookmarkEnd" | "permStart" | "permEnd" if hyperlinks > 0 => {
+                return true;
+            }
+            "fldChar" if !closing => {
+                if hyperlinks > 0 {
+                    return true;
+                }
+                if tag.contains("\"begin\"") {
+                    fields += 1;
+                    if fields > 1 {
+                        return true;
+                    }
+                } else if tag.contains("\"end\"") {
+                    fields = fields.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `units` without, and then with, the segments after the last pilcrow.
+/// Whether a story of `part` ends with inline content after its last pilcrow. Such a part
+/// splices only since the unchanged tail is accepted; before, it was always written whole.
+fn ends_with_inline_tail(seeded: &HashMap<String, Arc<StoryState>>, part: &SourcePart) -> bool {
+    part_stories(seeded, part)
+        .values()
+        .any(|state| split_tail(&state.units).1.is_some_and(|tail| tail.inline))
+}
+
+fn split_tail(units: &[UnitState]) -> (&[UnitState], Option<&UnitState>) {
+    match units.split_last() {
+        Some((tail, rest)) if tail.key.is_none() => (rest, Some(tail)),
+        _ => (units, None),
+    }
+}
+
+fn holder_ref(scan: &Scan, source: Option<&SourceIndex>, holder: Holder) -> Option<ParagraphRef> {
+    match holder {
+        Holder::Pilcrow(index) => Some(scan.pilcrows[index].session_ref()),
+        Holder::Occurrence(part, ordinal) => {
+            let source = source?;
+            Some(ParagraphRef::Source(
+                source.reference(&source.parts[part], ordinal),
+            ))
+        }
+        Holder::Retired => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        EditHistory, EditOperation, EditRequest, EditSource, EditStep, FormatPolicy,
+        ParagraphInput, ParagraphTarget, Position, StoryRange, TargetEdge, UndoSession,
+    };
+
+    const DATE: &str = "2026-09-24T00:00:00Z";
+
+    fn ctx() -> EditCtx {
+        EditCtx::local("", DATE)
+    }
+
+    fn save_seed_session() -> crate::session::EditSessionCore {
+        let bytes = ooxml_opc::rezip_parts(&[
+            (
+                "[Content_Types].xml".to_owned(),
+                br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
+            ),
+            (
+                "_rels/.rels".to_owned(),
+                br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="doc" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+            ),
+            (
+                "word/document.xml".to_owned(),
+                br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body><w:p w14:paraId="00000001"><w:r><w:t>Seed</w:t></w:r></w:p></w:body></w:document>"#.to_vec(),
+            ),
+        ])
+        .unwrap();
+        let session =
+            crate::session::EditSessionCore::new(41, crate::session::Host::deterministic());
+        session.open_docx(&bytes, true, None, None).unwrap();
+        session
+    }
+
+    fn save_plan_doc() -> EditingDoc {
+        let bytes = ooxml_opc::rezip_parts(&crate::seed::fixture::principal_parts()).unwrap();
+        let doc = EditingDoc::new(41);
+        crate::seed_from_docx(&doc, &bytes).unwrap();
+        doc
+    }
+
+    fn save_plans_agree(doc: &EditingDoc) {
+        let plan = doc.paragraph_save_plan();
+        assert_eq!(plan, doc.paragraph_save_plan());
+        let states = story_states(doc);
+        doc.save_story_states.lock().unwrap().clear();
+        doc.save_story_cache_disabled.store(true, Ordering::Relaxed);
+        let fresh_plan = doc.paragraph_save_plan();
+        doc.save_story_cache_disabled
+            .store(false, Ordering::Relaxed);
+        assert_eq!(plan, fresh_plan);
+        assert_eq!(plan, doc.paragraph_save_plan());
+        let txn = doc.yrs_doc().transact();
+        let mut fresh = story_states_within(doc, &txn, None).unwrap();
+        let source = doc.source_index().unwrap();
+        let seeded = units_by_key(source.seed_states());
+        for (story, state) in &mut fresh {
+            let state = Arc::get_mut(state).unwrap();
+            for (unit, cached) in state.units.iter_mut().zip(&states[story].units) {
+                if cached.segments.is_none() {
+                    let (_, seed) = seeded[unit.key.as_deref().unwrap()];
+                    assert_eq!(unit.digest, seed.digest);
+                    assert_eq!(unit.content_digest, seed.content_digest);
+                    assert!(seed.segments.is_some());
+                    unit.segments = None;
+                }
+            }
+        }
+        assert_eq!(states, fresh);
+    }
+
+    fn save_plan_media(bytes: Vec<u8>) -> docx_parse::media::MediaTable {
+        let package =
+            ooxml_opc::rezip_parts(&[("word/media/picture.png".to_owned(), bytes)]).unwrap();
+        docx_parse::media::MediaTable::new(
+            ooxml_opc::RetainedPackage::new(Arc::from(package)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cached_save_plans_match_fresh_states_across_edits_undo_and_remote_updates() {
+        let doc = save_plan_doc();
+        save_plans_agree(&doc);
+        doc.insert_text(
+            &ctx(),
+            Position::new("body", 0),
+            "New ",
+            FormatPolicy::Plain,
+        )
+        .unwrap();
+        save_plans_agree(&doc);
+        {
+            let cache = doc.save_story_states.lock().unwrap();
+            let body = &cache.entries["body"].state;
+            assert!(body.units[0].segments.is_some());
+            assert!(
+                body.units
+                    .iter()
+                    .skip(1)
+                    .any(|unit| unit.segments.is_none())
+            );
+        }
+        doc.delete_range(&ctx(), StoryRange::new("body", 0, 4))
+            .unwrap();
+        save_plans_agree(&doc);
+        {
+            let source = doc.source_index().unwrap();
+            let cache = doc.save_story_states.lock().unwrap();
+            assert!(Arc::ptr_eq(
+                &cache.entries["body"].state,
+                &source.seed_states()["body"]
+            ));
+        }
+        doc.insert_text(
+            &ctx(),
+            Position::new("body", 0),
+            "Again ",
+            FormatPolicy::Plain,
+        )
+        .unwrap();
+        save_plans_agree(&doc);
+        doc.delete_range(&ctx(), StoryRange::new("body", 0, 6))
+            .unwrap();
+        save_plans_agree(&doc);
+
+        let cell = {
+            let txn = doc.yrs_doc().transact();
+            let scan = doc.committed_scan(&txn);
+            scan.stories
+                .iter()
+                .find(|story| crate::structured::source::cell_table(story).is_some())
+                .unwrap()
+                .clone()
+        };
+        for story in ["hf:rIdHeader1", "hf:rIdFooter1", "fn:1", cell.as_str()] {
+            doc.insert_text(
+                &ctx(),
+                Position::new(story, 0),
+                "Edited ",
+                FormatPolicy::Plain,
+            )
+            .unwrap();
+            save_plans_agree(&doc);
+        }
+        let para_id = doc.paragraphs("body").unwrap()[0].para_id.clone();
+        doc.set_paragraph_attr(&para_id, "alignment", Any::from("center"))
+            .unwrap();
+        save_plans_agree(&doc);
+        doc.apply_raw_ops(
+            "body",
+            vec![crate::RawOp::Format {
+                index: 0,
+                len: 1,
+                attrs: yrs::types::Attrs::from([("bold".into(), Any::Bool(true))]),
+            }],
+            &ctx(),
+        )
+        .unwrap();
+        save_plans_agree(&doc);
+
+        let comment = doc
+            .add_comment(
+                &[StoryRange::new("body", 0, 2)],
+                "Ada",
+                DATE,
+                Any::from("hi"),
+            )
+            .unwrap();
+        save_plans_agree(&doc);
+        doc.set_comment_ranges(&comment, &[StoryRange::new("hf:rIdHeader1", 1, 3)])
+            .unwrap();
+        save_plans_agree(&doc);
+        doc.apply_raw_ops(
+            "body",
+            vec![crate::RawOp::RemoveComment { id: comment }],
+            &ctx(),
+        )
+        .unwrap();
+        save_plans_agree(&doc);
+
+        doc.insert_embed(
+            &ctx(),
+            Position::new("body", 0),
+            "image",
+            vec![("src".to_owned(), Any::from("media:0"))],
+        )
+        .unwrap();
+        save_plans_agree(&doc);
+        let before = story_states(&doc)["body"].fingerprint;
+        doc.install_media(save_plan_media(vec![1, 2, 3, 4]));
+        save_plans_agree(&doc);
+        assert_ne!(before, story_states(&doc)["body"].fingerprint);
+
+        let mut undo = doc.undo_manager();
+        doc.insert_text(
+            &ctx(),
+            Position::new("body", 1),
+            "undo",
+            FormatPolicy::Plain,
+        )
+        .unwrap();
+        save_plans_agree(&doc);
+        assert!(undo.undo());
+        save_plans_agree(&doc);
+        assert!(undo.redo());
+        save_plans_agree(&doc);
+
+        let remote = EditingDoc::new(9);
+        remote
+            .apply_update_v1(&doc.encode_state_as_update_v1())
+            .unwrap();
+        remote
+            .insert_text(
+                &ctx(),
+                Position::new("hf:rIdHeader1", 0),
+                "Remote ",
+                FormatPolicy::Plain,
+            )
+            .unwrap();
+        doc.apply_update_v1(
+            &remote
+                .encode_diff_v1(&doc.encode_state_vector_v1())
+                .unwrap(),
+        )
+        .unwrap();
+        save_plans_agree(&doc);
+    }
+
+    #[test]
+    fn unchanged_save_plans_skip_fingerprints_and_body_edits_only_hash_body() {
+        let doc = save_plan_doc();
+        let plan = doc.paragraph_save_plan();
+        STORY_FINGERPRINTS.with(|count| count.set(0));
+        assert_eq!(plan, doc.paragraph_save_plan());
+        STORY_FINGERPRINTS.with(|count| assert_eq!(count.get(), 0));
+        doc.insert_text(&ctx(), Position::new("body", 0), "x", FormatPolicy::Plain)
+            .unwrap();
+        doc.paragraph_save_plan();
+        STORY_FINGERPRINTS.with(|count| assert_eq!(count.get(), 1));
+        save_plans_agree(&doc);
+    }
+
+    #[test]
+    fn save_plans_share_story_states_with_the_cache() {
+        let doc = save_plan_doc();
+        doc.insert_text(&ctx(), Position::new("body", 0), "x", FormatPolicy::Plain)
+            .unwrap();
+        doc.paragraph_save_plan();
+        let before = story_states(&doc);
+        {
+            let cache = doc.save_story_states.lock().unwrap();
+            for (story, state) in &before {
+                assert!(Arc::ptr_eq(state, &cache.entries[story].state));
+            }
+        }
+        doc.paragraph_save_plan();
+        let after = story_states(&doc);
+        for (story, state) in &before {
+            assert!(Arc::ptr_eq(state, &after[story]));
+        }
+    }
+
+    #[test]
+    fn edited_save_states_only_retain_changed_unit_segments_and_projections() {
+        let doc = save_plan_doc();
+        let source = doc.source_index().unwrap();
+        let seeded = source.seed_states();
+        let seeded_units = units_by_key(seeded);
+        assert!(seeded["body"].units.len() > 1);
+        assert!(
+            seeded["body"]
+                .units
+                .iter()
+                .any(|unit| !unit.block_content.is_empty())
+        );
+        let edited = doc.paragraphs("body").unwrap()[0].para_id.clone();
+        doc.insert_text(&ctx(), Position::new("body", 0), "x", FormatPolicy::Plain)
+            .unwrap();
+        let mut previous = None;
+        for _ in 0..2 {
+            UNIT_PROJECTIONS.with(|count| count.set(0));
+            let plan = doc.paragraph_save_plan();
+            UNIT_PROJECTIONS.with(|count| {
+                assert_eq!(count.get(), usize::from(previous.is_none()));
+            });
+            if let Some(previous) = &previous {
+                assert_eq!(previous, &plan);
+            }
+            previous = Some(plan);
+            let cache = doc.save_story_states.lock().unwrap();
+            let body = &cache.entries["body"];
+            assert!(!body.pending_trim);
+            let retained: Vec<_> = body
+                .state
+                .units
+                .iter()
+                .filter(|unit| {
+                    unit.segments
+                        .as_ref()
+                        .is_some_and(|segments| !segments.is_empty())
+                })
+                .map(|unit| unit.key.as_deref().unwrap())
+                .collect();
+            assert_eq!(retained, [edited.as_str()]);
+            for unit in &body.state.units {
+                let key = unit.key.as_deref().unwrap();
+                let (_, seed) = seeded_units[key];
+                if key == edited {
+                    assert!(!Arc::ptr_eq(&unit.projection, &seed.projection));
+                } else {
+                    assert!(unit.segments.is_none());
+                    assert!(Arc::ptr_eq(&unit.projection, &seed.projection));
+                }
+            }
+        }
+        save_plans_agree(&doc);
+    }
+
+    #[test]
+    fn uncached_save_plans_bypass_story_states() {
+        let doc = save_plan_doc();
+        doc.insert_text(&ctx(), Position::new("body", 0), "x", FormatPolicy::Plain)
+            .unwrap();
+        let plan = doc.paragraph_save_plan();
+        let stories = doc.save_story_states.lock().unwrap().entries.len();
+        doc.save_story_states.lock().unwrap().clear();
+        doc.save_story_cache_disabled.store(true, Ordering::Relaxed);
+        STORY_FINGERPRINTS.with(|count| count.set(0));
+        for _ in 0..2 {
+            assert_eq!(plan, doc.paragraph_save_plan());
+            assert!(doc.save_story_states.lock().unwrap().entries.is_empty());
+        }
+        STORY_FINGERPRINTS.with(|count| assert_eq!(count.get(), 2 * stories));
+        doc.save_story_cache_disabled
+            .store(false, Ordering::Relaxed);
+        save_plans_agree(&doc);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore]
+    fn save_plan_cache_bench() {
+        fn prepared(bytes: &[u8], bypass: bool) -> EditingDoc {
+            let doc = EditingDoc::new(41);
+            crate::seed_from_docx(&doc, bytes).unwrap();
+            let paragraphs: Vec<_> = doc
+                .paragraphs("body")
+                .unwrap()
+                .into_iter()
+                .filter(|paragraph| !paragraph.text.is_empty())
+                .collect();
+            let paragraph = &paragraphs[paragraphs.len() / 2];
+            let position = doc.paragraph_mark_position(&paragraph.para_id).unwrap();
+            doc.insert_text(&ctx(), position, "x", FormatPolicy::Plain)
+                .unwrap();
+            doc.save_story_cache_disabled
+                .store(bypass, Ordering::Relaxed);
+            doc
+        }
+
+        let Some(path) = std::env::var_os("BO_BENCH_DOCX") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let mut samples: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(15));
+        for round in 0..15 {
+            let modes = if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            };
+            for bypass in modes {
+                let doc = prepared(&bytes, bypass);
+                let started = std::time::Instant::now();
+                let first = doc.paragraph_save_plan();
+                let first_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let started = std::time::Instant::now();
+                let repeat = doc.paragraph_save_plan();
+                let repeat_ms = started.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(first, repeat);
+                samples[usize::from(bypass)].push(first_ms);
+                samples[2 + usize::from(bypass)].push(repeat_ms);
+            }
+        }
+        let medians = samples.map(|mut samples| {
+            samples.sort_by(f64::total_cmp);
+            samples[7]
+        });
+        println!(
+            "PLANBENCH first_cache_ms={:.3} first_nocache_ms={:.3} repeat_cache_ms={:.3} repeat_nocache_ms={:.3}",
+            medians[0], medians[1], medians[2], medians[3]
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn progress_hooks_can_reenter_before_save_seed_states_are_initialized() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        thread_local! {
+            static TARGET: RefCell<Option<Rc<EditingDoc>>> = const { RefCell::new(None) };
+            static RESULT: RefCell<Option<ParagraphSavePlan>> = const { RefCell::new(None) };
+        }
+
+        fn reenter() {
+            ooxml_opc::progress::set_hook(None);
+            let doc = TARGET.with(|target| Rc::clone(target.borrow().as_ref().unwrap()));
+            let plan = doc.paragraph_save_plan();
+            RESULT.with(|result| *result.borrow_mut() = Some(plan));
+        }
+
+        struct ResetHook;
+
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                ooxml_opc::progress::set_hook(None);
+                TARGET.with(|target| *target.borrow_mut() = None);
+                RESULT.with(|result| *result.borrow_mut() = None);
+            }
+        }
+
+        let _reset = ResetHook;
+        let body: String = (1..=ooxml_opc::progress::EVERY)
+            .map(|id| {
+                crate::engine::preview_fixture::paragraph(
+                    id,
+                    &crate::engine::preview_fixture::run("Seed"),
+                )
+            })
+            .collect();
+        let bytes = crate::engine::preview_fixture::document(&body);
+        let doc = Rc::new(EditingDoc::new(41));
+        crate::seed_from_docx(&doc, &bytes).unwrap();
+        doc.insert_text(&ctx(), Position::new("body", 0), "x", FormatPolicy::Plain)
+            .unwrap();
+        let source = doc.source_index().unwrap();
+        assert!(!source.seed_states_initialized());
+        {
+            let txn = doc.yrs_doc().transact();
+            doc.committed_scan(&txn);
+        }
+        TARGET.with(|target| *target.borrow_mut() = Some(Rc::clone(&doc)));
+        ooxml_opc::progress::set_hook(Some(reenter));
+        let plan = doc.paragraph_save_plan();
+        ooxml_opc::progress::set_hook(None);
+        let nested = RESULT.with(|result| result.borrow_mut().take().unwrap());
+        assert_eq!(plan, nested);
+        save_plans_agree(&doc);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn progress_hooks_can_reenter_save_planning_without_publishing_cleared_states() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        thread_local! {
+            static TARGET: RefCell<Option<(Rc<EditingDoc>, bool)>> = const {
+                RefCell::new(None)
+            };
+            static RESULT: RefCell<Option<(ParagraphSavePlan, Arc<StoryState>)>> = const {
+                RefCell::new(None)
+            };
+        }
+
+        fn reenter() {
+            ooxml_opc::progress::set_hook(None);
+            STORY_FINGERPRINTS.with(|count| assert_eq!(count.get(), 1));
+            let (doc, clear) = TARGET.with(|target| target.borrow().as_ref().unwrap().clone());
+            let plan = doc.paragraph_save_plan();
+            let state = Arc::clone(&doc.save_story_states.lock().unwrap().entries["body"].state);
+            if clear {
+                let media = doc.media_table();
+                let mut cache = doc.save_story_states.lock().unwrap();
+                cache.clear();
+                cache.media = media;
+            }
+            RESULT.with(|result| *result.borrow_mut() = Some((plan, state)));
+        }
+
+        struct ResetHook;
+
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                ooxml_opc::progress::set_hook(None);
+                TARGET.with(|target| *target.borrow_mut() = None);
+                RESULT.with(|result| *result.borrow_mut() = None);
+            }
+        }
+
+        let _reset = ResetHook;
+        let body: String = (1..=ooxml_opc::progress::EVERY)
+            .map(|id| {
+                crate::engine::preview_fixture::paragraph(
+                    id,
+                    &crate::engine::preview_fixture::run("Seed"),
+                )
+            })
+            .collect();
+        let bytes = crate::engine::preview_fixture::document(&body);
+        let doc = Rc::new(EditingDoc::new(41));
+        crate::seed_from_docx(&doc, &bytes).unwrap();
+        doc.paragraph_save_plan();
+        doc.insert_text(
+            &ctx(),
+            Position::new("body", 0),
+            "New ",
+            FormatPolicy::Plain,
+        )
+        .unwrap();
+        {
+            let txn = doc.yrs_doc().transact();
+            doc.committed_scan(&txn);
+        }
+        for clear in [false, true] {
+            doc.save_story_states.lock().unwrap().clear();
+            TARGET.with(|target| *target.borrow_mut() = Some((Rc::clone(&doc), clear)));
+            STORY_FINGERPRINTS.with(|count| count.set(0));
+            ooxml_opc::progress::set_hook(Some(reenter));
+            let plan = doc.paragraph_save_plan();
+            ooxml_opc::progress::set_hook(None);
+            let (nested, state) = RESULT.with(|result| result.borrow_mut().take().unwrap());
+            assert_eq!(plan, nested);
+            {
+                let cache = doc.save_story_states.lock().unwrap();
+                if clear {
+                    assert!(cache.entries.is_empty());
+                } else {
+                    assert!(Arc::ptr_eq(&state, &cache.entries["body"].state));
+                }
+            }
+            save_plans_agree(&doc);
+        }
+    }
+
+    #[test]
+    fn duplicate_live_keys_use_full_save_states() {
+        let doc = save_plan_doc();
+        doc.insert_text(&ctx(), Position::new("body", 0), "x", FormatPolicy::Plain)
+            .unwrap();
+        doc.paragraph_save_plan();
+        let revision = doc.story_revisions.lock().unwrap().stamped["body"];
+        let key = {
+            let cache = doc.save_story_states.lock().unwrap();
+            let body = &cache.entries["body"].state;
+            body.units
+                .iter()
+                .find(|unit| unit.segments.is_none())
+                .unwrap()
+                .key
+                .clone()
+                .unwrap()
+        };
+        {
+            let mut txn = doc.yrs_doc().transact_mut();
+            let header = story_ref(&txn, "hf:rIdHeader1").unwrap();
+            let pilcrow = pilcrows(&header, &txn).remove(0).1;
+            pilcrow.insert(&mut txn, PARA_ID, key);
+        }
+        assert_eq!(
+            doc.story_revisions.lock().unwrap().stamped["body"],
+            revision
+        );
+        doc.paragraph_save_plan();
+        assert!(doc.save_story_states.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn embed_payload_kind_and_media_changes_invalidate_save_states() {
+        let session = save_seed_session();
+        let doc = session.engine.doc();
+        doc.insert_embed(
+            &ctx(),
+            Position::new("body", 0),
+            "image",
+            vec![("src".to_owned(), Any::from("media:0"))],
+        )
+        .unwrap();
+        doc.install_media(save_plan_media(vec![1, 2, 3, 4]));
+        save_plans_agree(doc);
+        let before = story_states(doc)["body"].fingerprint;
+        *doc.media.lock().unwrap() = Some(Arc::new(save_plan_media(vec![1, 2, 3, 5])));
+        save_plans_agree(doc);
+        assert_ne!(before, story_states(doc)["body"].fingerprint);
+        for (key, value) in [
+            ("horizontalRule", Any::Bool(true)),
+            ("src", Any::from("data:image/png;base64,AQIDBQ==")),
+            (KIND_KEY, Any::from("shape")),
+        ] {
+            let revision = doc.story_revisions.lock().unwrap().stamped["body"];
+            {
+                let mut txn = doc.yrs_doc().transact_mut();
+                let story = story_ref(&txn, "body").unwrap();
+                let embed = crate::ops::embed::embed_map_at(&story, &txn, 0).unwrap();
+                embed.insert(&mut txn, key, value);
+            }
+            assert!(doc.story_revisions.lock().unwrap().stamped["body"] > revision);
+            STORY_FINGERPRINTS.with(|count| count.set(0));
+            doc.paragraph_save_plan();
+            STORY_FINGERPRINTS.with(|count| assert_eq!(count.get(), 1));
+            save_plans_agree(doc);
+        }
+    }
+
+    #[test]
+    fn side_map_comment_changes_invalidate_save_states_without_story_stamps() {
+        let session = save_seed_session();
+        let doc = session.engine.doc();
+        save_plans_agree(doc);
+        let revision = doc.story_revisions.lock().unwrap().stamped["body"];
+        let mut before = story_states(doc)["body"].fingerprint;
+        let comment = doc
+            .add_comment(
+                &[StoryRange::new("body", 0, 2)],
+                "Ada",
+                DATE,
+                Any::from("hi"),
+            )
+            .unwrap();
+        for ranges in [Some((0, 2)), Some((1, 3)), None] {
+            if ranges != Some((0, 2)) {
+                let mut txn = doc.yrs_doc().transact_mut();
+                let comments = txn.get_map(crate::COMMENTS).unwrap();
+                if let Some((start, end)) = ranges {
+                    let story = story_ref(&txn, "body").unwrap();
+                    let start = crate::sticky_positions::sticky_index(
+                        &story,
+                        &txn,
+                        start,
+                        yrs::Assoc::After,
+                    )
+                    .unwrap();
+                    let end = crate::sticky_positions::sticky_index(
+                        &story,
+                        &txn,
+                        end,
+                        yrs::Assoc::Before,
+                    )
+                    .unwrap();
+                    let Out::YMap(entry) = comments.get(&txn, &comment).unwrap() else {
+                        unreachable!();
+                    };
+                    entry.insert(
+                        &mut txn,
+                        "anchors",
+                        Any::Array(Arc::from([crate::anchor_value("body", &start, &end)])),
+                    );
+                } else {
+                    comments.remove(&mut txn, &comment);
+                }
+            }
+            assert_eq!(
+                doc.story_revisions.lock().unwrap().stamped["body"],
+                revision
+            );
+            STORY_FINGERPRINTS.with(|count| count.set(0));
+            doc.paragraph_save_plan();
+            STORY_FINGERPRINTS.with(|count| assert_eq!(count.get(), 1));
+            let after = story_states(doc)["body"].fingerprint;
+            assert_ne!(before, after);
+            before = after;
+            save_plans_agree(doc);
+        }
+    }
+
+    #[test]
+    fn save_states_track_roots_and_prune_removed_or_unstamped_stories() {
+        let doc = save_plan_doc();
+        doc.create_story("nested", "Child", "Normal", "left")
+            .unwrap();
+        let embed = || crate::RawOp::InsertEmbed {
+            index: 0,
+            kind: "blockSdt".to_owned(),
+            payload: vec![("story".to_owned(), Any::from("nested"))],
+            attrs: Default::default(),
+        };
+        doc.apply_raw_ops("body", vec![embed()], &ctx()).unwrap();
+        save_plans_agree(&doc);
+        let revision = doc.story_revisions.lock().unwrap().stamped["nested"];
+        assert_eq!(story_states(&doc)["nested"].root, "body");
+        doc.apply_raw_ops(
+            "body",
+            vec![crate::RawOp::Delete { index: 0, len: 1 }],
+            &ctx(),
+        )
+        .unwrap();
+        doc.apply_raw_ops("hf:rIdHeader1", vec![embed()], &ctx())
+            .unwrap();
+        assert_eq!(
+            doc.story_revisions.lock().unwrap().stamped["nested"],
+            revision
+        );
+        assert_eq!(story_states(&doc)["nested"].root, "hf:rIdHeader1");
+        save_plans_agree(&doc);
+
+        doc.keep_deleted();
+        doc.delete_story("nested").unwrap();
+        assert!(
+            !doc.save_story_states
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key("nested")
+        );
+        doc.paragraph_save_plan();
+        doc.create_story("nested", "Replacement", "Normal", "left")
+            .unwrap();
+        save_plans_agree(&doc);
+        doc.story_revisions.lock().unwrap().stamped.remove("nested");
+        for _ in 0..2 {
+            STORY_FINGERPRINTS.with(|count| count.set(0));
+            doc.paragraph_save_plan();
+            STORY_FINGERPRINTS.with(|count| assert_eq!(count.get(), 1));
+            assert!(
+                !doc.save_story_states
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .contains_key("nested")
+            );
+        }
+    }
+
+    #[test]
+    fn removed_story_entries_release_cached_states_before_the_next_plan() {
+        let doc = save_plan_doc();
+        doc.create_story("transient", "Temporary", "Normal", "left")
+            .unwrap();
+        doc.paragraph_save_plan();
+        assert!(
+            doc.save_story_states
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key("transient")
+        );
+        doc.delete_story("transient").unwrap();
+        assert!(
+            !doc.save_story_states
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key("transient")
+        );
+    }
+
+    #[test]
+    fn budgeted_save_states_never_populate_the_story_cache() {
+        let doc = save_plan_doc();
+        {
+            let txn = doc.yrs_doc().transact();
+            assert!(story_states_within(&doc, &txn, Some(1)).is_none());
+            assert!(doc.save_story_states.lock().unwrap().entries.is_empty());
+            assert!(story_states_within(&doc, &txn, Some(usize::MAX)).is_some());
+            assert!(doc.save_story_states.lock().unwrap().entries.is_empty());
+        }
+        doc.paragraph_save_plan();
+        let txn = doc.yrs_doc().transact();
+        assert!(story_states_within(&doc, &txn, Some(1)).is_none());
+    }
+
+    #[test]
+    fn replacing_source_or_opening_state_drops_save_states() {
+        let session = save_seed_session();
+        let doc = session.engine.doc();
+        let bytes = doc.source_index().unwrap().bytes();
+        let resets: [fn(&EditingDoc); 4] = [
+            EditingDoc::mark_seeded,
+            EditingDoc::invalidate_projections,
+            |doc: &EditingDoc| doc.rotate_version(0),
+            |doc: &EditingDoc| doc.begin_opening(Some("reopened")),
+        ];
+        for reset in resets {
+            doc.paragraph_save_plan();
+            assert!(!doc.save_story_states.lock().unwrap().entries.is_empty());
+            reset(doc);
+            assert!(doc.save_story_states.lock().unwrap().entries.is_empty());
+        }
+        doc.paragraph_save_plan();
+        doc.retain_source_docx(bytes.as_ref());
+        assert!(doc.save_story_states.lock().unwrap().entries.is_empty());
+        doc.paragraph_save_plan();
+        doc.load_state_v1(&doc.encode_state_as_update_v1()).unwrap();
+        assert!(doc.save_story_states.lock().unwrap().entries.is_empty());
+        doc.paragraph_save_plan();
+        let media = Arc::downgrade(&doc.media_table().unwrap());
+        drop(session);
+        assert!(media.upgrade().is_none());
+    }
+
+    #[test]
+    fn priming_save_seed_states_preserves_the_plan_without_reseeding() {
+        let primed = save_seed_session();
+        let fallback = save_seed_session();
+        let source = primed.engine.doc().source_index().unwrap();
+        assert!(source.opened_under_own_digest());
+        assert!(!source.seed_states_initialized());
+        assert!(primed.prime_save_seed_states(u32::MAX, u32::MAX));
+        assert!(primed.prime_save_seed_states(u32::MAX, u32::MAX));
+        assert!(source.seed_states_initialized());
+        assert!(
+            primed
+                .engine
+                .doc()
+                .save_story_states
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        for session in [&primed, &fallback] {
+            session
+                .engine
+                .doc()
+                .insert_text(
+                    &ctx(),
+                    Position::new("body", 0),
+                    "New ",
+                    FormatPolicy::Plain,
+                )
+                .unwrap();
+        }
+        assert!(primed.prime_save_seed_states(u32::MAX, u32::MAX));
+        let plan = primed.paragraph_save_plan().unwrap();
+        assert_eq!(plan, fallback.paragraph_save_plan().unwrap());
+        assert_eq!(source.reseed_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fallback
+                .engine
+                .doc()
+                .source_index()
+                .unwrap()
+                .reseed_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        assert_eq!(plan["splicedParts"][0]["changed"], serde_json::json!([0]));
+    }
+
+    #[test]
+    fn priming_after_an_edit_declines_without_reseeding() {
+        let session = save_seed_session();
+        let expected = save_seed_session();
+        assert!(expected.prime_save_seed_states(u32::MAX, u32::MAX));
+        for session in [&session, &expected] {
+            session
+                .engine
+                .doc()
+                .insert_text(
+                    &ctx(),
+                    Position::new("body", 0),
+                    "New ",
+                    FormatPolicy::Plain,
+                )
+                .unwrap();
+        }
+        let source = session.engine.doc().source_index().unwrap();
+        assert!(!session.prime_save_seed_states(u32::MAX, u32::MAX));
+        assert!(!source.seed_states_initialized());
+        assert_eq!(source.reseed_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            session.paragraph_save_plan().unwrap(),
+            expected.paragraph_save_plan().unwrap()
+        );
+        assert_eq!(source.reseed_calls.load(Ordering::Relaxed), 1);
+        assert!(session.prime_save_seed_states(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn priming_declines_past_the_paragraph_or_inflated_budget() {
+        let session = save_seed_session();
+        let doc = session.engine.doc();
+        let source = doc.source_index().unwrap();
+        let paragraphs = {
+            let txn = doc.yrs_doc().transact();
+            doc.committed_scan(&txn).pilcrows.len() as u32
+        };
+        let packed = source.bytes().as_ref().len() as u32;
+        let package = ooxml_opc::RetainedPackage::from_bytes(source.bytes()).unwrap();
+        let inflated = package.parts().map(|(_, size)| size).sum::<u64>() as u32;
+        let size = packed.max(inflated);
+        assert!(paragraphs > 0 && size > 0);
+        assert!(!session.prime_save_seed_states(paragraphs - 1, u32::MAX));
+        assert!(!session.prime_save_seed_states(u32::MAX, size - 1));
+        assert!(!source.seed_states_initialized());
+        assert!(session.prime_save_seed_states(paragraphs, size));
+        assert!(source.seed_states_initialized());
+        assert_eq!(source.reseed_calls.load(Ordering::Relaxed), 0);
+    }
+
+    fn principal_session() -> crate::session::EditSessionCore {
+        let bytes = ooxml_opc::rezip_parts(&crate::seed::fixture::principal_parts()).unwrap();
+        let session =
+            crate::session::EditSessionCore::new(41, crate::session::Host::deterministic());
+        session.open_docx(&bytes, true, None, None).unwrap();
+        session
+    }
+
+    fn assert_same_seed_states(left: &SourceIndex, right: &SourceIndex) {
+        let (left, right) = (left.seed_states(), right.seed_states());
+        assert_eq!(left.len(), right.len());
+        for (story, was) in right {
+            let is = &left[story];
+            assert!(
+                was.root == is.root
+                    && was.fingerprint == is.fingerprint
+                    && was.comments == is.comments
+                    && was.units == is.units,
+                "{story}"
+            );
+        }
+    }
+
+    #[test]
+    fn sliced_priming_records_the_one_shot_seed_states() {
+        let whole = principal_session();
+        assert!(whole.prime_save_seed_states(u32::MAX, u32::MAX));
+        let whole_source = whole.engine.doc().source_index().unwrap();
+        for max_bytes in [1, 64, 4096] {
+            let sliced = principal_session();
+            let doc = sliced.engine.doc();
+            let mut slices = 0;
+            loop {
+                match doc.prime_save_seed_states_slice(u32::MAX, u32::MAX, max_bytes) {
+                    PrimeSlice::Pending => slices += 1,
+                    PrimeSlice::Known => break,
+                    PrimeSlice::Declined => panic!("declined at {max_bytes}"),
+                }
+            }
+            if max_bytes < 4096 {
+                assert!(slices > 1, "{max_bytes}");
+            }
+            assert!(doc.prime_progress.lock().unwrap().is_none());
+            let source = doc.source_index().unwrap();
+            assert_eq!(source.reseed_calls.load(Ordering::Relaxed), 0);
+            assert_same_seed_states(&source, &whole_source);
+            assert_eq!(
+                sliced.paragraph_save_plan().unwrap(),
+                whole.paragraph_save_plan().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_commit_between_prime_slices_declines_and_keeps_the_fallback() {
+        let session = principal_session();
+        let expected = principal_session();
+        let doc = session.engine.doc();
+        assert_eq!(
+            doc.prime_save_seed_states_slice(u32::MAX, u32::MAX, 1),
+            PrimeSlice::Pending
+        );
+        for session in [&session, &expected] {
+            session
+                .engine
+                .doc()
+                .insert_text(
+                    &ctx(),
+                    Position::new("body", 0),
+                    "New ",
+                    FormatPolicy::Plain,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            doc.prime_save_seed_states_slice(u32::MAX, u32::MAX, 1),
+            PrimeSlice::Declined
+        );
+        assert!(doc.prime_progress.lock().unwrap().is_none());
+        let source = doc.source_index().unwrap();
+        assert!(!source.seed_states_initialized());
+        assert_eq!(
+            session.paragraph_save_plan().unwrap(),
+            expected.paragraph_save_plan().unwrap()
+        );
+    }
+
+    #[test]
+    fn promoted_block_paragraphs_after_plain_and_offset_tables_splice_at_the_block_edge() {
+        let xml = concat!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+            "<w:body><w:p><w:r><w:t>Title</w:t></w:r></w:p><w:tbl><w:tblGrid>",
+            "<w:gridCol w:w=\"10\"/><w:gridCol w:w=\"10\"/><w:gridCol w:w=\"10\"/>",
+            "</w:tblGrid><w:tr><w:trPr><w:gridAfter w:val=\"1\"/></w:trPr>",
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"2\"/></w:tcPr>",
+            "<w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr><w:tr>",
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"3\"/></w:tcPr>",
+            "<w:p><w:r><w:t>Last</w:t></w:r></w:p></w:tc></w:tr></w:tbl>",
+            "</w:body></w:document>",
+        );
+        for shaped in [false, true] {
+            let xml = if shaped {
+                xml.to_owned()
+            } else {
+                xml.replace(
+                    "<w:gridCol w:w=\"10\"/><w:gridCol w:w=\"10\"/><w:gridCol w:w=\"10\"/>",
+                    "<w:gridCol w:w=\"10\"/>",
+                )
+                .replace("<w:trPr><w:gridAfter w:val=\"1\"/></w:trPr>", "")
+                .replace("<w:gridSpan w:val=\"2\"/>", "")
+                .replace("<w:gridSpan w:val=\"3\"/>", "")
+            };
+            let parts = [
+                (
+                    "[Content_Types].xml".to_owned(),
+                    br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
+                ),
+                (
+                    "_rels/.rels".to_owned(),
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="doc" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+                ),
+                ("word/document.xml".to_owned(), xml.as_bytes().to_vec()),
+            ];
+            let bytes = ooxml_opc::rezip_parts(&parts).unwrap();
+            let doc = EditingDoc::new(41);
+            crate::seed_from_docx(&doc, &bytes).unwrap();
+            let target = doc.paragraphs("body").unwrap()[1].para_id.clone();
+            assert!(
+                doc.paragraph_identities()
+                    .paragraphs
+                    .iter()
+                    .any(|identity| {
+                        matches!(
+                            &identity.paragraph,
+                            ParagraphRef::Session { para_id, .. } if para_id == &target
+                        ) && identity.origin == ParagraphOrigin::Synthetic
+                    })
+            );
+            doc.apply_edits(
+                &EditRequest {
+                    expect_version: doc.version(),
+                    source: EditSource::Host,
+                    history: EditHistory::Separate,
+                    steps: vec![EditStep::new(EditOperation::InsertParagraphs {
+                        target: ParagraphTarget {
+                            story: "body".to_owned(),
+                            para_id: target.clone(),
+                        },
+                        at: TargetEdge::End,
+                        paragraphs: vec![ParagraphInput {
+                            text: "Inserted".to_owned(),
+                            style_id: None,
+                        }],
+                    })],
+                },
+                &UndoSession::new(),
+            )
+            .unwrap()
+            .unwrap();
+            let identities = doc.paragraph_identities();
+            let anchor = identities
+                .paragraphs
+                .iter()
+                .find(|identity| {
+                    matches!(
+                        &identity.paragraph,
+                        ParagraphRef::Session { para_id, .. } if para_id == &target
+                    )
+                })
+                .unwrap();
+            assert_eq!(anchor.origin, ParagraphOrigin::Authored);
+            assert!(anchor.ooxml_para_id.is_some());
+            assert_eq!(
+                identities
+                    .paragraphs
+                    .iter()
+                    .filter(|identity| identity.origin == ParagraphOrigin::Authored)
+                    .count(),
+                2
+            );
+            let part = doc
+                .paragraph_save_plan()
+                .spliced_parts
+                .into_iter()
+                .find(|part| part.part == "word/document.xml")
+                .unwrap();
+            assert_eq!(part.inserted, vec![SpliceAnchor::After(2); 2]);
+            assert!(part.changed.is_empty());
+            assert!(part.table_patches.is_empty());
+            assert!(part.removed.is_empty());
+            assert_eq!(part.paragraphs.len(), 3);
+            let at = doc.paragraph_mark_position(&target).unwrap();
+            doc.insert_text(&ctx(), at, "Block note", FormatPolicy::Plain)
+                .unwrap();
+            let part = doc
+                .paragraph_save_plan()
+                .spliced_parts
+                .into_iter()
+                .find(|part| part.part == "word/document.xml")
+                .unwrap();
+            assert_eq!(part.inserted, vec![SpliceAnchor::After(2); 2]);
+            assert!(part.changed.is_empty());
+            assert!(part.table_patches.is_empty());
+        }
+    }
+
+    #[test]
+    fn paragraph_records_still_promote_an_empty_synthetic_paragraph_at_either_boundary() {
+        for at in [0, 1] {
+            let doc = EditingDoc::new(41);
+            doc.create_story("body", "", "Normal", "left").unwrap();
+            let target = {
+                let mut txn = doc.yrs_doc().transact_mut();
+                let story = story_ref(&txn, "body").unwrap();
+                let (_, map) = crate::next_pilcrow(&story, &txn, 0).unwrap();
+                map.insert(&mut txn, PARA_ORIGIN, SYNTHETIC);
+                map_string(&map, &txn, PARA_ID).unwrap()
+            };
+            doc.insert_paragraph_records(
+                "body",
+                at,
+                &[crate::ops::paragraph::ParagraphRecord {
+                    text: "Inserted".to_owned(),
+                    properties: Vec::new(),
+                    run: Vec::new(),
+                }],
+            )
+            .unwrap();
+            let identities = doc.paragraph_identities();
+            let anchor = identities
+                .paragraphs
+                .iter()
+                .find(|identity| {
+                    matches!(
+                        &identity.paragraph,
+                        ParagraphRef::Session { para_id, .. } if para_id == &target
+                    )
+                })
+                .unwrap();
+            assert_eq!(anchor.origin, ParagraphOrigin::Authored);
+            assert!(anchor.ooxml_para_id.is_some());
+        }
+    }
+
+    #[test]
+    fn candidate_unit_digest_matches_save_with_comment_boundaries() {
+        let doc = EditingDoc::new(77114);
+        doc.create_story("body", "A😀B", "Normal", "left").unwrap();
+        doc.split_paragraph(&ctx(), Position::new("body", 3), None)
+            .unwrap();
+        let comments = BTreeMap::from([
+            ("alpha".to_owned(), vec![(0, 2), (3, 3)]),
+            ("beta".to_owned(), vec![(4, 5)]),
+        ]);
+        let (_, units) = story_fingerprint(&doc, "body", &comments).unwrap();
+        assert_eq!(units.len(), 2);
+        for mut unit in units {
+            let segments = unit.segments.take().unwrap();
+            assert_eq!(
+                run_size_fingerprint(
+                    segments.into_iter(),
+                    unit.markers
+                        .iter()
+                        .map(|(at, key, end)| (*at, key.as_str(), *end)),
+                ),
+                Some(unit.digest),
+            );
+        }
+    }
+
+    #[test]
+    fn segment_text_len_counts_a_shared_string_at_every_use() {
+        let url: Arc<str> = Arc::from("data:image/png;base64,AQID");
+        let source = HashMap::from([("src".to_owned(), Any::String(Arc::clone(&url)))]);
+        let item = Any::Map(Arc::new(source));
+        let payload = BTreeMap::from([("content".to_owned(), Any::Array(vec![item; 3].into()))]);
+        let segment = crate::StorySegment {
+            content: crate::SegmentContent::OtherEmbed {
+                kind: "sdt".to_owned(),
+                payload,
+            },
+            attributes: BTreeMap::new(),
+        };
+        assert!(segment_text_len(&segment) >= 3 * url.len());
+    }
+
+    #[test]
+    fn segment_canonical_writes_the_bytes_of_its_sorted_value() {
+        let map = |entries: Vec<(&str, Any)>| {
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect::<HashMap<_, _>>()
+        };
+        let tree = |entries: Vec<(&str, Any)>| {
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let nested = Any::Map(Arc::new(map(vec![
+            ("zeta", Any::Number(1.0)),
+            ("alpha", Any::Number(1.5)),
+            ("Beta", Any::Number(-0.0)),
+            ("nan", Any::Number(f64::NAN)),
+            ("inf", Any::Number(f64::NEG_INFINITY)),
+            ("huge", Any::Number(1e300)),
+            ("tiny", Any::Number(5e-324)),
+            ("big", Any::BigInt(i64::MIN)),
+            ("yes", Any::Bool(true)),
+            ("none", Any::Null),
+            ("gone", Any::Undefined),
+            ("bytes", Any::Buffer(Arc::from(&[0u8, 7, 255][..]))),
+            (
+                "é\"\\/\n\u{1}",
+                Any::String(Arc::from("quote \" slash \\ / tab \t ctrl \u{1f} 😀")),
+            ),
+            (
+                "list",
+                Any::Array(Arc::from(vec![
+                    Any::Map(Arc::new(map(vec![
+                        ("b", Any::Null),
+                        ("a", Any::Number(2.0)),
+                    ]))),
+                    Any::Array(Arc::from(Vec::<Any>::new())),
+                    Any::String(Arc::from("")),
+                ])),
+            ),
+            ("empty", Any::Map(Arc::new(HashMap::new()))),
+        ])));
+        let attributes = [
+            BTreeMap::new(),
+            tree(vec![("bold", Any::Bool(true)), ("style", nested.clone())]),
+        ];
+        let pilcrows = [
+            tree(vec![]),
+            tree(vec![
+                ("styleId", Any::String(Arc::from("Heading1"))),
+                ("deep", nested.clone()),
+            ]),
+            tree(vec![
+                ("sectPr", nested.clone()),
+                ("_sectionProperties", Any::Null),
+                ("sectionBreakType", Any::String(Arc::from("nextPage"))),
+                ("align", Any::String(Arc::from("center"))),
+            ]),
+            tree(vec![("sectPr", Any::Null)]),
+        ];
+        let mut contents = vec![
+            crate::SegmentContent::Text(String::new()),
+            crate::SegmentContent::Text("plain é 😀 \"q\" \\ \u{0} \u{7f} \u{2028}".to_owned()),
+            crate::SegmentContent::OtherEmbed {
+                kind: "table".to_owned(),
+                payload: BTreeMap::new(),
+            },
+            crate::SegmentContent::OtherEmbed {
+                kind: "image \"x\"".to_owned(),
+                payload: tree(vec![
+                    ("src", Any::String(Arc::from("data:image/png;base64,AQID"))),
+                    ("nested", nested.clone()),
+                ]),
+            },
+        ];
+        contents.extend(pilcrows.into_iter().map(|values| {
+            crate::SegmentContent::Pilcrow(crate::ParagraphProperties {
+                para_id: "1A2B3C4D".to_owned(),
+                values,
+            })
+        }));
+        let (mut entry, mut section) = (Vec::new(), Vec::new());
+        for content in contents {
+            for attributes in &attributes {
+                let segment = crate::StorySegment {
+                    content: content.clone(),
+                    attributes: attributes.clone(),
+                };
+                let value = segment_value(&segment);
+                let mut section_value = value.clone();
+                if let Some(properties) = section_value[0]["pilcrow"].as_object_mut() {
+                    properties.remove("sectPr");
+                    properties.remove("_sectionProperties");
+                    properties.remove("sectionBreakType");
+                }
+                segment_canonical(&segment, &mut entry, &mut section);
+                assert_eq!(
+                    String::from_utf8(entry.clone()).unwrap(),
+                    String::from_utf8(serde_json::to_vec(&value).unwrap()).unwrap()
+                );
+                assert_eq!(
+                    String::from_utf8(section.clone()).unwrap(),
+                    String::from_utf8(serde_json::to_vec(&section_value).unwrap()).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn media_sources_have_the_same_fingerprint_in_both_seed_modes() {
+        let bytes =
+            ooxml_opc::rezip_parts(&[("word/media/picture.png".to_owned(), vec![1, 2, 3, 4])])
+                .unwrap();
+        let table = docx_parse::media::MediaTable::new(
+            ooxml_opc::RetainedPackage::new(Arc::from(bytes)).unwrap(),
+        )
+        .unwrap();
+        let url = table.data_url(0).unwrap();
+        for key in [
+            "src",
+            "shapeJson",
+            "chartJson",
+            "fieldData",
+            "propertiesJson",
+        ] {
+            let document = |src: &str| {
+                let doc = EditingDoc::new(7);
+                doc.create_story("body", "", "Normal", "left").unwrap();
+                let value = if key == "src" {
+                    src.to_owned()
+                } else {
+                    serde_json::json!({"nested": [{"src": src, "label": "media:0"}]}).to_string()
+                };
+                doc.apply_raw_ops(
+                    "body",
+                    vec![crate::RawOp::InsertEmbed {
+                        index: 0,
+                        kind: "image".into(),
+                        payload: vec![(key.into(), Any::String(value.into()))],
+                        attrs: Default::default(),
+                    }],
+                    &ctx(),
+                )
+                .unwrap();
+                doc
+            };
+            let default = document(&url);
+            let expected = story_fingerprint(&default, "body", &BTreeMap::new()).unwrap();
+            let segments = default.story_segments("body").unwrap();
+            default.install_media(table.clone());
+            assert_eq!(
+                story_fingerprint(&default, "body", &BTreeMap::new()),
+                Some(expected.clone()),
+                "{key}"
+            );
+            let mut normalized = segments.clone();
+            crate::media::write_segment_data_urls(&mut normalized, &table).unwrap();
+            assert_eq!(normalized, segments, "{key}");
+            let tokens = document("media:0");
+            tokens.install_media(table.clone());
+            assert_eq!(
+                story_fingerprint(&tokens, "body", &BTreeMap::new()),
+                Some(expected.clone()),
+                "{key}"
+            );
+            let changed = document("data:image/png;base64,AQIDBQ==");
+            changed.install_media(table.clone());
+            assert_ne!(
+                story_fingerprint(&changed, "body", &BTreeMap::new()),
+                Some(expected),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_removed_display_only_key_stays_removed_when_its_value_nests_one() {
+        let map = |entries: Vec<(&str, Any)>| {
+            Any::Map(Arc::new(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.to_owned(), value))
+                    .collect(),
+            ))
+        };
+        let nested = map(vec![
+            ("kind", Any::String("image".into())),
+            ("payload", map(vec![("horizontalRule", Any::Bool(true))])),
+        ]);
+        let picture = map(vec![
+            ("src", Any::String("media:0".into())),
+            ("horizontalRule", nested),
+        ]);
+        let Some(Any::Map(stripped)) = without_display_only_keys(Some("image"), &picture) else {
+            panic!("the rule key is stripped");
+        };
+        assert!(!stripped.contains_key("horizontalRule"));
+        assert!(stripped.contains_key("src"));
+    }
+
+    #[test]
+    fn display_only_keys_leave_the_fingerprint_unchanged() {
+        let fingerprint = |kind: &str, payload: Vec<(String, Any)>| {
+            let doc = EditingDoc::new(7);
+            doc.create_story("body", "", "Normal", "left").unwrap();
+            doc.apply_raw_ops(
+                "body",
+                vec![crate::RawOp::InsertEmbed {
+                    index: 0,
+                    kind: kind.into(),
+                    payload,
+                    attrs: Default::default(),
+                }],
+                &ctx(),
+            )
+            .unwrap();
+            story_fingerprint(&doc, "body", &BTreeMap::new()).unwrap()
+        };
+        let picture = |rule: bool| {
+            let mut payload = vec![("src".to_owned(), Any::String("media:0".into()))];
+            if rule {
+                payload.push(("horizontalRule".to_owned(), Any::Bool(true)));
+            }
+            payload
+        };
+        let content_control = |kind: &str, rule: bool| {
+            let item = HashMap::from([
+                ("kind".to_owned(), Any::String(kind.into())),
+                (
+                    "payload".to_owned(),
+                    Any::Map(Arc::new(picture(rule).into_iter().collect())),
+                ),
+            ]);
+            vec![(
+                "content".to_owned(),
+                Any::Array(Arc::from(vec![Any::Map(Arc::new(item))])),
+            )]
+        };
+        assert_eq!(
+            fingerprint("image", picture(true)),
+            fingerprint("image", picture(false))
+        );
+        assert_eq!(
+            fingerprint("sdt", content_control("image", true)),
+            fingerprint("sdt", content_control("image", false))
+        );
+        assert_ne!(
+            fingerprint("shape", picture(true)),
+            fingerprint("shape", picture(false))
+        );
+        assert_ne!(
+            fingerprint("sdt", content_control("shape", true)),
+            fingerprint("sdt", content_control("shape", false))
+        );
+    }
+
+    fn session(story: &str, key: &str) -> ParagraphRef {
+        ParagraphRef::Session {
+            story: story.into(),
+            para_id: key.into(),
+        }
+    }
+
+    fn ids(doc: &EditingDoc) -> Vec<(ParagraphRef, Option<String>)> {
+        doc.paragraph_identities()
+            .paragraphs
+            .into_iter()
+            .map(|identity| (identity.paragraph, identity.ooxml_para_id))
+            .collect()
+    }
+
+    /// Binds `id` to the paragraph `key` as its own claim, as an allocation would.
+    fn claim_id(doc: &EditingDoc, key: &str, id: &str, published: bool) {
+        let mut txn = doc.transact_for(&EditCtx::system(""));
+        let pilcrow = Scan::new(&txn)
+            .pilcrows
+            .into_iter()
+            .find(|pilcrow| pilcrow.key == key)
+            .unwrap();
+        record_claim(&mut txn, id, key, ParagraphIdOrigin::Authored, published);
+        pilcrow.map.insert(&mut txn, OOXML_PARA_ID, id);
+    }
+
+    #[test]
+    fn a_split_keeps_the_first_half_id_and_allocates_the_second_half_one() {
+        let doc = EditingDoc::new(7);
+        let first = doc.create_story("body", "abcd", "Normal", "left").unwrap();
+        assert_eq!(doc.paragraph_identities().paragraphs[0].ooxml_para_id, None);
+        let first_id = doc.persist_paragraph_ids().unwrap().assignments[0]
+            .ooxml_para_id
+            .clone();
+        let split = doc
+            .split_paragraph(&ctx(), Position::new("body", 2), None)
+            .unwrap();
+        let identities = doc.paragraph_identities().paragraphs;
+        assert_eq!(identities[0].paragraph, session("body", &first));
+        assert_eq!(
+            identities[0].ooxml_para_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(identities[0].id_origin, Some(ParagraphIdOrigin::Persisted));
+        let second = identities[1].ooxml_para_id.clone().unwrap();
+        assert_ne!(second, first_id);
+        assert_eq!(identities[1].id_origin, Some(ParagraphIdOrigin::Authored));
+        assert_eq!(identities[1].origin, ParagraphOrigin::Authored);
+        assert_eq!(
+            second,
+            format_paragraph_id(docx_parse::paragraph_identity::paragraph_id_candidate(
+                &split.second_para_id,
+                0
+            ))
+        );
+    }
+
+    #[test]
+    fn deleted_identities_stay_reserved_and_undo_restores_them() {
+        let doc = EditingDoc::new(7);
+        doc.create_story("body", "abcd", "Normal", "left").unwrap();
+        let mut undo = doc.undo_manager();
+        let split = doc
+            .split_paragraph(&ctx(), Position::new("body", 2), None)
+            .unwrap();
+        let second = doc.paragraph_identities().paragraphs[1]
+            .ooxml_para_id
+            .clone()
+            .unwrap();
+        assert!(undo.undo());
+        assert_eq!(doc.paragraph_identities().paragraphs.len(), 1);
+        let txn = doc.yrs_doc().transact();
+        assert!(
+            Seen::scan(&txn)
+                .ids
+                .contains(&parse_paragraph_id(&second).unwrap())
+        );
+        drop(txn);
+        assert!(undo.redo());
+        let restored = &doc.paragraph_identities().paragraphs[1];
+        assert_eq!(restored.paragraph, session("body", &split.second_para_id));
+        assert_eq!(restored.ooxml_para_id.as_deref(), Some(second.as_str()));
+    }
+
+    fn scan_view(scan: &Scan) -> (Vec<String>, Vec<String>, BTreeMap<String, String>) {
+        let pilcrows = scan.pilcrows.iter().map(|pilcrow| {
+            format!(
+                "{} {} {:?} {:?} {} {} {:?}",
+                pilcrow.story,
+                pilcrow.key,
+                pilcrow.allocated,
+                pilcrow.source,
+                pilcrow.synthetic,
+                pilcrow.content,
+                AsRef::<Branch>::as_ref(&pilcrow.map).id(),
+            )
+        });
+        (
+            scan.stories.clone(),
+            pilcrows.collect(),
+            scan.parents.clone().into_iter().collect(),
+        )
+    }
+
+    /// The cached scan, checked against a fresh one of the same state.
+    fn checked_scan(doc: &EditingDoc) -> Arc<Scan> {
+        let txn = doc.yrs_doc().transact();
+        let cached = doc.committed_scan(&txn);
+        assert_eq!(scan_view(&cached), scan_view(&Scan::new(&txn)));
+        cached
+    }
+
+    /// Every read-only identity query, answered from the cache and cold.
+    fn queries_agree(doc: &EditingDoc) {
+        let answers = |cold: bool| {
+            let forget = || {
+                if cold {
+                    *doc.scan_cache.0.lock().unwrap() = None;
+                }
+            };
+            forget();
+            let identities = doc.paragraph_identities();
+            let anchors: Vec<_> = identities
+                .paragraphs
+                .iter()
+                .map(|identity| {
+                    let ParagraphRef::Session { story, para_id } = &identity.paragraph else {
+                        unreachable!("no source package is retained");
+                    };
+                    forget();
+                    doc.resolve_paragraph_anchor(&ParagraphAnchor::Session {
+                        session_id: identities.session_id.clone(),
+                        story: story.clone(),
+                        para_id: para_id.clone(),
+                    })
+                })
+                .collect();
+            (format!("{identities:?}"), format!("{anchors:?}"))
+        };
+        checked_scan(doc);
+        assert_eq!(answers(false), answers(true));
+    }
+
+    #[test]
+    fn the_cached_scan_matches_a_fresh_one_across_edits_undo_and_remote_updates() {
+        let doc = EditingDoc::new(7);
+        doc.create_story("body", "abcd", "Normal", "left").unwrap();
+        doc.create_story("hf:rIdHeader", "head", "Normal", "left")
+            .unwrap();
+        let mut undo = doc.undo_manager();
+        let opened = checked_scan(&doc);
+        assert!(Arc::ptr_eq(&opened, &checked_scan(&doc)));
+        queries_agree(&doc);
+
+        doc.split_paragraph(&ctx(), Position::new("body", 2), None)
+            .unwrap();
+        let split = checked_scan(&doc);
+        assert!(!Arc::ptr_eq(&opened, &split));
+        assert_eq!(split.pilcrows.len(), 3);
+        queries_agree(&doc);
+
+        doc.persist_paragraph_ids().unwrap();
+        let persisted = checked_scan(&doc);
+        assert!(!Arc::ptr_eq(&split, &persisted));
+        assert!(persisted.pilcrows[0].allocated.is_some());
+        queries_agree(&doc);
+
+        assert!(undo.undo());
+        assert_eq!(checked_scan(&doc).pilcrows.len(), 2);
+        queries_agree(&doc);
+        assert!(undo.redo());
+        assert_eq!(checked_scan(&doc).pilcrows.len(), 3);
+        queries_agree(&doc);
+
+        let remote = EditingDoc::new(9);
+        remote
+            .apply_update_v1(&doc.encode_state_as_update_v1())
+            .unwrap();
+        remote
+            .split_paragraph(&ctx(), Position::new("body", 1), None)
+            .unwrap();
+        remote
+            .insert_text(
+                &ctx(),
+                Position::new("hf:rIdHeader", 0),
+                "x",
+                FormatPolicy::Plain,
+            )
+            .unwrap();
+        let before = checked_scan(&doc);
+        doc.apply_update_v1(
+            &remote
+                .encode_diff_v1(&doc.encode_state_vector_v1())
+                .unwrap(),
+        )
+        .unwrap();
+        let merged = checked_scan(&doc);
+        assert!(!Arc::ptr_eq(&before, &merged));
+        assert_eq!(merged.pilcrows.len(), 4);
+        queries_agree(&doc);
+
+        doc.delete_range(&ctx(), StoryRange::new("body", 0, 2))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&merged, &checked_scan(&doc)));
+        queries_agree(&doc);
+    }
+
+    #[test]
+    fn session_keys_skip_counters_a_restored_client_already_used() {
+        let first = EditingDoc::new(7);
+        first
+            .create_story("body", "abcd", "Normal", "left")
+            .unwrap();
+        first
+            .split_paragraph(&ctx(), Position::new("body", 2), None)
+            .unwrap();
+        let restored = EditingDoc::new(7);
+        restored
+            .apply_update_v1(&first.encode_state_as_update_v1())
+            .unwrap();
+        restored
+            .insert_text(&ctx(), Position::new("body", 0), "x", FormatPolicy::Plain)
+            .unwrap();
+        let split = restored
+            .split_paragraph(&ctx(), Position::new("body", 1), None)
+            .unwrap();
+        let keys: Vec<_> = restored
+            .paragraphs("body")
+            .unwrap()
+            .into_iter()
+            .map(|paragraph| paragraph.para_id)
+            .collect();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.iter().collect::<HashSet<_>>().len(), 3);
+        assert!(keys.contains(&split.second_para_id));
+        restored.persist_paragraph_ids().unwrap();
+        let ids: HashSet<_> = ids(&restored)
+            .into_iter()
+            .map(|(_, id)| id.unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn repair_and_persistence_are_idempotent() {
+        let doc = EditingDoc::new(7);
+        doc.create_story("body", "abcd", "Normal", "left").unwrap();
+        let before = doc.encode_state_vector_v1();
+        assert!(doc.repair_paragraph_identities().is_empty());
+        assert_eq!(doc.encode_state_vector_v1(), before);
+        let report = doc.persist_paragraph_ids().unwrap();
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].origin, ParagraphIdOrigin::Persisted);
+        assert_eq!(report.diagnostics, [ParagraphIdDiagnostic::NoSourcePackage]);
+        doc.delete_range(&ctx(), StoryRange::new("body", 0, 1))
+            .unwrap();
+        let persisted = doc.encode_state_vector_v1();
+        assert!(doc.persist_paragraph_ids().unwrap().assignments.is_empty());
+        assert_eq!(doc.encode_state_vector_v1(), persisted);
+    }
+
+    #[test]
+    fn ownership_keeps_the_stronger_claim_and_ties_break_by_owner() {
+        let claimant = |owner: &str, standing| Claimant {
+            holder: Holder::Pilcrow(0),
+            id: 1,
+            text: "00000001".into(),
+            owner: owner.into(),
+            standing,
+            views: Vec::new(),
+        };
+        let group = [
+            claimant("b", Standing::Unpublished),
+            claimant("a", Standing::Unpublished),
+            claimant("c", Standing::Unowned),
+        ];
+        assert_eq!(losers(&group, false), (vec![0, 2], false));
+        let group = [
+            claimant("copy", Standing::Unowned),
+            claimant("seed", Standing::Source),
+        ];
+        assert_eq!(losers(&group, false), (vec![0], false));
+        let group = [
+            claimant("first", Standing::Source),
+            claimant("second", Standing::Source),
+        ];
+        assert_eq!(losers(&group, false), (vec![], false));
+        assert_eq!(losers(&group, true), (vec![1], false));
+        let group = [
+            claimant("x", Standing::Published),
+            claimant("y", Standing::Published),
+            claimant("z", Standing::Unpublished),
+        ];
+        assert_eq!(losers(&group, true), (vec![2], true));
+    }
+
+    #[test]
+    fn replicas_keep_the_published_claim_when_ids_collide() {
+        let base = EditingDoc::new(1);
+        base.create_story("body", "one", "Normal", "left").unwrap();
+        base.create_story("note", "two", "Normal", "left").unwrap();
+        let update = base.encode_state_as_update_v1();
+        let (left, right) = (EditingDoc::new(2), EditingDoc::new(3));
+        left.apply_update_v1(&update).unwrap();
+        right.apply_update_v1(&update).unwrap();
+        let body = base.paragraphs("body").unwrap()[0].para_id.clone();
+        let note = base.paragraphs("note").unwrap()[0].para_id.clone();
+        claim_id(&left, &body, "0000AAAA", false);
+        claim_id(&right, &note, "0000AAAA", true);
+        let (from_left, from_right) = (
+            left.encode_state_as_update_v1(),
+            right.encode_state_as_update_v1(),
+        );
+        left.apply_update_v1(&from_right).unwrap();
+        right.apply_update_v1(&from_left).unwrap();
+        for doc in [&left, &right] {
+            doc.apply_update_v1(&left.encode_state_as_update_v1())
+                .unwrap();
+            doc.apply_update_v1(&right.encode_state_as_update_v1())
+                .unwrap();
+        }
+        assert_eq!(ids(&left), ids(&right));
+        let converged: HashMap<_, _> = ids(&left).into_iter().collect();
+        assert_eq!(
+            converged[&session("note", &note)].as_deref(),
+            Some("0000AAAA")
+        );
+        let body_id = converged[&session("body", &body)].clone().unwrap();
+        assert_ne!(body_id, "0000AAAA");
+        let identity = doc_identity(&left, &body);
+        assert_eq!(identity.id_origin, Some(ParagraphIdOrigin::Repaired));
+    }
+
+    fn doc_identity(doc: &EditingDoc, key: &str) -> ParagraphIdentity {
+        doc.paragraph_identities()
+            .paragraphs
+            .into_iter()
+            .find(|identity| matches!(&identity.paragraph, ParagraphRef::Session { para_id, .. } if para_id == key))
+            .unwrap()
+    }
+
+    #[test]
+    fn unpublished_collisions_keep_the_smallest_owner_on_every_replica() {
+        let base = EditingDoc::new(1);
+        base.create_story("a", "one", "Normal", "left").unwrap();
+        base.create_story("b", "two", "Normal", "left").unwrap();
+        let update = base.encode_state_as_update_v1();
+        let (left, right, late) = (EditingDoc::new(2), EditingDoc::new(3), EditingDoc::new(4));
+        for doc in [&left, &right, &late] {
+            doc.apply_update_v1(&update).unwrap();
+        }
+        let a = base.paragraphs("a").unwrap()[0].para_id.clone();
+        let b = base.paragraphs("b").unwrap()[0].para_id.clone();
+        claim_id(&left, &a, "0000BBBB", false);
+        claim_id(&right, &b, "0000BBBB", false);
+        let (from_left, from_right) = (
+            left.encode_state_as_update_v1(),
+            right.encode_state_as_update_v1(),
+        );
+        late.apply_update_v1(&from_left).unwrap();
+        left.apply_update_v1(&from_right).unwrap();
+        right.apply_update_v1(&from_left).unwrap();
+        late.apply_update_v1(&right.encode_state_as_update_v1())
+            .unwrap();
+        late.apply_update_v1(&left.encode_state_as_update_v1())
+            .unwrap();
+        for doc in [&left, &right] {
+            doc.apply_update_v1(&late.encode_state_as_update_v1())
+                .unwrap();
+        }
+        let keeper = a.clone().min(b.clone());
+        for doc in [&left, &right, &late] {
+            let converged: HashMap<_, _> = ids(doc).into_iter().collect();
+            let values: HashSet<_> = converged.values().cloned().collect();
+            assert_eq!(values.len(), 2);
+            let story = if keeper == a { "a" } else { "b" };
+            assert_eq!(
+                converged[&session(story, &keeper)].as_deref(),
+                Some("0000BBBB")
+            );
+        }
+        assert_eq!(ids(&left), ids(&late));
+        assert_eq!(ids(&right), ids(&late));
+    }
+
+    #[test]
+    fn conflicting_saved_claims_are_reported_and_resolve_as_ambiguous() {
+        let base = EditingDoc::new(1);
+        base.create_story("a", "one", "Normal", "left").unwrap();
+        base.create_story("b", "two", "Normal", "left").unwrap();
+        let update = base.encode_state_as_update_v1();
+        let (left, right) = (EditingDoc::new(2), EditingDoc::new(3));
+        left.apply_update_v1(&update).unwrap();
+        right.apply_update_v1(&update).unwrap();
+        let a = base.paragraphs("a").unwrap()[0].para_id.clone();
+        let b = base.paragraphs("b").unwrap()[0].para_id.clone();
+        claim_id(&left, &a, "0000CCCC", true);
+        claim_id(&right, &b, "0000CCCC", true);
+        left.apply_update_v1(&right.encode_state_as_update_v1())
+            .unwrap();
+        let report = left.persist_paragraph_ids().unwrap();
+        assert!(report.assignments.is_empty());
+        assert_eq!(
+            report.diagnostics,
+            [
+                ParagraphIdDiagnostic::ConflictingSavedIds {
+                    ooxml_para_id: "0000CCCC".into(),
+                    paragraphs: vec![session("a", &a), session("b", &b)],
+                },
+                ParagraphIdDiagnostic::NoSourcePackage,
+            ]
+        );
+        assert!(
+            ids(&left)
+                .iter()
+                .all(|(_, id)| id.as_deref() == Some("0000CCCC"))
+        );
+    }
+
+    #[test]
+    fn a_deleted_paragraph_keeps_its_saved_id_from_an_offline_claim() {
+        let base = EditingDoc::new(1);
+        base.create_story("body", "abc", "Normal", "left").unwrap();
+        base.create_story("note", "n", "Normal", "left").unwrap();
+        let update = base.encode_state_as_update_v1();
+        let (left, offline) = (EditingDoc::new(2), EditingDoc::new(3));
+        left.apply_update_v1(&update).unwrap();
+        offline.apply_update_v1(&update).unwrap();
+        left.split_paragraph(&ctx(), Position::new("body", 1), None)
+            .unwrap();
+        let saved = left
+            .split_paragraph(&ctx(), Position::new("body", 3), None)
+            .unwrap()
+            .first_para_id;
+        let id = doc_identity(&left, &saved).ooxml_para_id.unwrap();
+        assert!(
+            left.record_saved_paragraph_ids(&[(saved.clone(), id.clone())])
+                .is_empty()
+        );
+        left.delete_range(&ctx(), StoryRange::new("body", 1, 3))
+            .unwrap();
+        assert!(
+            ids(&left)
+                .iter()
+                .all(|(_, current)| current.as_deref() != Some(id.as_str()))
+        );
+
+        let note = base.paragraphs("note").unwrap()[0].para_id.clone();
+        claim_id(&offline, &note, &id, false);
+        left.apply_update_v1(&offline.encode_state_as_update_v1())
+            .unwrap();
+        let reassigned = doc_identity(&left, &note);
+        assert_ne!(reassigned.ooxml_para_id.as_deref(), Some(id.as_str()));
+        assert_eq!(reassigned.id_origin, Some(ParagraphIdOrigin::Repaired));
+        assert!(
+            ids(&left)
+                .iter()
+                .all(|(_, current)| current.as_deref() != Some(id.as_str()))
+        );
+    }
+
+    #[test]
+    fn a_hydrated_replica_never_reuses_a_deleted_paragraph_key() {
+        let first = EditingDoc::new(7);
+        first.create_story("body", "abc", "Normal", "left").unwrap();
+        first
+            .split_paragraph(&ctx(), Position::new("body", 1), None)
+            .unwrap();
+        let deleted = first
+            .split_paragraph(&ctx(), Position::new("body", 3), None)
+            .unwrap()
+            .first_para_id;
+        first
+            .delete_range(&ctx(), StoryRange::new("body", 1, 3))
+            .unwrap();
+        let stale = ParagraphAnchor::Session {
+            session_id: first.session_id(),
+            story: "body".into(),
+            para_id: deleted.clone(),
+        };
+        assert_eq!(
+            first.resolve_paragraph_anchor(&stale),
+            AnchorResolution::Missing
+        );
+
+        let hydrated = EditingDoc::new(7);
+        hydrated
+            .apply_update_v1(&first.encode_state_as_update_v1())
+            .unwrap();
+        let split = hydrated
+            .split_paragraph(&ctx(), Position::new("body", 1), None)
+            .unwrap();
+        assert_ne!(split.second_para_id, deleted);
+        assert_eq!(
+            hydrated.resolve_paragraph_anchor(&stale),
+            AnchorResolution::Missing
+        );
+    }
+
+    #[test]
+    fn a_save_reports_captured_ids_the_live_session_reassigned() {
+        let base = EditingDoc::new(1);
+        base.create_story("a", "one", "Normal", "left").unwrap();
+        base.create_story("b", "two", "Normal", "left").unwrap();
+        let update = base.encode_state_as_update_v1();
+        let (left, right) = (EditingDoc::new(2), EditingDoc::new(3));
+        left.apply_update_v1(&update).unwrap();
+        right.apply_update_v1(&update).unwrap();
+        let a = base.paragraphs("a").unwrap()[0].para_id.clone();
+        let b = base.paragraphs("b").unwrap()[0].para_id.clone();
+        claim_id(&left, &a, "0000DDDD", false);
+        claim_id(&left, &b, "0000EEEE", false);
+        let captured = vec![
+            (a.clone(), "0000DDDD".to_owned()),
+            (b.clone(), "0000EEEE".to_owned()),
+        ];
+        claim_id(&right, &b, "0000DDDD", true);
+        left.apply_update_v1(&right.encode_state_as_update_v1())
+            .unwrap();
+        assert_ne!(
+            doc_identity(&left, &a).ooxml_para_id.as_deref(),
+            Some("0000DDDD")
+        );
+
+        assert_eq!(left.record_saved_paragraph_ids(&captured), captured);
+        let txn = left.yrs_doc().transact();
+        assert!(!claim(&claims(&txn), "0000DDDD", &a).unwrap().published);
+        drop(txn);
+        let current = doc_identity(&left, &a).ooxml_para_id.unwrap();
+        assert!(
+            left.record_saved_paragraph_ids(&[(a.clone(), current.clone())])
+                .is_empty()
+        );
+        let txn = left.yrs_doc().transact();
+        assert!(claim(&claims(&txn), &current, &a).unwrap().published);
+    }
+
+    #[test]
+    fn a_synthetic_paragraph_is_promoted_by_authoring_into_it() {
+        let doc = EditingDoc::new(7);
+        doc.create_story("body", "", "Normal", "left").unwrap();
+        {
+            let mut txn = doc.yrs_doc().transact_mut();
+            let story = story_ref(&txn, "body").unwrap();
+            let (_, map) = crate::next_pilcrow(&story, &txn, 0).unwrap();
+            map.insert(&mut txn, PARA_ORIGIN, SYNTHETIC);
+        }
+        assert_eq!(
+            doc.paragraph_identities().paragraphs[0].origin,
+            ParagraphOrigin::Synthetic
+        );
+        assert!(doc.persist_paragraph_ids().unwrap().assignments.is_empty());
+        doc.insert_text(
+            &ctx(),
+            Position::new("body", 0),
+            "typed",
+            FormatPolicy::Plain,
+        )
+        .unwrap();
+        let identity = &doc.paragraph_identities().paragraphs[0];
+        assert_eq!(identity.origin, ParagraphOrigin::Authored);
+        assert_eq!(identity.id_origin, Some(ParagraphIdOrigin::Authored));
+        assert!(identity.ooxml_para_id.is_some());
+    }
+
+    #[test]
+    fn session_ids_identify_the_replicated_opening() {
+        let first = EditingDoc::new(7);
+        first.create_story("body", "a", "Normal", "left").unwrap();
+        first.begin_opening(None);
+        let replica = EditingDoc::new(8);
+        replica
+            .apply_update_v1(&first.encode_state_as_update_v1())
+            .unwrap();
+        assert_eq!(first.session_id(), replica.session_id());
+        let again = EditingDoc::new(7);
+        again.create_story("body", "a", "Normal", "left").unwrap();
+        again.begin_opening(None);
+        assert_ne!(again.session_id(), first.session_id());
+    }
+}

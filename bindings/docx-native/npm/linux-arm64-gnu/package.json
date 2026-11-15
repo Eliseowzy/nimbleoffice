@@ -1,0 +1,44 @@
+{
+  "name": "@nimbleoffice/docx-native-linux-arm64-gnu",
+  "version": "0.5.1",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "nimbleoffice-docx-native.linux-arm64-gnu.node",
+  "files": [
+    "nimbleoffice-docx-native.linux-arm64-gnu.node",
+    "BSD-3-Clause-Zstandard.txt",
+    "MIT-wuff.txt",
+    "MIT-mimalloc.txt"
+  ],
+  "description": "Native Rust bindings for the NimbleOffice DOCX engine in Node.js, Bun and Deno.",
+  "keywords": [
+    "docx",
+    "word",
+    "ooxml",
+    "nodejs",
+    "node-api",
+    "bun",
+    "deno",
+    "native",
+    "rust"
+  ],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "^20.16.0 || >=22.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eliseowzy/nimbleoffice.git",
+    "directory": "bindings/docx-native"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

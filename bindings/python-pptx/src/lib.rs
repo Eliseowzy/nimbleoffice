@@ -1,0 +1,2990 @@
+//! PyO3 bindings over the `nimbleoffice-pptx` facade.
+
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::path::PathBuf;
+use std::rc::{Rc, Weak};
+
+use pyo3::class::{PyTraverseError, PyVisit};
+use pyo3::create_exception;
+use pyo3::exceptions::{PyException, PyIndexError, PyKeyError, PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
+use pyo3::types::{PyBool, PyBytes, PyDict, PyInt};
+use python_common::{generated_client_id, map_io_error};
+
+use nimbleoffice_pptx::{
+    Background, CaretAnchor, CommentFlavor, CommentReceipt, CommentSnapshot, DeckSnapshot, EditCtx,
+    EditError, EditOrigin, EditRequest, Error as CoreError, ExportError as CoreExportError,
+    FindRequest, MAX_COLLABORATION_BYTES, MAX_COLLABORATION_CLIENT_ID, MAX_REQUEST_BYTES,
+    ParagraphSnapshot, ParseLimits, PictureDraft, PptxExportOptions, PptxMarkdownOptions,
+    PptxStructuredContent, Presentation as CorePresentation, PresetShapeDraft, ProposalError,
+    ProposalRequest, ReadRequest, RenderOptions, ShapeAdjustReceipt, ShapeDraft, ShapeFill,
+    ShapeFillReceipt, ShapeKind, ShapeReceipt, ShapeRect, ShapeSnapshot, ShapeStroke,
+    ShapeStrokeReceipt, SlideReceipt, SlideSnapshot, StorySnapshot, TableColumnWidth, TableEdit,
+    TableInsertPosition, TextParagraphDraft, TextReceipt, TextRunSnapshot, TextStyle,
+    TextStylePatch, TransformReceipt, UndoCaptureMode, UpdateEvent, UpdateOrigin,
+    UpdateSubscription, export_outcome_json, outcome_json, oversized_request,
+    snapshot_outcome_json,
+};
+
+create_exception!(
+    _nimbleoffice_pptx,
+    PptxError,
+    PyException,
+    "Base class for every error raised by the engine."
+);
+create_exception!(
+    _nimbleoffice_pptx,
+    ParseError,
+    PptxError,
+    "The presentation could not be read."
+);
+create_exception!(
+    _nimbleoffice_pptx,
+    RangeError,
+    PptxError,
+    "A slide, shape, or text index was out of bounds."
+);
+create_exception!(
+    _nimbleoffice_pptx,
+    RenderError,
+    PptxError,
+    "Layout failed or exceeded a resource limit."
+);
+create_exception!(
+    _nimbleoffice_pptx,
+    InvalidUpdateError,
+    PptxError,
+    "A peer sent an invalid collaboration update."
+);
+create_exception!(
+    _nimbleoffice_pptx,
+    CollaborativeStateError,
+    PptxError,
+    "The local collaborative state is invalid."
+);
+create_exception!(
+    _nimbleoffice_pptx,
+    NotCollaborativeError,
+    PptxError,
+    "The operation requires a collaborative presentation."
+);
+fn map_edit_error(error: EditError, message: String) -> PyErr {
+    match error {
+        EditError::Parse(_) => ParseError::new_err(message),
+        EditError::InvalidState(_) => CollaborativeStateError::new_err(message),
+        EditError::InvalidUpdate(_) | EditError::InvalidStateVector(_) => {
+            InvalidUpdateError::new_err(message)
+        }
+        EditError::InvalidClientId(_)
+        | EditError::InvalidGeometry(_)
+        | EditError::InvalidFill(_)
+        | EditError::InvalidAdjustment(_)
+        | EditError::InvalidText(_)
+        | EditError::InvalidComment(_) => PyValueError::new_err(message),
+        EditError::SlideNotFound(_)
+        | EditError::ShapeNotFound(_)
+        | EditError::StoryNotFound(_)
+        | EditError::CommentNotFound(_) => PyKeyError::new_err(message),
+        EditError::OutOfBounds { .. } | EditError::ParagraphBoundary { .. } => {
+            RangeError::new_err(message)
+        }
+        _ => PptxError::new_err(message),
+    }
+}
+
+fn png_target_slide<'py>(target: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let invalid =
+        || RangeError::new_err("target must be a dict containing only a slide index or ID");
+    let target = target.cast::<PyDict>().map_err(|_| invalid())?;
+    if target.len() != 1 {
+        return Err(invalid());
+    }
+    target.get_item("slide")?.ok_or_else(invalid)
+}
+
+fn map_error(error: CoreError) -> PyErr {
+    let message = error.to_string();
+    match error {
+        CoreError::Parse(_) => ParseError::new_err(message),
+        CoreError::Render(_) => RenderError::new_err(message),
+        CoreError::Edit(edit) => map_edit_error(edit, message),
+        CoreError::Proposal(ProposalError::Stale(targets)) => Python::attach(|py| {
+            let error = StaleProposalError::new_err(message);
+            match error.value(py).setattr("targets", targets) {
+                Ok(()) => error,
+                Err(error) => error,
+            }
+        }),
+        CoreError::Proposal(ProposalError::NotFound(_)) => PyKeyError::new_err(message),
+        CoreError::Proposal(ProposalError::Invalid(_)) => PyValueError::new_err(message),
+        CoreError::Proposal(ProposalError::Edit(edit)) => map_edit_error(edit, message),
+        _ => PptxError::new_err(message),
+    }
+}
+
+create_exception!(
+    _nimbleoffice_pptx,
+    StaleProposalError,
+    PptxError,
+    "Proposal targets changed before acceptance."
+);
+create_exception!(
+    _nimbleoffice_pptx,
+    ExportError,
+    PptxError,
+    "The engine refused a structured export's options or content."
+);
+
+fn export_options(options: &str) -> PyResult<PptxExportOptions> {
+    serde_json::from_str(options)
+        .map_err(|error| PyValueError::new_err(format!("invalid export options: {error}")))
+}
+
+/// Keeps a headless export's refusal as data; unreadable bytes raise `ParseError`.
+fn refusal_as_data<T>(outcome: Result<T, CoreError>) -> PyResult<Result<T, CoreExportError>> {
+    match outcome {
+        Ok(content) => Ok(Ok(content)),
+        Err(CoreError::Export(CoreExportError::Parse(message))) => {
+            Err(ParseError::new_err(message))
+        }
+        Err(CoreError::Export(refused)) => Ok(Err(refused)),
+        Err(error) => Err(map_error(error)),
+    }
+}
+
+fn envelope(json: Result<String, String>) -> PyResult<String> {
+    json.map_err(PptxError::new_err)
+}
+
+/// A structured export of PPTX bytes: `{"ok": true, "content"}` or `{"ok": false, "failure"}`.
+#[pyfunction]
+fn export_pptx_structured_json(
+    py: Python<'_>,
+    data: &Bound<'_, PyBytes>,
+    options: &str,
+) -> PyResult<String> {
+    let options = export_options(options)?;
+    let data = borrow_bytes(data);
+    let data: &[u8] = &data;
+    let outcome = py.detach(move || nimbleoffice_pptx::export_pptx_structured(data, &options));
+    envelope(snapshot_outcome_json(refusal_as_data(outcome)?))
+}
+
+/// `export_pptx_structured_json` rendered as Markdown.
+#[pyfunction]
+fn export_pptx_markdown_json(
+    py: Python<'_>,
+    data: &Bound<'_, PyBytes>,
+    options: &str,
+) -> PyResult<String> {
+    let options = export_options(options)?;
+    let data = borrow_bytes(data);
+    let data: &[u8] = &data;
+    let outcome = py.detach(move || nimbleoffice_pptx::export_pptx_markdown(data, &options));
+    envelope(snapshot_outcome_json(refusal_as_data(outcome)?))
+}
+
+/// Renders structured content JSON as Markdown: `{"ok": true, "content"}` or
+/// `{"ok": false, "failure"}`.
+#[pyfunction]
+fn render_pptx_markdown_json(py: Python<'_>, content: &str, options: &str) -> PyResult<String> {
+    let content: PptxStructuredContent = serde_json::from_str(content)
+        .map_err(|error| PyValueError::new_err(format!("invalid structured content: {error}")))?;
+    let options: PptxMarkdownOptions = serde_json::from_str(options)
+        .map_err(|error| PyValueError::new_err(format!("invalid Markdown options: {error}")))?;
+    let outcome = py.detach(move || nimbleoffice_pptx::render_pptx_markdown(&content, &options));
+    envelope(snapshot_outcome_json(refusal_as_data(outcome)?))
+}
+
+fn parse_background(value: &str) -> PyResult<Background> {
+    match value {
+        "slide" => Ok(Background::Slide),
+        "transparent" => Ok(Background::Transparent),
+        color if color.starts_with('#') => Ok(Background::Color(color.to_owned())),
+        other => Err(PyValueError::new_err(format!(
+            "background must be \"slide\", \"transparent\", or a #rrggbb color, not {other:?}"
+        ))),
+    }
+}
+
+fn parse_limits(limits: Option<&Bound<'_, PyDict>>) -> PyResult<ParseLimits> {
+    let mut parsed = ParseLimits::default();
+    let Some(limits) = limits else {
+        return Ok(parsed);
+    };
+    for (key, value) in limits.iter() {
+        let key = key
+            .extract::<String>()
+            .map_err(|_| PyTypeError::new_err("parse limit names must be strings"))?;
+        let value = value.extract::<usize>()?;
+        match key.as_str() {
+            "max_xml_bytes" => parsed.max_xml_bytes = value,
+            "max_xml_events" => parsed.max_xml_events = value,
+            "max_xml_text_bytes" => parsed.max_xml_text_bytes = value,
+            "max_xml_depth" => parsed.max_xml_depth = value,
+            "max_attributes_per_element" => parsed.max_attributes_per_element = value,
+            "max_attribute_bytes" => parsed.max_attribute_bytes = value,
+            "max_relationships" => parsed.max_relationships = value,
+            "max_shapes" => parsed.max_shapes = value,
+            "max_paragraphs" => parsed.max_paragraphs = value,
+            "max_runs" => parsed.max_runs = value,
+            "max_comments" => parsed.max_comments = value,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown parse limit {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_origin(origin: &str) -> PyResult<EditOrigin> {
+    match origin.to_ascii_lowercase().as_str() {
+        "local" => Ok(EditOrigin::Local),
+        "agent" => Ok(EditOrigin::Agent),
+        "remote" => Ok(EditOrigin::Remote),
+        "system" => Ok(EditOrigin::System),
+        other => Err(PyValueError::new_err(format!(
+            "origin must be local, agent, remote, or system, not {other:?}"
+        ))),
+    }
+}
+
+fn origin_name(origin: EditOrigin) -> &'static str {
+    match origin {
+        EditOrigin::Local => "local",
+        EditOrigin::Agent => "agent",
+        EditOrigin::Remote => "remote",
+        EditOrigin::System => "system",
+    }
+}
+
+fn kind_name(kind: ShapeKind) -> &'static str {
+    match kind {
+        ShapeKind::Shape => "shape",
+        ShapeKind::Picture => "picture",
+        ShapeKind::GraphicFrame => "graphicFrame",
+        ShapeKind::Group => "group",
+    }
+}
+
+fn json_result(py: Python<'_>, value: serde_json::Result<String>) -> PyResult<Py<PyAny>> {
+    let value = value.map_err(|error| PptxError::new_err(error.to_string()))?;
+    Ok(py.import("json")?.call_method1("loads", (value,))?.unbind())
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, *, include_media = true))]
+fn inspect_presentation(
+    py: Python<'_>,
+    data: &Bound<'_, PyBytes>,
+    include_media: bool,
+) -> PyResult<Py<PyAny>> {
+    let owned = borrow_bytes(data);
+    let data: &[u8] = &owned;
+    let payload = py
+        .detach(move || {
+            if include_media {
+                nimbleoffice_pptx::parse_pptx_json(data)
+            } else {
+                nimbleoffice_pptx::parse_pptx_json_without_media(data)
+            }
+        })
+        .map_err(|error| ParseError::new_err(error.to_string()))?;
+    Ok(py
+        .import("json")?
+        .call_method1("loads", (payload,))?
+        .unbind())
+}
+
+fn table_position(position: &str) -> PyResult<TableInsertPosition> {
+    match position {
+        "before" => Ok(TableInsertPosition::Before),
+        "after" => Ok(TableInsertPosition::After),
+        _ => Err(PyValueError::new_err("position must be before or after")),
+    }
+}
+
+fn table_width(width: Option<&str>) -> PyResult<TableColumnWidth> {
+    match width {
+        None | Some("split") => Ok(TableColumnWidth::Split),
+        Some("copy") => Ok(TableColumnWidth::Copy),
+        _ => Err(PyValueError::new_err("width must be split or copy")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_style(
+    bold: Option<bool>,
+    italic: Option<bool>,
+    font_size: Option<f64>,
+    color: Option<String>,
+    font_family: Option<String>,
+    underline: Option<String>,
+    strike: Option<String>,
+    spacing_pt: Option<f64>,
+    baseline_pct: Option<f64>,
+    kern_pt: Option<f64>,
+    caps: Option<&str>,
+) -> PyResult<TextStyle> {
+    let caps = caps
+        .map(|caps| {
+            serde_json::from_value(serde_json::Value::String(caps.to_owned()))
+                .map_err(|_| PyValueError::new_err("caps must be none, small, or all"))
+        })
+        .transpose()?;
+    Ok(TextStyle {
+        bold,
+        italic,
+        font_size_pt: font_size,
+        color,
+        font_family,
+        underline,
+        strike,
+        spacing_pt,
+        baseline_pct,
+        kern_pt,
+        caps,
+    })
+}
+
+fn text_style_patch(style: TextStyle) -> TextStylePatch {
+    TextStylePatch {
+        bold: style.bold,
+        italic: style.italic,
+        font_size_pt: style.font_size_pt,
+        color: style.color,
+        font_family: style.font_family,
+        underline: style.underline,
+        strike: style.strike,
+        spacing_pt: style.spacing_pt,
+        baseline_pct: style.baseline_pct,
+    }
+}
+
+#[pyclass(
+    module = "nimbleoffice_pptx",
+    name = "CaretAnchor",
+    frozen,
+    skip_from_py_object
+)]
+pub struct PyCaretAnchor {
+    anchor: CaretAnchor,
+}
+
+/// Renders `Option<String>` the way Python would, not the way Rust would.
+fn optional_repr(value: &Option<String>) -> String {
+    value
+        .as_ref()
+        .map_or_else(|| "None".to_owned(), |text| format!("{text:?}"))
+}
+
+fn index_repr(index: Option<u32>) -> String {
+    index.map_or_else(|| "None".to_owned(), |index| index.to_string())
+}
+
+fn rect(x: i64, y: i64, width: i64, height: i64) -> ShapeRect {
+    ShapeRect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// A shape's box in English Metric Units.
+#[pyclass(
+    module = "nimbleoffice_pptx",
+    name = "Rect",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyRect {
+    #[pyo3(get)]
+    x: i64,
+    #[pyo3(get)]
+    y: i64,
+    #[pyo3(get)]
+    width: i64,
+    #[pyo3(get)]
+    height: i64,
+}
+
+impl PyRect {
+    fn from_core(rect: ShapeRect) -> Self {
+        Self {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }
+    }
+}
+
+#[pymethods]
+impl PyRect {
+    fn __repr__(&self) -> String {
+        format!(
+            "Rect(x={}, y={}, width={}, height={})",
+            self.x, self.y, self.width, self.height
+        )
+    }
+}
+
+#[pyclass(
+    module = "nimbleoffice_pptx",
+    name = "Stroke",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyStroke {
+    #[pyo3(get)]
+    color: Option<String>,
+    #[pyo3(get)]
+    width_pt: Option<f64>,
+}
+
+impl PyStroke {
+    fn from_core(stroke: ShapeStroke) -> Self {
+        Self {
+            color: stroke.color,
+            width_pt: stroke.width_pt,
+        }
+    }
+}
+
+#[pymethods]
+impl PyStroke {
+    fn __repr__(&self) -> String {
+        let width = self
+            .width_pt
+            .map_or_else(|| "None".to_owned(), |width| width.to_string());
+        format!(
+            "Stroke(color={}, width_pt={})",
+            optional_repr(&self.color),
+            width
+        )
+    }
+}
+
+/// One styled run of text inside a paragraph.
+#[pyclass(
+    module = "nimbleoffice_pptx",
+    name = "TextRun",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyTextRun {
+    #[pyo3(get)]
+    text: String,
+    #[pyo3(get)]
+    bold: Option<bool>,
+    #[pyo3(get)]
+    italic: Option<bool>,
+    #[pyo3(get)]
+    font_size: Option<f64>,
+    #[pyo3(get)]
+    color: Option<String>,
+    #[pyo3(get)]
+    font_family: Option<String>,
+    #[pyo3(get)]
+    underline: Option<String>,
+    #[pyo3(get)]
+    strike: Option<String>,
+    #[pyo3(get)]
+    spacing_pt: Option<f64>,
+    #[pyo3(get)]
+    baseline_pct: Option<f64>,
+    #[pyo3(get)]
+    kern_pt: Option<f64>,
+    #[pyo3(get)]
+    caps: Option<String>,
+}
+
+impl PyTextRun {
+    fn from_core(run: &TextRunSnapshot) -> Self {
+        Self {
+            text: run.text.clone(),
+            bold: run.style.bold,
+            italic: run.style.italic,
+            font_size: run.style.font_size_pt,
+            color: run.style.color.clone(),
+            font_family: run.style.font_family.clone(),
+            underline: run.style.underline.clone(),
+            strike: run.style.strike.clone(),
+            spacing_pt: run.style.spacing_pt,
+            baseline_pct: run.style.baseline_pct,
+            kern_pt: run.style.kern_pt,
+            caps: run.style.caps.map(|caps| caps.as_attribute().to_owned()),
+        }
+    }
+}
+
+#[pymethods]
+impl PyTextRun {
+    fn __repr__(&self) -> String {
+        format!("TextRun({:?})", self.text)
+    }
+}
+
+#[pyclass(
+    module = "nimbleoffice_pptx",
+    name = "Paragraph",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyParagraph {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    alignment: Option<String>,
+    #[pyo3(get)]
+    level: u32,
+    #[pyo3(get)]
+    runs: Vec<PyTextRun>,
+    #[pyo3(get)]
+    text: String,
+}
+
+impl PyParagraph {
+    fn from_core(paragraph: &ParagraphSnapshot) -> Self {
+        Self {
+            id: paragraph.id.clone(),
+            alignment: paragraph.alignment.clone(),
+            level: paragraph.level,
+            runs: paragraph.runs.iter().map(PyTextRun::from_core).collect(),
+            text: paragraph.runs.iter().map(|run| run.text.as_str()).collect(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyParagraph {
+    fn __repr__(&self) -> String {
+        format!("Paragraph(level={}, text={:?})", self.level, self.text)
+    }
+}
+
+/// One editable text flow. Text offsets are UTF-16 code units, and every
+/// paragraph ends with a pilcrow that occupies one of them.
+#[pyclass(
+    module = "nimbleoffice_pptx",
+    name = "Story",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyStory {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    length: u32,
+    #[pyo3(get)]
+    paragraphs: Vec<PyParagraph>,
+    #[pyo3(get)]
+    text: String,
+}
+
+impl PyStory {
+    fn from_core(story: &StorySnapshot) -> Self {
+        Self {
+            id: story.id.clone(),
+            length: story.length,
+            paragraphs: story
+                .paragraphs
+                .iter()
+                .map(PyParagraph::from_core)
+                .collect(),
+            text: story.plain_text(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyStory {
+    fn __repr__(&self) -> String {
+        format!("Story(id={:?}, length={})", self.id, self.length)
+    }
+}
+
+#[pyclass(
+    module = "nimbleoffice_pptx",
+    name = "Shape",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyShape {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    kind: &'static str,
+    #[pyo3(get)]
+    x: i64,
+    #[pyo3(get)]
+    y: i64,
+    #[pyo3(get)]
+    width: i64,
+    #[pyo3(get)]
+    height: i64,
+    #[pyo3(get)]
+    rotation: f64,
+    #[pyo3(get)]
+    flip_h: bool,
+    #[pyo3(get)]
+    flip_v: bool,
+    #[pyo3(get)]
+    geometry: String,
+    #[pyo3(get)]
+    adjustments: BTreeMap<String, f64>,
+    #[pyo3(get)]
+    fill_color: Option<String>,
+    #[pyo3(get)]
+    outline_color: Option<String>,
+    #[pyo3(get)]
+    placeholder: Option<String>,
+    #[pyo3(get)]
+    media_path: Option<String>,
+    #[pyo3(get)]
+    stories: Vec<PyStory>,
+    #[pyo3(get)]
+    children: Vec<PyShape>,
+    #[pyo3(get)]
+    text: String,
+}
+
+impl PyShape {
+    fn from_core(shape: &ShapeSnapshot) -> Self {
+        let stories: Vec<PyStory> = shape.text_stories.iter().map(PyStory::from_core).collect();
+        let children: Vec<PyShape> = shape.children.iter().map(PyShape::from_core).collect();
+        let text = join_text(
+            stories
+                .iter()
+                .map(|story| story.text.as_str())
+                .chain(children.iter().map(|child| child.text.as_str())),
+        );
+        Self {
+            id: shape.id.clone(),
+            name: shape.name.clone(),
+            kind: kind_name(shape.kind),
+            x: shape.x,
+            y: shape.y,
+            width: shape.width,
+            height: shape.height,
+            rotation: shape.rotation_deg,
+            flip_h: shape.flip_h,
+            flip_v: shape.flip_v,
+            geometry: shape.geometry.clone(),
+            adjustments: shape.adjust_values.clone(),
+            fill_color: shape.resolved_fill_color.clone(),
+            outline_color: shape.resolved_outline_color.clone(),
+            placeholder: shape
+                .placeholder
+                .as_ref()
+                .and_then(|placeholder| placeholder.placeholder_type.clone()),
+            media_path: shape.media_part_path.clone(),
+            stories,
+            children,
+            text,
+        }
+    }
+}
+
+#[pymethods]
+impl PyShape {
+    fn __repr__(&self) -> String {
+        format!(
+            "Shape(id={:?}, kind={:?}, name={:?})",
+            self.id, self.kind, self.name
+        )
+    }
+}
+
+#[pyclass(
+    module = "nimbleoffice_pptx",
+    name = "Slide",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PySlide {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    index: usize,
+    #[pyo3(get)]
+    name: Option<String>,
+    #[pyo3(get)]
+    layout: Option<String>,
+    #[pyo3(get)]
+    part_path: Option<String>,
+    #[pyo3(get)]
+    shapes: Vec<PyShape>,
+    #[pyo3(get)]
+    text: String,
+}
+
+impl PySlide {
+    fn from_core(slide: &SlideSnapshot, index: usize) -> Self {
+        let shapes: Vec<PyShape> = slide.shapes.iter().map(PyShape::from_core).collect();
+        let text = join_text(shapes.iter().map(|shape| shape.text.as_str()));
+        Self {
+            id: slide.id.clone(),
+            index,
+            name: slide.name.clone(),
+            layout: slide.layout_part_path.clone(),
+            part_path: slide.source_part_path.clone(),
+            shapes,
+            text,
+        }
+    }
+}
+
+#[pymethods]
+impl PySlide {
+    fn __len__(&self) -> usize {
+        self.shapes.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Slide(index={}, id={:?}, shapes={})",
+            self.index,
+            self.id,
+            self.shapes.len()
+        )
+    }
+}
+
+/// The whole deck as plain data, as of one moment.
+#[pyclass(module = "nimbleoffice_pptx", name = "Deck", frozen)]
+pub struct PyDeck {
+    #[pyo3(get)]
+    width_emu: i64,
+    #[pyo3(get)]
+    height_emu: i64,
+    #[pyo3(get)]
+    slides: Vec<PySlide>,
+}
+
+impl PyDeck {
+    fn from_core(snapshot: &DeckSnapshot) -> Self {
+        Self {
+            width_emu: snapshot.width_emu,
+            height_emu: snapshot.height_emu,
+            slides: snapshot
+                .slides
+                .iter()
+                .enumerate()
+                .map(|(index, slide)| PySlide::from_core(slide, index))
+                .collect(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyDeck {
+    fn __len__(&self) -> usize {
+        self.slides.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Deck(width_emu={}, height_emu={}, slides={})",
+            self.width_emu,
+            self.height_emu,
+            self.slides.len()
+        )
+    }
+}
+
+/// One embedded binary part, such as a slide's image.
+#[pyclass(module = "nimbleoffice_pptx", name = "Media", frozen)]
+pub struct PyMedia {
+    data: Vec<u8>,
+    #[pyo3(get)]
+    path: String,
+    #[pyo3(get)]
+    content_type: String,
+}
+
+#[pymethods]
+impl PyMedia {
+    #[getter]
+    fn bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.data)
+    }
+
+    fn write(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        py.detach(|| fs::write(&path, &self.data))
+            .map_err(|error| map_io_error(&error, &path))
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Media(path={:?}, content_type={:?}, bytes={})",
+            self.path,
+            self.content_type,
+            self.data.len()
+        )
+    }
+}
+
+/// One rasterized slide.
+#[pyclass(module = "nimbleoffice_pptx", name = "Png", frozen)]
+pub struct PyPng {
+    data: Vec<u8>,
+    #[pyo3(get)]
+    width: u32,
+    #[pyo3(get)]
+    height: u32,
+    /// Pictures the backend could not draw: bytes missing from the package,
+    /// undecodable, or past its budget.
+    #[pyo3(get)]
+    skipped_images: usize,
+}
+
+#[pymethods]
+impl PyPng {
+    #[getter]
+    fn bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.data)
+    }
+
+    fn write(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        py.detach(|| fs::write(&path, &self.data))
+            .map_err(|error| map_io_error(&error, &path))
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Png(width={}, height={}, bytes={})",
+            self.width,
+            self.height,
+            self.data.len()
+        )
+    }
+}
+
+/// A laid-out slide as the renderer's display list, for hosts that paint it
+/// themselves; [`PyPresentation::render_png`] rasterizes it here instead.
+#[pyclass(module = "nimbleoffice_pptx", name = "DisplayList", frozen)]
+pub struct PyDisplayList {
+    payload: String,
+    #[pyo3(get)]
+    width: f32,
+    #[pyo3(get)]
+    height: f32,
+    #[pyo3(get)]
+    contract_version: u32,
+    primitives: usize,
+}
+
+#[pymethods]
+impl PyDisplayList {
+    #[getter]
+    fn json(&self) -> &str {
+        &self.payload
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        py.import("json")?
+            .call_method1("loads", (self.payload.as_str(),))
+    }
+
+    fn write(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        py.detach(|| fs::write(&path, self.payload.as_bytes()))
+            .map_err(|error| map_io_error(&error, &path))
+    }
+
+    fn __len__(&self) -> usize {
+        self.primitives
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DisplayList(width={}, height={}, primitives={})",
+            self.width, self.height, self.primitives
+        )
+    }
+}
+
+/// Where a slide moved. A missing index means the slide did not exist on that
+/// side of the edit.
+#[pyclass(module = "nimbleoffice_pptx", name = "SlideEdit", frozen)]
+pub struct PySlideEdit {
+    #[pyo3(get)]
+    slide_id: String,
+    #[pyo3(get)]
+    from_index: Option<u32>,
+    #[pyo3(get)]
+    to_index: Option<u32>,
+}
+
+impl PySlideEdit {
+    fn from_core(receipt: SlideReceipt) -> Self {
+        Self {
+            slide_id: receipt.slide_id,
+            from_index: receipt.from_index,
+            to_index: receipt.to_index,
+        }
+    }
+}
+
+#[pymethods]
+impl PySlideEdit {
+    fn __repr__(&self) -> String {
+        format!(
+            "SlideEdit(slide_id={:?}, from_index={}, to_index={})",
+            self.slide_id,
+            index_repr(self.from_index),
+            index_repr(self.to_index)
+        )
+    }
+}
+
+#[pyclass(module = "nimbleoffice_pptx", name = "ShapeEdit", frozen)]
+pub struct PyShapeEdit {
+    #[pyo3(get)]
+    slide_id: String,
+    #[pyo3(get)]
+    shape_id: String,
+    #[pyo3(get)]
+    index: u32,
+}
+
+impl PyShapeEdit {
+    fn from_core(receipt: ShapeReceipt) -> Self {
+        Self {
+            slide_id: receipt.slide_id,
+            shape_id: receipt.shape_id,
+            index: receipt.index,
+        }
+    }
+}
+
+#[pymethods]
+impl PyShapeEdit {
+    fn __repr__(&self) -> String {
+        format!(
+            "ShapeEdit(shape_id={:?}, index={})",
+            self.shape_id, self.index
+        )
+    }
+}
+
+#[pyclass(module = "nimbleoffice_pptx", name = "TransformEdit", frozen)]
+pub struct PyTransformEdit {
+    #[pyo3(get)]
+    slide_id: String,
+    #[pyo3(get)]
+    shape_id: String,
+    #[pyo3(get)]
+    before: PyRect,
+    #[pyo3(get)]
+    after: PyRect,
+}
+
+impl PyTransformEdit {
+    fn from_core(receipt: TransformReceipt) -> Self {
+        Self {
+            slide_id: receipt.slide_id,
+            shape_id: receipt.shape_id,
+            before: PyRect::from_core(receipt.before),
+            after: PyRect::from_core(receipt.after),
+        }
+    }
+}
+
+#[pymethods]
+impl PyTransformEdit {
+    fn __repr__(&self) -> String {
+        format!(
+            "TransformEdit(shape_id={:?}, after={})",
+            self.shape_id,
+            self.after.__repr__()
+        )
+    }
+}
+
+#[pyclass(module = "nimbleoffice_pptx", name = "FillEdit", frozen)]
+pub struct PyFillEdit {
+    #[pyo3(get)]
+    slide_id: String,
+    #[pyo3(get)]
+    shape_id: String,
+    #[pyo3(get)]
+    before: Option<String>,
+    #[pyo3(get)]
+    after: Option<String>,
+}
+
+impl PyFillEdit {
+    fn from_core(receipt: ShapeFillReceipt) -> Self {
+        Self {
+            slide_id: receipt.slide_id,
+            shape_id: receipt.shape_id,
+            before: receipt.before,
+            after: receipt.after,
+        }
+    }
+}
+
+#[pymethods]
+impl PyFillEdit {
+    fn __repr__(&self) -> String {
+        format!(
+            "FillEdit(shape_id={:?}, before={}, after={})",
+            self.shape_id,
+            optional_repr(&self.before),
+            optional_repr(&self.after)
+        )
+    }
+}
+
+#[pyclass(module = "nimbleoffice_pptx", name = "StrokeEdit", frozen)]
+pub struct PyStrokeEdit {
+    #[pyo3(get)]
+    slide_id: String,
+    #[pyo3(get)]
+    shape_id: String,
+    #[pyo3(get)]
+    before: Option<PyStroke>,
+    #[pyo3(get)]
+    after: Option<PyStroke>,
+}
+
+impl PyStrokeEdit {
+    fn from_core(receipt: ShapeStrokeReceipt) -> Self {
+        Self {
+            slide_id: receipt.slide_id,
+            shape_id: receipt.shape_id,
+            before: receipt.before.map(PyStroke::from_core),
+            after: receipt.after.map(PyStroke::from_core),
+        }
+    }
+}
+
+#[pymethods]
+impl PyStrokeEdit {
+    fn __repr__(&self) -> String {
+        let render = |stroke: &Option<PyStroke>| {
+            stroke
+                .as_ref()
+                .map_or_else(|| "None".to_owned(), PyStroke::__repr__)
+        };
+        format!(
+            "StrokeEdit(shape_id={:?}, before={}, after={})",
+            self.shape_id,
+            render(&self.before),
+            render(&self.after)
+        )
+    }
+}
+
+/// Adjustments the engine clamped into their guide's legal range.
+#[pyclass(module = "nimbleoffice_pptx", name = "AdjustEdit", frozen)]
+pub struct PyAdjustEdit {
+    #[pyo3(get)]
+    slide_id: String,
+    #[pyo3(get)]
+    shape_id: String,
+    #[pyo3(get)]
+    before: BTreeMap<String, f64>,
+    #[pyo3(get)]
+    after: BTreeMap<String, f64>,
+}
+
+impl PyAdjustEdit {
+    fn from_core(receipt: ShapeAdjustReceipt) -> Self {
+        Self {
+            slide_id: receipt.slide_id,
+            shape_id: receipt.shape_id,
+            before: receipt.before,
+            after: receipt.after,
+        }
+    }
+}
+
+#[pymethods]
+impl PyAdjustEdit {
+    fn __repr__(&self) -> String {
+        format!(
+            "AdjustEdit(shape_id={:?}, after={:?})",
+            self.shape_id, self.after
+        )
+    }
+}
+
+#[pyclass(module = "nimbleoffice_pptx", name = "Comment", frozen)]
+pub struct PyComment {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    slide_id: String,
+    #[pyo3(get)]
+    author: String,
+    #[pyo3(get)]
+    initials: String,
+    #[pyo3(get)]
+    text: String,
+    #[pyo3(get)]
+    created: Option<String>,
+    #[pyo3(get)]
+    x: i64,
+    #[pyo3(get)]
+    y: i64,
+    #[pyo3(get)]
+    parent_id: Option<String>,
+    #[pyo3(get)]
+    resolved: bool,
+}
+
+impl PyComment {
+    fn from_core(snapshot: CommentSnapshot) -> Self {
+        Self {
+            id: snapshot.id,
+            slide_id: snapshot.slide_id,
+            author: snapshot.author,
+            initials: snapshot.initials,
+            text: snapshot.text,
+            created: snapshot.created,
+            x: snapshot.x_emu,
+            y: snapshot.y_emu,
+            parent_id: snapshot.parent_id,
+            resolved: snapshot.resolved,
+        }
+    }
+}
+
+#[pymethods]
+impl PyComment {
+    fn __repr__(&self) -> String {
+        format!(
+            "Comment(id={:?}, author={:?}, resolved={})",
+            self.id, self.author, self.resolved
+        )
+    }
+}
+
+#[pyclass(module = "nimbleoffice_pptx", name = "CommentEdit", frozen)]
+pub struct PyCommentEdit {
+    #[pyo3(get)]
+    comment_id: String,
+    #[pyo3(get)]
+    slide_id: String,
+    #[pyo3(get)]
+    parent_id: Option<String>,
+    #[pyo3(get)]
+    resolved: bool,
+}
+
+impl PyCommentEdit {
+    fn from_core(receipt: CommentReceipt) -> Self {
+        Self {
+            comment_id: receipt.comment_id,
+            slide_id: receipt.slide_id,
+            parent_id: receipt.parent_id,
+            resolved: receipt.resolved,
+        }
+    }
+}
+
+#[pymethods]
+impl PyCommentEdit {
+    fn __repr__(&self) -> String {
+        format!("CommentEdit(comment_id={:?})", self.comment_id)
+    }
+}
+
+/// The affected range, in UTF-16 code units, and the text that occupied it.
+#[pyclass(module = "nimbleoffice_pptx", name = "TextEdit", frozen)]
+pub struct PyTextEdit {
+    #[pyo3(get)]
+    story_id: String,
+    #[pyo3(get)]
+    start: u32,
+    #[pyo3(get)]
+    end: u32,
+    #[pyo3(get)]
+    text: String,
+}
+
+impl PyTextEdit {
+    fn from_core(receipt: TextReceipt) -> Self {
+        Self {
+            story_id: receipt.story_id,
+            start: receipt.start,
+            end: receipt.end,
+            text: receipt.text,
+        }
+    }
+}
+
+#[pymethods]
+impl PyTextEdit {
+    fn __len__(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TextEdit(story_id={:?}, start={}, end={})",
+            self.story_id, self.start, self.end
+        )
+    }
+}
+
+fn join_text<'a>(parts: impl Iterator<Item = &'a str>) -> String {
+    parts
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Holds the argument's own reference so its bytes stay readable and immutable
+/// for as long as the caller keeps the result, `detach` included. Nothing is
+/// copied: `bytes` is already immutable, and pyo3 only ever binds one here.
+fn borrow_bytes(data: &Bound<'_, PyBytes>) -> PyBackedBytes {
+    PyBackedBytes::from(data.clone())
+}
+
+/// Moves a deck or a borrow of one across `detach`, which demands `Send`.
+///
+/// # Safety
+///
+/// The core type is `!Send` (`RefCell`s plus stored undo callbacks), but
+/// `PyPresentation` is `unsendable`, so any access from another thread panics
+/// inside pyo3 before reaching it, and `detach` keeps running on this thread.
+///
+/// Each deck shape is named on its own below: a blanket `impl<T>` would also
+/// hand `Send` to a `Bound` or a `Py<T>`, which pyo3 exists to keep out.
+struct DetachedDeck<T>(T);
+
+unsafe impl Send for DetachedDeck<CorePresentation> {}
+unsafe impl Send for DetachedDeck<&'_ CorePresentation> {}
+unsafe impl Send for DetachedDeck<&'_ mut CorePresentation> {}
+
+struct UpdateListener {
+    callback: RefCell<Option<Py<PyAny>>>,
+}
+
+struct PendingUpdate {
+    listener: Weak<UpdateListener>,
+    event: UpdateEvent,
+}
+
+#[pyclass(module = "nimbleoffice_pptx", name = "UpdateSubscription", unsendable)]
+pub struct PyUpdateSubscription {
+    listener: Rc<UpdateListener>,
+    subscription: RefCell<Option<UpdateSubscription>>,
+}
+
+#[pymethods]
+impl PyUpdateSubscription {
+    fn unsubscribe(&self) {
+        let callback = self.listener.callback.borrow_mut().take();
+        let subscription = self.subscription.borrow_mut().take();
+        drop(subscription);
+        drop(callback);
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Ok(callback) = self.listener.callback.try_borrow() {
+            visit.call(&*callback)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&mut self) {
+        self.unsubscribe();
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) {
+        self.unsubscribe();
+    }
+}
+
+#[pyclass(module = "nimbleoffice_pptx", name = "Presentation", unsendable)]
+pub struct PyPresentation {
+    presentation: CorePresentation,
+    author: String,
+    origin: EditOrigin,
+    edited: Cell<bool>,
+    collaborative: bool,
+    pending_updates: Rc<RefCell<VecDeque<PendingUpdate>>>,
+    flushing_updates: Cell<bool>,
+}
+
+impl PyPresentation {
+    /// The refusal JSON for a request over the byte budget, which is never decoded.
+    fn oversized(&self, request: &str) -> Option<PyResult<String>> {
+        (request.len() > MAX_REQUEST_BYTES).then(|| {
+            outcome_json::<()>(&Err(oversized_request(self.presentation.version())))
+                .map_err(|error| PptxError::new_err(error.to_string()))
+        })
+    }
+
+    fn edit_ctx(&self) -> EditCtx {
+        EditCtx {
+            origin: self.origin,
+            author: self.author.clone(),
+        }
+    }
+
+    /// Marks the deck dirty only once the engine has accepted the edit, so a
+    /// raised edit leaves `save` willing to serialize.
+    fn committed<T>(&self, edit: Result<T, CoreError>) -> PyResult<T> {
+        let receipt = edit.map_err(map_error);
+        if receipt.is_ok() {
+            self.edited.set(true);
+        }
+        Python::attach(|py| self.flush_updates(py))?;
+        receipt
+    }
+
+    fn flush_updates(&self, py: Python<'_>) -> PyResult<()> {
+        if self.flushing_updates.replace(true) {
+            return Ok(());
+        }
+        let mut failure = None;
+        loop {
+            let Some(pending) = self.pending_updates.borrow_mut().pop_front() else {
+                break;
+            };
+            let Some(listener) = pending.listener.upgrade() else {
+                continue;
+            };
+            let callback = listener
+                .callback
+                .borrow()
+                .as_ref()
+                .map(|callback| callback.clone_ref(py));
+            let Some(callback) = callback else {
+                continue;
+            };
+            let origin = match pending.event.origin {
+                UpdateOrigin::Local => "local",
+                UpdateOrigin::Remote => "remote",
+            };
+            if let Err(error) =
+                callback.call1(py, (PyBytes::new(py, &pending.event.update), origin))
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        self.flushing_updates.set(false);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn all_slide_ids(&self) -> PyResult<Vec<String>> {
+        self.presentation.slide_ids().map_err(map_error)
+    }
+
+    /// bool is an int subclass, so True would otherwise select slide 1.
+    fn reject_bool(key: &Bound<'_, PyAny>) -> PyResult<()> {
+        if key.is_instance_of::<PyBool>() {
+            return Err(PyTypeError::new_err(
+                "slide must be an ID (str) or an index (int), not bool",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_slide_index(&self, key: &Bound<'_, PyAny>) -> PyResult<usize> {
+        Self::reject_bool(key)?;
+        let ids = self.all_slide_ids()?;
+        Self::slide_index_in(key, &ids)
+    }
+
+    fn slide_index_in(key: &Bound<'_, PyAny>, ids: &[String]) -> PyResult<usize> {
+        if let Ok(id) = key.extract::<String>() {
+            return ids
+                .iter()
+                .position(|candidate| *candidate == id)
+                .ok_or_else(|| PyKeyError::new_err(format!("no slide with ID {id:?}")));
+        }
+        if key.is_instance_of::<PyInt>() {
+            let index = key
+                .extract::<usize>()
+                .ok()
+                .filter(|index| *index < ids.len());
+            return index.ok_or_else(|| {
+                PyIndexError::new_err(format!(
+                    "slide index {key} out of range for {} slide(s)",
+                    ids.len()
+                ))
+            });
+        }
+        Err(PyTypeError::new_err(
+            "slide must be an ID (str) or an index (int)",
+        ))
+    }
+
+    fn resolve_slide_id(&self, key: &Bound<'_, PyAny>) -> PyResult<String> {
+        Self::reject_bool(key)?;
+        if let Ok(id) = key.extract::<String>() {
+            return Ok(id);
+        }
+        let index = self.resolve_slide_index(key)?;
+        self.all_slide_ids()?
+            .get(index)
+            .cloned()
+            .ok_or_else(|| PyIndexError::new_err(format!("slide index {index} out of range")))
+    }
+
+    fn wrap(presentation: CorePresentation, collaborative: bool) -> Self {
+        Self {
+            presentation,
+            author: "python".to_owned(),
+            origin: EditOrigin::Local,
+            edited: Cell::new(false),
+            collaborative,
+            pending_updates: Default::default(),
+            flushing_updates: Cell::new(false),
+        }
+    }
+
+    /// Every non-collaborative deck shares one client ID, so two of them would
+    /// author under the same identity and never converge.
+    fn require_collaborative(&self) -> PyResult<()> {
+        if self.collaborative {
+            return Ok(());
+        }
+        Err(NotCollaborativeError::new_err(
+            "this presentation was not opened with open_collaborative, so it \
+             has no unique client ID; exchanging updates between standalone \
+             decks would silently diverge",
+        ))
+    }
+
+    fn saved_bytes(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
+        let deck = DetachedDeck(&self.presentation);
+        py.detach(move || {
+            let deck = deck;
+            deck.0.save()
+        })
+        .map_err(map_error)
+    }
+
+    fn open_bytes_inner(
+        py: Python<'_>,
+        data: &[u8],
+        limits: ParseLimits,
+        client_id: Option<u64>,
+    ) -> PyResult<Self> {
+        let opened = py
+            .detach(move || {
+                let opened = match client_id {
+                    Some(client_id) => {
+                        CorePresentation::open_collaborative_with_limits(data, client_id, &limits)
+                    }
+                    None => CorePresentation::open_with_limits(data, &limits),
+                };
+                opened.map(DetachedDeck)
+            })
+            .map_err(map_error)?;
+        Ok(Self::wrap(opened.0, client_id.is_some()))
+    }
+
+    /// The limits are parsed before anything touches the input, so a rejected
+    /// argument costs nothing whatever it was handed.
+    fn open_bytes(
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+        limits: Option<&Bound<'_, PyDict>>,
+        client_id: Option<u64>,
+    ) -> PyResult<Self> {
+        let limits = parse_limits(limits)?;
+        let data = borrow_bytes(data);
+        Self::open_bytes_inner(py, &data, limits, client_id)
+    }
+}
+
+#[pymethods]
+impl PyPresentation {
+    #[staticmethod]
+    #[pyo3(signature = (data, *, limits = None))]
+    fn open(
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+        limits: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        Self::open_bytes(py, data, limits, None)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (path, *, limits = None))]
+    fn open_path(
+        py: Python<'_>,
+        path: PathBuf,
+        limits: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        let data = py
+            .detach(|| fs::read(&path))
+            .map_err(|error| map_io_error(&error, &path))?;
+        Self::open_bytes_inner(py, &data, parse_limits(limits)?, None)
+    }
+
+    /// Open a replica with a generated ID unless `client_id` is supplied.
+    #[staticmethod]
+    #[pyo3(signature = (data, *, client_id = None, limits = None))]
+    fn open_collaborative(
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+        client_id: Option<u64>,
+        limits: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        // The engine rejects 0, so a masked draw of 0 becomes 1.
+        let client_id = match client_id {
+            Some(client_id) => client_id,
+            None => generated_client_id(MAX_COLLABORATION_CLIENT_ID)?.max(1),
+        };
+        Self::open_bytes(py, data, limits, Some(client_id))
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (update, *, client_id, source = None))]
+    fn open_from_update(
+        py: Python<'_>,
+        update: &Bound<'_, PyBytes>,
+        client_id: u64,
+        source: Option<&Bound<'_, PyBytes>>,
+    ) -> PyResult<Self> {
+        let update = borrow_bytes(update);
+        let source = source.map(borrow_bytes);
+        let opened = py
+            .detach(move || {
+                CorePresentation::open_from_update(&update, client_id, source.as_deref())
+                    .map(DetachedDeck)
+            })
+            .map_err(map_error)?;
+        Ok(Self::wrap(opened.0, true))
+    }
+
+    #[getter]
+    fn client_id(&self) -> u64 {
+        self.presentation.client_id()
+    }
+
+    #[getter]
+    fn is_collaborative(&self) -> bool {
+        self.collaborative || self.presentation.is_collaborative()
+    }
+
+    fn set_collaborative(&self) -> PyResult<()> {
+        self.presentation.set_collaborative().map_err(map_error)
+    }
+
+    fn on_update(&self, callback: &Bound<'_, PyAny>) -> PyResult<PyUpdateSubscription> {
+        if !callback.is_callable() {
+            return Err(PyTypeError::new_err("callback must be callable"));
+        }
+        let listener = Rc::new(UpdateListener {
+            callback: RefCell::new(Some(callback.clone().unbind())),
+        });
+        let weak = Rc::downgrade(&listener);
+        let pending = Rc::clone(&self.pending_updates);
+        let subscription = self
+            .presentation
+            .observe_update_v1(move |event| {
+                pending.borrow_mut().push_back(PendingUpdate {
+                    listener: weak.clone(),
+                    event,
+                });
+            })
+            .map_err(map_error)?;
+        Ok(PyUpdateSubscription {
+            listener,
+            subscription: RefCell::new(Some(subscription)),
+        })
+    }
+
+    /// Whether the engine has accepted an edit since the deck was opened.
+    #[getter]
+    fn is_edited(&self) -> bool {
+        self.edited.get()
+    }
+
+    #[getter]
+    fn author(&self) -> String {
+        self.author.clone()
+    }
+
+    #[setter]
+    fn set_author(&mut self, author: String) {
+        self.author = author;
+    }
+
+    /// One of local, agent, remote, or system. Only local edits enter the
+    /// local undo stack.
+    #[getter]
+    fn origin(&self) -> &'static str {
+        origin_name(self.origin)
+    }
+
+    #[setter]
+    fn set_origin(&mut self, origin: &str) -> PyResult<()> {
+        self.origin = parse_origin(origin)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn slide_count(&self) -> PyResult<usize> {
+        Ok(self.all_slide_ids()?.len())
+    }
+
+    #[getter]
+    fn slide_ids(&self) -> PyResult<Vec<String>> {
+        self.all_slide_ids()
+    }
+
+    #[getter]
+    fn width_emu(&self) -> PyResult<i64> {
+        Ok(self.presentation.snapshot().map_err(map_error)?.width_emu)
+    }
+
+    #[getter]
+    fn height_emu(&self) -> PyResult<i64> {
+        Ok(self.presentation.snapshot().map_err(map_error)?.height_emu)
+    }
+
+    /// Layout part paths, as `insert_slide` expects them.
+    #[getter]
+    fn layouts(&self) -> Vec<String> {
+        self.presentation
+            .layouts()
+            .iter()
+            .map(|layout| layout.part_path.clone())
+            .collect()
+    }
+
+    fn snapshot(&self) -> PyResult<PyDeck> {
+        let snapshot = self.presentation.snapshot().map_err(map_error)?;
+        Ok(PyDeck::from_core(&snapshot))
+    }
+
+    fn slide(&self, slide: &Bound<'_, PyAny>) -> PyResult<PySlide> {
+        let index = self.resolve_slide_index(slide)?;
+        let snapshot = self.presentation.snapshot().map_err(map_error)?;
+        let found = snapshot
+            .slides
+            .get(index)
+            .ok_or_else(|| PyIndexError::new_err(format!("slide index {index} out of range")))?;
+        Ok(PySlide::from_core(found, index))
+    }
+
+    fn story(&self, story_id: &str) -> PyResult<PyStory> {
+        let story = self.presentation.story(story_id).map_err(map_error)?;
+        Ok(PyStory::from_core(&story))
+    }
+
+    #[pyo3(signature = (query, *, case_sensitive = false, limit = None))]
+    fn search_text(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        case_sensitive: bool,
+        limit: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let matches = self
+            .presentation
+            .search_text(query, case_sensitive, limit)
+            .map_err(map_error)?;
+        json_result(py, serde_json::to_string(&matches))
+    }
+
+    fn anchor_caret(&self, story_id: &str, index: u32) -> PyResult<PyCaretAnchor> {
+        let anchor = self
+            .presentation
+            .anchor_caret(story_id, index)
+            .map_err(map_error)?;
+        Ok(PyCaretAnchor { anchor })
+    }
+
+    fn resolve_caret_anchor(&self, anchor: &PyCaretAnchor) -> Option<u32> {
+        self.presentation.resolve_caret_anchor(&anchor.anchor)
+    }
+
+    fn media_bytes<'py>(&self, py: Python<'py>, asset_id: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.presentation.media_bytes(asset_id).map_err(map_error)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn media(&self) -> Vec<PyMedia> {
+        self.presentation
+            .media()
+            .iter()
+            .map(|part| PyMedia {
+                data: part.bytes.clone(),
+                path: part.part_path.clone(),
+                content_type: part.content_type.clone(),
+            })
+            .collect()
+    }
+
+    #[pyo3(signature = (index, *, layout = None))]
+    fn insert_slide(&self, index: u32, layout: Option<&str>) -> PyResult<PySlideEdit> {
+        let receipt = self.committed(self.presentation.insert_slide(
+            &self.edit_ctx(),
+            index,
+            layout,
+        ))?;
+        Ok(PySlideEdit::from_core(receipt))
+    }
+
+    fn delete_slide(&self, slide: &Bound<'_, PyAny>) -> PyResult<PySlideEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt =
+            self.committed(self.presentation.delete_slide(&self.edit_ctx(), &slide_id))?;
+        Ok(PySlideEdit::from_core(receipt))
+    }
+
+    fn move_slide(&self, slide: &Bound<'_, PyAny>, index: u32) -> PyResult<PySlideEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.move_slide(
+            &self.edit_ctx(),
+            &slide_id,
+            index,
+        ))?;
+        Ok(PySlideEdit::from_core(receipt))
+    }
+
+    fn duplicate_slide(&self, slide: &Bound<'_, PyAny>, index: u32) -> PyResult<PySlideEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.duplicate_slide(
+            &self.edit_ctx(),
+            &slide_id,
+            index,
+        ))?;
+        Ok(PySlideEdit::from_core(receipt))
+    }
+
+    fn set_slide_notes(&self, slide: &Bound<'_, PyAny>, text: &str) -> PyResult<()> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        self.committed(
+            self.presentation
+                .set_slide_notes(&self.edit_ctx(), &slide_id, text),
+        )
+    }
+
+    #[pyo3(signature = (slide, layout, mapping = Vec::new()))]
+    fn set_slide_layout(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        layout: &str,
+        mapping: Vec<(String, u32)>,
+    ) -> PyResult<()> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        self.committed(self.presentation.set_slide_layout(
+            &self.edit_ctx(),
+            &slide_id,
+            layout,
+            &mapping,
+        ))
+    }
+
+    fn set_slide_background_json(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        background: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let background: Option<ShapeFill> = serde_json::from_str(background)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let receipt = self.committed(self.presentation.set_slide_background(
+            &self.edit_ctx(),
+            &slide_id,
+            background.as_ref(),
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    #[pyo3(signature = (slide, data, *, content_type, x, y, width, height, name = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_picture(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        data: &Bound<'_, PyBytes>,
+        content_type: String,
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+        name: Option<String>,
+    ) -> PyResult<PyShapeEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let draft = PictureDraft {
+            name: name.unwrap_or_else(|| "Picture".to_owned()),
+            rect: rect(x, y, width, height),
+            content_type,
+            media_bytes: data.as_bytes().to_vec(),
+        };
+        let receipt = self.committed(self.presentation.add_picture(
+            &self.edit_ctx(),
+            &slide_id,
+            &draft,
+        ))?;
+        Ok(PyShapeEdit::from_core(receipt))
+    }
+
+    #[pyo3(signature = (
+        slide, *, x, y, width, height, text = String::new(), name = None,
+        bold = None, italic = None, font_size = None,
+        color = None, font_family = None, underline = None, strike = None,
+        spacing_pt = None, baseline_pct = None, kern_pt = None, caps = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_text_box(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+        text: String,
+        name: Option<String>,
+        bold: Option<bool>,
+        italic: Option<bool>,
+        font_size: Option<f64>,
+        color: Option<String>,
+        font_family: Option<String>,
+        underline: Option<String>,
+        strike: Option<String>,
+        spacing_pt: Option<f64>,
+        baseline_pct: Option<f64>,
+        kern_pt: Option<f64>,
+        caps: Option<&str>,
+    ) -> PyResult<PyShapeEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let draft = ShapeDraft {
+            name: name.unwrap_or_else(|| "TextBox".to_owned()),
+            rect: rect(x, y, width, height),
+            text,
+            style: text_style(
+                bold,
+                italic,
+                font_size,
+                color,
+                font_family,
+                underline,
+                strike,
+                spacing_pt,
+                baseline_pct,
+                kern_pt,
+                caps,
+            )?,
+        };
+        let receipt = self.committed(self.presentation.add_text_box(
+            &self.edit_ctx(),
+            &slide_id,
+            &draft,
+        ))?;
+        Ok(PyShapeEdit::from_core(receipt))
+    }
+
+    #[pyo3(signature = (slide, geometry, *, x, y, width, height, fill = None, name = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_shape(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        geometry: String,
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+        fill: Option<String>,
+        name: Option<String>,
+    ) -> PyResult<PyShapeEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let draft = PresetShapeDraft {
+            name: name.unwrap_or_else(|| geometry.clone()),
+            geometry,
+            rect: rect(x, y, width, height),
+            fill,
+        };
+        let receipt = self.committed(self.presentation.add_shape(
+            &self.edit_ctx(),
+            &slide_id,
+            &draft,
+        ))?;
+        Ok(PyShapeEdit::from_core(receipt))
+    }
+
+    /// `None` clears the fill.
+    fn set_shape_fill(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        color: Option<&str>,
+    ) -> PyResult<PyFillEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.set_shape_fill(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            color,
+        ))?;
+        Ok(PyFillEdit::from_core(receipt))
+    }
+
+    /// Omitting both arguments clears the outline.
+    #[pyo3(signature = (slide, shape_id, *, color = None, width_pt = None))]
+    fn set_shape_stroke(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        color: Option<String>,
+        width_pt: Option<f64>,
+    ) -> PyResult<PyStrokeEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let stroke = ShapeStroke { color, width_pt };
+        let receipt = self.committed(self.presentation.set_shape_stroke(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            &stroke,
+        ))?;
+        Ok(PyStrokeEdit::from_core(receipt))
+    }
+
+    fn set_shape_adjust(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        adjustments: BTreeMap<String, f64>,
+    ) -> PyResult<PyAdjustEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.set_shape_adjust(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            &adjustments,
+        ))?;
+        Ok(PyAdjustEdit::from_core(receipt))
+    }
+
+    fn remove_shape(&self, slide: &Bound<'_, PyAny>, shape_id: &str) -> PyResult<PyShapeEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.remove_shape(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+        ))?;
+        Ok(PyShapeEdit::from_core(receipt))
+    }
+
+    fn move_shape(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        x: i64,
+        y: i64,
+    ) -> PyResult<PyTransformEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.move_shape(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            x,
+            y,
+        ))?;
+        Ok(PyTransformEdit::from_core(receipt))
+    }
+
+    fn resize_shape(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        width: i64,
+        height: i64,
+    ) -> PyResult<PyTransformEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.resize_shape(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            width,
+            height,
+        ))?;
+        Ok(PyTransformEdit::from_core(receipt))
+    }
+
+    fn set_shape_rect(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+    ) -> PyResult<PyTransformEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.set_shape_rect(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            rect(x, y, width, height),
+        ))?;
+        Ok(PyTransformEdit::from_core(receipt))
+    }
+
+    fn bring_shape_to_front(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.bring_shape_to_front(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    fn send_shape_to_back(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.send_shape_to_back(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    fn bring_shape_forward(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.bring_shape_forward(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    fn send_shape_backward(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.send_shape_backward(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    #[pyo3(signature = (slide, shape_id, index, position, cells = Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_table_row(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        index: u32,
+        position: &str,
+        cells: Vec<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.insert_table_row(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            index,
+            table_position(position)?,
+            &cells,
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    fn delete_table_row(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        index: u32,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.delete_table_row(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            index,
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    #[pyo3(signature = (slide, shape_id, index, position, cells = Vec::new(), *, width = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_table_column(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        index: u32,
+        position: &str,
+        cells: Vec<String>,
+        width: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.insert_table_column_with_width(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            index,
+            table_position(position)?,
+            &cells,
+            table_width(width)?,
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    fn delete_table_column(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        index: u32,
+    ) -> PyResult<Py<PyAny>> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.delete_table_column(
+            &self.edit_ctx(),
+            &slide_id,
+            shape_id,
+            index,
+        ))?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    #[pyo3(signature = (method, slide, shape_id, index, position = "before", cells = Vec::new(), *, width = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn check_table_edit(
+        &self,
+        method: &str,
+        slide: &Bound<'_, PyAny>,
+        shape_id: &str,
+        index: u32,
+        position: &str,
+        cells: Vec<String>,
+        width: Option<&str>,
+    ) -> PyResult<()> {
+        let edit = match method {
+            "insert_table_row" => TableEdit::InsertRow,
+            "delete_table_row" => TableEdit::DeleteRow,
+            "insert_table_column" => TableEdit::InsertColumn,
+            "delete_table_column" => TableEdit::DeleteColumn,
+            _ => return Err(PyValueError::new_err("unknown table edit method")),
+        };
+        let slide_id = self.resolve_slide_id(slide)?;
+        self.presentation
+            .check_table_edit_with_width(
+                edit,
+                &slide_id,
+                shape_id,
+                index,
+                table_position(position)?,
+                &cells,
+                table_width(width)?,
+            )
+            .map_err(map_error)
+    }
+
+    /// `index` is a UTF-16 offset into the story.
+    #[pyo3(signature = (
+        story_id, index, text, *,
+        bold = None, italic = None, font_size = None,
+        color = None, font_family = None, underline = None, strike = None,
+        spacing_pt = None, baseline_pct = None, kern_pt = None, caps = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_text(
+        &self,
+        story_id: &str,
+        index: u32,
+        text: &str,
+        bold: Option<bool>,
+        italic: Option<bool>,
+        font_size: Option<f64>,
+        color: Option<String>,
+        font_family: Option<String>,
+        underline: Option<String>,
+        strike: Option<String>,
+        spacing_pt: Option<f64>,
+        baseline_pct: Option<f64>,
+        kern_pt: Option<f64>,
+        caps: Option<&str>,
+    ) -> PyResult<PyTextEdit> {
+        let style = text_style(
+            bold,
+            italic,
+            font_size,
+            color,
+            font_family,
+            underline,
+            strike,
+            spacing_pt,
+            baseline_pct,
+            kern_pt,
+            caps,
+        )?;
+        let receipt = self.committed(self.presentation.insert_text(
+            &self.edit_ctx(),
+            story_id,
+            index,
+            text,
+            &style,
+        ))?;
+        Ok(PyTextEdit::from_core(receipt))
+    }
+
+    fn delete_text(&self, story_id: &str, start: u32, end: u32) -> PyResult<PyTextEdit> {
+        let receipt =
+            self.committed(
+                self.presentation
+                    .delete_text(&self.edit_ctx(), story_id, start, end),
+            )?;
+        Ok(PyTextEdit::from_core(receipt))
+    }
+
+    fn set_story_paragraphs_json(&self, story_id: &str, paragraphs: &str) -> PyResult<PyStory> {
+        let paragraphs: Vec<TextParagraphDraft> = serde_json::from_str(paragraphs)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let story = self.committed(self.presentation.set_story_paragraphs(
+            &self.edit_ctx(),
+            story_id,
+            &paragraphs,
+        ))?;
+        Ok(PyStory::from_core(&story))
+    }
+
+    fn set_paragraph_alignment(
+        &self,
+        story_id: &str,
+        start: u32,
+        end: u32,
+        alignment: Option<&str>,
+    ) -> PyResult<PyTextEdit> {
+        let receipt = self.committed(self.presentation.set_paragraph_alignment(
+            &self.edit_ctx(),
+            story_id,
+            start,
+            end,
+            alignment,
+        ))?;
+        Ok(PyTextEdit::from_core(receipt))
+    }
+
+    #[pyo3(signature = (
+        story_id, start, end, *,
+        bold = None, italic = None, font_size = None,
+        color = None, font_family = None, underline = None, strike = None,
+        spacing_pt = None, baseline_pct = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn format_text(
+        &self,
+        story_id: &str,
+        start: u32,
+        end: u32,
+        bold: Option<bool>,
+        italic: Option<bool>,
+        font_size: Option<f64>,
+        color: Option<String>,
+        font_family: Option<String>,
+        underline: Option<String>,
+        strike: Option<String>,
+        spacing_pt: Option<f64>,
+        baseline_pct: Option<f64>,
+    ) -> PyResult<PyTextEdit> {
+        let patch = text_style_patch(text_style(
+            bold,
+            italic,
+            font_size,
+            color,
+            font_family,
+            underline,
+            strike,
+            spacing_pt,
+            baseline_pct,
+            None,
+            None,
+        )?);
+        let receipt = self.committed(self.presentation.format_text(
+            &self.edit_ctx(),
+            story_id,
+            start,
+            end,
+            &patch,
+        ))?;
+        Ok(PyTextEdit::from_core(receipt))
+    }
+
+    #[pyo3(signature = (slide, text, *, author, initials = "", created, x = 0, y = 0))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_comment(
+        &self,
+        slide: &Bound<'_, PyAny>,
+        text: &str,
+        author: &str,
+        initials: &str,
+        created: &str,
+        x: i64,
+        y: i64,
+    ) -> PyResult<PyCommentEdit> {
+        let slide_id = self.resolve_slide_id(slide)?;
+        let receipt = self.committed(self.presentation.add_comment(
+            &self.edit_ctx(),
+            &slide_id,
+            author,
+            initials,
+            text,
+            created,
+            x,
+            y,
+        ))?;
+        Ok(PyCommentEdit::from_core(receipt))
+    }
+
+    #[pyo3(signature = (comment_id, text, *, author, initials = "", created))]
+    fn reply_to_comment(
+        &self,
+        comment_id: &str,
+        text: &str,
+        author: &str,
+        initials: &str,
+        created: &str,
+    ) -> PyResult<PyCommentEdit> {
+        let receipt = self.committed(self.presentation.reply_to_comment(
+            &self.edit_ctx(),
+            comment_id,
+            author,
+            initials,
+            text,
+            created,
+        ))?;
+        Ok(PyCommentEdit::from_core(receipt))
+    }
+
+    #[pyo3(signature = (comment_id, resolved = true))]
+    fn set_comment_status(&self, comment_id: &str, resolved: bool) -> PyResult<PyCommentEdit> {
+        let receipt = self.committed(self.presentation.set_comment_status(
+            &self.edit_ctx(),
+            comment_id,
+            resolved,
+        ))?;
+        Ok(PyCommentEdit::from_core(receipt))
+    }
+
+    fn remove_comment(&self, comment_id: &str) -> PyResult<PyCommentEdit> {
+        let receipt = self.committed(
+            self.presentation
+                .remove_comment(&self.edit_ctx(), comment_id),
+        )?;
+        Ok(PyCommentEdit::from_core(receipt))
+    }
+
+    fn set_comment_position(&self, comment_id: &str, x: i64, y: i64) -> PyResult<PyCommentEdit> {
+        let receipt = self.committed(self.presentation.set_comment_position(
+            &self.edit_ctx(),
+            comment_id,
+            x,
+            y,
+        ))?;
+        Ok(PyCommentEdit::from_core(receipt))
+    }
+
+    fn comments(&self) -> PyResult<Vec<PyComment>> {
+        Ok(self
+            .presentation
+            .comments()
+            .map_err(map_error)?
+            .into_iter()
+            .map(PyComment::from_core)
+            .collect())
+    }
+
+    #[getter]
+    fn comment_flavor(&self) -> PyResult<String> {
+        Ok(
+            match self.presentation.comment_flavor().map_err(map_error)? {
+                CommentFlavor::Legacy => "legacy".to_owned(),
+                CommentFlavor::Modern => "modern".to_owned(),
+            },
+        )
+    }
+
+    fn set_comment_flavor(&self, flavor: &str) -> PyResult<String> {
+        let flavor = match flavor {
+            "legacy" => CommentFlavor::Legacy,
+            "modern" => CommentFlavor::Modern,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown comment flavor {other:?}; expected \"legacy\" or \"modern\""
+                )));
+            }
+        };
+        self.committed(
+            self.presentation
+                .set_comment_flavor(&self.edit_ctx(), flavor),
+        )?;
+        self.comment_flavor()
+    }
+
+    fn insert_paragraph_break(&self, story_id: &str, index: u32) -> PyResult<PyTextEdit> {
+        let receipt = self.committed(self.presentation.insert_paragraph_break(
+            &self.edit_ctx(),
+            story_id,
+            index,
+        ))?;
+        Ok(PyTextEdit::from_core(receipt))
+    }
+
+    fn delete_paragraph_break(&self, story_id: &str, index: u32) -> PyResult<PyTextEdit> {
+        let receipt = self.committed(self.presentation.delete_paragraph_break(
+            &self.edit_ctx(),
+            story_id,
+            index,
+        ))?;
+        Ok(PyTextEdit::from_core(receipt))
+    }
+
+    /// Register a face for layout. Nothing is embedded in the wheel, so text
+    /// only measures against families registered here. The face itself is not
+    /// copied, so the engine's own size and count limits still reject one
+    /// before it costs anything.
+    #[pyo3(signature = (family, data, *, bold = false, italic = false))]
+    fn register_font(
+        &mut self,
+        py: Python<'_>,
+        family: &str,
+        data: &Bound<'_, PyBytes>,
+        bold: bool,
+        italic: bool,
+    ) -> PyResult<u32> {
+        let family = family.to_owned();
+        let owned = borrow_bytes(data);
+        let data: &[u8] = &owned;
+        let deck = DetachedDeck(&mut self.presentation);
+        py.detach(move || {
+            let deck = deck;
+            deck.0.register_font(&family, bold, italic, data)
+        })
+        .map_err(map_error)
+    }
+
+    #[pyo3(signature = (family, data, *, bold = false, italic = false))]
+    fn register_fallback_font(
+        &mut self,
+        py: Python<'_>,
+        family: &str,
+        data: &Bound<'_, PyBytes>,
+        bold: bool,
+        italic: bool,
+    ) -> PyResult<u32> {
+        let family = family.to_owned();
+        let owned = borrow_bytes(data);
+        let data: &[u8] = &owned;
+        let deck = DetachedDeck(&mut self.presentation);
+        py.detach(move || {
+            let deck = deck;
+            deck.0.register_fallback_font(&family, bold, italic, data)
+        })
+        .map_err(map_error)
+    }
+
+    fn hit_test(
+        &self,
+        py: Python<'_>,
+        slide: &Bound<'_, PyAny>,
+        x: f32,
+        y: f32,
+    ) -> PyResult<Py<PyAny>> {
+        let index = self.resolve_slide_index(slide)?;
+        let result = self.presentation.hit_test(index, x, y).map_err(map_error)?;
+        json_result(py, serde_json::to_string(&result))
+    }
+
+    fn render_slide(&self, py: Python<'_>, slide: &Bound<'_, PyAny>) -> PyResult<PyDisplayList> {
+        let index = self.resolve_slide_index(slide)?;
+        let deck = DetachedDeck(&self.presentation);
+        enum Failure {
+            Engine(CoreError),
+            Json(serde_json::Error),
+        }
+
+        py.detach(move || {
+            let deck = deck;
+            let rendered = deck.0.render_slide(index).map_err(Failure::Engine)?;
+            let payload = serde_json::to_string(&rendered.display_list).map_err(Failure::Json)?;
+            Ok(PyDisplayList {
+                payload,
+                width: rendered.display_list.width,
+                height: rendered.display_list.height,
+                contract_version: rendered.display_list.contract_version,
+                primitives: rendered.display_list.primitives.len(),
+            })
+        })
+        .map_err(|failure| match failure {
+            Failure::Engine(error) => map_error(error),
+            Failure::Json(error) => RenderError::new_err(error.to_string()),
+        })
+    }
+
+    /// Rasterize one slide to deterministic PNG bytes. Media resolves from the
+    /// package, so only fonts need registering; `background` is `"slide"`,
+    /// `"transparent"`, or a `#rrggbb` color painted under the slide's own.
+    #[pyo3(signature = (target, *, scale = 1.0, background = "slide", max_shadow_pixels = None))]
+    fn render_png(
+        &self,
+        py: Python<'_>,
+        target: &Bound<'_, PyAny>,
+        scale: f32,
+        background: &str,
+        max_shadow_pixels: Option<u64>,
+    ) -> PyResult<PyPng> {
+        let slide = self.resolve_slide_index(&png_target_slide(target)?)?;
+        let target = nimbleoffice_pptx::PngTarget { slide };
+        let options = RenderOptions {
+            scale,
+            background: parse_background(background)?,
+            max_shadow_pixels: max_shadow_pixels
+                .unwrap_or_else(|| RenderOptions::default().max_shadow_pixels),
+        };
+        let deck = DetachedDeck(&self.presentation);
+        py.detach(move || {
+            let deck = deck;
+            deck.0.render_png(target, &options)
+        })
+        .map(|rendered| PyPng {
+            data: rendered.bytes,
+            width: rendered.width,
+            height: rendered.height,
+            skipped_images: rendered.skipped_images,
+        })
+        .map_err(map_error)
+    }
+
+    fn save<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.saved_bytes(py)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn save_path(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let bytes = self.saved_bytes(py)?;
+        py.detach(|| fs::write(&path, bytes))
+            .map_err(|error| map_io_error(&error, &path))
+    }
+
+    /// This replica's state vector, to hand a peer so it can compute a diff.
+    fn state_vector<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.require_collaborative()?;
+        let bytes = self.presentation.encode_state_vector_v1();
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// The whole document as one update, for a peer joining from nothing.
+    fn state_as_update<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.require_collaborative()?;
+        let bytes = self.presentation.encode_state_as_update_v1();
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// The update carrying everything the peer's state vector is missing.
+    fn diff<'py>(&self, py: Python<'py>, state_vector: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        self.require_collaborative()?;
+        let update = self
+            .presentation
+            .encode_diff_v1(state_vector)
+            .map_err(map_error)?;
+        Ok(PyBytes::new(py, &update))
+    }
+
+    fn apply_update(&self, py: Python<'_>, update: &Bound<'_, PyBytes>) -> PyResult<PyDeck> {
+        self.require_collaborative()?;
+        let owned = borrow_bytes(update);
+        if owned.len() > MAX_COLLABORATION_BYTES {
+            return Err(InvalidUpdateError::new_err(format!(
+                "collaboration payload is {} bytes, exceeds the {MAX_COLLABORATION_BYTES}-byte limit",
+                owned.len()
+            )));
+        }
+        let update: &[u8] = &owned;
+        let deck = DetachedDeck(&self.presentation);
+        let snapshot = self.committed(py.detach(move || {
+            let deck = deck;
+            deck.0.apply_update_v1(update)
+        }))?;
+        Ok(PyDeck::from_core(&snapshot))
+    }
+
+    fn propose_json(&self, args: &str) -> PyResult<String> {
+        let request: ProposalRequest =
+            serde_json::from_str(args).map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let proposal = self.presentation.propose(request).map_err(map_error)?;
+        serde_json::to_string(&proposal).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    fn proposals_json(&self) -> PyResult<String> {
+        let proposals = self.presentation.proposals().map_err(map_error)?;
+        serde_json::to_string(&proposals).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    fn preview_proposal_json(&self, id: &str) -> PyResult<String> {
+        let preview = self.presentation.preview_proposal(id).map_err(map_error)?;
+        serde_json::to_string(&preview).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    fn proposal_slide_strip_json(&self, id: &str) -> PyResult<String> {
+        let entries = self
+            .presentation
+            .proposal_slide_strip(id)
+            .map_err(map_error)?;
+        serde_json::to_string(&entries).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    #[pyo3(signature = (id, *, force = false, receipt = false))]
+    fn accept_proposal(
+        &self,
+        py: Python<'_>,
+        id: &str,
+        force: bool,
+        receipt: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let accepted = self
+            .presentation
+            .accept_proposal(id, force)
+            .map_err(map_error)?;
+        self.edited.set(self.edited.get() || accepted.applied);
+        self.flush_updates(py)?;
+        if receipt {
+            json_result(py, serde_json::to_string(&accepted))
+        } else {
+            Ok(PyBool::new(py, accepted.applied)
+                .to_owned()
+                .into_any()
+                .unbind())
+        }
+    }
+
+    fn reject_proposal(&self, id: &str) -> bool {
+        self.presentation.reject_proposal(id)
+    }
+
+    /// The session-scoped version token of the committed deck state.
+    fn version(&self) -> String {
+        self.presentation.version().to_string()
+    }
+
+    fn read_content_json(&self, request: &str) -> PyResult<String> {
+        if let Some(refused) = self.oversized(request) {
+            return refused;
+        }
+        let request: ReadRequest = serde_json::from_str(request)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let outcome = self
+            .presentation
+            .read_content(&request)
+            .map_err(map_error)?;
+        outcome_json(&outcome).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    fn find_text_json(&self, request: &str) -> PyResult<String> {
+        if let Some(refused) = self.oversized(request) {
+            return refused;
+        }
+        let request: FindRequest = serde_json::from_str(request)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let outcome = self.presentation.find_text(&request).map_err(map_error)?;
+        outcome_json(&outcome).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    fn read_command_content_json(&self, request: &str) -> PyResult<String> {
+        if let Some(refused) = self.oversized(request) {
+            return refused;
+        }
+        let request: ReadRequest = serde_json::from_str(request)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let outcome = self
+            .presentation
+            .read_command_content(&request)
+            .map_err(map_error)?;
+        outcome_json(&outcome).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    fn validate_edits_json(&self, request: &str) -> PyResult<String> {
+        if let Some(refused) = self.oversized(request) {
+            return refused;
+        }
+        let request: EditRequest = serde_json::from_str(request)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let outcome = self
+            .presentation
+            .validate_edits(&request)
+            .map_err(map_error)?;
+        outcome_json(&outcome).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    /// Marks the deck edited only when the batch applied.
+    fn apply_edits_json(&self, request: &str) -> PyResult<String> {
+        if let Some(refused) = self.oversized(request) {
+            return refused;
+        }
+        let request: EditRequest = serde_json::from_str(request)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let outcome = self.presentation.apply_edits(&request).map_err(map_error)?;
+        if outcome
+            .as_ref()
+            .is_ok_and(|application| application.applied)
+        {
+            self.edited.set(true);
+        }
+        Python::attach(|py| self.flush_updates(py))?;
+        outcome_json(&outcome).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    /// Structured content of the committed deck: `{"ok", "version", "content" | "failure"}`.
+    fn export_structured_json(&self, options: &str) -> PyResult<String> {
+        let options = export_options(options)?;
+        let outcome = self
+            .presentation
+            .export_structured(&options)
+            .map_err(map_error)?;
+        export_outcome_json(&outcome).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    /// `export_structured_json` rendered as Markdown from the same read.
+    fn export_markdown_json(&self, options: &str) -> PyResult<String> {
+        let options = export_options(options)?;
+        let outcome = self
+            .presentation
+            .export_markdown(&options)
+            .map_err(map_error)?;
+        export_outcome_json(&outcome).map_err(|error| PptxError::new_err(error.to_string()))
+    }
+
+    fn render_proposal(&self, id: &str, slide: &Bound<'_, PyAny>) -> PyResult<PyDisplayList> {
+        Self::reject_bool(slide)?;
+        let preview = self.presentation.preview_proposal(id).map_err(map_error)?;
+        let ids: Vec<_> = preview
+            .snapshot
+            .slides
+            .into_iter()
+            .map(|slide| slide.id)
+            .collect();
+        let index = Self::slide_index_in(slide, &ids)?;
+        let rendered = self
+            .presentation
+            .render_proposal(id, index)
+            .map_err(map_error)?;
+        Ok(PyDisplayList {
+            payload: serde_json::to_string(&rendered.display_list)
+                .map_err(|error| RenderError::new_err(error.to_string()))?,
+            width: rendered.display_list.width,
+            height: rendered.display_list.height,
+            contract_version: rendered.display_list.contract_version,
+            primitives: rendered.display_list.primitives.len(),
+        })
+    }
+
+    fn layout_proposal_diff_slide(
+        &self,
+        py: Python<'_>,
+        id: &str,
+        slide: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let index = self.resolve_slide_index(slide)?;
+        let result = self
+            .presentation
+            .layout_proposal_diff_slide(id, index)
+            .map_err(map_error)?;
+        json_result(py, serde_json::to_string(&result))
+    }
+
+    fn layout_proposal_diff_slide_by_id(
+        &self,
+        py: Python<'_>,
+        id: &str,
+        slide_id: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let result = self
+            .presentation
+            .layout_proposal_diff_slide_by_id(id, slide_id)
+            .map_err(map_error)?;
+        json_result(py, serde_json::to_string(&result))
+    }
+
+    #[getter]
+    fn can_undo(&self) -> bool {
+        self.presentation.can_undo()
+    }
+
+    #[getter]
+    fn can_redo(&self) -> bool {
+        self.presentation.can_redo()
+    }
+
+    fn undo(&self, py: Python<'_>) -> PyResult<bool> {
+        let undone = self.presentation.undo();
+        self.edited.set(self.edited.get() || undone);
+        self.flush_updates(py)?;
+        Ok(undone)
+    }
+
+    fn redo(&self, py: Python<'_>) -> PyResult<bool> {
+        let redone = self.presentation.redo();
+        self.edited.set(self.edited.get() || redone);
+        self.flush_updates(py)?;
+        Ok(redone)
+    }
+
+    fn history_step(&self, py: Python<'_>, direction: &str) -> PyResult<Py<PyAny>> {
+        let redo = match direction {
+            "undo" => false,
+            "redo" => true,
+            _ => return Err(PyValueError::new_err("direction must be undo or redo")),
+        };
+        let receipt = self.presentation.history_step(redo).map_err(map_error)?;
+        self.edited.set(self.edited.get() || receipt.applied);
+        self.flush_updates(py)?;
+        json_result(py, serde_json::to_string(&receipt))
+    }
+
+    #[getter]
+    fn undo_capture_mode(&self) -> &'static str {
+        match self.presentation.undo_capture_mode() {
+            UndoCaptureMode::Auto => "auto",
+            UndoCaptureMode::Manual => "manual",
+        }
+    }
+
+    fn set_undo_capture_mode(&self, mode: &str) -> PyResult<()> {
+        let mode = match mode {
+            "auto" => UndoCaptureMode::Auto,
+            "manual" => UndoCaptureMode::Manual,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "undo capture mode must be auto or manual",
+                ));
+            }
+        };
+        self.presentation.set_undo_capture_mode(mode);
+        Ok(())
+    }
+
+    /// Close the current undo step so the next edit starts a new one.
+    fn add_undo_barrier(&self) {
+        self.presentation.add_undo_barrier();
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        self.slide_count()
+    }
+
+    fn __getitem__(&self, slide: &Bound<'_, PyAny>) -> PyResult<PySlide> {
+        self.slide(slide)
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        Ok(format!("Presentation(slides={})", self.slide_count()?))
+    }
+}
+
+#[pymodule]
+fn _nimbleoffice_pptx(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(python_common::decode_font_face, module)?)?;
+    module.add_function(wrap_pyfunction!(python_common::font_packs, module)?)?;
+    let py = module.py();
+    python_common::install_font_packs(py)?;
+    module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add_class::<PyPresentation>()?;
+    module.add_class::<PyUpdateSubscription>()?;
+    module.add_class::<PyCaretAnchor>()?;
+    module.add_class::<PyDeck>()?;
+    module.add_class::<PySlide>()?;
+    module.add_class::<PyShape>()?;
+    module.add_class::<PyStory>()?;
+    module.add_class::<PyParagraph>()?;
+    module.add_class::<PyTextRun>()?;
+    module.add_class::<PyRect>()?;
+    module.add_class::<PyStroke>()?;
+    module.add_class::<PyMedia>()?;
+    module.add_class::<PyDisplayList>()?;
+    module.add_class::<PyPng>()?;
+    module.add_class::<PySlideEdit>()?;
+    module.add_class::<PyShapeEdit>()?;
+    module.add_class::<PyTransformEdit>()?;
+    module.add_class::<PyFillEdit>()?;
+    module.add_class::<PyStrokeEdit>()?;
+    module.add_class::<PyAdjustEdit>()?;
+    module.add_class::<PyTextEdit>()?;
+    module.add_class::<PyComment>()?;
+    module.add_class::<PyCommentEdit>()?;
+    module.add("PptxError", py.get_type::<PptxError>())?;
+    module.add("StaleProposalError", py.get_type::<StaleProposalError>())?;
+    module.add("ExportError", py.get_type::<ExportError>())?;
+    module.add_function(wrap_pyfunction!(export_pptx_structured_json, module)?)?;
+    module.add_function(wrap_pyfunction!(export_pptx_markdown_json, module)?)?;
+    module.add_function(wrap_pyfunction!(render_pptx_markdown_json, module)?)?;
+    module.add_function(wrap_pyfunction!(inspect_presentation, module)?)?;
+    module.add("ParseError", py.get_type::<ParseError>())?;
+    module.add("RangeError", py.get_type::<RangeError>())?;
+    module.add("RenderError", py.get_type::<RenderError>())?;
+    module.add("InvalidUpdateError", py.get_type::<InvalidUpdateError>())?;
+    module.add(
+        "CollaborativeStateError",
+        py.get_type::<CollaborativeStateError>(),
+    )?;
+    module.add(
+        "NotCollaborativeError",
+        py.get_type::<NotCollaborativeError>(),
+    )?;
+    module.add("MAX_COLLABORATION_BYTES", MAX_COLLABORATION_BYTES)?;
+    Ok(())
+}

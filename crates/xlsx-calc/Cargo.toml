@@ -1,0 +1,26 @@
+[package]
+name = "nimbleoffice-xlsx-calc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Formula parser, dependency graph, and recalc engine for NimbleOffice XLSX workbooks."
+readme = "README.md"
+keywords = ["xlsx", "excel", "formula", "spreadsheet", "ooxml"]
+categories = ["parser-implementations", "mathematics"]
+
+[lib]
+name = "xlsx_calc"
+
+[features]
+test-counters = []
+
+[dependencies]
+xlsx-model.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libm.workspace = true
+
+[dev-dependencies]
+libm.workspace = true

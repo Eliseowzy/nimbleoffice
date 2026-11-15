@@ -1,0 +1,1401 @@
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+
+import type { CaretPosition, SelectionRect } from '@nimbleoffice/docx/layout';
+import type { WrapType } from '@nimbleoffice/docx/docx/wrapTypes';
+import {
+  captureInlinePositionEmuFromDisplayList,
+  DISPLAY_LIST_TABLE_INSERT_HIDE_DELAY_MS as TABLE_INSERT_HIDE_DELAY,
+  detectDisplayListTableInsertHover,
+  effectiveZoom,
+  findDisplayListHyperlinkAtPoint,
+  resolveCanvasPoint,
+  resolveDisplayPageClientRect,
+  type CanvasPointHit,
+  type DisplayListQueries,
+  type DisplayListTableRegion,
+} from '@nimbleoffice/docx/layout/render';
+import { sanitizeHref } from '@nimbleoffice/docx/utils';
+import type { YrsCellLoc, YrsPointerProjectionTarget, YrsSession } from '@nimbleoffice/docx/yrs';
+
+import type { YrsInputRef } from '../YrsInput';
+import { useDragAutoScroll } from '../../../hooks/useDragAutoScroll';
+import {
+  canvasHoverCursor,
+  createCursorPainter,
+  type CanvasHoverCursor,
+} from '../hoverCursor';
+import type { YrsPositionProjection } from '../internals/yrsPositionProjection';
+import { workerOpenReplicaLoadedVersion } from '../internals/workerOpenReplica';
+import {
+  hitBelongsToPart,
+  isNoteAreaHit,
+  noteEditFromHit,
+  partEditStory,
+  partImageRegion,
+  type NoteEdit,
+  type PartEdit,
+} from '../partEdit';
+import type { YrsEditorCommand } from '../yrsCommands';
+
+interface TableInsertButtonState {
+  type: 'row' | 'column';
+  x: number;
+  y: number;
+  cellPmPos: number;
+}
+
+interface ImageInfo {
+  pos: number;
+  wrapType: WrapType;
+  cssFloat?: 'left' | 'right' | 'none' | null;
+  inlinePositionEmu?: { horizontalEmu: number; verticalEmu: number };
+}
+
+interface QueuedGesture {
+  queries: DisplayListQueries;
+  anchor: CanvasPointHit;
+  head: CanvasPointHit;
+  kind: 'caret' | 'range' | 'word' | 'paragraph';
+  dragging: boolean;
+  rebind?: () => void;
+}
+
+export interface UsePagesPointerOptions {
+  pagesContainerRef: React.RefObject<HTMLDivElement | null>;
+  yrsInputRef: React.RefObject<YrsInputRef | null>;
+  yrsSession: YrsSession | null;
+  yrsRootStory: string;
+  /**
+   * A viewer session: the input holds the selection in the presented frame's display positions,
+   * so gestures address them directly and wait on no document copy.
+   */
+  viewerSelection?: boolean;
+  /** A viewer session's bookmark lookup, in body display positions. */
+  resolveBookmarkPosition?: (name: string) => Promise<number | null>;
+  getYrsPositionProjection: (rootStory: string) => YrsPositionProjection | null;
+  applyYrsCommand: (command: YrsEditorCommand) => boolean;
+  syncYrsInputState: (docChanged: boolean) => boolean;
+  readOnly: boolean;
+  inputScope?: number;
+  queueInput?: boolean;
+  inputQueries?: DisplayListQueries | null;
+  replicaPending?: () => boolean;
+  replicaReady?: boolean;
+  /** the non-body part open for editing — the body is inert behind it */
+  partEdit?: PartEdit | null;
+  displayListQueries?: DisplayListQueries | null;
+  canvasHostRef?: React.RefObject<HTMLDivElement | null>;
+  canvasOverlayTarget?: HTMLElement | null;
+  onBodyClick?: () => void;
+  onContextMenu?: (data: {
+    x: number;
+    y: number;
+    hasSelection: boolean;
+    image?: ImageInfo | null;
+  }) => void;
+  onHyperlinkClick?: (data: {
+    href: string;
+    displayText: string;
+    tooltip?: string;
+    position: { top: number; left: number };
+  }) => void;
+  onHeaderFooterDoubleClick?: (position: 'header' | 'footer', pageNumber?: number) => void;
+  /** A single click landed in a note area — the host opens it for editing. */
+  onNoteClick?: (note: NoteEdit) => void;
+  setSelectionRects: React.Dispatch<React.SetStateAction<SelectionRect[]>>;
+  setCaretPosition: React.Dispatch<React.SetStateAction<CaretPosition | null>>;
+  setIsFocused: React.Dispatch<React.SetStateAction<boolean>>;
+  scrollToPositionImpl: (pmPos: number, forParaIdScroll?: boolean) => void;
+}
+
+export interface UsePagesPointerReturn {
+  applyPendingSelection: () => void;
+  bumpInputEpoch: () => void;
+  /** The editor's keydown, which supersedes a pending gesture unless the hidden input takes it. */
+  handleEditorKeyDown: (e: React.KeyboardEvent) => void;
+  /** Advances on every input that supersedes a pending gesture. */
+  inputEpoch: () => number;
+  handlePagesMouseDown: (e: React.MouseEvent) => void;
+  handlePagesMouseMove: (e: React.MouseEvent) => void;
+  /** drops the hover cursor when the pointer leaves the pages */
+  handlePagesMouseLeave: () => void;
+  handlePagesClick: (e: React.MouseEvent) => void;
+  handlePagesContextMenu: (e: React.MouseEvent) => void;
+  handleTableInsertClick: (e: React.MouseEvent) => void;
+  tableInsertButton: TableInsertButtonState | null;
+  clearTableInsertTimer: () => void;
+  hideTableInsertButton: () => void;
+  getPositionFromMouse: (clientX: number, clientY: number) => number | null;
+}
+
+function sameYrsTable(a: YrsCellLoc, b: YrsCellLoc): boolean {
+  return a.story === b.story && a.tableIndex === b.tableIndex;
+}
+
+function sameYrsCell(a: YrsCellLoc, b: YrsCellLoc): boolean {
+  return sameYrsTable(a, b) && a.row === b.row && a.column === b.column;
+}
+
+function cellIsWithinYrsRange(
+  cell: YrsCellLoc | undefined,
+  range: ReturnType<YrsSession['cellSelection']>
+): boolean {
+  if (!cell || !range || !sameYrsTable(cell, range.anchor) || !sameYrsTable(cell, range.head)) {
+    return false;
+  }
+  const top = Math.min(range.anchor.row, range.head.row);
+  const bottom = Math.max(range.anchor.row, range.head.row);
+  const left = Math.min(range.anchor.column, range.head.column);
+  const right = Math.max(range.anchor.column, range.head.column);
+  return cell.row >= top && cell.row <= bottom && cell.column >= left && cell.column <= right;
+}
+
+function createTableKeyResolver(
+  projection: YrsPositionProjection
+): (docStart: number | undefined) => string | null {
+  const cache = new Map<number, string | null>();
+  return (docStart) => {
+    if (docStart == null) return null;
+    const cached = cache.get(docStart);
+    if (cached !== undefined) return cached;
+    const table = projection.tableAtPosition(docStart);
+    const key = table ? String(table.start) : null;
+    cache.set(docStart, key);
+    return key;
+  };
+}
+
+function createCellPmPosResolver(
+  projection: YrsPositionProjection
+): (tableKey: string, row: number, col: number) => number | null {
+  const cache = new Map<string, number | null>();
+  return (tableKey, row, col) => {
+    const key = `${tableKey}:${row}:${col}`;
+    const cached = cache.get(key);
+    if (cached !== undefined) return cached;
+    const tableStart = Number(tableKey);
+    const out = Number.isFinite(tableStart)
+      ? projection.cellPosition(tableStart, row, col)
+      : null;
+    cache.set(key, out);
+    return out;
+  };
+}
+
+function projectPageLocalRectToClient(
+  pageRect: { left: number; top: number; width: number; height: number },
+  pageSize: { width: number; height: number },
+  rect: { x: number; y: number; w: number; h: number }
+): { left: number; top: number; right: number; bottom: number } {
+  const scaleX = pageSize.width > 0 ? pageRect.width / pageSize.width : 1;
+  const scaleY = pageSize.height > 0 ? pageRect.height / pageSize.height : 1;
+  return {
+    left: pageRect.left + rect.x * scaleX,
+    top: pageRect.top + rect.y * scaleY,
+    right: pageRect.left + (rect.x + rect.w) * scaleX,
+    bottom: pageRect.top + (rect.y + rect.h) * scaleY,
+  };
+}
+
+export function usePagesPointer(opts: UsePagesPointerOptions): UsePagesPointerReturn {
+  const {
+    pagesContainerRef,
+    yrsInputRef,
+    yrsSession,
+    yrsRootStory,
+    viewerSelection = false,
+    resolveBookmarkPosition,
+    getYrsPositionProjection,
+    applyYrsCommand,
+    syncYrsInputState,
+    readOnly,
+    inputScope,
+    queueInput = false,
+    inputQueries,
+    replicaPending,
+    replicaReady = true,
+    partEdit = null,
+    displayListQueries,
+    canvasHostRef,
+    canvasOverlayTarget,
+    onBodyClick,
+    onContextMenu,
+    onHyperlinkClick,
+    onHeaderFooterDoubleClick,
+    onNoteClick,
+    setSelectionRects,
+    setCaretPosition,
+    setIsFocused,
+    scrollToPositionImpl,
+  } = opts;
+
+  const isDraggingRef = useRef(false);
+  const dragAnchorRef = useRef<number | null>(null);
+  const inputEpochRef = useRef(0);
+  const pendingGestureRef = useRef<{
+    kind: 'caret' | 'word' | 'paragraph' | 'range' | 'link';
+    href?: string;
+    anchor: number;
+    head: number;
+    epoch: number;
+  } | null>(null);
+  const pendingGestureCleanupRef = useRef<(() => void) | null>(null);
+  const queuedGestureRef = useRef<QueuedGesture | null>(null);
+  const inputQueriesRef = useRef(inputQueries ?? displayListQueries);
+  inputQueriesRef.current = inputQueries ?? displayListQueries;
+  const clearPendingGesture = useCallback(() => {
+    pendingGestureRef.current = null;
+    pendingGestureCleanupRef.current?.();
+    pendingGestureCleanupRef.current = null;
+  }, []);
+  const bumpInputEpoch = useCallback(() => {
+    inputEpochRef.current = viewerSelection && yrsInputRef.current?.beginGesture
+      ? yrsInputRef.current.beginGesture()
+      : inputEpochRef.current + 1;
+    if (pendingGestureRef.current) {
+      isDraggingRef.current = false;
+      dragAnchorRef.current = null;
+      clearPendingGesture();
+    }
+  }, [clearPendingGesture, viewerSelection, yrsInputRef]);
+  const inputEpoch = useCallback(() => inputEpochRef.current, []);
+  // A key at the hidden input follows a pending gesture; any other key in the editor replaces it.
+  const handleEditorKeyDown = useCallback(
+    (e: React.KeyboardEvent): void => {
+      if (!(e.target instanceof Element && e.target.closest('.paged-editor__yrs-input'))) {
+        bumpInputEpoch();
+      }
+    },
+    [bumpInputEpoch]
+  );
+  const listenForOutsideInput = useCallback(() => {
+    if (pendingGestureCleanupRef.current) return;
+    const onInput = (event: Event) => {
+      const target = event.target;
+      const host = canvasHostRef?.current ?? pagesContainerRef.current;
+      if (target instanceof Element) {
+        // A touch or pen pan on a page has no mousedown to supersede the gesture itself.
+        const pointerType = event.type === 'pointerdown' ? (event as PointerEvent).pointerType : '';
+        const panning = pointerType === 'touch' || pointerType === 'pen';
+        if (!panning && target.closest('.canvas-page') && host?.contains(target)) return;
+        if (target.closest('.paged-editor__yrs-input')) {
+          const editor = host?.closest('.paged-editor');
+          if (
+            editor?.contains(target) ||
+            (target === document.activeElement && yrsInputRef.current?.isFocused())
+          ) return;
+        }
+      }
+      bumpInputEpoch();
+    };
+    // Scrolling away cancels a pending link's navigation, not a selection.
+    const onWheel = () => {
+      if (pendingGestureRef.current?.kind === 'link') bumpInputEpoch();
+    };
+    document.addEventListener('pointerdown', onInput, true);
+    document.addEventListener('keydown', onInput, true);
+    document.addEventListener('wheel', onWheel, { capture: true, passive: true });
+    pendingGestureCleanupRef.current = () => {
+      document.removeEventListener('pointerdown', onInput, true);
+      document.removeEventListener('keydown', onInput, true);
+      document.removeEventListener('wheel', onWheel, true);
+    };
+  }, [bumpInputEpoch, canvasHostRef, pagesContainerRef, yrsInputRef]);
+  const gestureScope = inputScope ?? yrsSession;
+  const gestureScopeRef = useRef(gestureScope);
+  gestureScopeRef.current = gestureScope;
+  useEffect(() => {
+    clearPendingGesture();
+    isDraggingRef.current = false;
+    dragAnchorRef.current = null;
+    queuedGestureRef.current = null;
+    return clearPendingGesture;
+  }, [clearPendingGesture, gestureScope]);
+  const pendingPartCaretRef = useRef<{
+    session: YrsSession;
+    story: string;
+    position: number;
+  } | null>(null);
+  const [pendingPartCaretVersion, setPendingPartCaretVersion] = useState(0);
+  const yrsCellDragAnchorRef = useRef<YrsCellLoc | null>(null);
+  const yrsCellDraggingRef = useRef(false);
+  const [tableInsertButton, setTableInsertButton] = useState<TableInsertButtonState | null>(null);
+  const tableInsertHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearTableInsertTimer = useCallback(() => {
+    if (!tableInsertHideTimerRef.current) return;
+    clearTimeout(tableInsertHideTimerRef.current);
+    tableInsertHideTimerRef.current = null;
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (tableInsertHideTimerRef.current) clearTimeout(tableInsertHideTimerRef.current);
+    },
+    []
+  );
+
+  const dragExtendRef = useRef<(cx: number, cy: number) => void>(() => {});
+  const dragAutoScrollCallbackRef = useCallback((cx: number, cy: number) => {
+    dragExtendRef.current(cx, cy);
+  }, []);
+  const { updateMousePosition: updateDragScroll, stopAutoScroll: stopDragAutoScroll } =
+    useDragAutoScroll({
+      pagesContainerRef,
+      onScrollExtendSelection: dragAutoScrollCallbackRef,
+    });
+
+  const resolveCanvasHit = useCallback(
+    (clientX: number, clientY: number, clampToNearestPage: boolean): CanvasPointHit | null => {
+      if (!displayListQueries) return null;
+      const host = canvasHostRef?.current ?? pagesContainerRef.current;
+      return host
+        ? resolveCanvasPoint(host, displayListQueries, clientX, clientY, { clampToNearestPage })
+        : null;
+    },
+    [displayListQueries, canvasHostRef, pagesContainerRef]
+  );
+
+  // written straight to the DOM: hover fires on every pointer move, and
+  // re-rendering the editor for it is not affordable
+  const cursorPainterRef = useRef(createCursorPainter());
+  const paintHoverCursor = useCallback(
+    (cursor: CanvasHoverCursor) => {
+      cursorPainterRef.current(canvasHostRef?.current ?? pagesContainerRef.current, cursor);
+    },
+    [canvasHostRef, pagesContainerRef]
+  );
+  // last point over the pages, so a cursor that outlived what it described can
+  // be re-resolved without waiting for a move. Null while it is elsewhere.
+  const hoverPointRef = useRef<{ x: number; y: number } | null>(null);
+  const resolveHoverCursor = useCallback(
+    (clientX: number, clientY: number) => {
+      hoverPointRef.current = { x: clientX, y: clientY };
+      const hit = resolveCanvasHit(clientX, clientY, false)?.hit ?? null;
+      paintHoverCursor(canvasHoverCursor({ readOnly, partEdit }, hit));
+    },
+    [paintHoverCursor, partEdit, readOnly, resolveCanvasHit]
+  );
+  // A mode flip changes what is typeable under a pointer that has not moved.
+  // A gesture still holds its own cursor; the release resolves the new mode.
+  useEffect(() => {
+    const point = hoverPointRef.current;
+    if (!point || isDraggingRef.current || yrsCellDraggingRef.current) return;
+    resolveHoverCursor(point.x, point.y);
+  }, [resolveHoverCursor]);
+  // Clears the cursor on unmount only. Keying this on the painter would clear
+  // it on every identity change too — the effect above re-resolves in the same
+  // commit, so nothing shows, but the write is redundant and reads as an exit.
+  const paintHoverCursorRef = useRef(paintHoverCursor);
+  paintHoverCursorRef.current = paintHoverCursor;
+  useEffect(() => () => paintHoverCursorRef.current('default'), []);
+
+  const getPositionFromMouse = useCallback(
+    (clientX: number, clientY: number): number | null => {
+      const hit = resolveCanvasHit(clientX, clientY, isDraggingRef.current)?.hit;
+      if (!hit) return null;
+      if (partEdit) return hitBelongsToPart(partEdit, hit) ? hit.pos : null;
+      return hit.region === 'body' ? hit.pos : null;
+    },
+    [partEdit, resolveCanvasHit]
+  );
+
+  const resolveTarget = useCallback(
+    (position: number): YrsPointerProjectionTarget | null => {
+      if (viewerSelection) return { story: yrsRootStory, displayPosition: position };
+      const projection = getYrsPositionProjection(yrsRootStory);
+      return projection ? projection.targetAt(position) : null;
+    },
+    [getYrsPositionProjection, viewerSelection, yrsRootStory]
+  );
+
+  const setTextSelection = useCallback(
+    (anchor: number, head = anchor, gesture?: number): void => {
+      const input = yrsInputRef.current;
+      const anchorTarget = resolveTarget(anchor);
+      const headTarget = resolveTarget(head);
+      if (!input || !anchorTarget || !headTarget || anchorTarget.story !== headTarget.story) return;
+      if (viewerSelection && input.beginGesture && gesture === undefined) {
+        gesture = inputEpochRef.current = input.beginGesture();
+      }
+      if (
+        yrsSession &&
+        anchorTarget.cell &&
+        headTarget.cell &&
+        sameYrsTable(anchorTarget.cell, headTarget.cell)
+      ) {
+        yrsSession.setCellSelection({ anchor: anchorTarget.cell, head: headTarget.cell });
+      }
+      if (viewerSelection) {
+        input.setSelectionFromDisplay(anchorTarget.displayPosition, headTarget.displayPosition, anchorTarget.story, gesture);
+      } else {
+        input.setSelectionFromDisplay(anchorTarget.displayPosition, headTarget.displayPosition, anchorTarget.story);
+      }
+    },
+    [resolveTarget, viewerSelection, yrsInputRef, yrsSession]
+  );
+
+  const focusInput = useCallback(() => yrsInputRef.current?.focus(), [yrsInputRef]);
+  const prepareQueuedGestureRef = useRef<(gesture: QueuedGesture) => () => void>(() => () => {});
+  prepareQueuedGestureRef.current = (gesture) => {
+    const bodyHit = (point: QueuedGesture['anchor']) => {
+      let queries = gesture.queries;
+      let hit = point.hit ?? queries.hitTestRegions(point.pageIndex, point.x, point.y);
+      const current = inputQueriesRef.current;
+      if (!hit && current && current !== queries) {
+        queries = current;
+        hit = queries.hitTestRegions(point.pageIndex, point.x, point.y);
+      }
+      return hit?.region === 'body' ? { hit, queries } : null;
+    };
+    const start = bodyHit(gesture.anchor);
+    const image = start?.queries.imageAtPoint(
+      gesture.anchor.pageIndex, gesture.anchor.x, gesture.anchor.y, 'body', start.hit.rId
+    ) ?? null;
+    if (image) gesture.dragging = false;
+    const anchor = image ? image.pos : start?.hit.pos ?? null;
+    const head = image ? image.pos + 1 : bodyHit(gesture.head)?.hit.pos ?? null;
+    const anchorTarget = anchor == null ? null : resolveTarget(anchor);
+    const headTarget = head == null ? null : resolveTarget(head);
+    if (!anchorTarget || !headTarget) return () => {};
+    const cellRange = anchorTarget.cell && headTarget.cell && sameYrsTable(anchorTarget.cell, headTarget.cell)
+      ? { anchor: anchorTarget.cell, head: headTarget.cell }
+      : null;
+    const selectingCells = cellRange && !sameYrsCell(cellRange.anchor, cellRange.head);
+    if (!selectingCells && anchorTarget.story !== headTarget.story) return () => {};
+    const kind = anchor !== head ? 'range' : gesture.kind;
+    const apply = yrsInputRef.current?.captureSelectionFromDisplay?.(
+      anchorTarget.displayPosition, selectingCells ? anchorTarget.displayPosition : headTarget.displayPosition,
+      anchorTarget.story, selectingCells ? 'caret' : kind
+    );
+    return () => {
+      apply?.();
+      if (queuedGestureRef.current === gesture) {
+        queuedGestureRef.current = null;
+        isDraggingRef.current = gesture.dragging;
+        dragAnchorRef.current = gesture.dragging ? yrsInputRef.current?.displaySelection()?.anchor ?? null : null;
+        yrsCellDragAnchorRef.current = gesture.dragging ? anchorTarget.cell ?? null : null;
+        yrsCellDraggingRef.current = gesture.dragging && !!selectingCells;
+      }
+      if (yrsSession && cellRange) {
+        yrsSession.setCellSelection(cellRange);
+        if (selectingCells) {
+          syncYrsInputState(false);
+          setSelectionRects([]);
+          setCaretPosition(null);
+        }
+      }
+      if (image) {
+        setSelectionRects([]);
+        setCaretPosition(null);
+      }
+      yrsInputRef.current?.keepSelectionInPlace();
+    };
+  };
+  const beginQueuedGesture = useCallback((e: React.MouseEvent): boolean => {
+    queuedGestureRef.current = null;
+    if (!queueInput || partEdit) return false;
+    const queries = inputQueries ?? displayListQueries;
+    const host = canvasHostRef?.current ?? pagesContainerRef.current;
+    const point = queries && host ? resolveCanvasPoint(host, queries, e.clientX, e.clientY) : null;
+    if (!queries || !point) return false;
+    if (point.hit && point.hit.region !== 'body') return false;
+    const gesture: QueuedGesture = {
+      queries, anchor: point, head: point,
+      kind: e.detail >= 3 ? 'paragraph' : e.detail === 2 ? 'word' : 'caret', dragging: true,
+    };
+    const scope = gestureScopeRef.current;
+    let apply = yrsSession && !replicaPending?.() && queries.isReady()
+      ? prepareQueuedGestureRef.current(gesture)
+      : null;
+    if (apply) gesture.rebind = () => {
+      if (inputQueriesRef.current === queries && queries.isReady()) apply = prepareQueuedGestureRef.current(gesture);
+    };
+    const queued = yrsInputRef.current?.queueSelection?.(async () => {
+      if (apply) return gestureScopeRef.current === scope ? apply : () => {};
+      await queries.whenReady();
+      const currentQueries = inputQueriesRef.current;
+      if (gestureScopeRef.current === scope && currentQueries && currentQueries !== queries) {
+        await currentQueries.whenReady();
+      }
+      return gestureScopeRef.current === scope ? prepareQueuedGestureRef.current(gesture) : () => {};
+    }, !displayListQueries || queries.isReady?.() === false, () => {
+      const point = gesture.head;
+      const hit = point.hit ?? gesture.queries.hitTestRegions(point.pageIndex, point.x, point.y);
+      const position = hit?.region === 'body' ? hit.pos : null;
+      if (position == null) return false;
+      return gesture.queries.displayList.pages[point.pageIndex]?.primitives.some((primitive) =>
+        primitive.cell && !primitive.cell.continuation && primitive.docStart != null &&
+        primitive.docEnd != null && primitive.docStart <= position && position <= primitive.docEnd
+      ) === true;
+    });
+    if (!queued) return false;
+    queuedGestureRef.current = gesture;
+    focusInput();
+    if (!partEdit) setIsFocused(true);
+    return true;
+  }, [canvasHostRef, displayListQueries, focusInput, inputQueries, pagesContainerRef, partEdit, queueInput, replicaPending, setIsFocused, yrsInputRef, yrsSession]);
+  const updateQueuedGesture = useCallback((clientX: number, clientY: number): void => {
+    const gesture = queuedGestureRef.current;
+    const host = canvasHostRef?.current ?? pagesContainerRef.current;
+    if (!gesture?.dragging || !host) return;
+    const point = resolveCanvasPoint(host, gesture.queries, clientX, clientY, { clampToNearestPage: true });
+    if (!point) return;
+    gesture.head = point;
+    gesture.rebind?.();
+  }, [canvasHostRef, pagesContainerRef]);
+
+  const beginTextDrag = useCallback(
+    (position: number): void => {
+      yrsCellDragAnchorRef.current = replicaPending?.() ? null : resolveTarget(position)?.cell ?? null;
+      yrsCellDraggingRef.current = false;
+      isDraggingRef.current = true;
+      dragAnchorRef.current = position;
+      if (!replicaPending?.()) setTextSelection(position, position, viewerSelection ? inputEpochRef.current : undefined);
+      focusInput();
+      if (!partEdit) setIsFocused(true);
+    },
+    [focusInput, partEdit, replicaPending, resolveTarget, setIsFocused, setTextSelection, viewerSelection]
+  );
+
+  const beginPendingGesture = useCallback(
+    (position: number | null, detail: number): boolean => {
+      if (!replicaPending?.()) return false;
+      if (position != null) {
+        pendingGestureRef.current = {
+          kind: detail >= 3 ? 'paragraph' : detail === 2 ? 'word' : 'caret',
+          anchor: position,
+          head: position,
+          epoch: inputEpochRef.current,
+        };
+        listenForOutsideInput();
+        beginTextDrag(position);
+      }
+      return true;
+    },
+    [beginTextDrag, listenForOutsideInput, replicaPending]
+  );
+
+  const updatePendingGestureHead = useCallback((position: number): boolean => {
+    const pending = pendingGestureRef.current;
+    if (!pending) return false;
+    if (pending.epoch === inputEpochRef.current) {
+      pending.head = position;
+      if (position !== pending.anchor) pending.kind = 'range';
+    }
+    return true;
+  }, []);
+
+  const extendCellSelection = useCallback(
+    (pmPos: number): boolean => {
+      const anchor = yrsCellDragAnchorRef.current;
+      const head = resolveTarget(pmPos)?.cell;
+      if (!anchor || !head || !yrsSession || !sameYrsTable(anchor, head)) return false;
+      if (!yrsCellDraggingRef.current && sameYrsCell(anchor, head)) return false;
+      yrsCellDraggingRef.current = true;
+      yrsSession.setCellSelection({ anchor, head });
+      // Cell ranges are session-owned ephemeral state, not document updates.
+      // Publish the changed range explicitly so toolbar enablement follows
+      // drag selection even though the sticky text caret stays in one cell.
+      syncYrsInputState(false);
+      setSelectionRects([]);
+      setCaretPosition(null);
+      return true;
+    },
+    [resolveTarget, setCaretPosition, setSelectionRects, syncYrsInputState, yrsSession]
+  );
+
+  const replayPendingGesture = (): void => {
+    const pending = pendingGestureRef.current;
+    clearPendingGesture();
+    if (!pending || pending.epoch !== inputEpochRef.current) return;
+    // A change committed since the replica loaded is newer than the gesture.
+    const loadedVersion = yrsSession ? workerOpenReplicaLoadedVersion(yrsSession) : undefined;
+    if (loadedVersion !== undefined && yrsSession!.version() !== loadedVersion) {
+      isDraggingRef.current = false;
+      dragAnchorRef.current = null;
+      return;
+    }
+    // A drag still held when the replica lands keeps extending from its anchor, cells included.
+    const dragging = isDraggingRef.current && pending.kind !== 'link';
+    if (dragging || pending.kind === 'range') {
+      yrsCellDragAnchorRef.current = resolveTarget(pending.anchor)?.cell ?? null;
+      yrsCellDraggingRef.current = false;
+    }
+    if (pending.kind === 'caret') {
+      setTextSelection(pending.anchor);
+    } else if (pending.kind === 'range') {
+      if (!extendCellSelection(pending.head)) setTextSelection(pending.anchor, pending.head);
+      if (!dragging) {
+        yrsCellDragAnchorRef.current = null;
+        yrsCellDraggingRef.current = false;
+      }
+    } else if (pending.kind === 'link') {
+      const projection = getYrsPositionProjection(yrsRootStory);
+      if (!projection) return;
+      const targetPos = projection.bookmarkPosition(pending.href!.slice(1));
+      if (targetPos != null) {
+        scrollToPositionImpl(targetPos);
+        setTextSelection(targetPos + 1);
+      } else {
+        setTextSelection(pending.anchor);
+      }
+    } else {
+      const target = resolveTarget(pending.anchor);
+      if (!target) return;
+      if (pending.kind === 'word') {
+        yrsInputRef.current?.selectWordAtDisplay(target.displayPosition, target.story);
+      } else {
+        yrsInputRef.current?.selectParagraphAtDisplay(target.displayPosition, target.story);
+      }
+    }
+    // The user may have scrolled away while it loaded; the replayed selection stays put.
+    yrsInputRef.current?.keepSelectionInPlace();
+    const active = document.activeElement;
+    if (!active || active === document.body || yrsInputRef.current?.isFocused()) focusInput();
+  };
+  const replayPendingGestureRef = useRef(replayPendingGesture);
+  replayPendingGestureRef.current = replayPendingGesture;
+  const replicaPendingRef = useRef(replicaPending);
+  replicaPendingRef.current = replicaPending;
+  // Input that waited for the replica applies the gesture recorded before it first.
+  const applyPendingSelection = useCallback((): void => {
+    if (pendingGestureRef.current && !replicaPendingRef.current?.()) {
+      replayPendingGestureRef.current();
+    }
+  }, []);
+  useEffect(() => {
+    if (replicaReady) replayPendingGestureRef.current();
+  }, [replicaReady]);
+
+  const handlePagesMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      // A right-click leaves a viewer selection in place, so its context menu acts on it.
+      if (!(viewerSelection && e.button === 2)) bumpInputEpoch();
+      clearPendingGesture();
+      pendingPartCaretRef.current = null;
+      if (e.button === 2) {
+        e.preventDefault();
+        return;
+      }
+      if (e.button !== 0) return;
+      setTableInsertButton(null);
+      clearTableInsertTimer();
+      e.preventDefault();
+      if (beginQueuedGesture(e)) return;
+      if (readOnly) {
+        const position = getPositionFromMouse(e.clientX, e.clientY);
+        if (beginPendingGesture(position, e.detail)) return;
+        if (position != null) beginTextDrag(position);
+        return;
+      }
+
+      const point = resolveCanvasHit(e.clientX, e.clientY, false);
+      const hit = point?.hit ?? null;
+      const region = hit?.region ?? null;
+      // A note area opens on a single click, wherever the caret was before:
+      // one part is open at a time, so this both leaves the old one and picks
+      // the note up. The caret the click asked for is placed once the editor
+      // is on that note's story.
+      const note = noteEditFromHit(hit);
+      if (isNoteAreaHit(hit) && !note) return;
+      if (note && onNoteClick && !hitBelongsToPart(partEdit, hit)) {
+        e.stopPropagation();
+        const pending =
+          hit?.pos == null || !yrsSession
+            ? null
+            : {
+                session: yrsSession,
+                story: partEditStory(note),
+                position: hit.pos,
+              };
+        pendingPartCaretRef.current = pending;
+        onNoteClick(note);
+        if (pending) setPendingPartCaretVersion((version) => version + 1);
+        return;
+      }
+      // A press on a band outside the open part leaves that part open, so the
+      // body caret never returns and scrolls. With a band open, a single click
+      // moves into another existing band, like Word; otherwise the click
+      // handler opens it on a double-click.
+      if ((region === 'header' || region === 'footer') && !hitBelongsToPart(partEdit, hit)) {
+        if (
+          e.detail < 2 &&
+          (partEdit?.kind === 'header' || partEdit?.kind === 'footer') &&
+          hit?.rId != null &&
+          onHeaderFooterDoubleClick
+        ) {
+          e.stopPropagation();
+          const pending =
+            hit.pos == null || !yrsSession
+              ? null
+              : {
+                  session: yrsSession,
+                  story: partEditStory({ kind: region, rId: hit.rId }),
+                  position: hit.pos,
+                };
+          pendingPartCaretRef.current = pending;
+          onHeaderFooterDoubleClick(region, (point?.pageIndex ?? 0) + 1);
+          if (pending) setPendingPartCaretVersion((version) => version + 1);
+        }
+        return;
+      }
+      if (partEdit && !hitBelongsToPart(partEdit, hit) && onBodyClick) {
+        e.stopPropagation();
+        const pending =
+          hit?.region === 'body' && hit.pos != null && yrsSession
+            ? { session: yrsSession, story: 'body', position: hit.pos }
+            : null;
+        pendingPartCaretRef.current = pending;
+        onBodyClick();
+        if (pending) setPendingPartCaretVersion((version) => version + 1);
+        return;
+      }
+
+      if (beginPendingGesture(getPositionFromMouse(e.clientX, e.clientY), e.detail)) return;
+
+      const projection = getYrsPositionProjection(yrsRootStory);
+      if (!projection) return;
+
+      const imageRegion = partImageRegion(partEdit);
+      if (displayListQueries && point && imageRegion) {
+        const image = displayListQueries.imageAtPoint(
+          point.pageIndex,
+          point.x,
+          point.y,
+          imageRegion,
+          hit?.rId
+        );
+        if (image) {
+          e.stopPropagation();
+          setTextSelection(image.pos, image.pos + 1);
+          setSelectionRects([]);
+          setCaretPosition(null);
+          focusInput();
+          if (!partEdit) setIsFocused(true);
+          return;
+        }
+      }
+
+      const pmPos = getPositionFromMouse(e.clientX, e.clientY);
+      beginTextDrag(pmPos ?? Math.max(0, projection.size - 1));
+    },
+    [
+      beginTextDrag,
+      beginQueuedGesture,
+      beginPendingGesture,
+      bumpInputEpoch,
+      clearPendingGesture,
+      clearTableInsertTimer,
+      displayListQueries,
+      focusInput,
+      getPositionFromMouse,
+      getYrsPositionProjection,
+      onBodyClick,
+      onHeaderFooterDoubleClick,
+      onNoteClick,
+      partEdit,
+      readOnly,
+      resolveCanvasHit,
+      resolveTarget,
+      setCaretPosition,
+      setIsFocused,
+      setSelectionRects,
+      setTextSelection,
+      viewerSelection,
+      yrsRootStory,
+      yrsSession,
+    ]
+  );
+
+  useEffect(() => {
+    const pending = pendingPartCaretRef.current;
+    if (!pending) return;
+    pendingPartCaretRef.current = null;
+    if (
+      pending.session !== yrsSession ||
+      pending.story !== yrsRootStory ||
+      pending.story !== partEditStory(partEdit, yrsSession)
+    ) {
+      return;
+    }
+    const projection = getYrsPositionProjection(yrsRootStory);
+    if (!projection) return;
+    const position = Math.min(Math.max(0, pending.position), Math.max(0, projection.size - 1));
+    setTextSelection(position);
+    focusInput();
+  }, [
+    focusInput,
+    getYrsPositionProjection,
+    partEdit,
+    pendingPartCaretVersion,
+    setTextSelection,
+    yrsRootStory,
+    yrsSession,
+  ]);
+
+  dragExtendRef.current = (cx, cy) => {
+    if (!isDraggingRef.current || dragAnchorRef.current == null) return;
+    if (viewerSelection && yrsInputRef.current?.isGestureCurrent?.(inputEpochRef.current) === false) return;
+    const pmPos = getPositionFromMouse(cx, cy);
+    if (pmPos == null || updatePendingGestureHead(pmPos) || extendCellSelection(pmPos)) return;
+    setTextSelection(dragAnchorRef.current, pmPos, viewerSelection ? inputEpochRef.current : undefined);
+  };
+
+  const dragRafRef = useRef<number | null>(null);
+  const pendingDragPointRef = useRef<{ x: number; y: number } | null>(null);
+  useEffect(
+    () => () => {
+      if (dragRafRef.current != null) cancelAnimationFrame(dragRafRef.current);
+    },
+    []
+  );
+
+  const handleMouseMove = useCallback(
+    (e: MouseEvent) => {
+      if (!isDraggingRef.current || dragAnchorRef.current == null) return;
+      updateDragScroll(e.clientX, e.clientY);
+      if (pendingGestureRef.current) {
+        const position = getPositionFromMouse(e.clientX, e.clientY);
+        if (position != null) updatePendingGestureHead(position);
+        return;
+      }
+      pendingDragPointRef.current = { x: e.clientX, y: e.clientY };
+      dragRafRef.current ??= requestAnimationFrame(() => {
+        dragRafRef.current = null;
+        const point = pendingDragPointRef.current;
+        if (!point || dragAnchorRef.current == null) return;
+        if (viewerSelection && yrsInputRef.current?.isGestureCurrent?.(inputEpochRef.current) === false) return;
+        const pmPos = getPositionFromMouse(point.x, point.y);
+        if (pmPos == null || extendCellSelection(pmPos)) return;
+        setTextSelection(dragAnchorRef.current, pmPos, viewerSelection ? inputEpochRef.current : undefined);
+      });
+    },
+    [
+      extendCellSelection,
+      getPositionFromMouse,
+      setTextSelection,
+      updateDragScroll,
+      updatePendingGestureHead,
+      viewerSelection,
+      yrsInputRef,
+    ]
+  );
+
+  const handleMouseUp = useCallback(
+    (e: MouseEvent) => {
+      updateQueuedGesture(e.clientX, e.clientY);
+      if (queuedGestureRef.current) queuedGestureRef.current.dragging = false;
+      const wasDragging = isDraggingRef.current || yrsCellDraggingRef.current;
+      // the release applies a queued drag frame now, so it cannot land after a multi-click's selection
+      if (dragRafRef.current != null) {
+        cancelAnimationFrame(dragRafRef.current);
+        dragRafRef.current = null;
+        dragExtendRef.current(e.clientX, e.clientY);
+      }
+      if (isDraggingRef.current && pendingGestureRef.current) {
+        const position = getPositionFromMouse(e.clientX, e.clientY);
+        if (position != null) updatePendingGestureHead(position);
+      }
+      isDraggingRef.current = false;
+      yrsCellDragAnchorRef.current = null;
+      yrsCellDraggingRef.current = false;
+      stopDragAutoScroll();
+      // the gesture held its own cursor; a pointer that never moves again
+      // gets its answer here
+      if (wasDragging) resolveHoverCursor(e.clientX, e.clientY);
+    },
+    [getPositionFromMouse, resolveHoverCursor, stopDragAutoScroll, updatePendingGestureHead, updateQueuedGesture]
+  );
+
+  useEffect(() => {
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [handleMouseMove, handleMouseUp]);
+
+  const handlePagesMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      // a live gesture keeps the cursor it started with, and the release is
+      // what re-reads the point under it
+      if (isDraggingRef.current || yrsCellDraggingRef.current) return;
+      hoverPointRef.current = { x: e.clientX, y: e.clientY };
+      const point = resolveCanvasHit(e.clientX, e.clientY, false);
+      paintHoverCursor(canvasHoverCursor({ readOnly, partEdit }, point?.hit ?? null));
+      if (readOnly) return;
+      const scheduleHide = () => {
+        tableInsertHideTimerRef.current ??= setTimeout(() => {
+          setTableInsertButton(null);
+          tableInsertHideTimerRef.current = null;
+        }, TABLE_INSERT_HIDE_DELAY);
+      };
+      const queries = displayListQueries;
+      const host = canvasHostRef?.current ?? pagesContainerRef.current;
+      const overlayTarget = canvasOverlayTarget ?? pagesContainerRef.current?.parentElement;
+      const projection = getYrsPositionProjection(yrsRootStory);
+      if (!queries || !host || !overlayTarget || !projection) return;
+      const pageSize = point ? queries.pageSize(point.pageIndex) : null;
+      const pageRect = point ? resolveDisplayPageClientRect(host, queries, point.pageIndex) : null;
+      if (!point || !pageSize || !pageRect) {
+        scheduleHide();
+        return;
+      }
+      // Table affordances are indexed by band; a note carries none, so an open
+      // note has no table to offer a row/column on.
+      let region: DisplayListTableRegion = { kind: 'body' };
+      if (partEdit) {
+        const inBand =
+          (partEdit.kind === 'header' || partEdit.kind === 'footer') &&
+          hitBelongsToPart(partEdit, point.hit ?? null);
+        if (!inBand || !point.hit?.rId) {
+          scheduleHide();
+          return;
+        }
+        region = { kind: partEdit.kind, rId: point.hit.rId };
+      } else if (point.hit && point.hit.region !== 'body') {
+        scheduleHide();
+        return;
+      }
+      const targetZoom = effectiveZoom(overlayTarget);
+      const hit = detectDisplayListTableInsertHover({
+        list: queries.displayList,
+        pageIndex: point.pageIndex,
+        x: point.x,
+        y: point.y,
+        canvasRect: pageRect,
+        pageSize,
+        tableKeyOf: createTableKeyResolver(projection),
+        cellPmPosOf: createCellPmPosResolver(projection),
+        region,
+        buttonZoom: targetZoom,
+      });
+      if (!hit) {
+        scheduleHide();
+        return;
+      }
+      const targetRect = overlayTarget.getBoundingClientRect();
+      setTableInsertButton({
+        type: hit.type,
+        x: (hit.clientX - targetRect.left) / targetZoom,
+        y: (hit.clientY - targetRect.top) / targetZoom,
+        cellPmPos: hit.cellPmPos,
+      });
+      clearTableInsertTimer();
+    },
+    [
+      canvasHostRef,
+      canvasOverlayTarget,
+      clearTableInsertTimer,
+      displayListQueries,
+      getYrsPositionProjection,
+      pagesContainerRef,
+      paintHoverCursor,
+      partEdit,
+      readOnly,
+      resolveCanvasHit,
+      yrsRootStory,
+    ]
+  );
+
+  const handlePagesMouseLeave = useCallback(() => {
+    // a drag that runs off the pages keeps its cursor, like the move path
+    if (isDraggingRef.current || yrsCellDraggingRef.current) return;
+    hoverPointRef.current = null;
+    paintHoverCursor('default');
+  }, [paintHoverCursor]);
+
+  const handleTableInsertClick = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (readOnly || !tableInsertButton) return;
+      const at = resolveTarget(tableInsertButton.cellPmPos + 1)?.cell;
+      if (!at) return;
+      yrsSession?.setCellSelection({ anchor: at, head: at });
+      setTextSelection(tableInsertButton.cellPmPos + 1);
+      applyYrsCommand(
+        tableInsertButton.type === 'row'
+          ? { type: 'tableInsertRow', side: 'below', at }
+          : { type: 'tableInsertColumn', side: 'right', at }
+      );
+      setTableInsertButton(null);
+      focusInput();
+    },
+    [
+      applyYrsCommand,
+      focusInput,
+      readOnly,
+      resolveTarget,
+      setTextSelection,
+      tableInsertButton,
+      yrsSession,
+    ]
+  );
+
+  /** Whether a text range, or a cell range holding the point, is selected. */
+  const selectionUnder = useCallback(
+    (clientX: number, clientY: number): boolean => {
+      const current = yrsInputRef.current?.displaySelection();
+      if (current && current.anchor !== current.head) return true;
+      const cells = yrsSession?.cellSelection() ?? null;
+      if (!cells || sameYrsCell(cells.anchor, cells.head)) return false;
+      const position = getPositionFromMouse(clientX, clientY);
+      return cellIsWithinYrsRange(position == null ? undefined : resolveTarget(position)?.cell, cells);
+    },
+    [getPositionFromMouse, resolveTarget, yrsInputRef, yrsSession]
+  );
+
+  const handlePagesClick = useCallback(
+    (e: React.MouseEvent) => {
+      // Native canvas clicks move focus to the document body after mousedown.
+      // Reassert the hidden input from the terminal click event so pointer
+      // selection remains keyboard-ready even when the canvas host is outside
+      // PagedEditor's React subtree.
+      focusInput();
+      const queuedGesture = queuedGestureRef.current;
+      const projection = viewerSelection || queuedGesture ? null : getYrsPositionProjection(yrsRootStory);
+      const queries = queuedGesture?.queries ?? displayListQueries;
+      const host = canvasHostRef?.current ?? pagesContainerRef.current;
+      const point = queuedGesture && queries && host
+        ? resolveCanvasPoint(host, queries, e.clientX, e.clientY)
+        : resolveCanvasHit(e.clientX, e.clientY, false);
+      // read-only selection wins over a link: a drag that ends on one, or a double or triple click
+      const pending = pendingGestureRef.current;
+      const selecting = queuedGesture
+        ? e.detail > 1 || queuedGesture.kind !== 'caret' ||
+          queuedGesture.anchor.pageIndex !== queuedGesture.head.pageIndex ||
+          queuedGesture.anchor.x !== queuedGesture.head.x || queuedGesture.anchor.y !== queuedGesture.head.y
+        : readOnly &&
+          (e.detail > 1 ||
+            (pending?.epoch === inputEpochRef.current && pending.kind === 'range') ||
+            selectionUnder(e.clientX, e.clientY));
+      // An external link needs only the display list, so it opens before the replica has loaded.
+      if (queries && host && point && !selecting) {
+        // Hyperlink primitives are indexed by band, so an open note — whose
+        // area the index does not cover — resolves none and falls through to
+        // the multi-click selection below.
+        const inOpenPart = hitBelongsToPart(partEdit, point.hit ?? null);
+        const region: DisplayListTableRegion | null = !partEdit
+          ? { kind: 'body' }
+          : inOpenPart && (partEdit.kind === 'header' || partEdit.kind === 'footer')
+            ? { kind: partEdit.kind, rId: point.hit?.rId }
+            : null;
+        const displayHit = region
+          ? findDisplayListHyperlinkAtPoint(
+              queries.displayList,
+              point.pageIndex,
+              point.x,
+              point.y,
+              region
+            )
+          : null;
+        const href = sanitizeHref(displayHit?.href ?? '');
+        if (
+          href &&
+          (projection || replicaPending?.() || resolveBookmarkPosition || !href.startsWith('#'))
+        ) {
+          if (queuedGesture && href.startsWith('#')) return;
+          e.preventDefault();
+          if (viewerSelection) bumpInputEpoch();
+          const linkPosition = queuedGesture ? null : getPositionFromMouse(e.clientX, e.clientY);
+          if (href.startsWith('#') && replicaPending?.()) {
+            if (linkPosition != null) {
+              pendingGestureRef.current = {
+                kind: 'link',
+                href,
+                anchor: linkPosition,
+                head: linkPosition,
+                epoch: inputEpochRef.current,
+              };
+              listenForOutsideInput();
+            }
+            return;
+          }
+          if (!queuedGesture && (pendingGestureRef.current?.kind !== 'caret' || !replicaPending?.())) {
+            clearPendingGesture();
+          }
+          if (linkPosition != null) setTextSelection(linkPosition, linkPosition,
+            viewerSelection ? inputEpochRef.current : undefined);
+          if (href.startsWith('#')) {
+            const bookmarkName = href.slice(1);
+            if (!projection) {
+              const epoch = inputEpochRef.current;
+              void resolveBookmarkPosition?.(bookmarkName)
+                .then((targetPos) => {
+                  if (targetPos == null || (viewerSelection && yrsInputRef.current?.isGestureCurrent
+                    ? !yrsInputRef.current.isGestureCurrent(epoch)
+                    : epoch !== inputEpochRef.current)) return;
+                  scrollToPositionImpl(targetPos);
+                  setTextSelection(targetPos + 1, targetPos + 1, viewerSelection ? epoch : undefined);
+                })
+                .catch(() => {});
+              return;
+            }
+            const targetPos = projection.bookmarkPosition(bookmarkName);
+            if (targetPos != null) {
+              scrollToPositionImpl(targetPos);
+              setTextSelection(targetPos + 1);
+            }
+            return;
+          }
+          const selection = queuedGesture ? null : yrsInputRef.current?.displaySelection();
+          if (onHyperlinkClick && selection?.anchor === selection?.head) {
+            const pageSize = queries.pageSize(point.pageIndex);
+            const pageRect = resolveDisplayPageClientRect(host, queries, point.pageIndex);
+            const target = canvasOverlayTarget ?? host.closest('.oox-root.paged-editor');
+            const targetRect = target?.getBoundingClientRect() ?? null;
+            let linkLeft = e.clientX;
+            let linkBottom = e.clientY;
+            if (displayHit && pageRect && pageSize) {
+              const linkRect = projectPageLocalRectToClient(pageRect, pageSize, displayHit.rect);
+              linkLeft = linkRect.left;
+              linkBottom = linkRect.bottom;
+            }
+            if (target && targetRect) {
+              const targetZoom = effectiveZoom(target);
+              onHyperlinkClick({
+                href,
+                displayText: displayHit?.displayText ?? href,
+                tooltip: displayHit?.tooltip,
+                position: {
+                  top: (linkBottom - targetRect.top) / targetZoom + 4,
+                  left: (linkLeft - targetRect.left) / targetZoom,
+                },
+              });
+            }
+          }
+          return;
+        }
+      }
+
+      if (queuedGesture) return;
+      if (e.detail === 2 && !readOnly && onHeaderFooterDoubleClick) {
+        const region = point?.hit?.region;
+        if (
+          (region === 'header' || region === 'footer') &&
+          !hitBelongsToPart(partEdit, point?.hit ?? null)
+        ) {
+          clearPendingGesture();
+          e.preventDefault();
+          e.stopPropagation();
+          onHeaderFooterDoubleClick(region, (point?.pageIndex ?? 0) + 1);
+          return;
+        }
+      }
+
+      if (e.detail > 1 && pending?.epoch === inputEpochRef.current && pending.kind !== 'link') {
+        pending.kind = e.detail >= 3 ? 'paragraph' : 'word';
+      }
+      const pmPos = getPositionFromMouse(e.clientX, e.clientY);
+      const target = pmPos != null ? resolveTarget(pmPos) : null;
+      if (!target) return;
+      if (e.detail === 2) {
+        clearPendingGesture();
+        if (viewerSelection && yrsInputRef.current?.beginGesture) inputEpochRef.current = yrsInputRef.current.beginGesture();
+        yrsInputRef.current?.selectWordAtDisplay(target.displayPosition, target.story);
+        focusInput();
+      } else if (e.detail >= 3) {
+        clearPendingGesture();
+        if (viewerSelection && yrsInputRef.current?.beginGesture) inputEpochRef.current = yrsInputRef.current.beginGesture();
+        yrsInputRef.current?.selectParagraphAtDisplay(target.displayPosition, target.story);
+        focusInput();
+      }
+    },
+    [
+      canvasHostRef,
+      canvasOverlayTarget,
+      bumpInputEpoch,
+      clearPendingGesture,
+      displayListQueries,
+      focusInput,
+      getPositionFromMouse,
+      getYrsPositionProjection,
+      listenForOutsideInput,
+      onHeaderFooterDoubleClick,
+      onHyperlinkClick,
+      pagesContainerRef,
+      partEdit,
+      readOnly,
+      replicaPending,
+      resolveCanvasHit,
+      resolveTarget,
+      scrollToPositionImpl,
+      selectionUnder,
+      setTextSelection,
+      yrsInputRef,
+      yrsRootStory,
+      viewerSelection,
+    ]
+  );
+
+  const handlePagesContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      if (!onContextMenu) return;
+      e.preventDefault();
+      const projection = viewerSelection ? null : getYrsPositionProjection(yrsRootStory);
+      if (!projection && !viewerSelection) return;
+      const readImageNodeAt = (pos: number): ImageInfo | null => {
+        const node = projection?.nodeAt(pos);
+        if (node?.kind !== 'image') return null;
+        return {
+          pos,
+          wrapType: (node.attrs.wrapType as WrapType | undefined) ?? 'inline',
+          cssFloat: node.attrs.cssFloat as ImageInfo['cssFloat'],
+        };
+      };
+      let imageInfo: ImageInfo | null = null;
+      const point = resolveCanvasHit(e.clientX, e.clientY, false);
+      const imageRegion = partImageRegion(partEdit);
+      if (displayListQueries && point && imageRegion) {
+        const image = displayListQueries.imageAtPoint(
+          point.pageIndex,
+          point.x,
+          point.y,
+          imageRegion,
+          point.hit?.rId
+        );
+        if (image) imageInfo = readImageNodeAt(image.pos);
+      }
+      const selection = yrsInputRef.current?.displaySelection();
+      if (
+        !imageInfo &&
+        imageRegion &&
+        selection &&
+        Math.abs(selection.anchor - selection.head) === 1
+      ) {
+        imageInfo = readImageNodeAt(Math.min(selection.anchor, selection.head));
+      }
+      if (imageInfo?.wrapType === 'inline' && displayListQueries && !partEdit) {
+        imageInfo.inlinePositionEmu = captureInlinePositionEmuFromDisplayList(
+          displayListQueries,
+          imageInfo.pos
+        );
+      }
+      const pmPos = getPositionFromMouse(e.clientX, e.clientY);
+      const contextCell = pmPos != null ? resolveTarget(pmPos)?.cell : undefined;
+      const keepCellSelection = cellIsWithinYrsRange(contextCell, yrsSession?.cellSelection() ?? null);
+      if (
+        pmPos != null &&
+        !keepCellSelection &&
+        (!selection ||
+          selection.anchor === selection.head ||
+          pmPos < Math.min(selection.anchor, selection.head) ||
+          pmPos > Math.max(selection.anchor, selection.head))
+      ) {
+        setTextSelection(pmPos);
+        focusInput();
+        if (!partEdit) setIsFocused(true);
+      }
+      const latest = yrsInputRef.current?.displaySelection();
+      // a cell range keeps its caret collapsed; read-only offers Copy for it
+      const cells = readOnly && keepCellSelection ? yrsSession?.cellSelection() : null;
+      onContextMenu({
+        x: e.clientX,
+        y: e.clientY,
+        hasSelection:
+          (!!latest && latest.anchor !== latest.head) ||
+          (!!cells && !sameYrsCell(cells.anchor, cells.head)),
+        image: imageInfo,
+      });
+    },
+    [
+      displayListQueries,
+      focusInput,
+      getPositionFromMouse,
+      getYrsPositionProjection,
+      onContextMenu,
+      partEdit,
+      readOnly,
+      resolveCanvasHit,
+      resolveTarget,
+      setIsFocused,
+      setTextSelection,
+      yrsInputRef,
+      yrsRootStory,
+      yrsSession,
+    ]
+  );
+
+  const hideTableInsertButton = useCallback(() => setTableInsertButton(null), []);
+  useEffect(() => {
+    if (readOnly) setTableInsertButton(null);
+  }, [readOnly]);
+  const canvasHandlersRef = useRef({
+    mousedown: handlePagesMouseDown,
+    mousemove: handlePagesMouseMove,
+    mouseleave: handlePagesMouseLeave,
+    click: handlePagesClick,
+    contextmenu: handlePagesContextMenu,
+  });
+  canvasHandlersRef.current = {
+    mousedown: handlePagesMouseDown,
+    mousemove: handlePagesMouseMove,
+    mouseleave: handlePagesMouseLeave,
+    click: handlePagesClick,
+    contextmenu: handlePagesContextMenu,
+  };
+
+  const bindCanvasHandlers = useCallback(() => {
+    if (!displayListQueries && !queueInput) return;
+    const asReactEvent = (e: MouseEvent) => e as unknown as React.MouseEvent;
+    const onCurrentCanvas = (e: MouseEvent): boolean => {
+      const target = e.target instanceof Element ? e.target.closest('.canvas-pages') : null;
+      return target !== null && target === canvasHostRef?.current;
+    };
+    const onMouseDown = (e: MouseEvent) => {
+      if (onCurrentCanvas(e)) canvasHandlersRef.current.mousedown(asReactEvent(e));
+    };
+    const onMouseMove = (e: MouseEvent) => {
+      updateQueuedGesture(e.clientX, e.clientY);
+      // no event fires once the pointer is off the pages, so the move that
+      // leaves them is what drops the hover cursor
+      if (onCurrentCanvas(e)) canvasHandlersRef.current.mousemove(asReactEvent(e));
+      else canvasHandlersRef.current.mouseleave();
+    };
+    const onClick = (e: MouseEvent) => {
+      if (onCurrentCanvas(e)) canvasHandlersRef.current.click(asReactEvent(e));
+    };
+    const onContextMenu = (e: MouseEvent) => {
+      if (onCurrentCanvas(e)) canvasHandlersRef.current.contextmenu(asReactEvent(e));
+    };
+    // CanvasPagedArea briefly replaces its host while a new geometry cache
+    // becomes ready. Delegate from the stable document so the interactive
+    // surface never loses its listener during that ref-only handoff.
+    document.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('click', onClick);
+    document.addEventListener('contextmenu', onContextMenu);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('click', onClick);
+      document.removeEventListener('contextmenu', onContextMenu);
+    };
+  }, [canvasHostRef, displayListQueries, queueInput, updateQueuedGesture]);
+  useLayoutEffect(() => {
+    if (queueInput) return bindCanvasHandlers();
+  }, [bindCanvasHandlers, queueInput]);
+  useEffect(() => {
+    if (!queueInput) return bindCanvasHandlers();
+  }, [bindCanvasHandlers, queueInput]);
+
+  return {
+    applyPendingSelection,
+    bumpInputEpoch,
+    handleEditorKeyDown,
+    inputEpoch,
+    handlePagesMouseDown,
+    handlePagesMouseMove,
+    handlePagesMouseLeave,
+    handlePagesClick,
+    handlePagesContextMenu,
+    handleTableInsertClick,
+    tableInsertButton,
+    clearTableInsertTimer,
+    hideTableInsertButton,
+    getPositionFromMouse,
+  };
+}

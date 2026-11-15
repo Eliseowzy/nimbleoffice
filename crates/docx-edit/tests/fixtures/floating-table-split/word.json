@@ -1,0 +1,86 @@
+{
+ "source": "Word for Mac 16.114 PDF export of float3600.docx / float7000.docx, via pdfplumber (tools/word-parity/word_lines.py)",
+ "lines": {
+  "float3600": [
+   {
+    "page": 0,
+    "y": 83.28,
+    "x0": 72.0,
+    "x1": 158.74,
+    "text": "float3600before"
+   },
+   {
+    "page": 0,
+    "y": 97.68,
+    "x0": 77.76,
+    "x1": 243.82,
+    "text": "float3600r1c1float3600r1c2"
+   },
+   {
+    "page": 1,
+    "y": 83.28,
+    "x0": 77.76,
+    "x1": 508.97,
+    "text": "float3600r2c1float3600r2c2Aftertablewordswraparoundthefinalrowsof"
+   },
+   {
+    "page": 1,
+    "y": 96.96,
+    "x0": 261.5,
+    "x1": 493.69,
+    "text": "thisfloatingtableandcontinueonthepage."
+   }
+  ],
+  "float7000": [
+   {
+    "page": 0,
+    "y": 83.28,
+    "x0": 72.0,
+    "x1": 158.74,
+    "text": "float7000before"
+   },
+   {
+    "page": 0,
+    "y": 97.68,
+    "x0": 77.76,
+    "x1": 328.78,
+    "text": "float7000r1c1float7000r1c2"
+   },
+   {
+    "page": 1,
+    "y": 83.28,
+    "x0": 77.76,
+    "x1": 521.54,
+    "text": "float7000r2c1float7000r2c2Aftertablewords"
+   },
+   {
+    "page": 1,
+    "y": 96.96,
+    "x0": 431.5,
+    "x1": 518.23,
+    "text": "wraparoundthe"
+   },
+   {
+    "page": 1,
+    "y": 110.88,
+    "x0": 431.5,
+    "x1": 517.53,
+    "text": "finalrowsofthis"
+   },
+   {
+    "page": 1,
+    "y": 124.56,
+    "x0": 431.5,
+    "x1": 522.85,
+    "text": "floatingtableand"
+   },
+   {
+    "page": 2,
+    "y": 83.28,
+    "x0": 72.0,
+    "x1": 187.44,
+    "text": "continueonthepage."
+   }
+  ]
+ }
+}

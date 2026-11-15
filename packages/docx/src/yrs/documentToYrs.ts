@@ -1,0 +1,2225 @@
+/** Direct Document-to-yrs load projection. */
+
+/* eslint-disable max-lines -- the complete load projection is intentionally co-located */
+
+import { isRawXml } from '../types/content/rawXml';
+import { hasTrackedControlContent } from '../utils/trackedControlContent';
+import { isWrapNone } from '../docx/wrapTypes';
+import { sdtPropsToAttrs } from '../types/sdtAttributes';
+import { createStyleResolver, type StyleResolver } from '../styles';
+import type {
+  BlockContent,
+  CellMargins,
+  Chart,
+  ComplexField,
+  Document,
+  Hyperlink,
+  Image,
+  InlineSdt,
+  MathEquation,
+  Paragraph,
+  ParagraphFormatting,
+  ParagraphContent,
+  Run,
+  RunContent,
+  Shape,
+  SimpleField,
+  SdtProperties,
+  Table,
+  TableBorders,
+  TableCell,
+  TableCellFormatting,
+  TableRow,
+  TextFormatting,
+  Theme,
+  TrackedChangeInfo,
+} from '../types/document';
+import { ensureHexPrefix, resolveColorToHex } from '../utils/colorResolver';
+import { resolveThemeFont } from '../utils/fontResolver';
+import { mergeStyleRunFormatting, mergeTextFormatting } from '../utils/textFormattingMerge';
+import { tableCellParagraphFormatting, tableCellRunFormatting, tableColumnCount } from './tableParagraphFormatting';
+import type { Style } from '../types/styles';
+import type { YrsOpeningOptions, YrsRawOp, YrsSession } from './index';
+import { noteYrsStoriesDirty } from './yrsToDocument';
+import { calculateRowSpans, type RowSpanInfo } from './tableRowSpans';
+import { recoverGroupedStorySeeds } from './groupedStorySeed';
+import { sessionMaterializedSource } from './sessionInternals';
+import {
+  blockSdtAttrsToPayload,
+  blockSdtStoryId,
+  dropNulls,
+  footnoteStoryId,
+  endnoteStoryId,
+  headerFooterStoryId,
+  paraAttrsToPpr,
+  tableAttrsToGrid,
+  tableAttrsToTblPr,
+  tableCellAttrsToTcPr,
+  tableCellStoryId,
+  tableRowAttrsToTrPr,
+  type YrsAttrs,
+} from './storyAttributes';
+
+type Attrs = Record<string, unknown>;
+
+/**
+ * Aggregate cap, in xml bytes, for opaque drawing payloads copied into yrs
+ * state while seeding. Opaque markup replays verbatim through raw ops and
+ * yrs map values, so uncapped documents multiply memory once per layer.
+ * Both seeders enforce this constant and refuse over-budget documents
+ * instead of silently dropping content.
+ */
+export const OPAQUE_SEED_BUDGET_BYTES = 8 * 1024 * 1024;
+
+const OPAQUE_SEED_BUDGET_MESSAGE = 'opaque drawing seed budget exceeded';
+
+export class OpaqueSeedBudgetError extends Error {
+  readonly total: number;
+  readonly budget = OPAQUE_SEED_BUDGET_BYTES;
+  constructor(total: number) {
+    super(`${OPAQUE_SEED_BUDGET_MESSAGE} (${total} bytes of opaque xml, budget ${OPAQUE_SEED_BUDGET_BYTES} bytes)`);
+    this.name = 'OpaqueSeedBudgetError';
+    this.total = total;
+  }
+}
+
+export function normalizeSeedError(error: unknown): unknown {
+  if (error instanceof OpaqueSeedBudgetError) return error;
+  const message =
+    typeof error === 'string' ? error : error instanceof Error ? error.message : undefined;
+  if (message?.startsWith(OPAQUE_SEED_BUDGET_MESSAGE)) {
+    const total = /(\d+) bytes of opaque xml/.exec(message)?.[1];
+    return new OpaqueSeedBudgetError(total === undefined ? 0 : Number(total));
+  }
+  return error;
+}
+
+const textEncoder = new TextEncoder();
+
+function opaqueXmlBytes(value: unknown): number {
+  if (typeof value === 'string') return 0;
+  if (Array.isArray(value)) return value.reduce<number>((sum, entry) => sum + opaqueXmlBytes(entry), 0);
+  if (value instanceof Map) {
+    let sum = 0;
+    for (const entry of value.values()) sum += opaqueXmlBytes(entry);
+    return sum;
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const own =
+      record.type === 'opaqueDrawing' && typeof record.xml === 'string'
+        ? textEncoder.encode(record.xml).length
+        : 0;
+    return own + Object.values(record).reduce<number>((sum, entry) => sum + opaqueXmlBytes(entry), 0);
+  }
+  return 0;
+}
+
+export function assertOpaqueSeedBudget(document: Document): void {
+  const total = opaqueXmlBytes(document);
+  if (total > OPAQUE_SEED_BUDGET_BYTES) throw new OpaqueSeedBudgetError(total);
+}
+
+interface MarkDescriptor {
+  name: string;
+  /** Complete schema attrs, including non-null defaults. */
+  attrs: Attrs;
+}
+
+interface TextUnit {
+  kind: 'text';
+  text: string;
+  attrs: YrsAttrs;
+  /** Node width, used only for bookmark offsets. */
+  pmSize: number;
+  marks: MarkDescriptor[];
+}
+
+interface EmbedUnit {
+  kind: 'embed';
+  embedKind: string;
+  payload: Attrs;
+  attrs: YrsAttrs;
+  pmSize: number;
+  marks: MarkDescriptor[];
+}
+
+type InlineUnit = TextUnit | EmbedUnit;
+
+interface CommentMark {
+  unit: number;
+  start: boolean;
+  id: number;
+}
+
+interface StoryPlan {
+  storyId: string;
+  units: InlineUnit[];
+  commentMarks: CommentMark[];
+  commentCoverage: Map<number, Array<[number, number]>>;
+}
+
+interface StoryOptions {
+  includePageBreaks: boolean;
+  appendBodyTail: boolean;
+  seedComments: boolean;
+  extraRunFormatting?: TextFormatting;
+  tableParagraphFormatting?: ParagraphFormatting;
+}
+
+interface ProjectedCell {
+  paragraphFormatting?: ParagraphFormatting;
+  attrs: Attrs;
+  content: BlockContent[];
+  extraRunFormatting?: TextFormatting;
+}
+
+interface ProjectedRow {
+  attrs: Attrs;
+  cells: ProjectedCell[];
+}
+
+interface ProjectedTable {
+  attrs: Attrs;
+  rows: ProjectedRow[];
+}
+
+interface LoweringContext {
+  styleResolver: StyleResolver | null;
+  theme: Theme | null;
+  plans: StoryPlan[];
+  compatibilityMode: number;
+  opaqueSequences: string[];
+}
+
+function compatibilityModeFromDocument(document: Document): number {
+  const mode = document.package.settings?.compatibilityFlags?.compatibilityMode;
+  return typeof mode === 'number' && Number.isFinite(mode) ? Math.trunc(mode) : 12;
+}
+
+const BOOLEAN_MARKS = new Set([
+  'bold',
+  'italic',
+  'superscript',
+  'subscript',
+  'allCaps',
+  'smallCaps',
+  'emboss',
+  'imprint',
+  'textShadow',
+  'textOutline',
+  'hidden',
+  'rtl',
+]);
+
+function stableStringify(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (typeof value === 'object') {
+    const object = value as Attrs;
+    return `{${Object.keys(object)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function resolveTextFormatting(
+  formatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null
+): TextFormatting | undefined {
+  if (!formatting || !styleResolver) return formatting;
+  const styleFormatting = styleResolver.resolveRunStyle(formatting.styleId);
+  return styleFormatting ? mergeTextFormatting(styleFormatting, formatting) : formatting;
+}
+
+function formattingToMarks(formatting: TextFormatting | undefined): MarkDescriptor[] {
+  if (!formatting) return [];
+  const marks: MarkDescriptor[] = [];
+  const add = (name: string, attrs: Attrs = {}) => marks.push({ name, attrs });
+
+  if (formatting.bold) add('bold');
+  if (formatting.italic) add('italic');
+  if (formatting.underline && formatting.underline.style !== 'none') {
+    add('underline', {
+      style: formatting.underline.style,
+      color: formatting.underline.color ?? null,
+    });
+  }
+  if (formatting.strike || formatting.doubleStrike) {
+    add('strike', { double: formatting.doubleStrike || false });
+  }
+  if (formatting.color && !formatting.color.auto) {
+    add('textColor', {
+      rgb: formatting.color.rgb ?? null,
+      themeColor: formatting.color.themeColor ?? null,
+      themeTint: formatting.color.themeTint ?? null,
+      themeShade: formatting.color.themeShade ?? null,
+    });
+  }
+
+  const shadingFill = formatting.shading?.fill;
+  const shadingHighlight =
+    (!formatting.shading?.pattern || formatting.shading.pattern === 'clear') &&
+    shadingFill?.rgb &&
+    !shadingFill.auto
+      ? ensureHexPrefix(shadingFill.rgb)
+      : undefined;
+  const highlight =
+    formatting.highlight && formatting.highlight !== 'none'
+      ? formatting.highlight
+      : shadingHighlight;
+  if (highlight) add('highlight', { color: highlight });
+
+  if (formatting.fontSize != null || formatting.fontSizeCs != null) {
+    add('fontSize', {
+      size: formatting.fontSize ?? null,
+      sizeCs: formatting.fontSizeCs ?? null,
+    });
+  }
+  if (formatting.fontFamily) {
+    add('fontFamily', {
+      ascii: formatting.fontFamily.ascii ?? null,
+      hAnsi: formatting.fontFamily.hAnsi ?? null,
+      eastAsia: formatting.fontFamily.eastAsia ?? null,
+      cs: formatting.fontFamily.cs ?? null,
+      asciiTheme: formatting.fontFamily.asciiTheme ?? null,
+      hAnsiTheme: formatting.fontFamily.hAnsiTheme ?? null,
+      eastAsiaTheme: formatting.fontFamily.eastAsiaTheme ?? null,
+      csTheme: formatting.fontFamily.csTheme ?? null,
+    });
+  }
+  if (formatting.vertAlign === 'superscript') add('superscript');
+  else if (formatting.vertAlign === 'subscript') add('subscript');
+  if (formatting.allCaps) add('allCaps');
+  if (formatting.smallCaps) add('smallCaps');
+  if (
+    formatting.spacing != null ||
+    formatting.position != null ||
+    formatting.scale != null ||
+    formatting.kerning != null
+  ) {
+    add('characterSpacing', {
+      spacing: formatting.spacing ?? null,
+      position: formatting.position ?? null,
+      scale: formatting.scale ?? null,
+      kerning: formatting.kerning ?? null,
+    });
+  }
+  if (formatting.emboss) add('emboss');
+  if (formatting.imprint) add('imprint');
+  if (formatting.shadow) add('textShadow');
+  if (formatting.emphasisMark && formatting.emphasisMark !== 'none') {
+    add('emphasisMark', { type: formatting.emphasisMark });
+  }
+  if (formatting.outline) add('textOutline');
+  if (formatting.hidden) add('hidden');
+  if (formatting.rtl) add('rtl');
+  // Document-grid opt-out (w:snapToGrid, default on): only an authored off
+  // becomes a mark, mirroring how the layout bridge reads it.
+  if (formatting.snapToGrid === false) marks.push({ name: 'snapToGrid', attrs: {} });
+  if (formatting.effect && formatting.effect !== 'none') {
+    add('textEffect', { effect: formatting.effect });
+  }
+  if (formatting.modernEffects) {
+    add('modernTextEffects', { effects: formatting.modernEffects });
+  }
+  if (formatting.styleId) add('runStyle', { styleId: formatting.styleId });
+  return marks;
+}
+
+function marksToYrsAttrs(marks: readonly MarkDescriptor[]): YrsAttrs {
+  const attrs: YrsAttrs = {};
+  for (const mark of marks) {
+    if (mark.name === 'comment' || mark.name === 'footnoteRef') continue;
+    if (BOOLEAN_MARKS.has(mark.name)) {
+      attrs[mark.name] = true;
+    } else if (mark.name === 'snapToGrid') {
+      attrs.snapToGrid = false;
+    } else if (mark.name === 'rPrChange') {
+      attrs.rPrChange = mark.attrs.changes;
+    } else if (mark.name === 'highlight') {
+      attrs.highlight = mark.attrs.color;
+    } else if (mark.name === 'insertion' || mark.name === 'deletion') {
+      attrs[mark.name === 'insertion' ? 'ins' : 'del'] = dropNulls({
+        id: mark.attrs.revisionId,
+        author: mark.attrs.author,
+        date: mark.attrs.date,
+      });
+    } else {
+      attrs[mark.name] = dropNulls(mark.attrs);
+    }
+  }
+  return attrs;
+}
+
+function marksKey(marks: readonly MarkDescriptor[]): string {
+  return marks
+    .filter((mark) => mark.name !== 'hyperlink' && mark.name !== 'comment')
+    .map((mark) => `${mark.name}:${mark.name === 'rPrChange' ? stableStringify(mark.attrs) : JSON.stringify(mark.attrs)}`)
+    .sort()
+    .join('|');
+}
+
+function withMark(marks: readonly MarkDescriptor[], mark: MarkDescriptor): MarkDescriptor[] {
+  return [...marks.filter((candidate) => candidate.name !== mark.name), mark];
+}
+
+function textUnit(text: string, marks: readonly MarkDescriptor[]): TextUnit {
+  return {
+    kind: 'text',
+    text,
+    attrs: marksToYrsAttrs(marks),
+    pmSize: text.length,
+    marks: [...marks],
+  };
+}
+
+function embedUnit(
+  embedKind: string,
+  payload: Attrs,
+  marks: readonly MarkDescriptor[] = [],
+  pmSize = 1
+): EmbedUnit {
+  return {
+    kind: 'embed',
+    embedKind,
+    payload,
+    attrs: marksToYrsAttrs(marks),
+    pmSize,
+    marks: [...marks],
+  };
+}
+
+function runMarks(
+  run: Run,
+  styleFormatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null
+): MarkDescriptor[] {
+  const runStyleFormatting = run.formatting?.styleId
+    ? styleResolver?.getRunStyleOwnProperties(run.formatting.styleId)
+    : undefined;
+  const marks = formattingToMarks(
+    mergeTextFormatting(mergeStyleRunFormatting(styleFormatting, runStyleFormatting), run.formatting)
+  );
+  const styleId = run.formatting?.styleId;
+  const styleName = styleId ? styleResolver?.getStyle(styleId)?.name : undefined;
+  if ([styleId, styleName].some((name) => /^(?:Followed)?Hyperlink$/i.test(name ?? ''))) {
+    for (const [property, name] of [['color', 'textColor'], ['underline', 'underline']] as const) {
+      if (run.formatting?.[property] === undefined && runStyleFormatting?.[property] !== undefined) {
+        const mark = marks.find((mark) => mark.name === name);
+        if (mark) mark.attrs.inheritedHyperlink = true;
+      }
+    }
+  }
+  if (run.propertyChanges?.length) {
+    const changes = run.propertyChanges.map(change => {
+      const previousStyle = change.previousFormatting?.styleId
+        ? styleResolver?.getRunStyleOwnProperties(change.previousFormatting.styleId) : undefined;
+      const previous = mergeTextFormatting(mergeStyleRunFormatting(styleFormatting, previousStyle), change.previousFormatting);
+      return { ...change, previousAttributes: marksToYrsAttrs(formattingToMarks(previous)) };
+    });
+    marks.push({ name: 'rPrChange', attrs: { changes } });
+  }
+  return marks;
+}
+
+/** EMU to px, unrounded and in the native seed's operation order, so both seeds hash alike. */
+function emuPixels(emu: number): number {
+  return (emu / 914400) * 96;
+}
+
+function imagePayload(image: Image): Attrs {
+  const width = image.size?.width ? emuPixels(image.size.width) : undefined;
+  const height = image.size?.height ? emuPixels(image.size.height) : undefined;
+  const wrapType = image.wrap.type;
+  const wrapText = image.wrap.wrapText;
+  const hAlign = image.position?.horizontal?.alignment;
+  let cssFloat: 'left' | 'right' | 'none' | undefined;
+  if (wrapType === 'inline' || wrapType === 'topAndBottom') cssFloat = 'none';
+  else if (wrapType === 'square' || wrapType === 'tight' || wrapType === 'through') {
+    if (wrapText === 'left') cssFloat = 'right';
+    else if (wrapText === 'right') cssFloat = 'left';
+    else if (hAlign === 'left' || hAlign === 'right') cssFloat = hAlign;
+    else cssFloat = 'none';
+  } else cssFloat = 'none';
+
+  const displayMode =
+    wrapType === 'inline'
+      ? 'inline'
+      : wrapType === 'topAndBottom'
+        ? 'block'
+        : isWrapNone(wrapType) || (cssFloat && cssFloat !== 'none')
+          ? 'float'
+          : 'block';
+  const transforms: string[] = [];
+  if (image.transform?.rotation) transforms.push(`rotate(${image.transform.rotation}deg)`);
+  if (image.transform?.flipH) transforms.push('scaleX(-1)');
+  if (image.transform?.flipV) transforms.push('scaleY(-1)');
+
+  let borderWidth: number | undefined;
+  let borderColor: string | undefined;
+  let borderStyle: string | undefined;
+  if (image.outline?.width) {
+    borderWidth = Math.round((image.outline.width / 914400) * 96 * 100) / 100;
+    if (image.outline.color?.rgb) borderColor = `#${image.outline.color.rgb}`;
+    const styles: Record<string, string> = {
+      solid: 'solid',
+      dot: 'dotted',
+      dash: 'dashed',
+      lgDash: 'dashed',
+      dashDot: 'dashed',
+      lgDashDot: 'dashed',
+      lgDashDotDot: 'dashed',
+      sysDot: 'dotted',
+      sysDash: 'dashed',
+      sysDashDot: 'dashed',
+      sysDashDotDot: 'dashed',
+    };
+    borderStyle = image.outline.style ? styles[image.outline.style] || 'solid' : 'solid';
+  }
+
+  return dropNulls({
+    src: image.src || '',
+    alt: image.alt ?? null,
+    title: image.title ?? null,
+    width: width ?? null,
+    height: height ?? null,
+    rId: image.rId ?? null,
+    wrapType,
+    displayMode,
+    cssFloat: cssFloat ?? null,
+    transform: transforms.length > 0 ? transforms.join(' ') : null,
+    distTop: image.wrap.distT != null ? emuPixels(image.wrap.distT) : null,
+    distBottom: image.wrap.distB != null ? emuPixels(image.wrap.distB) : null,
+    distLeft: image.wrap.distL != null ? emuPixels(image.wrap.distL) : null,
+    distRight: image.wrap.distR != null ? emuPixels(image.wrap.distR) : null,
+    position: image.position
+      ? {
+          relativeHeight: image.position.relativeHeight,
+          behindDoc: image.position.behindDoc,
+          horizontal: image.position.horizontal
+            ? {
+                relativeTo: image.position.horizontal.relativeTo,
+                posOffset: image.position.horizontal.posOffset,
+                align: image.position.horizontal.alignment,
+              }
+            : undefined,
+          vertical: image.position.vertical
+            ? {
+                relativeTo: image.position.vertical.relativeTo,
+                posOffset: image.position.vertical.posOffset,
+                align: image.position.vertical.alignment,
+              }
+            : undefined,
+        }
+      : null,
+    borderWidth: borderWidth ?? null,
+    borderColor: borderColor ?? null,
+    borderColorValue: image.outline?.color ?? null,
+    borderStyle: borderStyle ?? null,
+    wrapText: wrapText ?? null,
+    hlinkHref: image.hlinkHref ?? null,
+    cropTop: image.crop?.top ?? null,
+    cropRight: image.crop?.right ?? null,
+    cropBottom: image.crop?.bottom ?? null,
+    cropLeft: image.crop?.left ?? null,
+    shapeType: image.shapeType ?? null,
+    opacity: image.opacity ?? null,
+    effectExtentTop: image.padding?.top != null ? emuPixels(image.padding.top) : null,
+    effectExtentBottom: image.padding?.bottom != null ? emuPixels(image.padding.bottom) : null,
+    effectExtentLeft: image.padding?.left != null ? emuPixels(image.padding.left) : null,
+    effectExtentRight: image.padding?.right != null ? emuPixels(image.padding.right) : null,
+    layoutInCell: image.layoutInCell ?? null,
+    noChangeAspect: image.noChangeAspect ?? null,
+    allowOverlap: image.allowOverlap ?? null,
+    horizontalRule: image.horizontalRule ?? null,
+  }) as Attrs;
+}
+
+/** Leaves out the source paragraph ordinals the native seed never writes into display JSON. */
+function withoutSourceOrdinal(key: string, value: unknown): unknown {
+  return key === 'sourceOrdinal' ? undefined : value;
+}
+
+function shapePayload(shape: Shape): Attrs {
+  return { shapeJson: JSON.stringify(shape) };
+}
+
+function chartPayload(chart: Chart): Attrs {
+  return dropNulls({
+    chartJson: JSON.stringify(chart),
+    chartType: chart.chartType ?? null,
+    title: chart.title ?? null,
+    width: chart.size?.width ? emuPixels(chart.size.width) : 320,
+    height: chart.size?.height ? emuPixels(chart.size.height) : 220,
+    rId: chart.rId ?? null,
+    path: chart.path ?? null,
+  }) as Attrs;
+}
+
+function fieldPayload(
+  field: SimpleField | ComplexField,
+  styleFormatting?: TextFormatting
+): {
+  payload: Attrs;
+  marks: MarkDescriptor[];
+} {
+  let displayText = '';
+  let fieldFormatting: TextFormatting | undefined;
+  const runs = field.type === 'simpleField' ? field.content : field.fieldResult;
+  for (const child of runs) {
+    if (child.type !== 'run') continue;
+    for (const content of child.content) {
+      if (content.type === 'text') displayText += content.text;
+    }
+    if (!fieldFormatting && child.formatting) fieldFormatting = child.formatting;
+  }
+  const formatting =
+    fieldFormatting ?? (field.type === 'complexField' ? field.formatting : undefined);
+  const displayMode = field.fieldTree?.displayMode ?? 'result';
+  return {
+    payload: {
+      fieldType: field.fieldType,
+      instruction: field.instruction,
+      displayText,
+      fieldKind: field.type === 'simpleField' ? 'simple' : 'complex',
+      fldLock: field.fldLock ?? false,
+      dirty: field.dirty ?? false,
+      displayMode,
+      hasCachedResult: displayText.length > 0,
+      fieldData: JSON.stringify(field),
+      modelKind: 'field',
+    },
+    marks: formattingToMarks(mergeTextFormatting(styleFormatting, formatting)),
+  };
+}
+
+function nestedSequenceNames(model: SimpleField | ComplexField | Image | Shape | Chart): string[] {
+  const names = new Set<string>();
+  const pending: Array<[unknown, boolean]> = [[model, false]];
+  while (pending.length > 0) {
+    const [value, scannedHyperlink] = pending.pop()!;
+    if (Array.isArray(value)) {
+      for (let index = value.length - 1; index >= 0; index--) {
+        pending.push([value[index], scannedHyperlink]);
+      }
+    } else if (value !== null && typeof value === 'object') {
+      const node = value as Attrs;
+      if (
+        value !== model &&
+        (node.type === 'complexField' || node.type === 'simpleField') &&
+        typeof node.instruction === 'string'
+      ) {
+        const name = sequenceName(node.instruction);
+        if (name !== undefined) names.add(name);
+      }
+      if (node.type === 'hyperlink' && !scannedHyperlink) {
+        for (const name of hyperlinkSequenceNames(value as Hyperlink)) names.add(name);
+      }
+      const insideScannedHyperlink = scannedHyperlink || node.type === 'hyperlink';
+      for (const key of Object.keys(node).sort().reverse()) {
+        pending.push([node[key], insideScannedHyperlink]);
+      }
+    }
+  }
+  return [...names];
+}
+
+function hyperlinkSequenceNames(hyperlink: Hyperlink): string[] {
+  const pending: ParagraphContent[] = [hyperlink];
+  const instructions: Array<string | undefined> = [];
+  const names: string[] = [];
+  const push = (children: readonly ParagraphContent[] | undefined): void => {
+    if (!Array.isArray(children)) return;
+    for (let index = children.length - 1; index >= 0; index--) pending.push(children[index]);
+  };
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    if (!node) continue;
+    if (
+      (node.type === 'simpleField' || node.type === 'complexField') &&
+      typeof node.instruction === 'string'
+    ) {
+      const name = sequenceName(node.instruction);
+      if (name !== undefined) names.push(name);
+    }
+    switch (node.type) {
+      case 'hyperlink':
+        push(node.structuredChildren ?? node.children);
+        break;
+      case 'inlineSdt':
+      case 'insertion':
+      case 'deletion':
+      case 'moveFrom':
+      case 'moveTo':
+        push(node.content);
+        break;
+      case 'simpleField':
+        push(node.structuredResult?.inline ?? node.fieldTree?.result?.inline ?? node.content);
+        break;
+      case 'complexField':
+        push(node.structuredResult?.inline ?? node.fieldTree?.result?.inline ?? node.fieldResult);
+        push(node.structuredCode?.inline ?? node.fieldTree?.code?.inline ?? node.fieldCode);
+        break;
+      case 'run':
+        if (!Array.isArray(node.content)) break;
+        for (const content of node.content) {
+          if (!content) continue;
+          let instruction: string | undefined;
+          if (content.type === 'fieldChar') {
+            if (content.charType === 'begin') instructions.push('');
+            else if (content.charType === 'separate' && instructions.length > 0) {
+              instruction = instructions[instructions.length - 1];
+              instructions[instructions.length - 1] = undefined;
+            } else if (content.charType === 'end') instruction = instructions.pop();
+          } else if (content.type === 'instrText') {
+            const index = instructions.length - 1;
+            if (instructions[index] !== undefined) {
+              instructions[index] += typeof content.text === 'string' ? content.text : '';
+            }
+          }
+          const name = instruction === undefined ? undefined : sequenceName(instruction);
+          if (name !== undefined) names.push(name);
+        }
+        break;
+    }
+  }
+  return names;
+}
+
+function sequenceName(instruction: string): string | undefined {
+  const tokens = instruction.matchAll(/"([^"]*)(?:"|$)|([^\p{White_Space}]+)/gu);
+  const first = tokens.next().value;
+  const second = tokens.next().value;
+  const kind = first?.[1] ?? first?.[2];
+  const name = second?.[1] ?? second?.[2];
+  if (!kind || !/^[sS][eE][qQ]$/.test(kind) || name === undefined || name.startsWith('\\')) return undefined;
+  return name.toLowerCase();
+}
+
+function mathPayload(math: MathEquation): Attrs {
+  return {
+    display: math.display,
+    ommlXml: math.ommlXml,
+    plainText: math.plainText || '',
+  };
+}
+
+function hyperlinkMark(hyperlink: Hyperlink): MarkDescriptor {
+  return {
+    name: 'hyperlink',
+    attrs: {
+      href: hyperlink.href || (hyperlink.anchor ? `#${hyperlink.anchor}` : ''),
+      tooltip: hyperlink.tooltip ?? null,
+      rId: hyperlink.rId ?? null,
+      ...(typeof hyperlink.history === 'boolean' ? { history: hyperlink.history } : {}),
+    },
+  };
+}
+
+function fieldToUnits(
+  value: SimpleField | ComplexField,
+  styleFormatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null,
+  projectionId: number,
+  opaqueSequences: string[]
+): InlineUnit[] {
+  const result = value.structuredResult?.inline ?? [];
+  const code = value.type === 'complexField' ? value.structuredCode?.inline ?? [] : [];
+  const projectedChildren = [
+    ...code.map((child, index) => ({ child, index: -index - 1 })),
+    ...result.map((child, index) => ({ child, index })),
+  ];
+  if (value.type !== 'complexField' || !projectedChildren.some(({ child }) => child.type === 'hyperlink' || child.type === 'simpleField')) {
+    opaqueSequences.push(...nestedSequenceNames(value));
+    const field = fieldPayload(value, styleFormatting);
+    return [embedUnit('field', field.payload, field.marks)];
+  }
+  const units: InlineUnit[] = [];
+  const children: Attrs[] = [];
+  projectedChildren.forEach(({ child, index }) => {
+    if (child.type !== 'hyperlink' && child.type !== 'simpleField') return;
+    opaqueSequences.push(
+      ...(child.type === 'hyperlink' ? hyperlinkSequenceNames(child) : nestedSequenceNames(child))
+    );
+    const nested = child.type === 'simpleField' ? fieldPayload(child, styleFormatting) : null;
+    const projected = child.type === 'hyperlink'
+      ? hyperlinkToUnits(child, styleFormatting, styleResolver, opaqueSequences)
+      : [embedUnit('field', nested!.payload, nested!.marks)];
+    children.push({ index, items: projected.map((unit) => unit.kind === 'text'
+      ? { kind: 'text', text: unit.text, attributes: unit.attrs }
+      : { kind: 'embed', embedKind: unit.embedKind, payload: unit.payload, attributes: unit.attrs }) });
+    for (const unit of projected) unit.attrs = { ...unit.attrs, fieldResult: { id: projectionId, index } };
+    units.push(...projected);
+  });
+  const visible = { ...value, fieldResult: result.filter((child): child is Run => child.type === 'run') };
+  const field = fieldPayload(visible, styleFormatting);
+  opaqueSequences.push(
+    ...nestedSequenceNames(sequenceName(value.instruction ?? '') === undefined ? visible : value)
+  );
+  field.payload.fieldData = JSON.stringify(value);
+  field.payload.resultProjection = { id: projectionId, children };
+  units.push(embedUnit('field', field.payload, field.marks));
+  return units;
+}
+
+function noteRefUnit(
+  id: number,
+  noteType: 'footnote' | 'endnote',
+  marks: readonly MarkDescriptor[]
+): EmbedUnit {
+  const noteMark: MarkDescriptor = {
+    name: 'footnoteRef',
+    attrs: { id: String(id), noteType },
+  };
+  const allMarks = [...marks, noteMark];
+  return embedUnit(
+    'noteRef',
+    noteType === 'endnote' ? { endnoteRefId: id } : { footnoteRefId: id },
+    allMarks
+  );
+}
+
+/** The tracked insertion or deletion a drawing keeps from its run. */
+function trackedMarks(marks: readonly MarkDescriptor[]): MarkDescriptor[] {
+  return marks.filter((mark) => mark.name === 'insertion' || mark.name === 'deletion' || mark.name === 'hyperlink');
+}
+
+function drawingMarks(marks: readonly MarkDescriptor[]): MarkDescriptor[] {
+  return marks.filter((mark) =>
+    mark.name === 'hidden' || mark.name === 'insertion' || mark.name === 'deletion' || mark.name === 'hyperlink'
+  );
+}
+
+function runContentToUnits(
+  content: RunContent,
+  marks: readonly MarkDescriptor[],
+  opaqueSequences: string[]
+): InlineUnit[] {
+  if (
+    (content.type === 'drawing' || content.type === 'shape' || content.type === 'chart') &&
+    marks.some((mark) => mark.name === 'hidden')
+  ) {
+    const model = content.type === 'drawing' ? content.image
+      : content.type === 'shape' ? content.shape : content.chart;
+    opaqueSequences.push(...nestedSequenceNames(model));
+  }
+  switch (content.type) {
+    case 'text':
+      return content.text ? [textUnit(content.text, marks)] : [];
+    case 'tab':
+      return [textUnit('\t', marks)];
+    case 'break':
+      return content.breakType === undefined || content.breakType === 'textWrapping'
+        ? [embedUnit('break', {}, marks)]
+        : [];
+    case 'softHyphen':
+      return [textUnit('\u00ad', marks)];
+    case 'noBreakHyphen':
+      return [textUnit('\u2011', marks)];
+    case 'symbol': {
+      const codePoint = Number.parseInt(content.char, 16);
+      if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return [];
+      const symbolMark: MarkDescriptor = {
+        name: 'fontFamily',
+        attrs: {
+          ascii: content.font || null,
+          hAnsi: content.font || null,
+          eastAsia: content.font || null,
+          cs: content.font || null,
+          asciiTheme: null,
+          hAnsiTheme: null,
+          eastAsiaTheme: null,
+          csTheme: null,
+        },
+      };
+      return [textUnit(String.fromCodePoint(codePoint), withMark(marks, symbolMark))];
+    }
+    case 'commentReference':
+      return [
+        embedUnit('field', {
+          fieldType: 'COMMENT',
+          instruction: '',
+          displayText: '',
+          fieldKind: 'simple',
+          fldLock: false,
+          dirty: false,
+          displayMode: 'result',
+          hasCachedResult: false,
+          modelKind: 'commentReference',
+          ...(content.id !== undefined ? { commentId: content.id } : {}),
+        }),
+      ];
+    case 'drawing':
+      return [embedUnit('image', { ...imagePayload(content.image), ...(content.drawing ? { docPr: content.drawing } : {}) }, trackedMarks(marks))];
+    case 'horizontalRule':
+      return [embedUnit('horizontalRule', { rule: content.rule }, marks)];
+    case 'shape':
+      return [embedUnit('shape', { ...shapePayload(content.shape), ...(content.drawing ? { docPr: content.drawing } : {}) }, content.shape.drawingRunXml || content.shape.drawingXml ? drawingMarks(marks) : trackedMarks(marks))];
+    case 'chart':
+      return [embedUnit('chart', { ...chartPayload(content.chart), ...(content.drawing ? { docPr: content.drawing } : {}) }, trackedMarks(marks))];
+    case 'opaqueDrawing':
+      return [embedUnit('opaqueDrawing', {
+        kind: content.kind,
+        xml: content.xml,
+        ...(content.preview ? { preview: imagePayload(content.preview) } : {}),
+        ...(content.previews?.length ? { previews: content.previews.map(imagePayload) } : {}),
+        ...(content.textBox ? { textBoxJson: JSON.stringify(content.textBox, withoutSourceOrdinal) } : {}),
+        ...(content.drawing ? { docPr: content.drawing } : {}),
+      }, drawingMarks(marks))];
+    case 'footnoteRef':
+      return [noteRefUnit(content.id, 'footnote', marks)];
+    case 'endnoteRef':
+      return [noteRefUnit(content.id, 'endnote', marks)];
+    default:
+      return [];
+  }
+}
+
+function runToUnits(
+  run: Run,
+  styleFormatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null,
+  opaqueSequences: string[],
+  extraMarks: readonly MarkDescriptor[] = []
+): InlineUnit[] {
+  const marks = [...runMarks(run, styleFormatting, styleResolver), ...extraMarks];
+  return run.content.flatMap((content) => replayedRunContentToUnits(run, content, marks, opaqueSequences));
+}
+
+function replayedRunContentToUnits(
+  run: Run,
+  content: RunContent,
+  marks: readonly MarkDescriptor[],
+  opaqueSequences: string[]
+): InlineUnit[] {
+  const units = runContentToUnits(content, marks, opaqueSequences);
+  if ((content.type === 'shape' && content.shape.drawingRunXml) ||
+    (content.type === 'opaqueDrawing' && content.kind === 'drawingRun')) {
+    for (const unit of units) {
+      if (unit.kind === 'embed') unit.payload.sourceRun = {
+        formatting: run.formatting ?? {},
+        attributes: { ...unit.attrs },
+        propertyChanges: run.propertyChanges ?? null,
+      };
+    }
+  }
+  return units;
+}
+
+function hyperlinkToUnits(
+  hyperlink: Hyperlink,
+  styleFormatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null,
+  opaqueSequences: string[],
+  extraMarks: readonly MarkDescriptor[] = []
+): InlineUnit[] {
+  const units: InlineUnit[] = [];
+  const link = hyperlinkMark(hyperlink);
+  for (const child of hyperlink.structuredChildren ?? hyperlink.children) {
+    if (child.type === 'run') {
+      const marks = [...runMarks(child, styleFormatting, styleResolver), ...extraMarks, link];
+      for (const content of child.content) units.push(...replayedRunContentToUnits(child, content, marks, opaqueSequences));
+    } else if (child.type === 'simpleField' || child.type === 'complexField') {
+      opaqueSequences.push(...nestedSequenceNames(child));
+      const field = fieldPayload(child, styleFormatting);
+      units.push(embedUnit('field', field.payload, [...field.marks, ...extraMarks, link]));
+    } else if (child.type === 'mathEquation') {
+      units.push(embedUnit('math', mathPayload(child), [...extraMarks, link]));
+    } else if (child.type === 'inlineSdt' && (
+      extraMarks.some((mark) => mark.name === 'insertion' || mark.name === 'deletion') ||
+      hasTrackedControlContent(child)
+    )) {
+      units.push(embedUnit(
+        'sdt', sdtPayload(child, styleFormatting, styleResolver, opaqueSequences), [...extraMarks, link], 2
+      ));
+    }
+  }
+  return units;
+}
+
+function trackedMark(
+  info: TrackedChangeInfo,
+  kind: 'insertion' | 'deletion',
+  isMovePair: boolean
+): MarkDescriptor {
+  return {
+    name: kind,
+    attrs: {
+      revisionId: info.id,
+      author: info.author,
+      date: info.date ?? null,
+      isMovePair,
+    },
+  };
+}
+
+function trackedToUnits(
+  content: Extract<ParagraphContent, { type: 'insertion' | 'deletion' | 'moveFrom' | 'moveTo' }>,
+  styleFormatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null,
+  opaqueSequences: string[],
+  inControl = false
+): InlineUnit[] {
+  const kind = content.type === 'insertion' || content.type === 'moveTo' ? 'insertion' : 'deletion';
+  const mark = trackedMark(
+    content.info,
+    kind,
+    content.type === 'moveFrom' || content.type === 'moveTo'
+  );
+  const units: InlineUnit[] = [];
+  for (const child of content.content) {
+    if (child.type === 'run') {
+      units.push(...runToUnits(child, styleFormatting, styleResolver, opaqueSequences, [mark]));
+    } else if (child.type === 'hyperlink') {
+      opaqueSequences.push(...hyperlinkSequenceNames(child));
+      const linked = hyperlinkToUnits(child, styleFormatting, styleResolver, opaqueSequences, [mark]);
+      units.push(...linked);
+    } else if (inControl || child.type === 'inlineSdt' || hasTrackedControlContent(child)) {
+      const nested = inlineContainerUnits(child, styleFormatting, styleResolver, opaqueSequences, inControl);
+      const attrs = marksToYrsAttrs([mark]);
+      units.push(...nested.map((unit) => ({
+        ...unit,
+        attrs: { ...attrs, ...unit.attrs },
+        marks: unit.marks.some((nested) => nested.name === mark.name) ? unit.marks : [...unit.marks, mark],
+      })));
+    }
+  }
+  return units;
+}
+
+function inlineContainerUnits(
+  child: InlineSdt['content'][number],
+  styleFormatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null,
+  opaqueSequences: string[],
+  inControl: boolean
+): InlineUnit[] {
+  if (child.type === 'run') return runToUnits(child, styleFormatting, styleResolver, opaqueSequences);
+  if (child.type === 'hyperlink') {
+    opaqueSequences.push(...hyperlinkSequenceNames(child));
+    return hyperlinkToUnits(child, styleFormatting, styleResolver, opaqueSequences);
+  }
+  if (child.type === 'simpleField' || child.type === 'complexField') {
+    opaqueSequences.push(...nestedSequenceNames(child));
+    const field = fieldPayload(child, styleFormatting);
+    return [embedUnit('field', field.payload, field.marks)];
+  }
+  if (child.type === 'inlineSdt') {
+    return [embedUnit('sdt', sdtPayload(child, styleFormatting, styleResolver, opaqueSequences), [], 2)];
+  }
+  if (child.type === 'mathEquation') return [embedUnit('math', mathPayload(child))];
+  return trackedToUnits(child, styleFormatting, styleResolver, opaqueSequences, inControl);
+}
+
+function sdtPayload(
+  sdt: InlineSdt,
+  styleFormatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null,
+  opaqueSequences: string[]
+): Attrs {
+  const content: Array<
+    | { kind: 'text'; text: string; attrs: YrsAttrs }
+    | { kind: 'tab'; attrs: YrsAttrs }
+    | { kind: string; payload: Attrs; attrs: YrsAttrs }
+  > = [];
+  const append = (unit: InlineUnit): void => {
+    if (unit.kind === 'text') {
+      const kind = unit.text === '\t' ? 'tab' : 'text';
+      if (kind === 'tab') {
+        content.push({ kind: 'tab', attrs: unit.attrs });
+        return;
+      }
+      const previous = content[content.length - 1];
+      if (
+        previous &&
+        'text' in previous &&
+        stableStringify(previous.attrs) === stableStringify(unit.attrs)
+      ) {
+        previous.text += unit.text;
+      } else {
+        content.push({ kind: 'text', text: unit.text, attrs: unit.attrs });
+      }
+      return;
+    }
+    content.push({ kind: unit.embedKind, payload: unit.payload, attrs: unit.attrs });
+  };
+
+  for (const child of sdt.content) {
+    if (child.type === 'run') {
+      runToUnits(child, styleFormatting, styleResolver, opaqueSequences).forEach(append);
+    } else if (child.type === 'hyperlink') {
+      opaqueSequences.push(...hyperlinkSequenceNames(child));
+      hyperlinkToUnits(child, styleFormatting, styleResolver, opaqueSequences).forEach(append);
+    } else if (child.type === 'simpleField' || child.type === 'complexField') {
+      opaqueSequences.push(...nestedSequenceNames(child));
+      const field = fieldPayload(child, styleFormatting);
+      append(embedUnit('field', field.payload, field.marks));
+    } else if (child.type === 'inlineSdt') {
+      append(embedUnit('sdt', sdtPayload(child, styleFormatting, styleResolver, opaqueSequences)));
+    } else if (child.type === 'mathEquation') {
+      append(embedUnit('math', mathPayload(child)));
+    } else {
+      trackedToUnits(child, styleFormatting, styleResolver, opaqueSequences, true).forEach(append);
+    }
+  }
+  return dropNulls({
+    ...sdtPropsToAttrs(sdt.properties),
+    propertiesJson: JSON.stringify(sdt.properties),
+    content,
+  }) as Attrs;
+}
+
+function paragraphStyleFormatting(
+  paragraph: Paragraph,
+  styleResolver: StyleResolver | null,
+  extraRunFormatting?: TextFormatting
+): TextFormatting | undefined {
+  const styleFormatting = styleResolver
+    ? styleResolver.resolveParagraphStyle(paragraph.formatting?.styleId, undefined, extraRunFormatting).runFormatting
+    : undefined;
+  return styleResolver ? styleFormatting : extraRunFormatting;
+}
+
+/**
+ * Note number marks carry no story unit, so the run boundary cache is the only
+ * place a saved paragraph can learn they were there.
+ */
+function noteRefMarkTypes(run: Run): string[] {
+  const marks: string[] = [];
+  for (const content of run.content) {
+    if (content.type === 'footnoteRefMark') marks.push('footnote');
+    else if (content.type === 'endnoteRefMark') marks.push('endnote');
+  }
+  return marks;
+}
+
+function unitsText(units: readonly InlineUnit[]): string {
+  return units
+    .map((unit) => {
+      if (unit.kind === 'text') return unit.text;
+      const id = unit.payload.footnoteRefId ?? unit.payload.endnoteRefId;
+      return String(id ?? '');
+    })
+    .join('');
+}
+
+/**
+ * `w:br w:type="page"|"column"`, which the story carries as a block embed
+ * beside the paragraph instead of as an inline unit.
+ */
+function flowBreakType(content: RunContent): 'page' | 'column' | null {
+  if (content.type !== 'break') return null;
+  return content.breakType === 'page' || content.breakType === 'column' ? content.breakType : null;
+}
+
+/**
+ * Where a run's flow breaks sit in its text. They occupy no story unit, so
+ * the save projection rebuilds them from these offsets.
+ */
+function flowBreakOffsets(run: Run): Array<{ offset: number; type: 'page' | 'column' }> {
+  if (!run.content.some((content) => flowBreakType(content) !== null)) return [];
+  const breaks: Array<{ offset: number; type: 'page' | 'column' }> = [];
+  let offset = 0;
+  for (const content of run.content) {
+    const type = flowBreakType(content);
+    if (type !== null) {
+      breaks.push({ offset, type });
+      continue;
+    }
+    offset += unitsText(runContentToUnits(content, [], [])).length;
+  }
+  return breaks;
+}
+
+function runBoundary(
+  run: Run,
+  styleFormatting: TextFormatting | undefined,
+  styleResolver: StyleResolver | null
+): Attrs | null {
+  const units = runToUnits(run, styleFormatting, styleResolver, []);
+  if (units.some((unit) => unit.kind !== 'text' && unit.embedKind !== 'noteRef')) return null;
+  const keys = units.map((unit) => marksKey(unit.marks));
+  if (keys.some((key) => key !== keys[0])) return null;
+  const marks = noteRefMarkTypes(run);
+  const breaks = flowBreakOffsets(run);
+  const key = keys[0];
+  const text = unitsText(units);
+  const storyText = units.map((unit) => unit.kind === 'text' ? unit.text : '\uFFFC').join('');
+  return {
+    text,
+    ...(storyText !== text ? { storyText } : {}),
+    ...(marks.length > 0 ? { noteMarks: marks } : {}),
+    ...(breaks.length > 0 ? { breaks } : {}),
+    ...(key !== undefined ? { marksKey: key } : {}),
+    ...(run.formatting ? { formatting: run.formatting } : {}),
+    ...(run.propertyChanges ? { propertyChanges: run.propertyChanges } : {}),
+  };
+}
+
+function paragraphAttrs(
+  paragraph: Paragraph,
+  styleResolver: StyleResolver | null,
+  units: readonly InlineUnit[],
+  runBoundaries: Attrs[] | undefined,
+  tableParagraphFormatting?: ParagraphFormatting,
+  tableRunFormatting?: TextFormatting
+): Attrs {
+  const formatting = paragraph.formatting;
+  const styleId = formatting?.styleId;
+  const directFirst = formatting?.indentFirstLine === 0 ? undefined : formatting?.indentFirstLine;
+  const firstLine = directFirst ?? paragraph.listRendering?.indentFirstLine ?? formatting?.indentFirstLine;
+  const hanging = directFirst === undefined && paragraph.listRendering?.indentFirstLine !== undefined
+    ? paragraph.listRendering.hangingIndent
+    : formatting?.hangingIndent ?? paragraph.listRendering?.hangingIndent;
+  const attrs: Attrs = {
+    paraId: paragraph.paraId ?? null,
+    textId: paragraph.textId ?? null,
+    styleId: styleId ?? null,
+    numPr: formatting?.numPr ?? null,
+    numPrFromStyle: formatting?.numPrFromStyle ?? null,
+    listNumFmt: paragraph.listRendering?.numFmt ?? null,
+    listIsBullet: paragraph.listRendering?.isBullet ?? null,
+    listMarker: paragraph.listRendering?.marker ?? null,
+    listMarkerHidden: paragraph.listRendering?.markerHidden || null,
+    listMarkerFontFamily: paragraph.listRendering?.markerFontFamily || null,
+    listMarkerFontSize: paragraph.listRendering?.markerFontSize || null,
+    listMarkerBold: paragraph.listRendering?.markerBold ?? null,
+    listMarkerItalic: paragraph.listRendering?.markerItalic ?? null,
+    listMarkerColor: paragraph.listRendering?.markerColor ?? null,
+    listMarkerSuffix: paragraph.listRendering?.markerSuffix || null,
+    listLevelNumFmts: paragraph.listRendering?.levelNumFmts || null,
+    listAbstractNumId: paragraph.listRendering?.abstractNumId ?? null,
+    listStartOverride: paragraph.listRendering?.startOverride ?? null,
+    _originalFormatting: formatting ?? null,
+    ...(formatting?.cnfStyle ? { cnfStyle: formatting.cnfStyle } : {}),
+  };
+
+  if (formatting?.frame) attrs.hasSourceContent = true;
+  if (styleResolver) {
+    const resolved = styleResolver.resolveParagraphStyle(styleId, tableParagraphFormatting, tableRunFormatting);
+    const stylePpr = resolved.paragraphFormatting;
+    if (stylePpr?.frame) attrs.hasSourceContent = true;
+    attrs.alignment = formatting?.alignment ?? stylePpr?.alignment ?? null;
+    attrs.spaceBefore = formatting?.spaceBefore ?? stylePpr?.spaceBefore ?? null;
+    attrs.spaceAfter = formatting?.spaceAfter ?? stylePpr?.spaceAfter ?? null;
+    attrs.spaceBeforeLines = formatting?.spaceBeforeLines ?? stylePpr?.spaceBeforeLines ?? null;
+    attrs.spaceAfterLines = formatting?.spaceAfterLines ?? stylePpr?.spaceAfterLines ?? null;
+    attrs.beforeAutospacing = formatting?.beforeAutospacing ?? stylePpr?.beforeAutospacing ?? null;
+    attrs.afterAutospacing = formatting?.afterAutospacing ?? stylePpr?.afterAutospacing ?? null;
+    attrs.lineSpacing = formatting?.lineSpacing ?? stylePpr?.lineSpacing ?? null;
+    attrs.lineSpacingRule = formatting?.lineSpacingRule ?? stylePpr?.lineSpacingRule ?? null;
+    attrs.spacingExplicit = formatting?.spacingExplicit || null;
+    attrs.indentLeft =
+      formatting?.indentLeft ??
+      paragraph.listRendering?.indentLeft ??
+      stylePpr?.indentLeft ??
+      null;
+    attrs.indentRight = formatting?.indentRight ?? stylePpr?.indentRight ?? null;
+    const numberingRemoved =
+      formatting?.numPr?.numId === 0 && stylePpr?.numPr && stylePpr.numPr.numId !== 0;
+    const styleFirstLine = numberingRemoved ? undefined : stylePpr;
+    attrs.indentFirstLine =
+      firstLine ??
+      styleFirstLine?.indentFirstLine ??
+      null;
+    attrs.hangingIndent =
+      hanging ??
+      styleFirstLine?.hangingIndent ??
+      false;
+    attrs.borders = formatting?.borders ?? stylePpr?.borders ?? null;
+    attrs.shading = formatting?.shading ?? stylePpr?.shading ?? null;
+    attrs.tabs = formatting?.tabs ?? stylePpr?.tabs ?? null;
+    attrs.pageBreakBefore = formatting?.pageBreakBefore ?? stylePpr?.pageBreakBefore ?? null;
+    attrs.keepNext = formatting?.keepNext ?? stylePpr?.keepNext ?? null;
+    attrs.keepLines = formatting?.keepLines ?? stylePpr?.keepLines ?? null;
+    attrs.widowControl = formatting?.widowControl ?? stylePpr?.widowControl ?? null;
+    attrs.contextualSpacing = formatting?.contextualSpacing ?? stylePpr?.contextualSpacing ?? null;
+    attrs.snapToGrid = formatting?.snapToGrid ?? stylePpr?.snapToGrid ?? null;
+    attrs.autoSpaceDE = formatting?.autoSpaceDE ?? stylePpr?.autoSpaceDE ?? null;
+    attrs.autoSpaceDN = formatting?.autoSpaceDN ?? stylePpr?.autoSpaceDN ?? null;
+    attrs.adjustRightInd = formatting?.adjustRightInd ?? stylePpr?.adjustRightInd ?? null;
+    attrs.outlineLevel = formatting?.outlineLevel ?? stylePpr?.outlineLevel ?? null;
+    attrs.bidi = formatting?.bidi ?? stylePpr?.bidi ?? null;
+
+    const defaultChar = styleResolver.getDefaultCharacterStyle()?.rPr;
+    const styleRpr = defaultChar
+      ? mergeStyleRunFormatting(resolved.runFormatting, defaultChar)
+      : resolved.runFormatting;
+    attrs.defaultTextFormatting =
+      mergeTextFormatting(
+        styleRpr,
+        resolveTextFormatting(formatting?.runProperties, styleResolver)
+      ) ?? null;
+    if (!formatting?.numPr && stylePpr?.numPr && stylePpr.numPr.numId !== 0) {
+      attrs.numPr = stylePpr.numPr;
+      attrs.numPrFromStyle = stylePpr.numPr;
+    }
+  } else {
+    attrs.alignment = formatting?.alignment ?? null;
+    attrs.spaceBefore = formatting?.spaceBefore ?? null;
+    attrs.spaceAfter = formatting?.spaceAfter ?? null;
+    attrs.spaceBeforeLines = formatting?.spaceBeforeLines ?? null;
+    attrs.spaceAfterLines = formatting?.spaceAfterLines ?? null;
+    attrs.beforeAutospacing = formatting?.beforeAutospacing ?? null;
+    attrs.afterAutospacing = formatting?.afterAutospacing ?? null;
+    attrs.lineSpacing = formatting?.lineSpacing ?? null;
+    attrs.lineSpacingRule = formatting?.lineSpacingRule ?? null;
+    attrs.spacingExplicit = formatting?.spacingExplicit || null;
+    attrs.indentLeft = formatting?.indentLeft ?? paragraph.listRendering?.indentLeft ?? null;
+    attrs.indentRight = formatting?.indentRight ?? null;
+    attrs.indentFirstLine =
+      firstLine ?? null;
+    attrs.hangingIndent =
+      hanging ?? false;
+    attrs.borders = formatting?.borders ?? null;
+    attrs.shading = formatting?.shading ?? null;
+    attrs.tabs = formatting?.tabs ?? null;
+    attrs.pageBreakBefore = formatting?.pageBreakBefore ?? null;
+    attrs.keepNext = formatting?.keepNext ?? null;
+    attrs.keepLines = formatting?.keepLines ?? null;
+    attrs.widowControl = formatting?.widowControl ?? null;
+    attrs.snapToGrid = formatting?.snapToGrid ?? null;
+    attrs.autoSpaceDE = formatting?.autoSpaceDE ?? null;
+    attrs.autoSpaceDN = formatting?.autoSpaceDN ?? null;
+    attrs.adjustRightInd = formatting?.adjustRightInd ?? null;
+    attrs.outlineLevel = formatting?.outlineLevel ?? null;
+    attrs.bidi = formatting?.bidi ?? null;
+    attrs.defaultTextFormatting = formatting?.runProperties ?? null;
+  }
+
+  if (paragraph.sectionProperties) {
+    attrs._sectionProperties = paragraph.sectionProperties;
+    const start = paragraph.sectionProperties.sectionStart;
+    if (
+      start === 'nextPage' ||
+      start === 'continuous' ||
+      start === 'oddPage' ||
+      start === 'evenPage' ||
+      start === 'nextColumn'
+    ) {
+      attrs.sectionBreakType = start;
+    }
+  }
+  if (paragraph.renderedPageBreakBefore) attrs.renderedPageBreakBefore = true;
+  if (paragraphStartsWithPageBreak(paragraph)) attrs.pageBreakBeforeRun = true;
+  if (paragraph.pPrIns) {
+    attrs.pPrIns = {
+      revisionId: paragraph.pPrIns.id,
+      author: paragraph.pPrIns.author,
+      date: paragraph.pPrIns.date ?? null,
+    };
+  }
+  if (paragraph.pPrDel) {
+    attrs.pPrDel = {
+      revisionId: paragraph.pPrDel.id,
+      author: paragraph.pPrDel.author,
+      date: paragraph.pPrDel.date ?? null,
+    };
+  }
+  if (paragraph.propertyChanges?.length) attrs.pPrChange = paragraph.propertyChanges;
+
+  const bookmarks: Attrs[] = [];
+  let contentIndex = 0;
+  let pmOffset = 0;
+  for (const content of paragraph.content) {
+    if (content.type === 'bookmarkStart') {
+      bookmarks.push({
+        id: content.id,
+        name: content.name,
+        kind: 'start',
+        offset: pmOffset,
+        ...(content.colFirst !== undefined ? { colFirst: content.colFirst } : {}),
+        ...(content.colLast !== undefined ? { colLast: content.colLast } : {}),
+      });
+    } else if (content.type === 'bookmarkEnd') {
+      bookmarks.push({ id: content.id, kind: 'end', offset: pmOffset });
+    } else {
+      const count = unitsForParagraphContent(content);
+      for (let index = 0; index < count; index += 1) {
+        pmOffset += units[contentIndex]?.pmSize ?? 0;
+        contentIndex += 1;
+      }
+    }
+  }
+  if (bookmarks.length > 0) attrs.bookmarks = bookmarks;
+  if (runBoundaries?.length) attrs._originalRunBoundaries = runBoundaries;
+  return attrs;
+}
+
+/* Set by paragraphUnits while paragraphAttrs calculates bookmark offsets. */
+const paragraphContentUnitCounts = new WeakMap<object, number>();
+
+function unitsForParagraphContent(content: ParagraphContent): number {
+  return paragraphContentUnitCounts.get(content as object) ?? 0;
+}
+
+function paragraphUnits(
+  paragraph: Paragraph,
+  styleResolver: StyleResolver | null,
+  extraRunFormatting?: TextFormatting,
+  tableParagraphFormatting?: ParagraphFormatting
+): { units: InlineUnit[]; commentMarks: CommentMark[]; ppr: Attrs; opaqueSequences: string[] } {
+  const units: InlineUnit[] = [];
+  const opaqueSequences: string[] = [];
+  const commentMarks: CommentMark[] = [];
+  let boundaries: Attrs[] | undefined = [];
+  const styleFormatting = paragraphStyleFormatting(paragraph, styleResolver, extraRunFormatting);
+
+  for (const [contentIndex, content] of paragraph.content.entries()) {
+    const start = units.length;
+    if (content.type === 'commentRangeStart' || content.type === 'commentRangeEnd') {
+      commentMarks.push({ unit: start, start: content.type === 'commentRangeStart', id: content.id });
+    } else if (content.type === 'run') {
+      const boundary = runBoundary(content, styleFormatting, styleResolver);
+      if (boundary && boundaries) boundaries.push(boundary);
+      else boundaries = undefined;
+      units.push(...runToUnits(content, styleFormatting, styleResolver, opaqueSequences));
+    } else if (content.type === 'hyperlink') {
+      boundaries = undefined;
+      opaqueSequences.push(...hyperlinkSequenceNames(content));
+      const linked = hyperlinkToUnits(content, styleFormatting, styleResolver, opaqueSequences);
+      units.push(...linked);
+    } else if (content.type === 'simpleField' || content.type === 'complexField') {
+      boundaries = undefined;
+      units.push(...fieldToUnits(content, styleFormatting, styleResolver, contentIndex, opaqueSequences));
+    } else if (content.type === 'inlineSdt') {
+      boundaries = undefined;
+      units.push(
+        embedUnit('sdt', sdtPayload(content, styleFormatting, styleResolver, opaqueSequences), [], 2)
+      );
+    } else if (
+      content.type === 'insertion' ||
+      content.type === 'deletion' ||
+      content.type === 'moveFrom' ||
+      content.type === 'moveTo'
+    ) {
+      boundaries = undefined;
+      units.push(...trackedToUnits(content, styleFormatting, styleResolver, opaqueSequences));
+    } else if (content.type === 'mathEquation') {
+      boundaries = undefined;
+      units.push(embedUnit('math', mathPayload(content)));
+    } else if (content.type !== 'bookmarkStart' && content.type !== 'bookmarkEnd' && content.type !== 'rawXml') {
+      boundaries = undefined;
+    }
+    paragraphContentUnitCounts.set(content as object, units.length - start);
+  }
+  const attrs = paragraphAttrs(paragraph, styleResolver, units, boundaries, tableParagraphFormatting, extraRunFormatting);
+  return { units, commentMarks, ppr: paraAttrsToPpr(attrs), opaqueSequences };
+}
+
+type ParagraphToken = 'pageBreak' | 'visible';
+
+function runTokens(run: Run, tokens: ParagraphToken[]): void {
+  for (const content of run.content) {
+    if (content.type === 'break' && content.breakType === 'page') tokens.push('pageBreak');
+    else if (content.type !== 'text' || content.text.length > 0) tokens.push('visible');
+  }
+}
+
+function inlineTokens(content: readonly ParagraphContent[], tokens: ParagraphToken[]): void {
+  for (const item of content) {
+    if (item.type === 'run') runTokens(item, tokens);
+    else if (item.type === 'hyperlink') {
+      for (const child of item.children) if (child.type === 'run') runTokens(child, tokens);
+    } else if (item.type === 'simpleField') {
+      for (const child of item.content) if (child.type === 'run') runTokens(child, tokens);
+    } else if (item.type === 'complexField') {
+      for (const child of [...item.fieldCode, ...item.fieldResult]) runTokens(child, tokens);
+    } else if (item.type === 'inlineSdt') inlineTokens(item.content as ParagraphContent[], tokens);
+    else if (
+      item.type === 'insertion' ||
+      item.type === 'deletion' ||
+      item.type === 'moveFrom' ||
+      item.type === 'moveTo'
+    ) {
+      for (const child of item.content) if (child.type === 'run') runTokens(child, tokens);
+    } else if (item.type === 'mathEquation') tokens.push('visible');
+  }
+}
+
+function paragraphStartsWithPageBreak(paragraph: Paragraph): boolean {
+  const tokens: ParagraphToken[] = [];
+  inlineTokens(paragraph.content, tokens);
+  return tokens[0] === 'pageBreak';
+}
+
+function paragraphHasNonLeadingPageBreak(paragraph: Paragraph): boolean {
+  const tokens: ParagraphToken[] = [];
+  inlineTokens(paragraph.content, tokens);
+  let leading = false;
+  let visible = false;
+  for (const token of tokens) {
+    if (token === 'pageBreak') {
+      if (visible || leading) return true;
+      leading = true;
+    } else visible = true;
+  }
+  return false;
+}
+
+
+function revisionAttrs(info: TrackedChangeInfo): Attrs {
+  return { revisionId: info.id, author: info.author, date: info.date ?? null };
+}
+
+function cellBorders(
+  formatting: TableCellFormatting | undefined,
+  tableBorders: TableBorders | undefined,
+  firstRow: boolean,
+  lastRow: boolean,
+  firstColumn: boolean,
+  lastColumn: boolean
+): TableBorders | undefined {
+  const inherited = tableBorders
+    ? {
+        top: firstRow ? tableBorders.top : tableBorders.insideH,
+        bottom: lastRow ? tableBorders.bottom : tableBorders.insideH,
+        left: firstColumn ? tableBorders.left : tableBorders.insideV,
+        right: lastColumn ? tableBorders.right : tableBorders.insideV,
+      }
+    : undefined;
+  return inherited || formatting?.borders
+    ? { ...(inherited ?? {}), ...(formatting?.borders ?? {}) }
+    : undefined;
+}
+
+function projectCell(
+  cell: TableCell,
+  options: {
+    isHeader: boolean;
+    rowspan: number;
+    gridWidth?: number;
+    firstRow: boolean;
+    lastRow: boolean;
+    firstColumn: boolean;
+    lastColumn: boolean;
+    tableBorders?: TableBorders;
+    defaultMargins?: { top?: number; bottom?: number; left?: number; right?: number };
+    theme: Theme | null;
+    tableBidi: boolean;
+  }
+): ProjectedCell {
+  const formatting = cell.formatting;
+  const backgroundColor = resolveColorToHex(formatting?.shading?.fill, options.theme);
+  const width = formatting?.width?.value ?? options.gridWidth;
+  const widthType = formatting?.width?.type ?? (options.gridWidth !== undefined ? 'pct' : null);
+  const attrs: Attrs = {
+    colspan: formatting?.gridSpan ?? 1,
+    rowspan: options.rowspan,
+    width: width ?? null,
+    widthType,
+    verticalAlign: formatting?.verticalAlign ?? null,
+    backgroundColor: backgroundColor ?? null,
+    borders:
+      cellBorders(
+        formatting,
+        options.tableBorders,
+        options.firstRow,
+        options.lastRow,
+        options.firstColumn,
+        options.lastColumn
+      ) ?? null,
+    margins: formatting?.margins
+      ? {
+          top: formatting.margins.top?.value,
+          bottom: formatting.margins.bottom?.value,
+          left:
+            formatting.margins.left?.value ??
+            (options.tableBidi ? formatting.margins.end?.value : formatting.margins.start?.value),
+          right:
+            formatting.margins.right?.value ??
+            (options.tableBidi ? formatting.margins.start?.value : formatting.margins.end?.value),
+        }
+      : (options.defaultMargins ?? null),
+    textDirection: formatting?.textDirection ?? null,
+    noWrap: formatting?.noWrap ?? false,
+    _originalFormatting: formatting ?? null,
+    _originalResolvedFill: backgroundColor ?? null,
+  };
+  if (cell.structuralChange) {
+    const change = cell.structuralChange;
+    const info = revisionAttrs(change.info);
+    if (change.type === 'tableCellInsertion') attrs.cellMarker = { kind: 'ins', info };
+    else if (change.type === 'tableCellDeletion') attrs.cellMarker = { kind: 'del', info };
+    else if (change.type === 'tableCellMerge') {
+      attrs.cellMarker = {
+        kind: 'merge',
+        info,
+        vMerge: change.vMerge ?? 'cont',
+        ...(change.vMergeOrig ? { vMergeOrig: change.vMergeOrig } : {}),
+      };
+    }
+  }
+  if (cell.propertyChanges?.length) attrs.tcPrChange = cell.propertyChanges;
+  return {
+    attrs: tableCellAttrsToTcPr(attrs, options.isHeader),
+    content:
+      cell.content.length > 0
+        ? cell.content
+        : [{ type: 'paragraph', content: [] } satisfies Paragraph],
+  };
+}
+
+function projectRow(
+  row: TableRow,
+  table: Table,
+  rowIndex: number,
+  rowSpans: Map<string, RowSpanInfo>,
+  tableBorders: TableBorders | undefined,
+  defaultMargins: { top?: number; bottom?: number; left?: number; right?: number } | undefined,
+  theme: Theme | null,
+  tableStyle: Style | undefined,
+  styleColumns: number
+): ProjectedRow {
+  const attrs: Attrs = {
+    height: row.formatting?.height?.value ?? null,
+    heightRule: row.formatting?.heightRule ?? null,
+    isHeader: !!row.formatting?.header,
+    _originalFormatting: row.formatting ?? null,
+  };
+  if (row.structuralChange) {
+    if (row.structuralChange.type === 'tableRowInsertion') {
+      attrs.trIns = revisionAttrs(row.structuralChange.info);
+    } else if (row.structuralChange.type === 'tableRowDeletion') {
+      attrs.trDel = revisionAttrs(row.structuralChange.info);
+    }
+  }
+  if (row.propertyChanges?.length) attrs.trPrChange = row.propertyChanges;
+  if (row.extraAttributes) attrs._extraAttributes = row.extraAttributes;
+
+  const columnWidths = table.columnWidths;
+  const totalWidth = columnWidths?.reduce((sum, width) => sum + width, 0) ?? 0;
+  const totalColumns =
+    columnWidths?.length ??
+    Math.max(
+      0,
+      ...table.rows.map((candidate) =>
+        candidate.cells.reduce((sum, cell) => sum + (cell.formatting?.gridSpan ?? 1), 0)
+      )
+    );
+  let column = 0;
+  const cells: ProjectedCell[] = [];
+  row.cells.forEach((cell) => {
+    const colspan = cell.formatting?.gridSpan ?? 1;
+    const startColumn = column;
+    const rowSpan = rowSpans.get(`${rowIndex}-${startColumn + (row.formatting?.gridBefore ?? 0)}`);
+    let gridWidth: number | undefined;
+    if (columnWidths && totalWidth > 0) {
+      let cellWidth = 0;
+      for (
+        let index = 0;
+        index < colspan && startColumn + index < columnWidths.length;
+        index += 1
+      ) {
+        cellWidth += columnWidths[startColumn + index];
+      }
+      gridWidth = Math.round((cellWidth / totalWidth) * 100);
+    }
+    column += colspan;
+    if (rowSpan?.skip) return;
+    cells.push({
+      extraRunFormatting: tableCellRunFormatting(table, tableStyle, rowIndex, startColumn, column, styleColumns),
+      paragraphFormatting: tableCellParagraphFormatting(
+        table,
+        tableStyle,
+        rowIndex,
+        startColumn,
+        column,
+        styleColumns
+      ),
+      ...projectCell(cell, {
+        isHeader: rowIndex === 0 && !!table.formatting?.look?.firstRow,
+        rowspan: rowSpan?.rowSpan ?? 1,
+        gridWidth,
+        firstRow: rowIndex === 0,
+        lastRow: rowIndex === table.rows.length - 1,
+        firstColumn: startColumn === 0,
+        lastColumn: column === totalColumns,
+        tableBorders,
+        defaultMargins,
+        theme,
+        tableBidi: Boolean(table.formatting?.bidi),
+      }),
+    });
+  });
+  if (cells.length === 0) {
+    cells.push({
+      extraRunFormatting: tableCellRunFormatting(table, tableStyle, rowIndex, 0, totalColumns, styleColumns),
+      paragraphFormatting: tableCellParagraphFormatting(
+        table,
+        tableStyle,
+        rowIndex,
+        0,
+        totalColumns,
+        styleColumns
+      ),
+      ...projectCell(
+        {
+          type: 'tableCell',
+          formatting: totalColumns > 1 ? { gridSpan: totalColumns } : undefined,
+          content: [{ type: 'paragraph', content: [] }],
+        },
+        {
+          isHeader: rowIndex === 0 && !!table.formatting?.look?.firstRow,
+          rowspan: 1,
+          gridWidth: totalWidth > 0 ? 100 : undefined,
+          firstRow: rowIndex === 0,
+          lastRow: rowIndex === table.rows.length - 1,
+          firstColumn: true,
+          lastColumn: true,
+          tableBorders,
+          defaultMargins,
+          theme,
+          tableBidi: Boolean(table.formatting?.bidi),
+        }
+      ),
+    });
+  }
+  return { attrs: tableRowAttrsToTrPr(attrs), cells };
+}
+
+function projectTable(
+  table: Table,
+  styleResolver: StyleResolver | null,
+  theme: Theme | null,
+  compatibilityMode: number
+): ProjectedTable {
+  const defaultStyle = styleResolver?.getDefaultTableStyle();
+  const styleId = table.formatting?.styleId;
+  const effectiveStyleId = styleId ?? defaultStyle?.styleId;
+  const tableStyle = effectiveStyleId ? styleResolver?.getStyle(effectiveStyleId) : undefined;
+  const borders =
+    table.formatting?.borders ?? tableStyle?.tblPr?.borders ?? defaultStyle?.tblPr?.borders;
+  const marginLayers = [
+    table.formatting?.cellMargins,
+    tableStyle?.tblPr?.cellMargins ?? defaultStyle?.tblPr?.cellMargins,
+  ].filter((margins): margins is CellMargins => margins != null);
+  const marginSide = (...keys: (keyof CellMargins)[]) => {
+    for (const margins of marginLayers) {
+      for (const key of keys) {
+        const value = margins[key]?.value;
+        if (value != null) return value;
+      }
+    }
+    return undefined;
+  };
+  const [logicalLeft, logicalRight]: (keyof CellMargins)[] = table.formatting?.bidi
+    ? ['end', 'start']
+    : ['start', 'end'];
+  const defaultMargins =
+    marginLayers.length > 0
+      ? {
+          top: marginSide('top'),
+          bottom: marginSide('bottom'),
+          left: marginSide('left', logicalLeft),
+          right: marginSide('right', logicalRight),
+        }
+      : undefined;
+  const basedOnStyleIds: string[] = [];
+  const visited = new Set<string>();
+  let inherited = tableStyle;
+  while (inherited?.basedOn && basedOnStyleIds.length < 32) {
+    if (visited.has(inherited.basedOn)) break;
+    visited.add(inherited.basedOn);
+    basedOnStyleIds.unshift(inherited.basedOn);
+    inherited = styleResolver?.getStyle(inherited.basedOn);
+  }
+  const originalFormatting = {
+    ...(table.formatting ?? {}),
+    styleCascade: {
+      ...(styleId ? { selectedStyleId: styleId } : {}),
+      ...(defaultStyle?.styleId ? { defaultStyleId: defaultStyle.styleId } : {}),
+      ...(basedOnStyleIds.length > 0 ? { basedOnStyleIds } : {}),
+    },
+  };
+  const attrs: Attrs = {
+    styleId: styleId ?? null,
+    width: table.formatting?.width?.value ?? null,
+    widthType: table.formatting?.width?.type ?? null,
+    justification: table.formatting?.justification ?? null,
+    columnWidths: table.columnWidths ?? null,
+    tableLayout: table.formatting?.layout ?? null,
+    floating: table.formatting?.floating ?? null,
+    cellMargins: defaultMargins ?? null,
+    look: table.formatting?.look ?? null,
+    bidi: table.formatting?.bidi || null,
+    // Omit the default so pre-existing yrs snapshots (no field) keep matching;
+    // the bridge treats an absent mode as 12.
+    compatibilityMode: compatibilityMode === 12 ? null : compatibilityMode,
+    _originalFormatting: originalFormatting,
+  };
+  if (table.propertyChanges?.length) attrs.tblPrChange = table.propertyChanges;
+  const rowSpans = calculateRowSpans(table);
+  const styleColumns = tableColumnCount(table);
+  return {
+    attrs,
+    rows: table.rows.map((row, rowIndex) =>
+      projectRow(
+        row,
+        table,
+        rowIndex,
+        rowSpans,
+        borders,
+        defaultMargins,
+        theme,
+        tableStyle ?? defaultStyle,
+        styleColumns
+      )
+    ),
+  };
+}
+
+function blockSdtAttrs(properties: SdtProperties): Attrs {
+  return blockSdtAttrsToPayload(sdtPropsToAttrs(properties));
+}
+
+function addCommentCoverage(plan: StoryPlan): void {
+  const addRange = (id: number, start: number, end: number) => {
+    if (end <= start) return;
+    const intervals = plan.commentCoverage.get(id)!;
+    const previous = intervals[intervals.length - 1];
+    if (previous && previous[1] === start) previous[1] = end;
+    else intervals.push([start, end]);
+  };
+  const open: Array<{ id: number; start: number; paragraphEnd?: number }> = [];
+  let offset = 0;
+  let markIndex = 0;
+  for (let unitIndex = 0; unitIndex <= plan.units.length; unitIndex += 1) {
+    while (plan.commentMarks[markIndex]?.unit === unitIndex) {
+      const mark = plan.commentMarks[markIndex++]!;
+      if (mark.start) {
+        if (open.some((range) => range.id === mark.id)) continue;
+        if (!plan.commentCoverage.has(mark.id)) plan.commentCoverage.set(mark.id, []);
+        open.push({ id: mark.id, start: offset });
+      } else {
+        const index = open.findIndex((range) => range.id === mark.id);
+        if (index !== -1) {
+          const [range] = open.splice(index, 1);
+          addRange(range!.id, range!.start, offset);
+        }
+      }
+    }
+    const unit = plan.units[unitIndex];
+    if (unit) {
+      if (unit.kind === 'embed' && unit.embedKind === 'pilcrow') {
+        for (const range of open) range.paragraphEnd ??= offset;
+      }
+      offset += unit.kind === 'text' ? unit.text.length : 1;
+    }
+  }
+  for (const range of open) addRange(range.id, range.start, range.paragraphEnd ?? offset);
+  for (const [id, intervals] of plan.commentCoverage) {
+    if (intervals.length === 0) plan.commentCoverage.delete(id);
+  }
+}
+
+interface BlockCursor {
+  paragraph: number;
+  table: number;
+  sdt: number;
+}
+
+/** Hands each block of a story the identity `visitStory` seeds it with. */
+function takeBlockId(cursor: BlockCursor, storyId: string, block: BlockContent): string | null {
+  if (isRawXml(block)) return null;
+  if (block.type === 'paragraph') {
+    const index = cursor.paragraph++;
+    return (!block.repeatedParaId && block.paraId) || `${storyId}:p${index}`;
+  }
+  if (block.type === 'table') return `${storyId}:t${cursor.table++}`;
+  return blockSdtStoryId(storyId, cursor.sdt++);
+}
+
+function numericFieldInstruction(instruction: string): boolean {
+  return /^\d+$/.test(instruction.trim());
+}
+
+/** How many story blocks a suppressed field's cached result duplicates. */
+function cachedResultBlockCount(field: SimpleField | ComplexField): number | null {
+  const blocks = field.structuredResult?.blocks ?? [];
+  const last = blocks[blocks.length - 1];
+  if (!last || last.type !== 'paragraph' || (last.content?.length ?? 0) > 0) return null;
+  return blocks.length;
+}
+
+/** Binds each suppressed field to the story blocks its cached result duplicates. */
+function bindFieldResultBlocks(
+  units: readonly InlineUnit[],
+  storyId: string,
+  blocks: readonly BlockContent[],
+  owner: number,
+  afterOwner: BlockCursor,
+  tableIds: Map<number, string>
+): void {
+  for (const unit of units) {
+    if (unit.kind !== 'embed' || unit.embedKind !== 'field') continue;
+    const instruction = unit.payload.instruction;
+    if (typeof instruction !== 'string' || !numericFieldInstruction(instruction)) continue;
+    const data = unit.payload.fieldData;
+    if (typeof data !== 'string') continue;
+    let parsed: SimpleField | ComplexField;
+    try {
+      parsed = JSON.parse(data) as SimpleField | ComplexField;
+    } catch {
+      continue;
+    }
+    const count = cachedResultBlockCount(parsed);
+    if (count === null || owner + 1 + count > blocks.length) continue;
+    const cursor = { ...afterOwner };
+    const ids: string[] = [];
+    for (let offset = 0; offset < count; offset += 1) {
+      const block = blocks[owner + 1 + offset]!;
+      const id = takeBlockId(cursor, storyId, block);
+      if (id === null) continue;
+      if (block.type === 'table') tableIds.set(owner + 1 + offset, id);
+      ids.push(id);
+    }
+    if (ids.length > 0) unit.payload.fieldResultBlocks = ids;
+  }
+}
+
+function opensWithFieldSeparator(block: BlockContent): boolean {
+  return (
+    !isRawXml(block) &&
+    block.type === 'paragraph' &&
+    (block.content?.some(
+      (content) =>
+        content.type === 'run' &&
+        content.content.some((item) => item.type === 'fieldChar' && item.charType === 'separate')
+    ) ?? false)
+  );
+}
+
+/** Binds each spanning field's hidden paragraphs and join target. */
+function bindFieldCodeBlocks(
+  units: readonly InlineUnit[],
+  storyId: string,
+  blocks: readonly BlockContent[],
+  owner: number,
+  afterOwner: BlockCursor
+): void {
+  for (const unit of units) {
+    if (unit.kind !== 'embed' || unit.embedKind !== 'field') continue;
+    const data = unit.payload.fieldData;
+    if (typeof data !== 'string' || !data.includes('"blocks"')) continue;
+    let parsed: ComplexField;
+    try {
+      parsed = JSON.parse(data) as ComplexField;
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object') continue;
+    const codeBlocks = parsed.structuredCode?.blocks;
+    const resultBlocks = parsed.structuredResult?.blocks;
+    const code = Array.isArray(codeBlocks) ? codeBlocks.length : 0;
+    const hasResult = Array.isArray(resultBlocks) && resultBlocks.length > 0;
+    let hidden: number;
+    if (code === 0) {
+      const next = blocks[owner + 1];
+      if (!hasResult || !next || !opensWithFieldSeparator(next)) continue;
+      hidden = 0;
+    } else {
+      hidden = hasResult ? code : code - 1;
+    }
+    if (owner + 1 + hidden + 1 > blocks.length) continue;
+    const joined = blocks.slice(owner + 1, owner + 1 + hidden + 1);
+    if (joined.some((block) => isRawXml(block) || block.type !== 'paragraph')) continue;
+    const cursor = { ...afterOwner };
+    const ids: string[] = [];
+    for (const block of joined) {
+      const id = takeBlockId(cursor, storyId, block);
+      if (id !== null) ids.push(id);
+    }
+    const target = ids.pop();
+    if (target === undefined) continue;
+    unit.payload.fieldCodeMarks = ids;
+    unit.payload.fieldCodeTarget = target;
+  }
+}
+
+function visitStory(
+  context: LoweringContext,
+  storyId: string,
+  sourceBlocks: readonly BlockContent[],
+  options: StoryOptions
+): void {
+  const plan: StoryPlan = {
+    storyId,
+    units: [],
+    commentMarks: [],
+    commentCoverage: new Map(),
+  };
+  context.plans.push(plan);
+  const source = sourceBlocks.length > 0;
+  const blocks = source ? [...sourceBlocks] : [{ type: 'paragraph', content: [] } as Paragraph];
+  const cursor: BlockCursor = { paragraph: 0, table: 0, sdt: 0 };
+  const resultTableIds = new Map<number, string>();
+  let lastKind: 'paragraph' | 'table' | 'blockSdt' | null = null;
+
+  for (const [blockIndex, block] of blocks.entries()) {
+    if (isRawXml(block)) continue;
+    const currentTable = cursor.table;
+    const blockId = takeBlockId(cursor, storyId, block);
+    if (blockId === null) continue;
+    if (block.type === 'paragraph') {
+      const paragraph = paragraphUnits(
+        block,
+        context.styleResolver,
+        options.extraRunFormatting,
+        options.tableParagraphFormatting
+      );
+      context.opaqueSequences.push(...paragraph.opaqueSequences);
+      bindFieldResultBlocks(
+        paragraph.units,
+        storyId,
+        blocks,
+        blockIndex,
+        cursor,
+        resultTableIds
+      );
+      bindFieldCodeBlocks(paragraph.units, storyId, blocks, blockIndex, cursor);
+      const unitBase = plan.units.length;
+      plan.commentMarks.push(
+        ...paragraph.commentMarks.map((mark) => ({ ...mark, unit: unitBase + mark.unit }))
+      );
+      plan.units.push(...paragraph.units);
+      plan.units.push(
+        embedUnit('pilcrow', {
+          ...paragraph.ppr,
+          ...(source && block.paraId ? { sourceParaId: block.paraId } : {}),
+          ...(source ? {} : { paraOrigin: 'synthetic' }),
+          paraId: blockId,
+        })
+      );
+      if (options.includePageBreaks && paragraphHasNonLeadingPageBreak(block)) {
+        plan.units.push(embedUnit('pageBreak', {}));
+      }
+      lastKind = 'paragraph';
+      continue;
+    }
+    if (block.type === 'table') {
+      const table = projectTable(
+        block,
+        context.styleResolver,
+        context.theme,
+        context.compatibilityMode
+      );
+      const rows = table.rows.map((row, rowIndex) => ({
+        trPr: row.attrs,
+        cells: row.cells.map((cell, cellIndex) => ({
+          tcPr: cell.attrs,
+          story: tableCellStoryId(storyId, currentTable, rowIndex, cellIndex),
+        })),
+      }));
+      const resultTableId = resultTableIds.get(blockIndex);
+      plan.units.push(
+        embedUnit('table', {
+          tblPr: tableAttrsToTblPr(table.attrs),
+          grid: tableAttrsToGrid(table.attrs),
+          rows,
+          ...(resultTableId === undefined ? {} : { blockId: resultTableId }),
+        })
+      );
+      table.rows.forEach((row, rowIndex) => {
+        row.cells.forEach((cell, cellIndex) => {
+          visitStory(
+            context,
+            tableCellStoryId(storyId, currentTable, rowIndex, cellIndex),
+            cell.content,
+            {
+              includePageBreaks: false,
+              appendBodyTail: false,
+              seedComments: options.seedComments,
+              extraRunFormatting: cell.extraRunFormatting,
+              tableParagraphFormatting: cell.paragraphFormatting,
+            }
+          );
+        });
+      });
+      lastKind = 'table';
+      continue;
+    }
+    const childStory = blockId;
+    plan.units.push(
+      embedUnit('blockSdt', {
+        ...blockSdtAttrs(block.properties),
+        story: childStory,
+      })
+    );
+    visitStory(context, childStory, block.content, {
+      includePageBreaks: options.includePageBreaks,
+      appendBodyTail: false,
+      seedComments: options.seedComments,
+      tableParagraphFormatting: options.tableParagraphFormatting,
+    });
+    lastKind = 'blockSdt';
+  }
+
+  if (options.appendBodyTail && (lastKind === 'table' || lastKind === 'blockSdt')) {
+    plan.units.push(
+      embedUnit('pilcrow', {
+        hangingIndent: false,
+        paraId: `${storyId}:p${cursor.paragraph}`,
+        paraOrigin: 'synthetic',
+      })
+    );
+  }
+  if (options.seedComments) addCommentCoverage(plan);
+}
+
+function unitsToRawOps(units: readonly InlineUnit[]): YrsRawOp[] {
+  const ops: YrsRawOp[] = [{ op: 'delete', index: 0, len: 1 }];
+  let index = 0;
+  let text = '';
+  let attrs: YrsAttrs = {};
+  let attrsKey = stableStringify(attrs);
+  const flush = () => {
+    if (!text) return;
+    ops.push({ op: 'insert', index, text, attrs });
+    index += text.length;
+    text = '';
+  };
+  for (const unit of units) {
+    if (unit.kind === 'text') {
+      const key = stableStringify(unit.attrs);
+      if (text && key !== attrsKey) flush();
+      attrs = unit.attrs;
+      attrsKey = key;
+      text += unit.text;
+    } else {
+      flush();
+      ops.push({
+        op: 'insertEmbed',
+        index,
+        kind: unit.embedKind,
+        payload: unit.payload,
+        attrs: unit.attrs,
+      });
+      index += 1;
+    }
+  }
+  flush();
+  return ops;
+}
+
+function seedPlan(session: YrsSession, plan: StoryPlan): void {
+  const ops = unitsToRawOps(plan.units);
+  for (const [id, ranges] of plan.commentCoverage) {
+    ops.push({
+      op: 'setComment',
+      id: String(id),
+      ranges,
+      author: '',
+      date: '',
+      body: null,
+    });
+  }
+  session.applySeedRawOps(plan.storyId, ops);
+}
+
+function seedFontNames(document: Document): () => void {
+  const restore: Array<() => void> = [];
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object' || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return;
+    if (value instanceof Map) {
+      for (const child of value.values()) visit(child);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    if (record.fontFamily && typeof record.fontFamily === 'object') {
+      const original = record.fontFamily;
+      const fonts = { ...original } as Record<string, unknown>;
+      for (const [explicit, reference] of [['ascii', 'asciiTheme'], ['hAnsi', 'hAnsiTheme'], ['eastAsia', 'eastAsiaTheme'], ['cs', 'csTheme']] as const) {
+        const referenceName = fonts[reference];
+        if (!fonts[explicit] && typeof referenceName === 'string') {
+          const name = resolveThemeFont(referenceName, document.package.theme?.fontScheme);
+          if (name !== null) fonts[explicit] = name;
+        }
+      }
+      const keys = new Set(['ascii', 'hAnsi', 'eastAsia', 'cs', 'asciiTheme', 'hAnsiTheme', 'eastAsiaTheme', 'csTheme', 'hint', ...Object.keys(fonts)]);
+      record.fontFamily = Object.fromEntries([...keys].filter(key => key in fonts).map(key => [key, fonts[key]]));
+      restore.push(() => { record.fontFamily = original; });
+    }
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(document.package);
+  return () => { restore.reverse().forEach(reset => reset()); };
+}
+
+/**
+ * Seeds every yrs-owned editable story directly from a parsed Document.
+ *
+ * Stories are `body`, `hf:{rId}`, `fn:{id}`, `en:{id}`, and recursively generated table
+ * cell / block-SDT stories. The target session must not already contain any of
+ * those story ids. Seeding starts a new opening; see {@link YrsSession.beginOpening}.
+ *
+ * @public
+ */
+export function documentToYrs(
+  session: YrsSession,
+  document: Document,
+  options: YrsOpeningOptions = {}
+): void {
+  const restoreGroups = recoverGroupedStorySeeds(document, () => sessionMaterializedSource(session));
+  const restore = seedFontNames(document);
+  try { seedDocument(session, document, options); }
+  finally { restore(); restoreGroups(); }
+}
+
+function seedDocument(
+  session: YrsSession,
+  document: Document,
+  options: YrsOpeningOptions = {}
+): void {
+  noteYrsStoriesDirty(session, 'all');
+  assertOpaqueSeedBudget(document);
+  const context: LoweringContext = {
+    styleResolver: document.package.styles ? createStyleResolver(document.package.styles) : null,
+    theme: document.package.theme ?? null,
+    plans: [],
+    compatibilityMode: compatibilityModeFromDocument(document),
+    opaqueSequences: [],
+  };
+  visitStory(context, 'body', document.package.document.content, {
+    includePageBreaks: true,
+    appendBodyTail: true,
+    seedComments: true,
+  });
+  for (const [rId, part] of document.package.headers ?? []) {
+    visitStory(context, headerFooterStoryId(rId), part.content, {
+      includePageBreaks: false,
+      appendBodyTail: false,
+      seedComments: true,
+    });
+  }
+  for (const [rId, part] of document.package.footers ?? []) {
+    if (context.plans.some((plan) => plan.storyId === headerFooterStoryId(rId))) continue;
+    visitStory(context, headerFooterStoryId(rId), part.content, {
+      includePageBreaks: false,
+      appendBodyTail: false,
+      seedComments: true,
+    });
+  }
+  for (const note of document.package.footnotes ?? []) {
+    visitStory(context, footnoteStoryId(note.id), note.content, {
+      includePageBreaks: false,
+      appendBodyTail: false,
+      seedComments: true,
+    });
+  }
+  for (const note of document.package.endnotes ?? []) {
+    visitStory(context, endnoteStoryId(note.id), note.content, {
+      includePageBreaks: false,
+      appendBodyTail: false,
+      seedComments: true,
+    });
+  }
+
+  for (const plan of context.plans) session.createStory(plan.storyId, '', 'Normal', 'left');
+  for (const plan of context.plans) seedPlan(session, plan);
+  session.seedOpaqueSequences(context.opaqueSequences);
+  session.beginOpening(options.generation);
+}

@@ -1,0 +1,59 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nimbleoffice-pptx"
+dynamic = ["version"]
+description = "Read, edit, and lay out PPTX presentations. Rust engine, no PowerPoint and no LibreOffice."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-NOTICES.md", "licenses/BSD-3-Clause-Zstandard.txt", "licenses/MIT-wuff.txt"]
+requires-python = ">=3.9"
+dependencies = [
+  "nimbleoffice-fonts-latin==0.4.2",
+  "nimbleoffice-fonts-intl==0.4.2",
+  "nimbleoffice-fonts-cjk==0.4.2",
+]
+authors = [{ name = "NimbleOffice" }]
+keywords = [
+  "pptx",
+  "powerpoint",
+  "presentation",
+  "ooxml",
+  "presentationml",
+  "slides",
+  "python-pptx",
+  "rust",
+]
+classifiers = [
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Rust",
+  "Topic :: Office/Business :: Office Suites",
+  "Topic :: Software Development :: Libraries",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Changelog = "https://github.com/Eliseowzy/nimbleoffice/blob/main/bindings/python-pptx/CHANGELOG.md"
+Source = "https://github.com/Eliseowzy/nimbleoffice"
+Issues = "https://github.com/Eliseowzy/nimbleoffice/issues"
+
+[tool.maturin]
+module-name = "nimbleoffice_pptx._nimbleoffice_pptx"
+python-source = "python"
+features = ["pyo3/extension-module"]
+strip = true
+exclude = ["**/__pycache__/**", "**/*.pyc", "**/*.so"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

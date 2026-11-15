@@ -1,0 +1,42 @@
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Zlib",
+  "Unicode-3.0",
+  "OFL-1.1",
+  "ISC",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+exceptions = [
+  # libFuzzer's vendored C++ sources are NCSA-licensed. The crate is only ever a dependency of the
+  # nightly-only fuzz/ package, never of anything built by the workspace or published.
+  { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+  { id = "RUSTSEC-2026-0192", reason = "unmaintained ttf-parser, transitive via rustybuzz; migration tracked to fontations" },
+  { id = "RUSTSEC-2026-0206", reason = "rustybuzz declared unmaintained; migration to harfrust tracked with the fontations move" },
+  { id = "RUSTSEC-2026-0215", reason = "unmaintained smallstr, transitive via yrs" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

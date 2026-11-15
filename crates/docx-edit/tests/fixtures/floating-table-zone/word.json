@@ -1,0 +1,264 @@
+{
+ "source": "Word for Mac 16.114 PDF export of zone-sz4.docx / zone-none.docx (250pt-wide floating table, five 150pt rows, splits: rows 1-4 on page one, row 5 on page two; paragraph wraps beside the fragments).",
+ "openRules": [
+  "Word's fragment bottom sits at the outer edge of its last row's bottom border; the engine's is ~0.5pt short (floattable-avoid-last-manip-ofst.docx: 51.78 vs 51.33)."
+ ],
+ "lines": {
+  "zone-sz4": [
+   {
+    "page": 0,
+    "y": 111.84,
+    "x0": 77.76,
+    "x1": 103.77,
+    "text": "row1"
+   },
+   {
+    "page": 0,
+    "y": 262.32,
+    "x0": 77.76,
+    "x1": 103.77,
+    "text": "row2"
+   },
+   {
+    "page": 0,
+    "y": 412.8,
+    "x0": 77.76,
+    "x1": 103.77,
+    "text": "row3"
+   },
+   {
+    "page": 0,
+    "y": 563.28,
+    "x0": 77.76,
+    "x1": 103.77,
+    "text": "row4"
+   },
+   {
+    "page": 1,
+    "y": 83.28,
+    "x0": 77.76,
+    "x1": 465.57,
+    "text": "row5wrapword01wrapword02"
+   },
+   {
+    "page": 1,
+    "y": 96.96,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword03wrapword04"
+   },
+   {
+    "page": 1,
+    "y": 110.88,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword05wrapword06"
+   },
+   {
+    "page": 1,
+    "y": 124.56,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword07wrapword08"
+   },
+   {
+    "page": 1,
+    "y": 138.48,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword09wrapword10"
+   },
+   {
+    "page": 1,
+    "y": 152.16,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword11wrapword12"
+   },
+   {
+    "page": 1,
+    "y": 166.08,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword13wrapword14"
+   },
+   {
+    "page": 1,
+    "y": 179.76,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword15wrapword16"
+   },
+   {
+    "page": 1,
+    "y": 193.68,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword17wrapword18"
+   },
+   {
+    "page": 1,
+    "y": 207.36,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword19wrapword20"
+   },
+   {
+    "page": 1,
+    "y": 221.28,
+    "x0": 331.5,
+    "x1": 465.57,
+    "text": "wrapword21wrapword22"
+   },
+   {
+    "page": 1,
+    "y": 234.96,
+    "x0": 72.0,
+    "x1": 480.89,
+    "text": "wrapword23wrapword24wrapword25wrapword26wrapword27wrapword28"
+   },
+   {
+    "page": 1,
+    "y": 248.88,
+    "x0": 72.0,
+    "x1": 480.89,
+    "text": "wrapword29wrapword30wrapword31wrapword32wrapword33wrapword34"
+   },
+   {
+    "page": 1,
+    "y": 262.56,
+    "x0": 72.0,
+    "x1": 480.89,
+    "text": "wrapword35wrapword36wrapword37wrapword38wrapword39wrapword40"
+   }
+  ],
+  "zone-none": [
+   {
+    "page": 0,
+    "y": 111.12,
+    "x0": 77.28,
+    "x1": 103.29,
+    "text": "row1"
+   },
+   {
+    "page": 0,
+    "y": 261.12,
+    "x0": 77.28,
+    "x1": 103.29,
+    "text": "row2"
+   },
+   {
+    "page": 0,
+    "y": 411.12,
+    "x0": 77.28,
+    "x1": 103.29,
+    "text": "row3"
+   },
+   {
+    "page": 0,
+    "y": 561.12,
+    "x0": 77.28,
+    "x1": 103.29,
+    "text": "row4"
+   },
+   {
+    "page": 1,
+    "y": 83.28,
+    "x0": 77.28,
+    "x1": 465.82,
+    "text": "row5wrapword01wrapword02"
+   },
+   {
+    "page": 1,
+    "y": 96.96,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword03wrapword04"
+   },
+   {
+    "page": 1,
+    "y": 110.88,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword05wrapword06"
+   },
+   {
+    "page": 1,
+    "y": 124.56,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword07wrapword08"
+   },
+   {
+    "page": 1,
+    "y": 138.48,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword09wrapword10"
+   },
+   {
+    "page": 1,
+    "y": 152.16,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword11wrapword12"
+   },
+   {
+    "page": 1,
+    "y": 166.08,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword13wrapword14"
+   },
+   {
+    "page": 1,
+    "y": 179.76,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword15wrapword16"
+   },
+   {
+    "page": 1,
+    "y": 193.68,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword17wrapword18"
+   },
+   {
+    "page": 1,
+    "y": 207.36,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword19wrapword20"
+   },
+   {
+    "page": 1,
+    "y": 221.28,
+    "x0": 331.75,
+    "x1": 465.82,
+    "text": "wrapword21wrapword22"
+   },
+   {
+    "page": 1,
+    "y": 234.96,
+    "x0": 72.0,
+    "x1": 480.89,
+    "text": "wrapword23wrapword24wrapword25wrapword26wrapword27wrapword28"
+   },
+   {
+    "page": 1,
+    "y": 248.88,
+    "x0": 72.0,
+    "x1": 480.89,
+    "text": "wrapword29wrapword30wrapword31wrapword32wrapword33wrapword34"
+   },
+   {
+    "page": 1,
+    "y": 262.56,
+    "x0": 72.0,
+    "x1": 480.89,
+    "text": "wrapword35wrapword36wrapword37wrapword38wrapword39wrapword40"
+   }
+  ]
+ }
+}

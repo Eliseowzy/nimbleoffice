@@ -1,0 +1,71 @@
+# Contributing to NimbleOffice
+
+Thanks for your interest in contributing! This guide will help you get started.
+
+## Prerequisites
+
+- [Bun](https://bun.sh/) (v1.0+)
+- [Rust](https://rustup.rs/) (stable, with `rustfmt` and `clippy`)
+- `wasm32-unknown-unknown` (`rustup target add wasm32-unknown-unknown`)
+- [`wasm-pack`](https://rustwasm.github.io/wasm-pack/) 0.15.0
+  (`cargo install wasm-pack --version 0.15.0 --locked`)
+- [`binaryen`](https://github.com/WebAssembly/binaryen) for `wasm-opt`
+  (`brew install binaryen` / `apt-get install binaryen`)
+
+## Development Setup
+
+```bash
+# Clone the repo
+git clone git@github.com:Eliseowzy/nimbleoffice.git
+cd nimbleoffice
+
+# Install dependencies
+bun install
+```
+
+## Running Tests
+
+```bash
+# TypeScript (`bun run test` builds the xlsx and docx wasm itself)
+bun run typecheck
+bun run test
+
+# Rust engines (fmt + clippy with -D warnings + tests)
+bun run rust:check
+
+# Headless Chromium: real DOCX, XLSX, and PPTX editor interactions.
+bunx playwright install chromium
+bun run test:e2e:browser
+```
+
+## Making Changes
+
+1. **Fork** the repository and create a branch from `main`
+2. **Read the code** before modifying it — match the conventions you find
+3. **Make your changes** — keep them focused and minimal
+4. **Add/update tests** for your changes
+5. **Verify** everything works:
+   ```bash
+   bun run typecheck && bun run test && bun run rust:check
+   ```
+6. **Submit a PR** against `main` — the CLA bot will prompt you on your first one
+
+## Translations
+
+Editor UI text lives in `packages/docx-i18n`, `packages/xlsx-i18n` and `packages/pptx-i18n`. `en.json` is the source; PPTX also uses `proposals/en.json` for lazy review messages. Every other locale file has the combined English keys, placeholders and the plural categories of its language. A new key needs a translation in every locale file of that package. Use the Office terms in `shared/i18n-glossary/<locale>.json`. React code never renders literal text: use `t()` (allowed exceptions go in `scripts/hardcoded-ui-strings.allowlist.json` with a reason). Check with:
+
+```bash
+bun test scripts/hardcoded-ui-strings.test.ts packages/docx-i18n packages/xlsx-i18n packages/pptx-i18n shared/i18n-glossary
+```
+
+## Reporting Bugs
+
+Open an issue at [github.com/Eliseowzy/nimbleoffice/issues](https://github.com/Eliseowzy/nimbleoffice/issues) with:
+
+- Steps to reproduce
+- Expected vs actual behavior
+- Attach a repro file if relevant (remove sensitive content first)
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE).

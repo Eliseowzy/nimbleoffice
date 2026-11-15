@@ -1,0 +1,26 @@
+[package]
+name = "nimbleoffice-xlsx-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Workbook, worksheet, and cell model for SpreadsheetML: address types, values, styles. Framework- and IO-free."
+readme = "README.md"
+keywords = ["xlsx", "excel", "spreadsheet", "ooxml", "spreadsheetml"]
+categories = ["data-structures", "parser-implementations"]
+
+[lib]
+name = "xlsx_model"
+
+[features]
+test-counters = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libm.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

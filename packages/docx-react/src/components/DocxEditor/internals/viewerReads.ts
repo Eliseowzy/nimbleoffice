@@ -1,0 +1,22 @@
+import type { DocxDocumentRead, ResidentEngineWorkerClient } from '@nimbleoffice/docx/yrs';
+import type { DocxDocumentReadValues } from '@nimbleoffice/docx/yrs/residentEngineWorkerProtocol';
+
+export type ViewerReadOutcome<V> =
+  | { status: 'ok'; version: string; value: V }
+  | { status: 'superseded' };
+
+type VersionedRead = Extract<DocxDocumentRead, { expectVersion: string }>;
+
+export async function readAt<K extends VersionedRead['kind']>(
+  read: ResidentEngineWorkerClient['documentRead'],
+  request: VersionedRead & { kind: K }
+): Promise<ViewerReadOutcome<DocxDocumentReadValues[K]>> {
+  try {
+    const reply = await read<K>(request);
+    return reply.version === request.expectVersion
+      ? { status: 'ok', version: reply.version, value: reply.value }
+      : { status: 'superseded' };
+  } catch {
+    return { status: 'superseded' };
+  }
+}

@@ -1,0 +1,619 @@
+use std::collections::BTreeMap;
+
+use ooxml_drawingml::{ShapeFill, ShapeOutline};
+use pptx_parse::{BlipEffect, GraphicFrameData, Placeholder};
+
+pub use pptx_parse::{CommentFlavor, TextCaps};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EditOrigin {
+    #[default]
+    Local,
+    Agent,
+    Remote,
+    System,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditCtx {
+    pub origin: EditOrigin,
+    pub author: String,
+}
+
+impl EditCtx {
+    pub fn local(author: impl Into<String>) -> Self {
+        Self {
+            origin: EditOrigin::Local,
+            author: author.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextStyle {
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub font_size_pt: Option<f64>,
+    pub color: Option<String>,
+    pub font_family: Option<String>,
+    pub underline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strike: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacing_pt: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_pct: Option<f64>,
+    /// `a:rPr@kern`: the smallest size, in points, the run is kerned at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kern_pt: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<TextCaps>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextStylePatch {
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub font_size_pt: Option<f64>,
+    pub color: Option<String>,
+    pub font_family: Option<String>,
+    pub underline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strike: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacing_pt: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_pct: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextRunSnapshot {
+    pub text: String,
+    pub style: TextStyle,
+}
+
+/// A theme font slot: the heading (`major`) or body (`minor`) font.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemeFontSlot {
+    Major,
+    Minor,
+}
+
+impl ThemeFontSlot {
+    /// The slot of a `+mj-lt`/`+mn-lt` style reference for `script` (`lt`, `ea` or `cs`).
+    pub fn from_reference(reference: &str, script: &str) -> Option<Self> {
+        let (slot, suffix) = reference.strip_prefix('+')?.split_once('-')?;
+        if !suffix.eq_ignore_ascii_case(script) {
+            return None;
+        }
+        if slot.eq_ignore_ascii_case("mj") {
+            Some(Self::Major)
+        } else if slot.eq_ignore_ascii_case("mn") {
+            Some(Self::Minor)
+        } else {
+            None
+        }
+    }
+
+    /// The `a:latin` (`lt`) or `a:ea` (`ea`) typeface reference of this slot.
+    pub fn reference(self, script: &str) -> String {
+        match self {
+            Self::Major => format!("+mj-{script}"),
+            Self::Minor => format!("+mn-{script}"),
+        }
+    }
+}
+
+/// Theme slots of a run's effective Latin and East Asian fonts; `None` for a literal family.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFontThemes {
+    pub latin: Option<ThemeFontSlot>,
+    pub east_asian: Option<ThemeFontSlot>,
+}
+
+/// One theme font slot's typefaces.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeFontFace {
+    pub latin: String,
+    /// `None` when the theme leaves the East Asian face empty.
+    pub east_asian: Option<String>,
+}
+
+/// The heading and body fonts of a slide's theme.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeFonts {
+    pub major: ThemeFontFace,
+    pub minor: ThemeFontFace,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphSnapshot {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_paragraphs: Vec<ParagraphSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_xml: Option<String>,
+    pub alignment: Option<String>,
+    pub level: u32,
+    pub bullet_json: Option<String>,
+    pub runs: Vec<TextRunSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParagraphSource {
+    pub id: String,
+    pub xml: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorySnapshot {
+    pub id: String,
+    pub length: u32,
+    pub paragraphs: Vec<ParagraphSnapshot>,
+}
+
+impl StorySnapshot {
+    pub fn plain_text(&self) -> String {
+        self.paragraphs
+            .iter()
+            .map(|paragraph| {
+                paragraph
+                    .runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeSnapshot {
+    pub id: String,
+    pub source_id: u32,
+    pub kind: ShapeKind,
+    pub name: String,
+    /// `cNvPr/@title`, the alternative-text title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// `cNvPr/@descr`, the alternative-text description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// True when `cNvPr` carries the a16 decorative extension.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub decorative: bool,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub rotation_deg: f64,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    /// The geometry the shape draws at, present only while it has none of
+    /// its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited: Option<InheritedGeometry>,
+    /// Hides this shape and its descendants.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub text_box: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aspect_ratio_locked: bool,
+    pub geometry: String,
+    pub adjust_values: BTreeMap<String, f64>,
+    pub placeholder: Option<Placeholder>,
+    pub fill: Option<ShapeFill>,
+    pub resolved_fill_color: Option<String>,
+    pub outline: Option<ShapeOutline>,
+    pub resolved_outline_color: Option<String>,
+    pub media_part_path: Option<String>,
+    /// Image data added to this session, retained across saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_media: Option<PendingMedia>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blip_effects: Vec<BlipEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_structure: Option<pptx_parse::TableStructure>,
+    pub graphic: Option<GraphicFrameData>,
+    pub text_stories: Vec<StorySnapshot>,
+    pub children: Vec<ShapeSnapshot>,
+}
+
+/// The transform a placeholder takes from its layout or master.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InheritedGeometry {
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub rotation_deg: f64,
+    pub flip_h: bool,
+    pub flip_v: bool,
+}
+
+/// Image data shared by editing peers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMedia {
+    pub content_type: String,
+    pub base64: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShapeKind {
+    Shape,
+    Picture,
+    GraphicFrame,
+    Group,
+}
+
+pub use pptx_parse::HeaderFooterSettings;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideHeaderFooterText {
+    pub shape_id: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideDateText {
+    pub shape_id: String,
+    pub text: String,
+    pub field: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideHeaderFooter {
+    pub footer: Option<SlideHeaderFooterText>,
+    pub slide_number: Option<SlideHeaderFooterText>,
+    pub date: Option<SlideDateText>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideLayoutSnapshot {
+    #[serde(default)]
+    pub header_footer: Option<HeaderFooterSettings>,
+    pub name: Option<String>,
+    pub r#type: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideSnapshot {
+    #[serde(default)]
+    pub header_footer: Option<SlideHeaderFooter>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub layout: Option<SlideLayoutSnapshot>,
+    pub id: String,
+    pub source_part_path: Option<String>,
+    pub layout_part_path: Option<String>,
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<ShapeFill>,
+    /// An edit changed the background from what the source part declares, so
+    /// `background` stands for the slide whatever `p:bg` that part holds.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background_edited: bool,
+    pub shapes: Vec<ShapeSnapshot>,
+}
+
+/// One slide's snapshot plus deck geometry — the slide-scoped render input.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideScope {
+    /// The slide's position in deck order.
+    pub index: usize,
+    pub slide: SlideSnapshot,
+    pub width_emu: i64,
+    pub height_emu: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeckSnapshot {
+    pub width_emu: i64,
+    pub height_emu: i64,
+    pub slides: Vec<SlideSnapshot>,
+    #[serde(default, skip_serializing_if = "legacy_comment_flavor")]
+    pub comment_flavor: CommentFlavor,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<CommentSnapshot>,
+}
+
+fn legacy_comment_flavor(flavor: &CommentFlavor) -> bool {
+    *flavor == CommentFlavor::Legacy
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentSnapshot {
+    pub id: String,
+    pub slide_id: String,
+    pub author: String,
+    pub initials: String,
+    pub text: String,
+    pub created: Option<String>,
+    pub x_emu: i64,
+    pub y_emu: i64,
+    pub parent_id: Option<String>,
+    pub resolved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentReceipt {
+    pub comment_id: String,
+    pub slide_id: String,
+    pub parent_id: Option<String>,
+    pub resolved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideReceipt {
+    pub slide_id: String,
+    pub from_index: Option<u32>,
+    pub to_index: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeReceipt {
+    pub slide_id: String,
+    pub shape_id: String,
+    pub index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeZOrderReceipt {
+    pub slide_id: String,
+    pub shape_id: String,
+    pub from_index: u32,
+    pub to_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformReceipt {
+    pub slide_id: String,
+    pub shape_id: String,
+    pub before: ShapeRect,
+    pub after: ShapeRect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShapeRect {
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextReceipt {
+    pub story_id: String,
+    pub start: u32,
+    pub end: u32,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeDraft {
+    pub name: String,
+    pub rect: ShapeRect,
+    pub text: String,
+    pub style: TextStyle,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetShapeDraft {
+    pub name: String,
+    pub geometry: String,
+    pub rect: ShapeRect,
+    pub fill: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PictureDraft {
+    pub name: String,
+    pub rect: ShapeRect,
+    pub content_type: String,
+    #[serde(rename = "mediaBase64", with = "picture_media_base64")]
+    pub media_bytes: Vec<u8>,
+}
+
+mod picture_media_base64 {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeStroke {
+    pub color: Option<String>,
+    pub width_pt: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeFillReceipt {
+    pub slide_id: String,
+    pub shape_id: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideBackgroundReceipt {
+    pub slide_id: String,
+    pub before: Option<ShapeFill>,
+    pub after: Option<ShapeFill>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeStrokeReceipt {
+    pub slide_id: String,
+    pub shape_id: String,
+    pub before: Option<ShapeStroke>,
+    pub after: Option<ShapeStroke>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeAdjustReceipt {
+    pub slide_id: String,
+    pub shape_id: String,
+    pub before: BTreeMap<String, f64>,
+    pub after: BTreeMap<String, f64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateOrigin {
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateEvent {
+    pub update: Vec<u8>,
+    pub origin: UpdateOrigin,
+}
+
+#[derive(Debug, Error)]
+pub enum EditError {
+    #[error("invalid client ID {0}")]
+    InvalidClientId(u64),
+    #[error("could not parse PPTX: {0}")]
+    Parse(String),
+    #[error("invalid deck state: {0}")]
+    InvalidState(String),
+    #[error("invalid yrs update: {0}")]
+    InvalidUpdate(String),
+    #[error("invalid yrs state vector: {0}")]
+    InvalidStateVector(String),
+    #[error("slide {0:?} was not found")]
+    SlideNotFound(String),
+    #[error("shape {0:?} was not found")]
+    ShapeNotFound(String),
+    #[error("story {0:?} was not found")]
+    StoryNotFound(String),
+    #[error("comment {0:?} was not found")]
+    CommentNotFound(String),
+    #[error("invalid comment: {0}")]
+    InvalidComment(String),
+    #[error("index {index} is outside length {length}")]
+    OutOfBounds { index: u32, length: u32 },
+    #[error("text range {start}..{end} crosses a paragraph boundary")]
+    ParagraphBoundary { start: u32, end: u32 },
+    #[error("invalid shape geometry: {0}")]
+    InvalidGeometry(String),
+    #[error("invalid fill: {0}")]
+    InvalidFill(String),
+    #[error("invalid shape adjustment: {0}")]
+    InvalidAdjustment(String),
+    #[error("invalid table: {0}")]
+    InvalidTable(String),
+    #[error(
+        "structural table operations are unavailable in collaborative mode; edit cell text instead, or change the table structure outside the shared session"
+    )]
+    CollaborativeStructureOperation,
+    #[error("invalid text: {0}")]
+    InvalidText(String),
+    #[error("update observer failed: {0}")]
+    Observer(String),
+    #[error("JSON boundary error: {0}")]
+    Json(String),
+    #[error("could not write PPTX: {0}")]
+    Write(String),
+}
+
+pub type EditResult<T> = Result<T, EditError>;
+
+/// Rejects characters XML 1.0 cannot carry, so a bad edit fails loudly
+/// instead of producing an unopenable file at save time.
+pub(crate) fn validate_xml_text(value: &str) -> EditResult<()> {
+    match value
+        .chars()
+        .find(|character| !legal_xml_character(*character))
+    {
+        Some(character) => Err(EditError::InvalidText(format!(
+            "character U+{:04X} cannot be stored in a PPTX file",
+            character as u32
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn legal_xml_character(character: char) -> bool {
+    matches!(character, '\u{9}' | '\u{a}' | '\u{d}')
+        || ('\u{20}'..='\u{d7ff}').contains(&character)
+        || ('\u{e000}'..='\u{fffd}').contains(&character)
+        || ('\u{10000}'..='\u{10ffff}').contains(&character)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TextParagraphDraft {
+    pub alignment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bullet: Option<bool>,
+    pub runs: Vec<TextRunDraft>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TextRunDraft {
+    pub text: String,
+    #[serde(default)]
+    pub style: TextStyle,
+}

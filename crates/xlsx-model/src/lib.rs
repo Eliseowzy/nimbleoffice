@@ -1,0 +1,51 @@
+//! workbook model: address types, cell values, and the cell-access trait the
+//! calc engine reads through. pure data — no io, no xml, no dom.
+
+pub mod addr;
+pub mod chart;
+pub mod date;
+mod fmath;
+pub mod numfmt;
+#[cfg(feature = "test-counters")]
+#[doc(hidden)]
+pub mod open_timing;
+pub mod progress;
+pub mod rich_text;
+#[doc(hidden)]
+pub mod sort;
+pub mod styles;
+pub mod value;
+pub mod workbook;
+
+#[cfg(feature = "test-counters")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! open_timing {
+    ($($tokens:tt)*) => { $($tokens)* };
+}
+
+#[cfg(not(feature = "test-counters"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! open_timing {
+    ($($tokens:tt)*) => {};
+}
+
+pub use addr::{CellRange, CellRef, ColId, MAX_COLS, MAX_ROWS, RowId, SheetId};
+pub use chart::{
+    AnchorCell, AnchorEditAs, AnchorExtent, AnchorPos, ChartAnchor, ChartEdit, ChartMetadata,
+    ChartRef, ChartRefKind, ChartSeriesInfo, ChartSeriesName, SheetChart,
+};
+pub use date::DateSystem;
+pub use rich_text::{RichRun, RunBaseline, RunStyle, RunUnderline};
+pub use styles::{
+    Alignment, Border, BorderEdge, BorderStyle, CellFormat, Color, DifferentialFormat, Fill, Font,
+    FormatCode, HAlign, NumFmtTableFull, NumberFormat, PatternType, PoolMarks, Protection,
+    Stylesheet, Theme, VAlign, Xf,
+};
+pub use value::{CellValue, ErrorValue};
+pub use workbook::{
+    AutoFilter, Cell, CellProvider, ColStyle, ConditionalFormatRule, ConditionalFormatting,
+    DefinedName, FreezePane, Hyperlink, MAX_SPILL_CELLS, Sheet, SheetFormat, SparseCells, Table,
+    Workbook,
+};

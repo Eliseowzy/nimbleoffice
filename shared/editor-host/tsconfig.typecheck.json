@@ -1,0 +1,28 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "#session-worker": ["../../packages/docx/src/yrs/sessionWorker.node.ts"],
+      "@nimbleoffice/docx-react": ["../../packages/docx-react/src/index.ts"],
+      "@nimbleoffice/xlsx-react": ["../../packages/xlsx-react/src/index.ts"],
+      "@nimbleoffice/pptx-react": ["../../packages/pptx-react/src/index.ts"],
+      "@nimbleoffice/docx": ["../../packages/docx/src/core.ts"],
+      "@nimbleoffice/docx/*": ["../../packages/docx/src/*"],
+      "@nimbleoffice/xlsx": ["../../packages/xlsx/src/index.ts"],
+      "@nimbleoffice/xlsx/*": ["../../packages/xlsx/src/*"],
+      "@nimbleoffice/pptx": ["../../packages/pptx/src/index.ts"],
+      "@nimbleoffice/pptx/*": ["../../packages/pptx/src/*"],
+      "@nimbleoffice/fonts": ["../../packages/fonts/src/index.ts"],
+      "@nimbleoffice/fonts/progressive": ["../../packages/fonts/src/progressive-entry.ts"],
+      "@nimbleoffice/fonts-cjk": ["../../packages/fonts-cjk/src/index.ts"],
+      "@nimbleoffice/fonts-intl": ["../../packages/fonts-intl/src/index.ts"],
+      "@nimbleoffice/fonts-latin": ["../../packages/fonts-latin/src/index.ts"],
+      "@nimbleoffice/docx-i18n": ["../../packages/docx-i18n/src/index.ts"],
+      "@nimbleoffice/docx-i18n/*": ["../../packages/docx-i18n/src/*"],
+      "@nimbleoffice/xlsx-i18n": ["../../packages/xlsx-i18n/src/index.ts"],
+      "@nimbleoffice/xlsx-i18n/*": ["../../packages/xlsx-i18n/src/*"],
+      "@nimbleoffice/pptx-i18n": ["../../packages/pptx-i18n/src/index.ts"],
+      "@nimbleoffice/pptx-i18n/*": ["../../packages/pptx-i18n/src/*"]
+    }
+  }
+}

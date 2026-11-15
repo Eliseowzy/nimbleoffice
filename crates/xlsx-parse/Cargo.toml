@@ -1,0 +1,24 @@
+[package]
+name = "nimbleoffice-xlsx-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Streaming SpreadsheetML parser and serializer building the NimbleOffice workbook model."
+readme = "README.md"
+keywords = ["xlsx", "excel", "ooxml", "spreadsheetml", "parser"]
+categories = ["parser-implementations", "encoding"]
+
+[lib]
+name = "xlsx_parse"
+
+[features]
+test-counters = []
+test-oracle = []
+
+[dependencies]
+ooxml-drawingml = { workspace = true, features = ["chart"] }
+quick-xml = "0.41"
+serde = { version = "1", features = ["derive"] }
+xlsx-model.workspace = true

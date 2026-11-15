@@ -1,0 +1,37 @@
+[package]
+name = "nimbleoffice-pptx-edit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Collaborative yrs-backed editing core for PPTX decks."
+readme = "README.md"
+keywords = ["pptx", "powerpoint", "ooxml", "collaboration"]
+categories = ["text-processing", "data-structures"]
+
+[lib]
+name = "pptx_edit"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+engine = []
+metafile-svg = ["ooxml-metafile/svg"]
+wasm = ["engine", "dep:js-sys", "dep:wasm-bindgen"]
+
+[dependencies]
+base64 = "0.22"
+js-sys = { version = "0.3", optional = true }
+ooxml-drawingml.workspace = true
+ooxml-diff.workspace = true
+ooxml-metafile.workspace = true
+pptx-parse.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+thiserror = "2"
+wasm-bindgen = { version = "0.2", optional = true }
+yrs = "0.27.3"
+
+[dev-dependencies]
+ooxml-opc.workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "nimbleoffice-ooxml-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Shared OOXML text shaping, measurement, line breaking, and bidirectional text support."
+readme = "README.md"
+keywords = ["ooxml", "text", "typography", "fonts"]
+categories = ["text-processing", "rendering"]
+
+[lib]
+name = "ooxml_text"
+crate-type = ["rlib"]
+
+[dependencies]
+base-latin = { workspace = true, optional = true }
+ooxml-drawingml.workspace = true
+skrifa = "0.44"
+rustybuzz = "0.20"
+unicode-linebreak = "0.1"
+unicode-bidi = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[features]
+base-latin = ["dep:base-latin"]
+
+[dev-dependencies]
+nimbleoffice-fonts.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "nimbleoffice-xlsx-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Invertible op log: undo/redo, provenance-tagged proposals, address remapping, collab-ready serialization."
+readme = "README.md"
+keywords = ["xlsx", "spreadsheet", "undo", "collaboration", "ooxml"]
+categories = ["data-structures", "text-processing"]
+
+[lib]
+name = "xlsx_ops"
+
+[features]
+fuzzing = []
+
+[dependencies]
+quick-xml = "0.41"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+xlsx-model.workspace = true
+xlsx-calc.workspace = true
+
+[dev-dependencies]
+xlsx-parse.workspace = true

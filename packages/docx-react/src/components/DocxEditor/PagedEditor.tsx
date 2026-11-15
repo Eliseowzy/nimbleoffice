@@ -1,0 +1,2467 @@
+/**
+ * PagedEditor Component
+ *
+ * Main paginated editing component that integrates:
+ * - YrsInput: browser input translated directly into yrs operations
+ * - Layout engine: computes page layout from yrs story blocks
+ * - Canvas renderer: replays the Rust display list on visible pages
+ * - Selection overlay: renders caret and selection highlights
+ *
+ * Architecture:
+ * 1. User clicks on visible pages → hit test → update the yrs selection
+ * 2. User types → YrsInput applies a yrs operation
+ * 3. Yrs story blocks → measure → layout → display list
+ * 4. Selection changes → compute rects → update overlay
+ */
+
+import React, { useEffect, useRef, useState, useCallback, useMemo, forwardRef, memo } from 'react';
+import type { CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
+
+// Internal components
+import {
+  YrsInput,
+  type YrsDisplaySelection,
+  type YrsInputRef,
+  type YrsStoredFormatting,
+} from './YrsInput';
+import { useViewerSidebarAnchors } from './hooks/useViewerSidebarAnchors';
+import {
+  sidebarAnchorProjectY,
+  SIDEBAR_ANCHOR_EMIT_MS,
+  SIDEBAR_ANCHOR_STALE_MS,
+} from './internals/sidebarAnchorProjection';
+import { EMPTY_TRACKED_CHANGES_RESULT, type ViewerCommentRanges } from './internals/viewerSidebarReads';
+import { yieldToMainThread } from './internals/yieldToMainThread';
+import { ViewerInput } from './ViewerInput';
+import type { ViewerSelectionChange } from './internals/viewerSelectionController';
+import { CanvasSelectionOverlay } from './overlays/CanvasSelectionOverlay';
+import { RemotePresenceOverlay } from './overlays/RemotePresenceOverlay';
+import { CanvasCellSelectionOverlay } from './overlays/CanvasCellSelectionOverlay';
+import { CanvasImageSelectionOverlay } from './overlays/CanvasImageSelectionOverlay';
+import { CanvasTableResizeOverlay } from './overlays/CanvasTableResizeOverlay';
+import {
+  CanvasParagraphFlashOverlay,
+  type CanvasParagraphFlashRequest,
+} from './overlays/CanvasParagraphFlashOverlay';
+
+// Layout engine
+import type { Layout } from '@nimbleoffice/docx/layout/pagination';
+import {
+  computeAnchorPositionsFromYrs,
+  type TrackedChangesResult,
+  type DisplayList,
+  type DisplayListQueries,
+} from '@nimbleoffice/docx/layout/render';
+import type { DocxFindDisplayMatch, DocxReservationsPayload, DocxResolvedReservations } from '@nimbleoffice/docx/yrs';
+import type { FindOptions } from '@nimbleoffice/docx/utils/findReplace';
+import type { ParagraphHighlightOptions, ScrollToParaIdOptions } from '@nimbleoffice/docx/utils';
+
+// Layout bridge
+import { DEFAULT_PAGE_HEIGHT_PX, type BundledFontProvider } from '@nimbleoffice/docx/layout';
+
+// Selection sync
+import { LayoutSelectionGate } from './internals/LayoutSelectionGate';
+
+// Types
+import type {
+  Document,
+  TextFormatting,
+  Theme,
+  StyleDefinitions,
+  SectionProperties,
+  HeaderFooter,
+} from '@nimbleoffice/docx/types/document';
+import type { WrapType } from '@nimbleoffice/docx/docx/wrapTypes';
+import {
+  breakRefusedWhileSuggesting,
+  yrsLocToProjectedDisplayPosition,
+  type YrsInlineFormatDelta,
+  type YrsLoc,
+  type YrsRenderEnv,
+  type YrsResidentCaretSnapshot,
+  type YrsSession,
+  type ResidentEngineWorkerClient,
+} from '@nimbleoffice/docx/yrs';
+import { createStyleResolver } from '@nimbleoffice/docx/styles';
+import { resolveImageLayoutAttrs } from '@nimbleoffice/docx/docx';
+import { compressesPunctuation } from './internals/compressPunctuation';
+import type { PointPosition, RenderedDomContext } from '../../plugin-api/types';
+import { EMPTY_ANCHOR_POSITIONS } from './commentFactories';
+import {
+  DEFAULT_PAGE_WIDTH,
+  DEFAULT_PAGE_GAP,
+  VIEWPORT_PADDING_BOTTOM,
+  VIEWPORT_PADDING_TOP,
+  containerStyles,
+  pluginOverlaysStyles,
+} from './internals/styles';
+import { viewportMinHeightPx } from './internals/scrollUtils';
+import type { LayoutUpdateOrigin } from './internals/viewportAnchoring';
+import {
+  createCanvasHostProjector,
+  createRenderedDomContext,
+} from '../../plugin-api/RenderedDomContext';
+import { useLayoutPipeline } from './hooks/useLayoutPipeline';
+import type {
+  DisplayPageNavigation,
+  FontRequirementsInWorker,
+  LayoutInWorker,
+  ResidentFrameApplyResult,
+} from './hooks/useDisplayList';
+import { workerOpenReplicaPending, workerOpenReplicaStarted } from './internals/workerOpenReplica';
+import { registeredWorkerProposalAuthority } from './internals/workerProposalAuthority';
+import type { ResolveDisplayListQueries } from './hooks/displayListQueryEpochGate';
+import { useRustMeasurement, type RustFontChainsProvider } from './hooks/useRustMeasurement';
+import type { YrsCoreSession } from './hooks/useYrsCoreSession';
+import { useSelectionOverlay } from './hooks/useSelectionOverlay';
+import { useImageInteractions } from './hooks/useImageInteractions';
+import { usePagedScrollApi, type RevealPositionOutcome } from './hooks/usePagedScrollApi';
+import { usePagesPointer } from './hooks/usePagesPointer';
+import {
+  usePagedEditorCommandBridge,
+  usePagedEditorRefApi,
+  type PagedEditorCommandBridge,
+} from './hooks/usePagedEditorRefApi';
+import { useLayoutTriggers } from './hooks/useLayoutTriggers';
+import { useRevisionPreview } from './hooks/useRevisionPreview';
+import { TableInsertButton } from './overlays/TableInsertButton';
+import { HyperlinkPopup, type HyperlinkPopupData } from '../ui/HyperlinkPopup';
+import {
+  applyYrsToolbarFormatting,
+  currentYrsToolbarSelection,
+  storedYrsToolbarFormatting,
+  withStoredYrsFormatting,
+  type FormattingAction,
+  type YrsToolbarSelection,
+} from './yrsToolbar';
+import {
+  currentYrsTableTarget,
+  currentYrsSelectionRange,
+  setYrsTableProperty,
+  setYrsSelectionInCell,
+  yrsEmbedIdForProjectedNode,
+  yrsImageGeometryForProjectedNode,
+  yrsImageTransformForProjectedNode,
+  yrsHyperlinkAtSelection,
+  yrsSelectionNearTable,
+  yrsTableSelectionRange,
+  type YrsEditorCommand,
+} from './yrsCommands';
+import {
+  createYrsPositionProjection,
+  projectYrsDisplayPosition,
+  type YrsPositionProjection,
+} from './internals/yrsPositionProjection';
+import { SidebarRevisionReads } from './internals/sidebarRevisionReads';
+import { storySegmentSource, YrsStorySegmentCache } from './internals/yrsStorySegmentCache';
+import { partEditStory, type NoteEdit, type PartEdit } from './partEdit';
+import type { DocxEditorCollaborationOptions, DocxPointPosition } from './types';
+import {
+  positionAtClientPoint,
+  readViewerPositionAtClientPoint,
+  ViewerPointPositions,
+} from './internals/pointPosition';
+import { isPresented, onPresented, presentedWorkerVersion } from './internals/layoutProvenance';
+import { navigateViewer, readViewerFindMatches, readViewerSelectionInfo, type ViewerNavigationTarget } from './internals/viewerRefReads';
+import type { DocxSelectionInfo } from '../DocxEditor';
+import { readAt } from './internals/viewerReads';
+
+export { DEFAULT_PAGE_WIDTH };
+
+function yrsDeltaForTextFormatting(formatting: TextFormatting | undefined): YrsInlineFormatDelta {
+  if (!formatting) return {};
+  const delta: YrsInlineFormatDelta = {};
+  if (formatting.bold !== undefined) delta.bold = formatting.bold;
+  if (formatting.italic !== undefined) delta.italic = formatting.italic;
+  if (formatting.underline !== undefined) {
+    delta.underline = formatting.underline
+      ? { style: formatting.underline.style, color: formatting.underline.color?.rgb }
+      : null;
+  }
+  if (formatting.strike !== undefined) delta.strike = formatting.strike;
+  if (formatting.color?.rgb) delta.color = { rgb: formatting.color.rgb };
+  else if (formatting.color?.themeColor) {
+    delta.color = { themeColor: formatting.color.themeColor };
+  }
+  if (formatting.highlight !== undefined) {
+    delta.highlight = formatting.highlight === 'none' ? null : formatting.highlight;
+  }
+  if (formatting.fontSize !== undefined) delta.fontSize = formatting.fontSize / 2;
+  if (formatting.fontFamily) {
+    const ascii = formatting.fontFamily.ascii ?? formatting.fontFamily.hAnsi;
+    if (ascii) {
+      delta.fontFamily = {
+        ascii,
+        hAnsi: formatting.fontFamily.hAnsi ?? formatting.fontFamily.ascii,
+      };
+    }
+  }
+  return delta;
+}
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+export interface PagedEditorProps {
+  /** The document to edit. */
+  document: Document | null;
+  /** The parent-owned authoritative editing session. */
+  yrsCore: YrsCoreSession;
+  pluginHostOpen?: boolean;
+  /** Plugin layout reservations, laid out without reaching the document. */
+  reservations?: DocxResolvedReservations | null;
+  reservationSets?: DocxReservationsPayload | null;
+  /** Collaboration identity and replica lifecycle callback. */
+  collaboration?: DocxEditorCollaborationOptions;
+  /** Document styles for style resolution. */
+  styles?: StyleDefinitions | null;
+  /** Theme for styling. */
+  theme?: Theme | null;
+  /** Section properties (page size, margins). */
+  sectionProperties?: SectionProperties | null;
+  /** Body-level final section properties, used after the last explicit section break. */
+  finalSectionProperties?: SectionProperties | null;
+  /** Header content for all pages (or pages 2+ when titlePg is set). */
+  headerContent?: HeaderFooter | null;
+  /** Footer content for all pages (or pages 2+ when titlePg is set). */
+  footerContent?: HeaderFooter | null;
+  /** Header content for first page only (when titlePg is set). */
+  firstPageHeaderContent?: HeaderFooter | null;
+  /** Footer content for first page only (when titlePg is set). */
+  firstPageFooterContent?: HeaderFooter | null;
+  /** Whether the editor is read-only. */
+  readOnly?: boolean;
+  holdInput?: boolean;
+  inputScope?: number;
+  inputQueries?: DisplayListQueries | null;
+  /**
+   * A viewer session's reads of the document the resident worker holds. The session holds no
+   * document on this thread: selection, copy and point reads go to the worker.
+   */
+  viewerDocumentRead?: ResidentEngineWorkerClient['documentRead'];
+  onViewerCommentRangesChange?: (ranges: ViewerCommentRanges) => void;
+  /** Whether a viewer session's sidebar is shown, so its cards read from the worker. */
+  viewerSidebarActive?: boolean;
+  /** Gap between pages in pixels. */
+  pageGap?: number;
+  /** Zoom level (1 = 100%). */
+  zoom?: number;
+  /** Reveal hidden text in the layout instead of hiding it. */
+  showHiddenText?: boolean;
+  /** Callback when Yrs content changes. */
+  onYrsContentChange?: () => void;
+  /** Callback when the native Yrs undo/redo availability changes. */
+  onYrsHistoryChange?: (canUndo: boolean, canRedo: boolean) => void;
+  /** Callback when selection changes. */
+  onSelectionChange?: (from: number, to: number, initializing?: boolean) => void;
+  /** Yrs-authoritative toolbar state, emitted while standard yrs input is active. */
+  onYrsSelectionChange?: (selection: YrsToolbarSelection) => void;
+  onViewerSelectionChange?: (selection: ViewerSelectionChange) => void;
+  /** Callback when editor is ready. */
+  onReady?: (ref: PagedEditorRef) => void;
+  /** Callback when rendered DOM context is ready. */
+  /** Receives each rendered-DOM context with the query facade it was built over. */
+  onRenderedDomContextReady?: (context: RenderedDomContext, queries: DisplayListQueries) => void;
+  /** Plugin overlays to render inside the viewport. */
+  pluginOverlays?: React.ReactNode;
+  /** Callback when header or footer is double-clicked for editing. */
+  onHeaderFooterDoubleClick?: (position: 'header' | 'footer', pageNumber?: number) => void;
+  /** Callback when a note area is clicked for editing. */
+  onNoteClick?: (note: NoteEdit) => void;
+  /** The one non-body part open for editing (dims body, intercepts body clicks). */
+  partEdit?: PartEdit | null;
+  /** Called when user clicks the body area while a part is open. */
+  onBodyClick?: () => void;
+  /** Custom class name. */
+  className?: string;
+  /** Custom styles. */
+  style?: CSSProperties;
+  /** Whether comments sidebar is open (shifts document left). */
+  commentsSidebarOpen?: boolean;
+  /** Sidebar overlay rendered inside the scroll container (scrolls with document). */
+  sidebarOverlay?: React.ReactNode;
+  /** Ref callback for the scroll container element. */
+  scrollContainerRef?: React.Ref<HTMLDivElement>;
+  /** Callback when a hyperlink is clicked (for showing popup). */
+  onHyperlinkClick?: (data: {
+    href: string;
+    displayText: string;
+    tooltip?: string;
+    position: { top: number; left: number };
+  }) => void;
+  /** Hyperlink popup state (null = hidden). */
+  hyperlinkPopupData?: HyperlinkPopupData | null;
+  /** Called when user wants to navigate to the link. */
+  onHyperlinkPopupNavigate?: (href: string) => void;
+  /** Called when user wants to copy the URL. */
+  onHyperlinkPopupCopy?: (href: string) => void;
+  /** Called when user saves hyperlink edits. */
+  onHyperlinkPopupEdit?: (displayText: string, href: string) => void;
+  /** Called when user removes the hyperlink. */
+  onHyperlinkPopupRemove?: () => void;
+  /** Called when the popup should close. */
+  onHyperlinkPopupClose?: () => void;
+  /** Callback when user right-clicks on the pages (for context menu).
+   *  When the right-click target resolves to an image node, `image` carries
+   *  the image's document position, current wrap type, current cssFloat (lets
+   *  the menu disambiguate Square Left vs Square Right), and — for inline
+   *  images only — the rendered EMU offset of the image relative to the
+   *  page content origin. The host promotes that offset into the new
+   *  anchor's `wp:positionH/V` if the user converts inline → anchor. */
+  onContextMenu?: (data: {
+    x: number;
+    y: number;
+    hasSelection: boolean;
+    image?: {
+      pos: number;
+      wrapType: WrapType;
+      cssFloat?: 'left' | 'right' | 'none' | null;
+      inlinePositionEmu?: { horizontalEmu: number; verticalEmu: number };
+    } | null;
+  }) => void;
+  /** Callback with pre-computed Y positions for comment/tracked-change anchors (for sidebar positioning without DOM queries). */
+  onAnchorPositionsChange?: (positions: Map<string, number>) => void;
+  /** Comment ids whose sticky yrs coverage should be projected into sidebar anchors. */
+  sidebarCommentIds?: readonly (string | number)[];
+  /** yrs-authoritative tracked-change list, emitted while standard yrs input is active. */
+  onYrsTrackedChangesChange?: (result: TrackedChangesResult) => void;
+  /** Sticky yrs selection inside the open part, in that part's display positions. */
+  onYrsPartSelectionChange?: (part: PartEdit, selection: { from: number; to: number }) => void;
+  /**
+   * Callback fired when the page count changes after a layout pass.
+   * Parents use this to keep their own page counters (e.g. scroll indicator,
+   * `getTotalPages()` ref method) in sync without having to poll `getLayout()`.
+   */
+  onTotalPagesChange?: (totalPages: number) => void;
+  /** Layout of each pass (null on reset) — canvas renderer plumbing. */
+  onLayoutComputed?: (layout: Layout | null, engine?: YrsSession | null) => void;
+  /** Hands layout passes to the resident worker, which then owns them. */
+  layoutInWorker?: LayoutInWorker;
+  fontRequirementsInWorker?: FontRequirementsInWorker;
+  /** `session`: the session whose layout failed, if known. */
+  onError?: (error: Error, session?: unknown) => void;
+  /** One-call resident body-text edit supplied by the canvas frame owner. */
+  applyResidentInput?: (text: string) => Promise<ResidentFrameApplyResult | null>;
+  /** One-call resident body-text deletion supplied by the canvas frame owner. */
+  applyResidentDelete?: (
+    direction: 'backward' | 'forward'
+  ) => Promise<ResidentFrameApplyResult | null>;
+  /** Set of resolved comment IDs — hides highlight for these comments */
+  resolvedCommentIds?: Set<number>;
+  /** Suggestion mode active state */
+  isSuggesting?: boolean;
+  /** Active author for suggestion mode */
+  author?: string;
+  /** Bundled metric-compatible font provider for Rust measurement. */
+  measurementFontProvider?: BundledFontProvider;
+  /**
+   * Host slot the Rust measure source fills with the merged doc-wide font
+   * chains; the canvas display-list build (mounted in DocxEditor) reads it to
+   * gate GlyphRun emission. Undefined ⇒ the measure source has nowhere to
+   * publish its chains (no canvas renderer to feed).
+   */
+  rustFontChainsProviderRef?: React.RefObject<RustFontChainsProvider | null>;
+  /**
+   * Display-list query source (null until the first display-list build lands).
+   * Routes pointer resolution, selection rects / caret, and sidebar anchor Ys
+   * through Rust queries over the display list.
+   */
+  displayListQueries?: DisplayListQueries | null;
+  resolveDisplayListQueries?: ResolveDisplayListQueries;
+  pageNavigation?: DisplayPageNavigation | null;
+  canvasDisplayList?: DisplayList | null;
+  displayListFrameEpoch?: number | null;
+  residentCaret?: YrsResidentCaretSnapshot | null;
+  residentCaretAuthoritative?: boolean;
+  /** Worker-painted caret line is on screen; hide the DOM blink caret. */
+  paintedCaretActive?: boolean;
+  /** Document-mutating input notification for the painted-caret mode machine. */
+  onCaretInput?(): void;
+  /** Text input dispatched: hide the DOM caret before the worker round-trip. */
+  onCaretInputDispatched?(): void;
+  /** Selection move / blur / IME / mode change: swap to the DOM caret now. */
+  onCaretInterrupt?(): void;
+  /** `.canvas-pages` host element — canvas-path pointer events attach here. */
+  canvasHostRef?: React.RefObject<HTMLDivElement | null>;
+  /**
+   * Portal target for the caret / selection overlay — resolves to
+   * `editorContentRef.current` (the positioned ancestor sharing the
+   * `.canvas-pages` host's top-left). The selection overlay portals here so it
+   * shares the visible canvas pages' coordinate space.
+   */
+  canvasOverlayTarget?: HTMLElement | null;
+  /** Receives the ordered command entry points used by editor chrome. */
+  commandBridgeRef?: React.MutableRefObject<PagedEditorCommandBridge | null>;
+}
+
+export interface PagedEditorRef {
+  /** Get the current document (projected from yrs on demand in direct-input mode). */
+  getDocument(): Document | null;
+  /** Focus the editor. */
+  focus(): void;
+  /** Blur the editor. */
+  blur(): void;
+  /** Check if focused. */
+  isFocused(): boolean;
+  /** Undo. */
+  undo(): boolean;
+  /** Redo. */
+  redo(): boolean;
+  /** Check whether the authoritative input surface has undo history. */
+  canUndo(): boolean;
+  /** Check whether the authoritative input surface has redo history. */
+  canRedo(): boolean;
+  /** Set selection by display position. */
+  setSelection(anchor: number, head?: number): void;
+  /** Insert plain text through the authoritative Yrs input path. */
+  insertText(text: string): void;
+  /** Delete the current authoritative selection. */
+  deleteSelection(): void;
+  /** Select the full active Yrs story. */
+  selectAll(): void;
+  /** A viewer session's selected text, read from the document worker; null elsewhere. */
+  readSelectedText(): Promise<string> | null;
+  /** Get the current display-position selection. */
+  getSelectionRange(): { from: number; to: number } | null;
+  /**
+   * Resolve a body position or region-aware hit into an authoritative Yrs location, against the
+   * current document. A hit from a layout behind the document maps to the wrong place; prefer
+   * {@link getPositionAtPoint}, which refuses one.
+   */
+  displayPositionToYrsLoc(position: number | PointPosition): YrsLoc | null;
+  /**
+   * The text under a client point with an edit batch target, without moving selection or focus.
+   * Null outside text, while input is pending and until the painted layout shows the current
+   * version; retry after {@link flushPendingInput} or on the next frame.
+   */
+  getPositionAtPoint(clientX: number, clientY: number): DocxPointPosition | null;
+  /**
+   * The text under a client point, read through the document's owner: the worker in a viewer
+   * session. Null outside text or when the painted layout changes version before the answer.
+   */
+  readPositionAtPoint(clientX: number, clientY: number): Promise<DocxPointPosition | null>;
+  /** Whether this view currently reads its document from the worker. */
+  isWorkerViewer(): boolean;
+  /** Reads the display selection from the worker. */
+  readViewerSelectionInfo(): Promise<DocxSelectionInfo | null>;
+  readViewerFindMatches(
+    searchText: string,
+    options: FindOptions
+  ): Promise<{ version: string; matches: DocxFindDisplayMatch[] } | null>;
+  /** Resolves, selects and reveals a worker-owned range. */
+  navigateViewer(target: ViewerNavigationTarget, options?: ScrollToParaIdOptions): Promise<boolean>;
+
+  /** Live authoritative yrs session. */
+  getYrsSession(): YrsSession | null;
+  /** Commits accepted input and selection; waits for active IME composition. */
+  flushPendingInput(): Promise<void>;
+  /** Whether typed or composed input has yet to reach the session. @internal */
+  hasPendingInput(): boolean;
+  /** Paragraph-local stored inline formatting for the current yrs caret. */
+  getYrsStoredFormatting(): YrsStoredFormatting | null;
+  /** Resolve a live yrs Loc to the display position used by overlays. */
+  yrsLocToDisplayPosition(loc: YrsLoc): number | null;
+  /**
+   * Publish a yrs selection/mutation through the direct-input refresh path. `dirtyStories`
+   * names every story a mutation changed; the live selection's story by default. `inWorker`
+   * lets the resident worker lay out a host batch, which no caret waits on.
+   */
+  syncYrsInputState(
+    docChanged: boolean,
+    dirtyStories?: readonly string[],
+    options?: { inWorker?: boolean }
+  ): boolean;
+  /** Schedules layout of the resident worker document. */
+  refreshWorkerLayout(): void;
+  /** Apply a body-toolbar command through yrs. */
+  applyYrsFormatting(action: FormattingAction): boolean;
+  /** Apply a non-toolbar body command through yrs. */
+  applyYrsCommand(command: YrsEditorCommand): boolean;
+  /** Get current layout. */
+  getLayout(): Layout | null;
+  /**
+   * The region layout request the editor would lay the current document out with now, or
+   * `null` while the fonts it needs are not ready. @internal
+   */
+  getLayoutRequest(): string | null;
+  /** @internal */
+  readLayoutRequest(): Promise<string | null>;
+  /** Force re-layout; `onHost` keeps the pass on this thread. */
+  relayout(options?: { onHost?: boolean }): void;
+  /** Scroll the visible pages to bring a display position into view. */
+  scrollToPosition(position: number): void;
+  /**
+   * Scrolls a display position into view without moving focus or selection, saying why not.
+   * Aborting `signal` stops following the position while its page is still being built.
+   */
+  revealDisplayPosition(position: number, signal?: AbortSignal): RevealPositionOutcome;
+  /**
+   * Scroll to the paragraph identified by Word `w14:paraId`.
+   * Pass `options.highlight` to briefly flash rendered paragraph fragments.
+   * @returns whether a matching paragraph was found
+   */
+  scrollToParaId(paraId: string, options?: ScrollToParaIdOptions): boolean;
+  /**
+   * Scroll the paginated view so `pageNumber` (1-indexed) is in view.
+   * No-op if the layout isn't ready yet or pageNumber is out of range.
+   */
+  scrollToPage(pageNumber: number): void;
+  /**
+   * Scroll to the comment identified by `commentId` and select its range so
+   * the selection overlay highlights it. Resolves the id to a live Yrs range;
+   * returns `false` (not a throw, not a silent no-op)
+   * when the id no longer resolves so the caller can surface a "location no
+   * longer exists" affordance.
+   */
+  scrollToCommentId(commentId: number): boolean;
+  /**
+   * Scroll to the tracked change identified by `revisionId` and select its
+   * range so the selection overlay highlights it. Resolves the id to a live
+   * Yrs range; returns `false` when the id no longer
+   * resolves (the change was accepted/rejected/deleted).
+   */
+  scrollToChangeId(revisionId: number): boolean;
+  /**
+   * Select the display-position range `[from, to]` so the selection overlay
+   * highlights it, and scroll its start into view. No-op for a malformed
+   * range or a `from` past the document end; `to` is clamped to the document
+   * size (raw caller positions, so out-of-range must not throw).
+   */
+  highlightRange(from: number, to: number): void;
+}
+
+// =============================================================================
+// COMPONENT (module-scope helpers live in per-domain files — see imports)
+// =============================================================================
+
+/**
+ * PagedEditor - Main paginated editing component.
+ */
+const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
+  function PagedEditor(props, ref) {
+    const {
+      document,
+      yrsCore,
+      pluginHostOpen,
+      reservations,
+      reservationSets,
+      collaboration,
+      styles,
+      theme: _theme,
+      headerContent,
+      footerContent,
+      firstPageHeaderContent,
+      firstPageFooterContent,
+      readOnly = false,
+      holdInput = false,
+      inputScope,
+      inputQueries,
+      viewerDocumentRead: viewerDocumentReadProp,
+      onViewerCommentRangesChange,
+      viewerSidebarActive = true,
+      pageGap = DEFAULT_PAGE_GAP,
+      zoom = 1,
+      showHiddenText = false,
+      onYrsContentChange,
+      onYrsHistoryChange,
+      onSelectionChange,
+      onYrsSelectionChange,
+      onViewerSelectionChange,
+      onYrsPartSelectionChange,
+      onReady,
+      onRenderedDomContextReady,
+      pluginOverlays,
+      onHeaderFooterDoubleClick,
+      onNoteClick,
+      partEdit = null,
+      onBodyClick,
+      className,
+      style,
+      commentsSidebarOpen = false,
+      sidebarOverlay,
+      scrollContainerRef: scrollContainerRefProp,
+      onHyperlinkClick,
+      onContextMenu,
+      onAnchorPositionsChange,
+      sidebarCommentIds = [],
+      onYrsTrackedChangesChange,
+      onTotalPagesChange,
+      onLayoutComputed,
+      layoutInWorker,
+      fontRequirementsInWorker,
+      onError,
+      applyResidentInput,
+      applyResidentDelete,
+      hyperlinkPopupData,
+      onHyperlinkPopupNavigate,
+      onHyperlinkPopupCopy,
+      onHyperlinkPopupEdit,
+      onHyperlinkPopupRemove,
+      onHyperlinkPopupClose,
+      isSuggesting = false,
+      author = 'User',
+      measurementFontProvider,
+      rustFontChainsProviderRef,
+      displayListQueries = null,
+      resolveDisplayListQueries,
+      pageNavigation,
+      canvasDisplayList = null,
+      displayListFrameEpoch = null,
+      residentCaret = null,
+      residentCaretAuthoritative = false,
+      paintedCaretActive = false,
+      onCaretInput,
+      onCaretInputDispatched,
+      onCaretInterrupt,
+      canvasHostRef,
+      canvasOverlayTarget = null,
+      commandBridgeRef,
+    } = props;
+    const viewerDocumentRead = viewerDocumentReadProp;
+    const yrsStyleResolver = useMemo(() => (styles ? createStyleResolver(styles) : null), [styles]);
+
+    // Resolve the scroll container: prefer parent-provided ref, fallback to own container
+    const getScrollContainer = useCallback((): HTMLDivElement | null => {
+      if (scrollContainerRefProp && typeof scrollContainerRefProp === 'object') {
+        return (scrollContainerRefProp as React.RefObject<HTMLDivElement | null>).current;
+      }
+      return containerRef.current;
+    }, [scrollContainerRefProp]);
+
+    // Refs
+    const containerRef = useRef<HTMLDivElement>(null);
+    const pagesContainerRef = useRef<HTMLDivElement>(null);
+    useEffect(() => {
+      if (!canvasHostRef || canvasHostRef.current) return;
+      const host = pagesContainerRef.current;
+      if (!host) return;
+      canvasHostRef.current = host;
+      return () => {
+        if (canvasHostRef.current === host) canvasHostRef.current = null;
+      };
+    }, [canvasHostRef]);
+    /** Viewport wrapper: sync minHeight/marginBottom in layout pipeline before scroll restore. */
+    const viewportLayoutRef = useRef<HTMLDivElement>(null);
+    const yrsInputRef = useRef<YrsInputRef>(null);
+
+    const proposalPreview = useRevisionPreview(yrsCore.session);
+    const yrsRenderEnv = useMemo<YrsRenderEnv>(() => {
+      const themeColors: Record<string, string> = {};
+      for (const [name, value] of Object.entries(_theme?.colorScheme ?? {})) {
+        if (typeof value === 'string') themeColors[name] = value;
+      }
+      return {
+        themeColors,
+        defaultTabStopTwips: document?.package.settings?.defaultTabStop ?? null,
+        compressPunctuation: compressesPunctuation(document?.package.settings),
+        numericIds: {},
+        showHiddenText,
+        mediaTokens: true,
+        ...(proposalPreview.revisionPreview
+          ? { revisionPreview: proposalPreview.revisionPreview }
+          : {}),
+        ...(reservations ? { reservations } : {}),
+        ...(reservationSets ? { reservationSets } : {}),
+      };
+    }, [
+      _theme?.colorScheme,
+      document?.package.settings?.defaultTabStop,
+      showHiddenText,
+      proposalPreview,
+      reservations,
+      reservationSets,
+    ]);
+    const activeYrsRootStory = partEditStory(partEdit, yrsCore.session);
+    const yrsInputPositionMap = useCallback(
+      (storyId = activeYrsRootStory) => yrsCore.inputPositionMap(storyId),
+      [activeYrsRootStory, yrsCore.inputPositionMap]
+    );
+    const yrsDisplayPositionToLoc = useCallback(
+      (position: number, story = 'body') => yrsCore.displayPositionToLoc(position, story),
+      [yrsCore.displayPositionToLoc]
+    );
+    const getYrsPositionProjectionRef = useRef<(rootStory: string) => YrsPositionProjection | null>(
+      () => null
+    );
+    const yrsLocToDisplayPosition = useCallback(
+      (loc: YrsLoc): number | null => {
+        const session = yrsCore.session;
+        if (!session) return null;
+        return yrsLocToProjectedDisplayPosition(
+          session,
+          getYrsPositionProjectionRef.current,
+          loc,
+          activeYrsRootStory,
+          yrsCore.inputPositionMap
+        );
+      },
+      [activeYrsRootStory, yrsCore.session, yrsCore.inputPositionMap]
+    );
+    const displayPositionToViewportLoc = useCallback(
+      (position: number): YrsLoc | null => {
+        const target = getYrsPositionProjectionRef.current('body')?.targetAt(position);
+        return target
+          ? yrsCore.displayPositionToLoc(target.displayPosition, target.story)
+          : yrsCore.displayPositionToLoc(position, 'body');
+      },
+      [yrsCore.displayPositionToLoc]
+    );
+    const yrsLocToViewportDisplayPosition = useCallback(
+      (loc: YrsLoc): number | null =>
+        getYrsPositionProjectionRef.current('body')?.positionForLoc(loc) ??
+        (loc.story === 'body' ? yrsLocToDisplayPosition(loc) : null),
+      [yrsLocToDisplayPosition]
+    );
+    // Store callbacks in refs to avoid infinite re-render loops
+    // when parent passes unstable callback references
+    const onSelectionChangeRef = useRef(onSelectionChange);
+    const onYrsSelectionChangeRef = useRef(onYrsSelectionChange);
+    const onViewerSelectionChangeRef = useRef(onViewerSelectionChange);
+    const onYrsPartSelectionChangeRef = useRef(onYrsPartSelectionChange);
+    const onYrsContentChangeRef = useRef(onYrsContentChange);
+    const onYrsHistoryChangeRef = useRef(onYrsHistoryChange);
+    const onReadyRef = useRef(onReady);
+    // Keep refs in sync with latest props
+    onSelectionChangeRef.current = onSelectionChange;
+    onYrsSelectionChangeRef.current = onYrsSelectionChange;
+    onViewerSelectionChangeRef.current = onViewerSelectionChange;
+    onYrsPartSelectionChangeRef.current = onYrsPartSelectionChange;
+    onYrsContentChangeRef.current = onYrsContentChange;
+    onYrsHistoryChangeRef.current = onYrsHistoryChange;
+    onReadyRef.current = onReady;
+
+    useEffect(() => {
+      const session = yrsCore.session;
+      onYrsHistoryChangeRef.current?.(session?.canUndo() ?? false, session?.canRedo() ?? false);
+    }, [yrsCore.session]);
+
+    // State
+    const [isFocused, setIsFocused] = useState(false);
+
+    useEffect(() => {
+      if (partEdit) setIsFocused(false);
+    }, [partEdit]);
+
+    useEffect(() => {
+      if (!isFocused) onCaretInterrupt?.();
+    }, [isFocused, onCaretInterrupt]);
+
+    // Read-only / suggesting / part-edit transitions bypass the resident input
+    // path, so any painted caret line would go stale — swap to the DOM caret.
+    useEffect(() => {
+      onCaretInterrupt?.();
+    }, [readOnly, isSuggesting, partEdit, onCaretInterrupt]);
+
+    // Image selection state — `isImageInteractingRef` lives at the parent so
+    // useSelectionOverlay can read it (to gate the deferred image-info clear)
+    // while useImageInteractions writes it (during drag / resize).
+    const isImageInteractingRef = useRef(false);
+
+    // Selection gate - ensures selection renders only when layout is current
+    const syncCoordinator = useMemo(() => new LayoutSelectionGate(), []);
+    const getYrsSelectionHead = useCallback(
+      () => yrsInputRef.current?.displaySelection()?.head ?? 0,
+      []
+    );
+
+    // Rust measurement — the sole measurement path. Wiring lives in the
+    // hook; engine-ready and fonts-ready re-layouts reach back through its
+    // runLayoutPipelineRef, and deferLayoutPass gates provisional passes.
+    const {
+      deferLayoutPass,
+      residentMeasurementConfig,
+      runLayoutPipelineRef,
+    } = useRustMeasurement({
+      onError,
+      document,
+      fontProvider: measurementFontProvider,
+      fontChainsProviderRef: rustFontChainsProviderRef,
+      textEngine: yrsCore.session,
+    });
+
+    // Layout pipeline — owns layout state, the rAF-coalesced scheduler,
+    // scroll-restore plumbing, and the page-count notifier.
+    const publishResidentLayout = useCallback(
+      (nextLayout: Layout | null) => onLayoutComputed?.(nextLayout, yrsCore.session),
+      [onLayoutComputed, yrsCore.session]
+    );
+    const {
+      layout,
+      layoutUpdateOrigin,
+      layoutCommit,
+      layoutCommitVersion,
+      runLayoutPipeline,
+      scheduleLayout,
+      cancelPendingScrollRestore,
+      navigationEpoch,
+      getLayoutRequest,
+      readLayoutRequest,
+    } = useLayoutPipeline({
+      onError,
+      document,
+      session: yrsCore.session,
+      renderEnv: yrsRenderEnv,
+      pageGap,
+      zoom,
+      deferLayoutPass,
+      residentMeasurementConfig,
+      displayListQueries,
+      interactionPageHostRef: canvasHostRef,
+      pagesContainerRef,
+      viewportLayoutRef,
+      getSelectionHead: getYrsSelectionHead,
+      displayPositionToYrsLoc: displayPositionToViewportLoc,
+      yrsLocToDisplayPosition: yrsLocToViewportDisplayPosition,
+      syncCoordinator,
+      getScrollContainer,
+      onTotalPagesChange,
+      onLayoutComputed: publishResidentLayout,
+      layoutInWorker,
+      fontRequirementsInWorker,
+      experimentalWorkerOpen: yrsCore.experimentalWorkerOpen,
+      onAnchorPositionsChange,
+    });
+    runLayoutPipelineRef.current = yrsCore.session ? runLayoutPipeline : null;
+    const handleLocalCaretInterrupt = useCallback(() => {
+      cancelPendingScrollRestore();
+      onCaretInterrupt?.();
+    }, [cancelPendingScrollRestore, onCaretInterrupt]);
+
+    // Selection overlay — caret, range rects, image overlay info, plus the
+    // ResizeObserver + post-layout recompute that keep geometry fresh.
+    const getYrsDisplaySelection = useCallback(
+      () => yrsInputRef.current?.displaySelection() ?? null,
+      []
+    );
+    const getYrsStickySelection = useCallback(
+      () => yrsCore.session?.selection() ?? null,
+      [yrsCore.session]
+    );
+    const {
+      selectionRects,
+      caretPosition,
+      setSelectionRects,
+      setCaretPosition,
+      updateSelectionOverlay,
+    } = useSelectionOverlay({
+      layout,
+      containerRef,
+      syncCoordinator,
+      displayListQueries,
+      displayListFrameEpoch,
+      residentCaret,
+      residentCaretAuthoritative,
+      getYrsDisplaySelection,
+      getYrsStickySelection,
+    });
+    const updateSelectionOverlayRef = useRef(updateSelectionOverlay);
+    updateSelectionOverlayRef.current = updateSelectionOverlay;
+    const handleViewerSelectionChange = useCallback((selection: ViewerSelectionChange) => {
+      if (yrsInputRef.current?.displaySelection()) {
+        updateSelectionOverlayRef.current();
+      } else {
+        setSelectionRects((current) => (current.length === 0 ? current : []));
+        setCaretPosition((current) => (current === null ? current : null));
+      }
+      onViewerSelectionChangeRef.current?.(selection);
+    }, [setCaretPosition, setSelectionRects]);
+    const viewerDocumentReadRef = useRef(viewerDocumentRead);
+    viewerDocumentReadRef.current = viewerDocumentRead;
+    const viewerSessionRef = useRef(yrsCore.session);
+    viewerSessionRef.current = yrsCore.session;
+    const viewerMountedRef = useRef(true);
+    useEffect(() => {
+      viewerMountedRef.current = true;
+      return () => { viewerMountedRef.current = false; };
+    }, []);
+    const viewerQueriesRef = useRef(displayListQueries);
+    viewerQueriesRef.current = displayListQueries;
+    const viewerFrameListenersRef = useRef(new Set<() => void>());
+    useEffect(() => {
+      for (const listener of viewerFrameListenersRef.current) listener();
+    }, [displayListQueries]);
+    useEffect(() => onPresented(() => {
+      for (const listener of viewerFrameListenersRef.current) listener();
+    }), []);
+    const awaitViewerFrame = useCallback((previous: DisplayListQueries | null | undefined, timeoutMs: number): Promise<DisplayListQueries | null> =>
+      new Promise((resolve) => {
+        const listeners = viewerFrameListenersRef.current;
+        const finish = (queries: DisplayListQueries | null): void => {
+          clearTimeout(timer);
+          listeners.delete(check);
+          resolve(queries);
+        };
+        const check = (): void => {
+          const queries = viewerQueriesRef.current;
+          const nextVersion = presentedWorkerVersion(queries);
+          if (queries && nextVersion !== null && queries !== previous && isPresented(canvasHostRef?.current, queries.displayList)) {
+            finish(queries);
+          }
+        };
+        const timer = setTimeout(() => finish(null), timeoutMs);
+        listeners.add(check);
+        check();
+      }), [canvasHostRef]);
+    const [viewerPointPositions] = useState(() => new ViewerPointPositions());
+    const resolveViewerBookmark = useCallback(async (name: string): Promise<number | null> => {
+      const read = viewerDocumentReadRef.current;
+      const expectVersion = presentedWorkerVersion(viewerQueriesRef.current);
+      if (!read || expectVersion === null) return null;
+      const reply = await readAt(read, { kind: 'bookmarkPosition', story: 'body', name, expectVersion });
+      return reply.status === 'ok' &&
+        presentedWorkerVersion(viewerQueriesRef.current) === expectVersion
+        ? reply.value
+        : null;
+    }, []);
+
+    // Route body focus to the yrs textarea input surface.
+    const focusBodyInput = useCallback((): void => {
+      yrsInputRef.current?.focus();
+    }, []);
+
+    const yrsProjectionVersionRef = useRef(0);
+    const [overlayProjectionSession, setOverlayProjectionSession] = useState<YrsSession | null>(null);
+    useEffect(() => {
+      if (!yrsCore.experimentalWorkerOpen || !yrsCore.replicaReady || !yrsCore.session) return;
+      const controller = new AbortController();
+      const session = yrsCore.session;
+      void yieldToMainThread().then(() => {
+        if (!controller.signal.aborted) setOverlayProjectionSession(session);
+      });
+      return () => controller.abort();
+    }, [yrsCore.experimentalWorkerOpen, yrsCore.replicaReady, yrsCore.session]);
+    const overlayProjectionReady = !yrsCore.experimentalWorkerOpen ||
+      (yrsCore.replicaReady && overlayProjectionSession === yrsCore.session);
+    const projectionReplicaReadyRef = useRef(yrsCore.replicaReady);
+    if (
+      yrsCore.experimentalWorkerOpen &&
+      projectionReplicaReadyRef.current !== yrsCore.replicaReady
+    ) {
+      projectionReplicaReadyRef.current = yrsCore.replicaReady;
+      yrsProjectionVersionRef.current += 1;
+    }
+    const latestYrsToolbarSelectionRef = useRef<YrsToolbarSelection | null>(null);
+    const stateListenersRef = useRef(new Set<() => void>());
+    const notifyStateListeners = useCallback(() => {
+      for (const listener of [...stateListenersRef.current]) listener();
+    }, []);
+    const lastYrsToolbarSelectionKeyRef = useRef<string | null>(null);
+    const lastPublishedBodySelectionKeyRef = useRef<string | null>(null);
+    const lastPublishedPresenceSelectionKeyRef = useRef<string | null>(null);
+    const documentChangeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const publishYrsDirectInput = useCallback((dirtyStories?: string | readonly string[]): void => {
+      yrsCore.publishDirectInput(dirtyStories);
+      // Structural input can mint a paragraph before the existing projection
+      // can map its new sticky caret. Invalidate first so emitSelection can
+      // rebuild the projection and reach the normal layout-refresh callback.
+      yrsProjectionVersionRef.current += 1;
+    }, [yrsCore.publishDirectInput]);
+    useEffect(
+      () => () => {
+        if (documentChangeTimerRef.current !== null) {
+          clearTimeout(documentChangeTimerRef.current);
+        }
+      },
+      []
+    );
+    const refreshYrsLayout = useCallback(
+      (origin: LayoutUpdateOrigin, inWorker?: boolean): void => {
+        yrsProjectionVersionRef.current += 1;
+        syncCoordinator.incrementStateSeq();
+        syncCoordinator.requestRender();
+        scheduleLayout(origin, inWorker);
+      },
+      [scheduleLayout, syncCoordinator]
+    );
+
+    const refreshWorkerLayout = useCallback(
+      () => refreshYrsLayout('remote', true),
+      [refreshYrsLayout]
+    );
+
+    /**
+     * Publish sticky yrs selection geometry and refresh the yrs-backed layout.
+     */
+    const handleYrsStateChange = useCallback(
+      (
+        selection: YrsDisplaySelection,
+        docChanged: boolean,
+        residentLayoutReady = false,
+        residentCaretReady = false,
+        updateOrigin: LayoutUpdateOrigin = 'local',
+        inWorker?: boolean,
+        initializing = false
+      ): void => {
+        const session = yrsCore.session;
+        if (session) {
+          onYrsHistoryChangeRef.current?.(session.canUndo(), session.canRedo());
+        }
+        const presence = collaboration?.presence;
+        const stickySelection = session?.selection() ?? null;
+        const presenceSelectionKey = stickySelection
+          ? JSON.stringify([stickySelection.anchor, stickySelection.head])
+          : null;
+        if (
+          presence &&
+          session &&
+          lastPublishedPresenceSelectionKeyRef.current !== presenceSelectionKey
+        ) {
+          lastPublishedPresenceSelectionKeyRef.current = presenceSelectionKey;
+          try {
+            presence.setCursor(session.encodeSelection(), !docChanged);
+          } catch {
+            presence.setCursor(null, !docChanged);
+          }
+        }
+        const liveStory = session?.selection()?.head.story ?? activeYrsRootStory;
+        const inputMap = yrsCore.inputPositionMap(liveStory);
+        latestYrsToolbarSelectionRef.current = null;
+        if (session && inputMap) {
+          const toolbarSelection = currentYrsToolbarSelection(session, inputMap);
+          if (toolbarSelection) {
+            const nextToolbarSelection = withStoredYrsFormatting(
+              toolbarSelection,
+              yrsInputRef.current?.storedFormatting() ?? null
+            );
+            latestYrsToolbarSelectionRef.current = nextToolbarSelection;
+            const key = JSON.stringify([
+              nextToolbarSelection.context,
+              nextToolbarSelection.tableContext,
+              nextToolbarSelection.range.story,
+              nextToolbarSelection.startParagraphIndex,
+              nextToolbarSelection.endParagraphIndex,
+            ]);
+            if (lastYrsToolbarSelectionKeyRef.current !== key) {
+              lastYrsToolbarSelectionKeyRef.current = key;
+              onYrsSelectionChangeRef.current?.(nextToolbarSelection);
+            }
+          }
+        }
+
+        if (partEdit && activeYrsRootStory !== 'body') {
+          lastPublishedBodySelectionKeyRef.current = null;
+          onYrsPartSelectionChangeRef.current?.(partEdit, {
+            from: selection.anchor,
+            to: selection.head,
+          });
+        } else {
+          const stickySelection = session?.selection();
+          const selectionKey = stickySelection
+            ? JSON.stringify([stickySelection.anchor, stickySelection.head])
+            : `${selection.anchor}:${selection.head}`;
+          const selectionChanged = lastPublishedBodySelectionKeyRef.current !== selectionKey;
+          lastPublishedBodySelectionKeyRef.current = selectionKey;
+          // Publish body selection before the asynchronous layout/sidebar
+          // projection. React state consumes the authoritative yrs positions
+          // directly.
+          if (!docChanged && selectionChanged) {
+            onSelectionChangeRef.current?.(selection.anchor, selection.head, initializing);
+          }
+        }
+        // Layout reads the same authoritative selection, but selection state
+        // itself is published above from the yrs event rather than inferred
+        // later from a projection rebuild.
+        if (!residentCaretReady) updateSelectionOverlay();
+        if (docChanged && !residentLayoutReady) {
+          refreshYrsLayout(updateOrigin, inWorker);
+        }
+        if (docChanged) {
+          // Compatibility callbacks stay off the synchronous input path.
+          if (documentChangeTimerRef.current !== null) {
+            clearTimeout(documentChangeTimerRef.current);
+          }
+          documentChangeTimerRef.current = setTimeout(() => {
+            documentChangeTimerRef.current = null;
+            onYrsContentChangeRef.current?.();
+          }, 100);
+        }
+        notifyStateListeners();
+      },
+      [
+        activeYrsRootStory,
+        collaboration?.presence,
+        notifyStateListeners,
+        partEdit,
+        refreshYrsLayout,
+        updateSelectionOverlay,
+        yrsCore.inputPositionMap,
+        yrsCore.session,
+      ]
+    );
+
+    useEffect(() => {
+      const presence = collaboration?.presence;
+      const session = yrsCore.session;
+      lastPublishedPresenceSelectionKeyRef.current = null;
+      if (!presence || !session) return;
+      const selection = session.selection();
+      lastPublishedPresenceSelectionKeyRef.current = selection
+        ? JSON.stringify([selection.anchor, selection.head])
+        : null;
+      try {
+        presence.setCursor(session.encodeSelection());
+      } catch {
+        presence.setCursor(null);
+      }
+    }, [collaboration?.presence, yrsCore.session]);
+
+    const syncYrsInputState = useCallback(
+      (
+        docChanged: boolean,
+        origin: LayoutUpdateOrigin = 'local',
+        dirtyStory?: string | readonly string[],
+        inWorker?: boolean
+      ): boolean => {
+        if (!yrsCore.session) return false;
+        const displaySelection = yrsInputRef.current?.displaySelection() ?? { anchor: 0, head: 0 };
+        if (docChanged) {
+          yrsCore.publishDirectInput(dirtyStory);
+        }
+        handleYrsStateChange(displaySelection, docChanged, false, false, origin, inWorker);
+        return true;
+      },
+      [handleYrsStateChange, yrsCore.publishDirectInput, yrsCore.session]
+    );
+
+    useEffect(() => {
+      const session = yrsCore.session;
+      if (!session) return;
+      return session.onUpdate((_update, origin) => {
+        if (
+          origin === 'remote' &&
+          (!yrsCore.experimentalWorkerOpen || !workerOpenReplicaPending(session))
+        ) {
+          syncYrsInputState(true, origin);
+        }
+      });
+    }, [syncYrsInputState, yrsCore.session]);
+
+    const executeYrsFormatting = useCallback(
+      (action: FormattingAction): boolean => {
+        if (!yrsCore.session) return false;
+        const liveStory = yrsCore.session.selection()?.head.story ?? activeYrsRootStory;
+        const map = yrsCore.inputPositionMap(liveStory);
+        if (!map) return false;
+        try {
+          const structuralAuthor = isSuggesting
+            ? { name: author, date: new Date().toISOString() }
+            : undefined;
+          const selection = currentYrsToolbarSelection(yrsCore.session, map);
+          if (
+            selection &&
+            typeof action === 'object' &&
+            action.type === 'applyStyle' &&
+            yrsStyleResolver
+          ) {
+            const resolved = yrsStyleResolver.resolveParagraphStyle(action.value);
+            const delta = yrsDeltaForTextFormatting(resolved.runFormatting);
+            yrsCore.session.applyParagraphStyle(selection.range, action.value, structuralAuthor);
+            if (selection.context.hasSelection) {
+              if (Object.keys(delta).length > 0) {
+                yrsCore.session.formatRange(selection.range, delta);
+              }
+              yrsInputRef.current?.clearStoredFormatting();
+            } else if (Object.keys(delta).length > 0) {
+              yrsInputRef.current?.applyStoredFormatting({ type: 'set', delta });
+            }
+            return syncYrsInputState(true);
+          }
+          if (selection && !selection.context.hasSelection) {
+            const storedAction = storedYrsToolbarFormatting(selection.context, action);
+            if (storedAction) {
+              yrsInputRef.current?.applyStoredFormatting(storedAction);
+              return true;
+            }
+          }
+          const changed = applyYrsToolbarFormatting(yrsCore.session, map, action, structuralAuthor);
+          if (!changed) return false;
+          yrsInputRef.current?.clearStoredFormatting();
+          return syncYrsInputState(true);
+        } catch (error) {
+          syncYrsInputState(true);
+          throw error;
+        }
+      },
+      [
+        activeYrsRootStory,
+        author,
+        isSuggesting,
+        syncYrsInputState,
+        yrsStyleResolver,
+        yrsCore.inputPositionMap,
+        yrsCore.session,
+      ]
+    );
+
+    const applyYrsFormatting = useCallback(
+      (action: FormattingAction): boolean => {
+        let changed: boolean;
+        try {
+          changed = executeYrsFormatting(action);
+        } catch (error) {
+          console.error('[yrs] toolbar formatting failed', error);
+          return false;
+        }
+        if (changed) yrsInputRef.current?.focus();
+        return changed;
+      },
+      [executeYrsFormatting]
+    );
+
+    const executeYrsCommand = useCallback(
+      (command: YrsEditorCommand): boolean => {
+        const session = yrsCore.session;
+        if (!session || activeYrsRootStory !== 'body') return false;
+        const displaySelection = yrsInputRef.current?.displaySelection() ?? { anchor: 0, head: 0 };
+        const positionProjection = getYrsPositionProjectionRef.current('body');
+        if (!positionProjection) return false;
+        try {
+          const structuralAuthor = isSuggesting
+            ? { name: author, date: new Date().toISOString() }
+            : undefined;
+          let docChanged = true;
+          const imageAt = (start: number) => {
+            const target = positionProjection.targetAt(start);
+            return yrsCore.displayPositionToLoc(target.displayPosition, target.story);
+          };
+          if (command.type === 'imageGeometry') {
+            const node = positionProjection.nodeAt(command.pmPos);
+            if (!node || node.kind !== 'image') return false;
+            const at = imageAt(node.start);
+            const geometry = yrsImageGeometryForProjectedNode(node, command.patch);
+            if (!at || !geometry) return false;
+            session.setImageGeometryAt(at, geometry);
+          } else if (command.type === 'imageWrap') {
+            const node = positionProjection.nodeAt(command.pmPos);
+            if (!node || node.kind !== 'image') return false;
+            const at = imageAt(node.start);
+            const patch = resolveImageLayoutAttrs(command.target, node.attrs, command.options);
+            const geometry = yrsImageGeometryForProjectedNode(node, patch);
+            if (!at || !geometry) return false;
+            session.setImageGeometryAt(at, geometry);
+          } else if (command.type === 'imageTransform') {
+            const node = positionProjection.nodeAt(command.pmPos);
+            if (!node || node.kind !== 'image') return false;
+            const at = imageAt(node.start);
+            const transform = yrsImageTransformForProjectedNode(node, command.action);
+            const geometry = yrsImageGeometryForProjectedNode(node, { transform });
+            if (!at || !geometry) return false;
+            session.setImageGeometryAt(at, geometry);
+          } else if (command.type === 'insertImage') {
+            const at = session.selection()?.head;
+            if (!at) return false;
+            const landed = session.insertImage(at, command.image, structuralAuthor).range;
+            session.setSelection(
+              landed ? { story: landed.story, ...landed.end } : { ...at, offset: at.offset + 1 }
+            );
+          } else if (command.type === 'contentControlValue') {
+            const node = positionProjection.nodeAt(command.pmPos);
+            const embedId = command.embedId ?? (node ? yrsEmbedIdForProjectedNode(node) : null);
+            if (embedId) {
+              session.setContentControlValue(embedId, command.value);
+            } else {
+              if (!node || (node.kind !== 'sdt' && node.kind !== 'blockSdt')) return false;
+              const target = positionProjection.targetAt(node.start);
+              const at = yrsCore.displayPositionToLoc(target.displayPosition, target.story);
+              if (!at) return false;
+              session.setContentControlValueAt(at, command.value);
+            }
+          } else if (command.type === 'paragraphAttrs' || command.type === 'removeTabStop') {
+            const map = yrsCore.inputPositionMap('body');
+            const selection = map ? currentYrsToolbarSelection(session, map) : null;
+            if (!selection) return false;
+            if (command.type === 'paragraphAttrs') {
+              session.setParagraphAttrs(selection.range, command.attrs, structuralAuthor);
+            } else {
+              const currentTabs = selection.context.paragraphProperties.tabs;
+              const tabs = Array.isArray(currentTabs)
+                ? currentTabs.filter(
+                    (tab) =>
+                      tab != null &&
+                      typeof tab === 'object' &&
+                      Number((tab as { position?: unknown }).position) !== command.positionTwips
+                  )
+                : [];
+              session.setParagraphAttrs(
+                selection.range,
+                { tabs: tabs.length > 0 ? (tabs as never) : null },
+                structuralAuthor
+              );
+            }
+          } else if (command.type === 'setHyperlink') {
+            const selected = currentYrsSelectionRange(session);
+            const existing = command.editExisting
+              ? yrsHyperlinkAtSelection(session, command.matchHref)
+              : null;
+            if (!selected) return false;
+            let range = existing?.range ?? selected;
+            const collapsed =
+              range.start.paraId === range.end.paraId && range.start.offset === range.end.offset;
+            if ((collapsed || existing) && command.displayText) {
+              const at = { story: range.story, ...range.start };
+              const insertedRange = {
+                story: at.story,
+                start: { paraId: at.paraId, offset: at.offset },
+                end: { paraId: at.paraId, offset: at.offset + command.displayText.length },
+              };
+              if (existing) {
+                const receipt = session.replaceRange(range, command.displayText, structuralAuthor);
+                range = receipt.range ?? insertedRange;
+              } else {
+                range =
+                  session.insertText(at, command.displayText, structuralAuthor).range ??
+                  insertedRange;
+              }
+            }
+            if (
+              range.start.paraId === range.end.paraId &&
+              range.start.offset === range.end.offset
+            ) {
+              return false;
+            }
+            session.setHyperlink(range, {
+              href: command.href,
+              tooltip: command.tooltip ?? null,
+              rId: null,
+            });
+            session.setSelection({ story: range.story, ...range.end });
+          } else if (command.type === 'removeHyperlink') {
+            const selected = currentYrsSelectionRange(session);
+            if (!selected) return false;
+            const collapsed =
+              selected.start.paraId === selected.end.paraId &&
+              selected.start.offset === selected.end.offset;
+            const range = collapsed
+              ? yrsHyperlinkAtSelection(session, command.href)?.range
+              : selected;
+            if (!range) return false;
+            session.setHyperlink(range, null);
+          } else if (command.type === 'insertPageBreak' || command.type === 'insertSectionBreak') {
+            const at = session.selection()?.head;
+            if (!at || breakRefusedWhileSuggesting(command.type, isSuggesting)) return false;
+            if (command.type === 'insertPageBreak') {
+              // The native renderer consumes page breaks at block boundaries.
+              // Split a non-empty prefix first so the facade insert lands
+              // between paragraph pilcrows.
+              const breakAt =
+                at.offset > 0
+                  ? {
+                      story: at.story,
+                      paraId: session.splitParagraph(at).secondParaId,
+                      offset: 0,
+                    }
+                  : at;
+              session.setSelection(breakAt);
+              session.insertPageBreak(breakAt);
+            } else session.insertSectionBreak(at, command.breakType);
+          } else if (command.type === 'insertTable') {
+            const at = session.selection()?.head;
+            if (!at || command.rows < 1 || command.columns < 1) return false;
+            // Tables are block embeds in the yrs save projection. When the
+            // caret follows text, split first so the embed lands between two
+            // paragraph pilcrows instead of inside the current paragraph.
+            const tableAt =
+              at.offset > 0
+                ? {
+                    story: at.story,
+                    paraId: session.splitParagraph(at).secondParaId,
+                    offset: 0,
+                  }
+                : at;
+            const receipt = session.insertTable(
+              tableAt,
+              command.rows,
+              command.columns,
+              structuralAuthor
+            );
+            const firstCell = {
+              story: receipt.table.story,
+              tableIndex: receipt.table.tableIndex,
+              row: 0,
+              column: 0,
+            };
+            session.setCellSelection({ anchor: firstCell, head: firstCell });
+            setYrsSelectionInCell(session, firstCell);
+          } else if (command.type === 'tableSetBorders') {
+            const target = currentYrsTableTarget(session);
+            if (!target) return false;
+            session.setCellBorders(target.range, command.borders);
+          } else if (command.type === 'tableProperties') {
+            const target = currentYrsTableTarget(session);
+            if (!target) return false;
+            if (
+              !setYrsTableProperty(
+                session,
+                { story: target.focused.story, tableIndex: target.focused.tableIndex },
+                'tblPr',
+                command.properties
+              )
+            ) {
+              return false;
+            }
+          } else if (command.type === 'tableColumnWidths') {
+            if (command.widths.length === 0) return false;
+            const table = positionProjection.tableAtStart(command.pmStart);
+            if (!table) return false;
+            const targets = command.widths.map((width) => ({
+              ...width,
+              at: {
+                story: table.story,
+                tableIndex: table.tableIndex,
+                row: 0,
+                column: width.column,
+              },
+            }));
+            for (const target of targets) {
+              session.setColumnWidth(target.at, target.widthTwips);
+            }
+            setYrsTableProperty(
+              session,
+              { story: targets[0].at.story, tableIndex: targets[0].at.tableIndex },
+              'tblPr',
+              { tableLayout: 'fixed' }
+            );
+          } else {
+            const target = currentYrsTableTarget(session);
+            if (!target) return false;
+            const table = { story: target.focused.story, tableIndex: target.focused.tableIndex };
+            const nearTable = yrsSelectionNearTable(session, table);
+
+            if (command.type === 'tableInsertRow') {
+              const at = command.at ?? target.focused;
+              session.setCellSelection({ anchor: at, head: at });
+              session.insertRow(at, command.side, structuralAuthor);
+            } else if (command.type === 'tableInsertColumn') {
+              const at = command.at ?? target.focused;
+              session.setCellSelection({ anchor: at, head: at });
+              session.insertColumn(at, command.side);
+            } else if (command.type === 'tableDeleteRow') {
+              const receipt = session.deleteRow(target.range, structuralAuthor);
+              if (receipt.deletedTable) {
+                if (nearTable) session.setSelection(nearTable);
+              } else {
+                const surviving = session.cellSelection()?.anchor ?? target.focused;
+                setYrsSelectionInCell(session, surviving);
+              }
+            } else if (command.type === 'tableDeleteColumn') {
+              const receipt = session.deleteColumn(target.range);
+              if (receipt.deletedTable) {
+                if (nearTable) session.setSelection(nearTable);
+              } else {
+                const surviving = session.cellSelection()?.anchor ?? target.focused;
+                setYrsSelectionInCell(session, surviving);
+              }
+            } else if (command.type === 'tableDelete') {
+              session.deleteTable(table);
+              if (nearTable) session.setSelection(nearTable);
+            } else if (command.type === 'tableMergeCells') {
+              if (
+                target.range.anchor.row === target.range.head.row &&
+                target.range.anchor.column === target.range.head.column
+              ) {
+                return false;
+              }
+              session.mergeCells(target.range);
+              const surviving = session.cellSelection()?.anchor ?? target.range.anchor;
+              setYrsSelectionInCell(session, surviving);
+            } else if (command.type === 'tableSplitCell') {
+              session.splitCell(target.focused, command.rows, command.columns);
+            } else if (command.type === 'tableCellShading') {
+              session.setCellShading(target.range, command.color);
+            } else {
+              const range = yrsTableSelectionRange(session, target.focused, command.target);
+              if (!range) return false;
+              session.setCellSelection(range);
+              docChanged = false;
+            }
+          }
+
+          if (docChanged) {
+            yrsCore.publishDirectInput();
+          }
+          handleYrsStateChange(
+            yrsInputRef.current?.displaySelection() ?? displaySelection,
+            docChanged
+          );
+          return true;
+        } catch (error) {
+          yrsCore.publishDirectInput();
+          handleYrsStateChange(yrsInputRef.current?.displaySelection() ?? displaySelection, true);
+          throw error;
+        }
+      },
+      [
+        activeYrsRootStory,
+        author,
+        handleYrsStateChange,
+        isSuggesting,
+        yrsCore.inputPositionMap,
+        yrsCore.publishDirectInput,
+        yrsCore.session,
+      ]
+    );
+
+    const applyYrsCommand = useCallback(
+      (command: YrsEditorCommand): boolean => {
+        let applied: boolean;
+        try {
+          applied = executeYrsCommand(command);
+        } catch (error) {
+          console.error('[yrs] non-toolbar command failed', error);
+          return false;
+        }
+        if (applied) yrsInputRef.current?.focus();
+        return applied;
+      },
+      [executeYrsCommand]
+    );
+
+    const [canvasFlashRequest, setCanvasFlashRequest] =
+      useState<CanvasParagraphFlashRequest | null>(null);
+    const requestCanvasParagraphFlash = useCallback(
+      (req: { from: number; to: number; options?: ParagraphHighlightOptions }) => {
+        setCanvasFlashRequest((prev) => ({
+          from: req.from,
+          to: req.to,
+          color: req.options?.color,
+          durationMs: req.options?.durationMs,
+          nonce: (prev?.nonce ?? 0) + 1,
+        }));
+      },
+      []
+    );
+    const handleCanvasFlashDone = useCallback((nonce: number) => {
+      setCanvasFlashRequest((prev) => (prev && prev.nonce === nonce ? null : prev));
+    }, []);
+
+    // Scroll API exposed via the PagedEditorRef. Owns the AbortController
+    // chain that lets a fresh scroll supersede an in-flight paint-settle.
+    const { scrollToPositionImpl, revealPositionImpl, scrollToPageImpl, scrollToParaIdImpl } =
+      usePagedScrollApi({
+        pagesContainerRef,
+        yrsInputRef,
+        yrsSession: yrsCore.session,
+        yrsLocToDisplayPosition,
+        getScrollContainer,
+        displayListQueries,
+        pageNavigation,
+        layout,
+        canvasHostRef,
+        onNavigationIntent: cancelPendingScrollRestore,
+        navigationEpoch,
+        requestCanvasParagraphFlash,
+      });
+    const scrollToPositionImplRef = useRef(scrollToPositionImpl);
+    scrollToPositionImplRef.current = scrollToPositionImpl;
+    const requestCanvasParagraphFlashRef = useRef(requestCanvasParagraphFlash);
+    requestCanvasParagraphFlashRef.current = requestCanvasParagraphFlash;
+
+    // Display-list positions retain the document tree's integer coordinate
+    // space. Build a lightweight index directly from the authoritative yrs
+    // stories and cache it across gestures until the next mutation.
+    const yrsPositionProjectionCacheRef = useRef<{
+      version: number;
+      session: YrsSession;
+      rootStory: string;
+      projection: YrsPositionProjection;
+    } | null>(null);
+    // Rebuilding a projection re-reads only the paragraphs that changed.
+    const yrsStorySegmentsRef = useRef<YrsStorySegmentCache | null>(null);
+    useEffect(
+      () => () => {
+        yrsStorySegmentsRef.current?.dispose();
+        yrsStorySegmentsRef.current = null;
+      },
+      []
+    );
+    const currentStorySegments = useCallback((session: YrsSession): YrsStorySegmentCache => {
+      let segments = yrsStorySegmentsRef.current;
+      if (segments?.session !== session) {
+        segments?.dispose();
+        segments = yrsStorySegmentsRef.current = new YrsStorySegmentCache(session);
+      }
+      segments.refresh();
+      return segments;
+    }, []);
+    const getYrsPositionProjection = useCallback(
+      (rootStory: string): YrsPositionProjection | null => {
+        const session = yrsCore.session;
+        if (!session || !session.hasStory(rootStory)) return null;
+        if (yrsCore.experimentalWorkerOpen) {
+          const ready = yrsCore.replicaReadyRef?.current ?? yrsCore.replicaReady;
+          if (projectionReplicaReadyRef.current !== ready) {
+            projectionReplicaReadyRef.current = ready;
+            yrsProjectionVersionRef.current += 1;
+          }
+        }
+        const cached = yrsPositionProjectionCacheRef.current;
+        if (
+          cached?.version === yrsProjectionVersionRef.current &&
+          cached.session === session &&
+          cached.rootStory === rootStory
+        ) {
+          return cached.projection;
+        }
+        const segments = currentStorySegments(session);
+        const projection = createYrsPositionProjection(session, rootStory, segments);
+        segments.scheduleDigests();
+        if (!projection) return null;
+        yrsPositionProjectionCacheRef.current = {
+          version: yrsProjectionVersionRef.current,
+          session,
+          rootStory,
+          projection,
+        };
+        return projection;
+      },
+      [currentStorySegments, yrsCore.session]
+    );
+    getYrsPositionProjectionRef.current = getYrsPositionProjection;
+    const resolveYrsDisplayTarget = useCallback(
+      (position: number) => {
+        const target = getYrsPositionProjection(activeYrsRootStory)?.targetAt(position);
+        return target
+          ? { story: target.story, displayPosition: target.displayPosition }
+          : null;
+      },
+      [activeYrsRootStory, getYrsPositionProjection]
+    );
+
+    // Pointer routing — every mouse path on the visible pages: cursor
+    // placement, drag-to-select (with cell-selection promotion), table
+    // resize handles, the floating "+" insert button, hyperlink clicks,
+    // header/footer double-clicks, word/paragraph multi-click, and
+    // right-click → host context-menu.
+    const {
+      applyPendingSelection,
+      bumpInputEpoch,
+      handleEditorKeyDown,
+      inputEpoch,
+      handlePagesContextMenu,
+      handleTableInsertClick,
+      tableInsertButton,
+      clearTableInsertTimer,
+      hideTableInsertButton,
+      getPositionFromMouse,
+    } = usePagesPointer({
+      pagesContainerRef,
+      yrsInputRef,
+      yrsSession: viewerDocumentRead ? null : yrsCore.session!,
+      yrsRootStory: activeYrsRootStory,
+      viewerSelection: viewerDocumentRead !== undefined,
+      resolveBookmarkPosition: viewerDocumentRead ? resolveViewerBookmark : undefined,
+      getYrsPositionProjection,
+      applyYrsCommand,
+      syncYrsInputState,
+      readOnly: readOnly && !holdInput,
+      inputScope,
+      inputQueries,
+      queueInput: !!yrsCore.experimentalWorkerOpen && !viewerDocumentRead,
+      replicaPending: viewerDocumentRead
+        ? undefined
+        : () =>
+            holdInput ||
+            (!!yrsCore.experimentalWorkerOpen &&
+              !(yrsCore.replicaReadyRef?.current ?? yrsCore.replicaReady)),
+      replicaReady: holdInput ? false : viewerDocumentRead ? true : yrsCore.replicaReady,
+      partEdit,
+      displayListQueries,
+      canvasHostRef,
+      canvasOverlayTarget,
+      onBodyClick,
+      onContextMenu,
+      onHyperlinkClick,
+      onHeaderFooterDoubleClick,
+      onNoteClick,
+      setSelectionRects,
+      setCaretPosition,
+      setIsFocused,
+      scrollToPositionImpl,
+    });
+
+    /**
+     * Handle focus on container - redirect to hidden input.
+     */
+    const handleContainerFocus = useCallback(
+      (e: React.FocusEvent) => {
+        if (readOnly) return;
+        // Don't steal focus from sidebar inputs (textareas, inputs, buttons)
+        const target = e.target as HTMLElement;
+        if (target.closest('.docx-comments-sidebar') || target.closest('.docx-unified-sidebar'))
+          return;
+        // Don't steal focus from the hyperlink popup's text/URL inputs —
+        // the focus event bubbles up here and would bounce focus back to
+        // the body input, making the inputs impossible to edit.
+        if (target.closest('.oox-hyperlink-popup')) return;
+        focusBodyInput();
+        setIsFocused(true);
+      },
+      [readOnly, focusBodyInput]
+    );
+
+    /**
+     * Handle blur from container.
+     */
+    const handleContainerBlur = useCallback((e: React.FocusEvent) => {
+      // Check if focus is staying within the editor container.
+      const relatedTarget = e.relatedTarget as HTMLElement | null;
+      if (relatedTarget && containerRef.current?.contains(relatedTarget)) {
+        return; // Focus staying within editor
+      }
+      // Keep selection visible when focus moves to toolbar or dropdown portals
+      if (
+        relatedTarget?.closest(
+          '[role="toolbar"], [data-radix-popper-content-wrapper], [data-radix-select-content], .docx-table-options-dropdown'
+        )
+      ) {
+        return;
+      }
+      setIsFocused(false);
+    }, []);
+
+    // Image overlay interactions — resize + drag-to-move. Owns the writes
+    // to `isImageInteractingRef` that gate the selection hook's deferred
+    // image-info clear during drag/resize gestures.
+    const {
+      handleImageResize,
+      handleImageResizeStart,
+      handleImageResizeEnd,
+      handleImageDragMove,
+      handleImageDragStart,
+      handleImageDragEnd,
+    } = useImageInteractions({
+      pagesContainerRef,
+      getPositionProjection: () => getYrsPositionProjection('body'),
+      isImageInteractingRef,
+      getPositionFromMouse,
+      canvasHostRef,
+      displayListQueries,
+      applyYrsCommand,
+    });
+
+    /**
+     * Handle keyboard events on container.
+     * The hidden textarea handles native keyboard/IME input; this container
+     * only intercepts shortcuts that originate outside it.
+     */
+    const handleKeyDown = useCallback(
+      (e: React.KeyboardEvent) => {
+        handleEditorKeyDown(e);
+        if (readOnly) return;
+        // The hidden textarea owns every keyboard/IME event for both body and
+        // header/footer roots. Do not re-interpret its bubbled events.
+        if (yrsInputRef.current?.isFocused()) return;
+        const target = e.target as HTMLElement | null;
+        // Don't hijack keystrokes typed into the hyperlink popup's inputs —
+        // refocusing the body input here would steal focus mid-type and route
+        // keys (e.g. space) into the document instead of the input.
+        if (target?.closest('.oox-hyperlink-popup')) return;
+        // Ensure the input surface is focused if the user types.
+        if (!yrsInputRef.current?.isFocused()) {
+          focusBodyInput();
+          setIsFocused(true);
+        }
+
+        // PageUp/PageDown - let container handle scrolling
+        if (['PageUp', 'PageDown'].includes(e.key) && !e.metaKey && !e.ctrlKey) {
+          // Let the editor handle the cursor movement first
+          // If it doesn't handle it (at bounds), the container will scroll
+        }
+
+        // Cmd/Ctrl+Home - scroll to top and move cursor to start
+        if (e.key === 'Home' && (e.metaKey || e.ctrlKey)) {
+          cancelPendingScrollRestore();
+          const sc = getScrollContainer();
+          if (sc) sc.scrollTop = 0;
+        }
+
+        // Cmd/Ctrl+End - scroll to bottom and move cursor to end
+        if (e.key === 'End' && (e.metaKey || e.ctrlKey)) {
+          cancelPendingScrollRestore();
+          const sc = getScrollContainer();
+          if (sc) sc.scrollTop = sc.scrollHeight;
+        }
+      },
+      [
+        handleEditorKeyDown,
+        cancelPendingScrollRestore,
+        readOnly,
+        getScrollContainer,
+        focusBodyInput,
+      ]
+    );
+
+    /**
+     * Handle mousedown on container (outside pages).
+     */
+    const handleContainerMouseDown = useCallback(
+      (e: React.MouseEvent) => {
+        if (readOnly) return;
+        // Don't steal focus from sidebar inputs
+        if (
+          (e.target as HTMLElement).closest('.docx-comments-sidebar') ||
+          (e.target as HTMLElement).closest('.docx-unified-sidebar')
+        )
+          return;
+        // Focus the input surface if clicking outside pages area
+        if (!yrsInputRef.current?.isFocused()) {
+          focusBodyInput();
+          setIsFocused(true);
+        }
+      },
+      [readOnly, focusBodyInput]
+    );
+
+    // =========================================================================
+    // Initial Layout
+    // =========================================================================
+
+    useEffect(() => {
+      if (!yrsCore.session) return;
+      runLayoutPipelineRef.current?.();
+      updateSelectionOverlayRef.current();
+      if (!readOnly) {
+        const raf = requestAnimationFrame(() => {
+          focusBodyInput();
+          setIsFocused(true);
+        });
+        return () => cancelAnimationFrame(raf);
+      }
+    }, [focusBodyInput, readOnly, runLayoutPipelineRef, yrsCore.session]);
+
+    // Canvas renderer: re-derive sidebar anchor Ys from the display list once
+    // each build lands. The layout pipeline's pass writes Ys in the DOM
+    // viewport's coordinate space (VIEWPORT_PADDING_TOP + pageGap), which
+    // doesn't correspond to the canvas page stack; this effect overrides them
+    // with `.canvas-pages`-host offsets derived from Rust range_rects
+    // queries. No-op (and no listener churn) on the default DOM-painter path.
+    //
+    // Under direct yrs input, the session's sticky comment coverage and revision
+    // ranges are projected to the body/HF display-list regions without touching
+    // an editor view.
+    const anchorEmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const lastAnchorEmitAtRef = useRef(0);
+    const lastAnchorPositionsRef = useRef<Map<string, number> | null>(null);
+    useViewerSidebarAnchors({
+      read: viewerSidebarActive ? viewerDocumentRead : undefined,
+      queries: displayListQueries,
+      commentIds: sidebarCommentIds,
+      zoom,
+      canvasHostRef,
+      pagesContainerRef,
+      overlayTarget: canvasOverlayTarget,
+      document,
+      onPositions: onAnchorPositionsChange,
+      onTracked: onYrsTrackedChangesChange,
+      onRanges: onViewerCommentRangesChange,
+    });
+    const sidebarReadsRef = useRef<SidebarRevisionReads | null>(null);
+    sidebarReadsRef.current ??= new SidebarRevisionReads();
+    useEffect(() => {
+      if (viewerDocumentRead) return;
+      const session = yrsCore.session;
+      if (!session || !yrsCore.replicaReady || !displayListQueries || !onAnchorPositionsChange) {
+        return;
+      }
+      const sidebarReads = sidebarReadsRef.current!;
+      let cancelled = false;
+      let hostRaf: number | null = null;
+      const emit = (): void => {
+        if (cancelled) return;
+        const host = canvasHostRef?.current ?? pagesContainerRef.current;
+        if (!host?.classList.contains('canvas-pages')) {
+          hostRaf = requestAnimationFrame(emit);
+          return;
+        }
+        const target = canvasOverlayTarget ?? host?.parentElement ?? null;
+        if (!target) return;
+        const projectY = sidebarAnchorProjectY(host, target, displayListQueries, zoom);
+        const { version, revisions } = sidebarReads.revisions(session);
+        if (sidebarCommentIds.length === 0 && revisions.length === 0) {
+          sidebarReads.deliver(
+            onYrsTrackedChangesChange,
+            EMPTY_TRACKED_CHANGES_RESULT,
+            session,
+            version
+          );
+          if (lastAnchorPositionsRef.current !== EMPTY_ANCHOR_POSITIONS) {
+            lastAnchorPositionsRef.current = EMPTY_ANCHOR_POSITIONS;
+            onAnchorPositionsChange(EMPTY_ANCHOR_POSITIONS);
+          }
+          return;
+        }
+        const { tracked, projection } = sidebarReads.tracked(
+          session,
+          storySegmentSource(session, currentStorySegments(session))
+        );
+        sidebarReads.deliver(onYrsTrackedChangesChange, tracked, session, version);
+        const hfRegions = new Map<string, 'header' | 'footer'>();
+        for (const rId of document?.package?.headers?.keys() ?? []) {
+          hfRegions.set(rId, 'header');
+        }
+        for (const rId of document?.package?.footers?.keys() ?? []) {
+          if (!hfRegions.has(rId)) hfRegions.set(rId, 'footer');
+        }
+        const positions = computeAnchorPositionsFromYrs(
+          session,
+          sidebarCommentIds,
+          revisions,
+          projection,
+          displayListQueries,
+          hfRegions,
+          projectY
+        );
+        const previous = lastAnchorPositionsRef.current;
+        const unchanged =
+          previous !== null &&
+          previous.size === positions.size &&
+          [...positions].every(([key, y]) => previous.get(key) === y);
+        if (unchanged) return;
+        lastAnchorPositionsRef.current = positions;
+        onAnchorPositionsChange(positions);
+      };
+      const scheduleEmit = (): void => {
+        // A superseded run's whenReady() may resolve late; its timer would block the live emit.
+        if (cancelled || anchorEmitTimerRef.current !== null) return;
+        if (performance.now() - lastAnchorEmitAtRef.current >= SIDEBAR_ANCHOR_STALE_MS) {
+          lastAnchorEmitAtRef.current = performance.now();
+          emit();
+          return;
+        }
+        anchorEmitTimerRef.current = setTimeout(() => {
+          anchorEmitTimerRef.current = null;
+          lastAnchorEmitAtRef.current = performance.now();
+          emit();
+        }, SIDEBAR_ANCHOR_EMIT_MS);
+      };
+      scheduleEmit();
+      void displayListQueries.whenReady().then(scheduleEmit, () => undefined);
+      return () => {
+        cancelled = true;
+        if (hostRaf !== null) cancelAnimationFrame(hostRaf);
+        if (anchorEmitTimerRef.current !== null) {
+          clearTimeout(anchorEmitTimerRef.current);
+          anchorEmitTimerRef.current = null;
+        }
+      };
+    }, [
+      viewerDocumentRead,
+      canvasHostRef,
+      canvasOverlayTarget,
+      currentStorySegments,
+      displayListQueries,
+      document,
+      onAnchorPositionsChange,
+      onYrsTrackedChangesChange,
+      pagesContainerRef,
+      sidebarCommentIds,
+      yrsCore.session,
+      yrsCore.replicaReady,
+      zoom,
+    ]);
+
+    // Canvas renderer (H2): re-back the plugin-facing RenderedDomContext with
+    // the a11y mirror. The pipeline's painter-backed context resolves against
+    // the parked 0×0 stage while the canvas paints, so this effect owns the
+    // context on the canvas path (the pipeline skips its own emit when
+    // source. The mirror speaks the same data-doc-* semantics
+    // contract, so third-party plugins keep resolving geometry unchanged.
+    useEffect(() => {
+      if (
+        (!yrsCore.replicaReady && !yrsCore.workerProposalsReady) ||
+        !displayListQueries ||
+        !onRenderedDomContextReady
+      ) return;
+      let cancelled = false;
+      let hostRaf: number | null = null;
+      const emit = (): void => {
+        if (cancelled) return;
+        const host = canvasHostRef?.current;
+        if (!host?.classList.contains('canvas-pages')) {
+          hostRaf = requestAnimationFrame(emit);
+          return;
+        }
+        onRenderedDomContextReady(
+          createRenderedDomContext(host, zoom, {
+            displayListQueries,
+            projector: createCanvasHostProjector(host, displayListQueries, zoom),
+          }),
+          displayListQueries
+        );
+      };
+      emit();
+      return () => {
+        cancelled = true;
+        if (hostRaf !== null) cancelAnimationFrame(hostRaf);
+      };
+    }, [
+      displayListQueries, onRenderedDomContextReady, canvasHostRef, zoom,
+      yrsCore.replicaReady, yrsCore.workerProposalsReady,
+    ]);
+
+    const fontRefreshStateRef = useRef({ yrsCore, viewerDocumentReadProp });
+    fontRefreshStateRef.current = { yrsCore, viewerDocumentReadProp };
+    const holdFontRefresh = useCallback(() => {
+      const { yrsCore: core, viewerDocumentReadProp: viewerRead } = fontRefreshStateRef.current;
+      const session = core.session;
+      return Boolean(
+        core.experimentalWorkerOpen &&
+        !core.previewing &&
+        !viewerRead &&
+        session &&
+        !session.isDisplayOnly?.() &&
+        workerOpenReplicaStarted(session) &&
+        workerOpenReplicaPending(session) &&
+        registeredWorkerProposalAuthority(session)?.holdsWorkerState() !== true
+      );
+    }, []);
+
+    // Re-layout triggers: web-font load complete + header/footer content + render-env changes.
+    useLayoutTriggers({
+      runLayoutPipeline,
+      updateSelectionOverlay,
+      headerContent,
+      footerContent,
+      firstPageHeaderContent,
+      firstPageFooterContent,
+      renderEnv: yrsRenderEnv,
+      holdFontRefresh,
+      fontRefreshReleased: Boolean(yrsCore.session) && yrsCore.replicaReady &&
+        pluginHostOpen !== false && !workerOpenReplicaPending(yrsCore.session!),
+      fontRefreshScope: yrsCore.session,
+    });
+
+    const displayPositionToYrsLoc = (position: number | PointPosition): YrsLoc | null => {
+      const target = projectYrsDisplayPosition(position, getYrsPositionProjection, yrsCore.session);
+      return target ? yrsCore.displayPositionToLoc(target.displayPosition, target.story) : null;
+    };
+
+    // Imperative-handle setup — exposes PagedEditorRef + mirrors via onReady.
+    const viewerReadAccess = () => {
+      const read = viewerDocumentReadRef.current;
+      const session = viewerSessionRef.current;
+      if (!read || !session) return null;
+      return {
+        read,
+        story: activeYrsRootStory,
+        host: () => canvasHostRef?.current,
+        queries: () => viewerQueriesRef.current,
+        awaitFrame: awaitViewerFrame,
+        current: () => viewerMountedRef.current && viewerSessionRef.current === session && viewerDocumentReadRef.current === read,
+        selection: () => yrsInputRef.current?.displaySelection() ?? null,
+      };
+    };
+
+    usePagedEditorRefApi({
+      readViewerFindMatches: async (searchText, options) => {
+        const access = viewerReadAccess();
+        return access ? readViewerFindMatches(access, searchText, options) : null;
+      },
+      readViewerSelectionInfo: async () => {
+        const access = viewerReadAccess();
+        return access ? readViewerSelectionInfo(access) : null;
+      },
+      navigateViewer: async (target, options, current) => {
+        const access = viewerReadAccess();
+        const input = yrsInputRef.current;
+        const gesture = input?.currentGesture?.();
+        if (!access || !input || gesture === undefined) return false;
+        const epoch = inputEpoch();
+        let interrupted = false;
+        const surface = getScrollContainer();
+        const interrupt = () => { interrupted = true; };
+        const events = ['pointerdown', 'mousedown', 'touchstart', 'keydown', 'wheel'];
+        for (const event of events) surface?.addEventListener(event, interrupt, { capture: true, passive: true });
+        try {
+          return await navigateViewer({
+            ...access,
+            current: () => access.current() && !interrupted && inputEpoch() === epoch &&
+              yrsInputRef.current === input && input.isGestureCurrent?.(gesture) === true &&
+              (current?.() ?? true),
+          }, target,
+            (range, flash) => {
+              yrsInputRef.current?.setSelectionFromDisplay(range.anchor, target.kind === 'paragraphTarget' ? range.anchor : range.head);
+              scrollToPositionImplRef.current(range.anchor, true);
+              if (target.kind === 'paragraphTarget' && flash?.highlight) {
+                requestCanvasParagraphFlashRef.current({ from: range.anchor, to: Math.max(range.anchor + 1, range.head), options: flash.highlight });
+              }
+              yrsInputRef.current?.focus();
+            }, options);
+        } finally {
+          for (const event of events) surface?.removeEventListener(event, interrupt, true);
+        }
+      },
+      viewerSelection: viewerDocumentRead !== undefined,
+      bumpInputEpoch,
+      inputEpoch,
+      readerSurface: getScrollContainer,
+      ref,
+      yrsInputRef,
+      layout,
+      runLayoutPipeline,
+      getLayoutRequest,
+      readLayoutRequest,
+      scrollToPositionImpl,
+      revealPositionImpl,
+      scrollToParaIdImpl,
+      scrollToPageImpl,
+      setIsFocused,
+      onReadyRef,
+      documentFromYrs: yrsCore.documentFromYrs,
+      yrsSession: yrsCore.session,
+      replicaReady: yrsCore.replicaReady,
+      refreshWorkerLayout,
+      experimentalWorkerOpen: yrsCore.experimentalWorkerOpen,
+      yrsLocToDisplayPosition,
+      syncYrsInputState: (docChanged, dirtyStory, options) =>
+        syncYrsInputState(docChanged, 'local', dirtyStory, options?.inWorker),
+      applyYrsFormatting,
+      applyYrsCommand,
+      getYrsPositionProjection: () => getYrsPositionProjection('body'),
+      displayPositionToYrsLoc,
+      getPositionAtPoint: (clientX, clientY) =>
+        viewerDocumentRead
+          ? viewerPointPositions.positionAt(
+              viewerDocumentRead,
+              canvasHostRef?.current,
+              displayListQueries,
+              zoom,
+              clientX,
+              clientY
+            )
+          : positionAtClientPoint(
+          {
+            getYrsSession: () => yrsCore.session,
+            displayPositionToYrsLoc,
+            hasPendingInput: () => yrsInputRef.current?.hasPendingInput() ?? false,
+          },
+            canvasHostRef?.current,
+            displayListQueries,
+            zoom,
+            clientX,
+            clientY
+          ),
+      readPositionAtPoint: async (clientX, clientY) =>
+        viewerDocumentRead
+          ? readViewerPositionAtClientPoint(
+              viewerDocumentRead,
+              canvasHostRef?.current,
+              displayListQueries,
+              zoom,
+              clientX,
+              clientY,
+              () => viewerQueriesRef.current,
+              awaitViewerFrame
+            )
+          : positionAtClientPoint(
+              {
+                getYrsSession: () => yrsCore.session,
+                displayPositionToYrsLoc,
+                hasPendingInput: () => yrsInputRef.current?.hasPendingInput() ?? false,
+              },
+              canvasHostRef?.current,
+              displayListQueries,
+              zoom,
+              clientX,
+              clientY
+            ),
+    });
+
+    usePagedEditorCommandBridge({
+      bumpInputEpoch,
+      bridgeRef: commandBridgeRef,
+      experimentalWorkerOpen: yrsCore.experimentalWorkerOpen,
+      viewerSession: viewerDocumentRead !== undefined,
+      yrsInputRef,
+      session: yrsCore.session,
+      rootStory: activeYrsRootStory,
+      inputPositionMap: yrsCore.inputPositionMap,
+      latestSelectionRef: latestYrsToolbarSelectionRef,
+      listenersRef: stateListenersRef,
+      getPositionProjection: () => getYrsPositionProjection('body'),
+      displayPositionToLoc: displayPositionToViewportLoc,
+      format: executeYrsFormatting,
+      command: executeYrsCommand,
+      syncYrsInputState: (docChanged, dirtyStory) =>
+        syncYrsInputState(docChanged, 'local', dirtyStory),
+      yrsLocToDisplayPosition,
+      scrollToPositionImpl,
+    });
+
+    // =========================================================================
+    // Render
+    // =========================================================================
+
+    // Min-height of the viewport wrapper. Delegates to `viewportMinHeightPx`
+    // so the same math runs in both the JSX commit and the imperative write
+    // the layout pipeline does mid-pipeline (needed for scroll-restore math
+    // before React commits).
+    const totalHeight = useMemo(() => {
+      if (!layout) return DEFAULT_PAGE_HEIGHT_PX + VIEWPORT_PADDING_TOP + VIEWPORT_PADDING_BOTTOM;
+      return viewportMinHeightPx(layout, pageGap);
+    }, [layout, pageGap]);
+
+    // Canvas path: the painted `.layout-run-image` the DOM overlay measures is
+    // parked, so `selectedImageInfo` never populates. Derive the selected image
+    // node's display position straight from the live selection instead — the
+    // CanvasImageSelectionOverlay sources its rect from the display list. Both a
+    // Both an image-node selection and a one-atom text range count as
+    // "image selected". Re-derived every render; selection changes already
+    // re-render PagedEditor (handleSelectionChange sets overlay state).
+    const canvasSelectedImagePos = (() => {
+      if (!canvasOverlayTarget || !displayListQueries) return null;
+      const selection = yrsInputRef.current?.displaySelection();
+      if (!selection || Math.abs(selection.anchor - selection.head) !== 1) return null;
+      const from = Math.min(selection.anchor, selection.head);
+      return getYrsPositionProjection('body')?.nodeAt(from)?.kind === 'image' ? from : null;
+    })();
+    const interactionPageHostRef =
+      canvasHostRef?.current != null ? canvasHostRef : pagesContainerRef;
+
+    return (
+      <div
+        ref={containerRef}
+        className={`oox-root paged-editor ${className ?? ''}`}
+        style={{ ...containerStyles, ...style, display: 'contents' }}
+        tabIndex={0}
+        onFocus={handleContainerFocus}
+        onBlur={handleContainerBlur}
+        onKeyDown={handleKeyDown}
+        onMouseDown={handleContainerMouseDown}
+      >
+        {/* Hidden textarea input surface that writes directly to yrs. */}
+        {viewerDocumentRead ? (
+          <ViewerInput
+            ref={yrsInputRef}
+            read={viewerDocumentRead}
+            story={activeYrsRootStory}
+            queries={displayListQueries ?? null}
+            document={yrsCore.session}
+            onSelectionChange={handleViewerSelectionChange}
+            onFocusChange={setIsFocused}
+          />
+        ) : (
+          <YrsInput
+            ref={yrsInputRef}
+            enabled
+            readOnly={(readOnly && !holdInput) || (!!partEdit && activeYrsRootStory === 'body')}
+            holdInput={holdInput}
+            inputScope={inputScope}
+            replicaReadyRef={yrsCore.experimentalWorkerOpen ? yrsCore.replicaReadyRef : undefined}
+            inputEpoch={inputEpoch}
+            applyPendingSelection={applyPendingSelection}
+            seedSelection={viewerDocumentRead === undefined && !holdInput}
+            session={yrsCore.session}
+            story={activeYrsRootStory}
+            isSuggesting={isSuggesting}
+            author={author}
+            inputPositionMap={yrsInputPositionMap}
+            displayPositionToLoc={yrsDisplayPositionToLoc}
+            resolveDisplayTarget={resolveYrsDisplayTarget}
+            locToDisplayPosition={yrsLocToDisplayPosition}
+            nextParagraphStyleId={(styleId) => yrsStyleResolver?.getNextStyleId(styleId) ?? null}
+            displayListQueries={activeYrsRootStory === 'body' ? displayListQueries : null}
+            resolveDisplayListQueries={
+              activeYrsRootStory === 'body' ? resolveDisplayListQueries : undefined
+            }
+            displayListFrameEpoch={displayListFrameEpoch}
+            residentCaret={residentCaret}
+            residentCaretAuthoritative={residentCaretAuthoritative}
+            layoutUpdateOrigin={layoutUpdateOrigin}
+            layoutCommit={layoutCommit}
+            layoutCommitVersion={layoutCommitVersion}
+            canvasHostRef={canvasHostRef ?? pagesContainerRef}
+            onStateChange={handleYrsStateChange}
+            onDirectInput={publishYrsDirectInput}
+            applyResidentInput={applyResidentInput}
+            applyResidentDelete={applyResidentDelete}
+            onFocusChange={setIsFocused}
+            onPendingInputChange={notifyStateListeners}
+            onCaretInput={activeYrsRootStory === 'body' ? onCaretInput : undefined}
+            onCaretInputDispatched={activeYrsRootStory === 'body' ? onCaretInputDispatched : undefined}
+            onCaretInterrupt={handleLocalCaretInterrupt}
+          />
+        )}
+
+        <div ref={viewportLayoutRef} style={{ display: 'contents' }}>
+          <div
+            ref={pagesContainerRef}
+            className="paged-editor__layout-host"
+            style={{ display: 'none' }}
+            aria-hidden="true"
+          />
+
+          {canvasOverlayTarget &&
+            canvasDisplayList &&
+            (residentCaretAuthoritative || displayListQueries) && (
+              <CanvasSelectionOverlay
+                selectionRects={partEdit ? [] : selectionRects}
+                // While the worker paints the caret into the presented frame,
+                // the DOM blink caret stays unmounted (two-mode caret).
+                caretPosition={partEdit || paintedCaretActive ? null : caretPosition}
+                isFocused={isFocused && !partEdit}
+                readOnly={readOnly}
+                overlayTarget={canvasOverlayTarget}
+                canvasHostRef={interactionPageHostRef}
+                displayList={canvasDisplayList}
+                displayListQueries={displayListQueries}
+                directProjection={residentCaretAuthoritative}
+                sidebarOpen={commentsSidebarOpen}
+                zoom={zoom}
+              />
+            )}
+
+          {canvasOverlayTarget &&
+            canvasDisplayList &&
+            displayListQueries &&
+            collaboration?.presence &&
+            yrsCore.session && (
+              <RemotePresenceOverlay
+                presence={collaboration.presence}
+                session={yrsCore.session}
+                locToDisplayPosition={yrsLocToDisplayPosition}
+                overlayTarget={canvasOverlayTarget}
+                canvasHostRef={interactionPageHostRef}
+                displayListQueries={displayListQueries}
+                displayListIdentity={canvasDisplayList}
+                displayListFrameEpoch={displayListFrameEpoch}
+                sidebarOpen={commentsSidebarOpen}
+                zoom={zoom}
+              />
+            )}
+
+          {canvasOverlayTarget && displayListQueries && !partEdit && (
+            <CanvasCellSelectionOverlay
+              session={viewerDocumentRead ? null : yrsCore.session}
+              positionProjection={overlayProjectionReady ? getYrsPositionProjection('body') : null}
+              overlayTarget={canvasOverlayTarget}
+              canvasHostRef={interactionPageHostRef}
+              displayListQueries={displayListQueries}
+              sidebarOpen={commentsSidebarOpen}
+              zoom={zoom}
+            />
+          )}
+
+          {canvasOverlayTarget && displayListQueries && (
+            <CanvasImageSelectionOverlay
+              pmPos={partEdit ? null : canvasSelectedImagePos}
+              isFocused={isFocused && !partEdit}
+              readOnly={readOnly}
+              overlayTarget={canvasOverlayTarget}
+              canvasHostRef={interactionPageHostRef}
+              displayListQueries={displayListQueries}
+              sidebarOpen={commentsSidebarOpen}
+              zoom={zoom}
+              onResize={handleImageResize}
+              onResizeStart={handleImageResizeStart}
+              onResizeEnd={handleImageResizeEnd}
+              onDragMove={handleImageDragMove}
+              onDragStart={handleImageDragStart}
+              onDragEnd={handleImageDragEnd}
+              onContextMenu={handlePagesContextMenu}
+            />
+          )}
+
+          {canvasOverlayTarget && displayListQueries && !partEdit && (
+            <CanvasTableResizeOverlay
+              overlayTarget={canvasOverlayTarget}
+              canvasHostRef={interactionPageHostRef}
+              displayListQueries={displayListQueries}
+              positionProjection={overlayProjectionReady ? getYrsPositionProjection('body') : null}
+              applyYrsCommand={applyYrsCommand}
+              readOnly={readOnly}
+              sidebarOpen={commentsSidebarOpen}
+              zoom={zoom}
+            />
+          )}
+
+          {canvasOverlayTarget && displayListQueries && (
+            <CanvasParagraphFlashOverlay
+              request={canvasFlashRequest}
+              overlayTarget={canvasOverlayTarget}
+              canvasHostRef={interactionPageHostRef}
+              displayListQueries={displayListQueries}
+              sidebarOpen={commentsSidebarOpen}
+              zoom={zoom}
+              onDone={handleCanvasFlashDone}
+            />
+          )}
+
+          {/* Table quick action insert button */}
+          {tableInsertButton &&
+            (() => {
+              const button = (
+                <TableInsertButton
+                  type={tableInsertButton.type}
+                  x={tableInsertButton.x}
+                  y={tableInsertButton.y}
+                  onMouseDown={handleTableInsertClick}
+                  onMouseEnter={clearTableInsertTimer}
+                  onMouseLeave={hideTableInsertButton}
+                />
+              );
+              return canvasOverlayTarget ? createPortal(button, canvasOverlayTarget) : button;
+            })()}
+
+          {/* Plugin overlays (highlights, annotations) */}
+          {pluginOverlays &&
+            (() => {
+              const overlay = (
+                <div className="paged-editor__plugin-overlays" style={pluginOverlaysStyles}>
+                  {pluginOverlays}
+                </div>
+              );
+              return canvasOverlayTarget ? createPortal(overlay, canvasOverlayTarget) : overlay;
+            })()}
+        </div>
+
+        {/* Sidebar overlay — positioned to match visual document height, visible overflow for sidebar items */}
+        {sidebarOverlay && (
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              right: 0,
+              height: totalHeight * zoom,
+              pointerEvents: 'none',
+              overflow: 'visible',
+            }}
+          >
+            <div style={{ pointerEvents: 'auto' }}>{sidebarOverlay}</div>
+          </div>
+        )}
+
+        {/* Hyperlink popup — rendered inside containerRef so it shares a
+            scroll context with the link. position: absolute + coords in
+            container space mean the browser repositions on scroll for free. */}
+        {hyperlinkPopupData &&
+          onHyperlinkPopupNavigate &&
+          onHyperlinkPopupCopy &&
+          onHyperlinkPopupEdit &&
+          onHyperlinkPopupRemove &&
+          onHyperlinkPopupClose &&
+          (() => {
+            const popup = (
+              <HyperlinkPopup
+                data={hyperlinkPopupData}
+                onNavigate={onHyperlinkPopupNavigate}
+                onCopy={onHyperlinkPopupCopy}
+                onEdit={onHyperlinkPopupEdit}
+                onRemove={onHyperlinkPopupRemove}
+                onClose={onHyperlinkPopupClose}
+                readOnly={readOnly}
+              />
+            );
+            return canvasOverlayTarget ? createPortal(popup, canvasOverlayTarget) : popup;
+          })()}
+      </div>
+    );
+  }
+);
+
+export const PagedEditor = memo(PagedEditorComponent);
+
+export default PagedEditor;

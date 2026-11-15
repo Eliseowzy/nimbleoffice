@@ -1,0 +1,2 @@
+export const MAX_REFERENCE_PAGES = 250;
+export const MAX_LOCAL_REFERENCE_PAGES = 5000;

@@ -1,0 +1,342 @@
+/**
+ * UnifiedSidebar
+ *
+ * Renders sidebar items from any source (comments, template tags, plugins)
+ * in a single column with shared collision avoidance and positioning.
+ */
+
+import React, { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react';
+import type { ReactSidebarItem, RenderedDomContext } from '../plugin-api/types';
+import { SIDEBAR_WIDTH, SIDEBAR_PAGE_GAP, SIDEBAR_DOCUMENT_SHIFT } from './sidebar/constants';
+import { resolveItemPositions } from './sidebar/resolveItemPositions';
+import { useTranslation } from '../i18n';
+
+export { SIDEBAR_WIDTH, SIDEBAR_PAGE_GAP, SIDEBAR_DOCUMENT_SHIFT } from './sidebar/constants';
+
+export interface UnifiedSidebarProps {
+  items: ReactSidebarItem[];
+  anchorPositions: Map<string, number>;
+  renderedDomContext: RenderedDomContext | null;
+  pageWidth: number;
+  zoom: number;
+  editorContainerRef: React.RefObject<HTMLDivElement | null>;
+  onExpandedItemChange?: (itemId: string | null) => void;
+  /** Controlled: sidebar item to expand based on cursor position. */
+  activeItemId?: string | null;
+  /** How far the page is shifted left to make room for the sidebar; defaults to `SIDEBAR_DOCUMENT_SHIFT`. */
+  documentShift?: number;
+  /** Column width; defaults to `SIDEBAR_WIDTH`. */
+  width?: number;
+  /** `'inset'` pulls a column that overflows the container back inside its right edge. */
+  overflow?: 'clip' | 'inset';
+  /** Client X where the selection ended; the inset column prefers to start just right of it. */
+  selectionEndX?: number | null;
+}
+
+const INSET_MARGIN = 12;
+const INSET_GAP = 16;
+
+export function UnifiedSidebar({
+  items,
+  anchorPositions,
+  renderedDomContext,
+  pageWidth,
+  zoom,
+  editorContainerRef,
+  onExpandedItemChange,
+  activeItemId,
+  documentShift = SIDEBAR_DOCUMENT_SHIFT,
+  width = SIDEBAR_WIDTH,
+  overflow = 'clip',
+  selectionEndX = null,
+}: UnifiedSidebarProps) {
+  const { t } = useTranslation();
+  // Fully controlled: parent owns expansion state via activeItemId
+  const expandedItem = activeItemId ?? null;
+  // Ref keeps toggleExpand stable so card children don't re-render on every cursor move
+  const expandedItemRef = useRef(expandedItem);
+  expandedItemRef.current = expandedItem;
+
+  const [initialPositionsDone, setInitialPositionsDone] = useState(false);
+  const cardHeightsRef = useRef<Map<string, number>>(new Map());
+  const lastKnownRef = useRef<Map<string, number>>(new Map());
+  const lastAnchorsRef = useRef<Map<string, number>>(new Map());
+  const knownCardsRef = useRef<Set<string>>(new Set());
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const cardElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  // Stable ref callbacks per item ID — avoids creating new closures on every render
+  const measureRefsRef = useRef<Map<string, (el: HTMLDivElement | null) => void>>(new Map());
+
+  const [positionVersion, setPositionVersion] = useState(0);
+
+  const resolved = useMemo(
+    () =>
+      resolveItemPositions(
+        items.filter((item) => !item.hidden),
+        anchorPositions,
+        renderedDomContext,
+        zoom,
+        cardHeightsRef.current,
+        lastKnownRef.current
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [items, anchorPositions, renderedDomContext, zoom, positionVersion]
+  );
+
+  const hasPositions = resolved.length > 0;
+  const anchorsMoved = resolved.some(({ item }) => {
+    const previous = lastAnchorsRef.current.get(item.id);
+    return previous !== undefined && previous !== lastKnownRef.current.get(item.id);
+  });
+
+  // Build position map for O(1) lookup by item ID
+  const positionMap = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const r of resolved) {
+      map.set(r.item.id, r.y);
+    }
+    return map;
+  }, [resolved]);
+
+  // Track newly positioned cards in an effect (not during render); a hidden card fades back in.
+  useLayoutEffect(() => {
+    for (const r of resolved) {
+      knownCardsRef.current.add(r.item.id);
+    }
+    lastAnchorsRef.current = new Map(lastKnownRef.current);
+    for (const item of items) if (item.hidden) knownCardsRef.current.delete(item.id);
+  }, [items, resolved]);
+
+  // Forget removed items, so a card that returns is placed afresh instead of at a stale Y.
+  useEffect(() => {
+    const live = new Set(items.map((item) => item.id));
+    for (const cache of [lastKnownRef.current, lastAnchorsRef.current, cardHeightsRef.current, measureRefsRef.current]) {
+      for (const id of cache.keys()) if (!live.has(id)) cache.delete(id);
+    }
+    for (const id of knownCardsRef.current) if (!live.has(id)) knownCardsRef.current.delete(id);
+  }, [items]);
+
+  // Re-measure card heights and bump positionVersion only if anything
+  // changed, so the collision-avoidance useMemo re-runs with real sizes.
+  // Reads are batched in a single rAF to avoid forced sync layout.
+  const remeasureAll = useCallback(() => {
+    let changed = false;
+    for (const [id, el] of cardElsRef.current) {
+      const h = el.offsetHeight;
+      if (cardHeightsRef.current.get(id) !== h) {
+        cardHeightsRef.current.set(id, h);
+        changed = true;
+      }
+    }
+    if (changed) setPositionVersion((v) => v + 1);
+  }, []);
+
+  // Items added/removed (incl. programmatic add via agent ref). The ref
+  // callback captures heights only on mount, so re-measure once they've
+  // committed (rAF) and again after layout settles (400ms).
+  useEffect(() => {
+    const raf = requestAnimationFrame(remeasureAll);
+    const timerFull = setTimeout(() => {
+      remeasureAll();
+      setInitialPositionsDone(true);
+    }, 400);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(timerFull);
+    };
+  }, [items.length, remeasureAll]);
+
+  useEffect(() => {
+    const container = editorContainerRef?.current;
+    if (!container) return;
+
+    const observer = new ResizeObserver(() => {
+      requestAnimationFrame(() => setPositionVersion((v) => v + 1));
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [editorContainerRef]);
+
+  // Re-measure on expand/collapse so collision avoidance uses up-to-date sizes.
+  useEffect(() => {
+    const raf = requestAnimationFrame(remeasureAll);
+    return () => cancelAnimationFrame(raf);
+  }, [expandedItem, remeasureAll]);
+
+  // Watch expanded card for ongoing size changes (e.g. typing in reply input)
+  useEffect(() => {
+    if (!expandedItem) return;
+    const el = cardElsRef.current.get(expandedItem);
+    if (!el) {
+      // Card just expanded but element not measured yet — trigger one recalc
+      const raf = requestAnimationFrame(() => setPositionVersion((v) => v + 1));
+      return () => cancelAnimationFrame(raf);
+    }
+
+    let rafId: number;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        cardHeightsRef.current.set(expandedItem, el.offsetHeight);
+        setPositionVersion((v) => v + 1);
+      });
+    });
+    observer.observe(el);
+    return () => {
+      cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, [expandedItem]);
+
+  const resizeRef = useRef<ResizeObserver | null>(null);
+  useEffect(() => {
+    let frame = 0, live = true;
+    const observer = new ResizeObserver(() => {
+      if (!live) return;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(remeasureAll);
+    });
+    resizeRef.current = observer;
+    for (const el of cardElsRef.current.values()) observer.observe(el);
+    return () => {
+      live = false;
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+      if (resizeRef.current === observer) resizeRef.current = null;
+    };
+  }, [remeasureAll]);
+  const getMeasureRef = useCallback((itemId: string): ((el: HTMLDivElement | null) => void) => {
+    let fn = measureRefsRef.current.get(itemId);
+    if (!fn) {
+      fn = (el: HTMLDivElement | null) => {
+        const previous = cardElsRef.current.get(itemId);
+        if (previous && previous !== el) resizeRef.current?.unobserve(previous);
+        if (el) {
+          cardElsRef.current.set(itemId, el);
+          cardHeightsRef.current.set(itemId, el.offsetHeight);
+          resizeRef.current?.observe(el);
+        } else {
+          cardElsRef.current.delete(itemId);
+          cardHeightsRef.current.delete(itemId);
+        }
+      };
+      measureRefsRef.current.set(itemId, fn);
+    }
+    return fn;
+  }, []);
+
+  const toggleExpand = useCallback(
+    (itemId: string) => {
+      onExpandedItemChange?.(expandedItemRef.current === itemId ? null : itemId);
+    },
+    [onExpandedItemChange]
+  );
+
+  const [insetShift, setInsetShift] = useState(0);
+  const insetShiftRef = useRef(0);
+  useLayoutEffect(() => {
+    if (overflow !== 'inset') {
+      insetShiftRef.current = 0;
+      setInsetShift(0);
+      return;
+    }
+    const aside = sidebarRef.current;
+    const container = editorContainerRef?.current;
+    if (!aside || !container) return;
+    const measure = () => {
+      const rect = aside.getBoundingClientRect();
+      const area = container.getBoundingClientRect();
+      const left = rect.left - insetShiftRef.current;
+      const max = area.right - INSET_MARGIN - rect.width;
+      let shift = 0;
+      if (left > max) {
+        const preferred = selectionEndX != null ? selectionEndX + INSET_GAP : max;
+        shift = Math.round(Math.max(area.left + INSET_MARGIN, Math.min(max, preferred)) - left);
+      }
+      if (shift !== insetShiftRef.current) {
+        insetShiftRef.current = shift;
+        setInsetShift(shift);
+      }
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [overflow, selectionEndX, editorContainerRef, pageWidth, zoom, documentShift, width, items.length]);
+
+  if (items.length === 0) return null;
+
+  return (
+    <aside
+      ref={sidebarRef}
+      className="docx-unified-sidebar"
+      data-docx-comment-sidebar=""
+      role="complementary"
+      aria-label={t('sidebar.ariaLabel')}
+      style={{
+        position: 'absolute',
+        top: 0,
+        left: `calc(50% - ${documentShift}px + ${(pageWidth * zoom) / 2 + SIDEBAR_PAGE_GAP}px)`,
+        width,
+        translate: insetShift ? `${insetShift}px 0` : undefined,
+        fontFamily: "'Google Sans', Roboto, Arial, sans-serif",
+        zIndex: 40,
+        backgroundColor: 'transparent',
+        overflowY: 'visible',
+        overflowX: 'visible',
+        opacity: hasPositions ? 1 : 0,
+        transition: 'opacity 0.15s ease',
+      }}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <div style={{ position: 'relative' }}>
+        {items.map((item) => {
+          const yPos = positionMap.get(item.id);
+          const isExpanded = expandedItem === item.id;
+          const isKnown = knownCardsRef.current.has(item.id);
+          const isNewCard = !isKnown && yPos !== undefined;
+          const noPosition = item.hidden || (hasPositions && yPos === undefined);
+
+          const style: React.CSSProperties = noPosition
+            ? {
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                opacity: 0,
+                visibility: 'hidden',
+              }
+            : hasPositions
+              ? { position: 'absolute', top: yPos, left: 0, right: 0, opacity: 1 }
+              : { marginBottom: 6 };
+
+          const transition = noPosition
+            ? 'none'
+            : isNewCard || item.isTemporary
+              ? 'opacity 0.2s ease'
+              : initialPositionsDone && !anchorsMoved
+                ? 'opacity 0.2s ease, top 0.15s ease'
+                : 'none';
+
+          return (
+            <div key={item.id} style={{ ...style, transition }}>
+              <SidebarItemContent render={item.render} id={item.id} isExpanded={isExpanded}
+                toggleExpand={toggleExpand} measureRef={getMeasureRef(item.id)} />
+            </div>
+          );
+        })}
+      </div>
+    </aside>
+  );
+}
+
+const SidebarItemContent = React.memo(function SidebarItemContent({ render, id, isExpanded, toggleExpand, measureRef }: {
+  render: ReactSidebarItem['render'];
+  id: string;
+  isExpanded: boolean;
+  toggleExpand(id: string): void;
+  measureRef(element: HTMLDivElement | null): void;
+}) {
+  const onToggleExpand = useCallback(() => toggleExpand(id), [toggleExpand, id]);
+  return <>{render({ isExpanded, onToggleExpand, measureRef })}</>;
+});

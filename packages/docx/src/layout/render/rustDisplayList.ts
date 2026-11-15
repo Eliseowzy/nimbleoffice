@@ -1,0 +1,597 @@
+/**
+ * JS seam to the Rust display-list builder.
+ *
+ * Marshals the `{ measured, options, layout }` envelope across the wasm
+ * boundary and hands back a DisplayList. Every paint and geometry decision
+ * happens in Rust; this module is serialization glue and nothing else, so a
+ * failure here is terminal — the types below carry no second engine to fall
+ * back to, only a typed {@link RustDisplayListSourceError} naming the stage
+ * that failed.
+ *
+ * Two transports exist. {@link buildRustDisplayList} sends the whole envelope
+ * and parses a DisplayList back. {@link buildRustDisplayFrame} prefers an
+ * engine that already retains pagination: it sends only the display-level
+ * extras and receives a binary FrameDelta, which is applied to the previous
+ * frame so unchanged pages keep object identity — the invariant the query
+ * facade's page-delta adoption depends on. An engine without
+ * `buildDisplayListFrame` takes the full-JSON path instead.
+ *
+ * The wasm module is loaded lazily on first build, so the inlined binary costs
+ * nothing until a display list is actually requested.
+ */
+
+import type { Layout } from '../pagination/types';
+import type { MeasuredBlock } from '../pagination/measuredBlock';
+import type { DisplayList } from './displayList';
+import { applyFrameDelta, decodeFrameDelta, type RetainedFrame } from './frameDelta';
+
+/**
+ * One header/footer part in the `headersFooters` envelope field: the measured
+ * blocks of the header/footer document identified by `rId`, plus the band
+ * metrics the caller already computed. The builder passes the metrics through
+ * verbatim and re-derives none of them.
+ */
+export interface DisplayListHfVariant {
+  rId: string;
+  kind: 'header' | 'footer';
+  type: 'default' | 'first' | 'even';
+  /** `toMeasuredBlocks(content.blocks, content.measures)` — same schema as body `measured` */
+  measured: MeasuredBlock[];
+  /** HeaderFooterContent.height (in-flow stack incl. floating blocks) */
+  height: number;
+  /** HeaderFooterContent.flowHeight (in-flow band height; fallback: height) */
+  flowHeight?: number;
+  visualTop?: number;
+  visualBottom?: number;
+  /**
+   * Per-page resolved widths of PAGE/NUMPAGES field runs in this HF part, so a
+   * centered/right-aligned line carrying such a field re-centers per page. The
+   * line width is measured ONCE at the field's fallback text ("1"), so without
+   * this the builder holds the same centered position on every page even though
+   * "Page 2 of 3"/"Page 10 of 12" have different widths. Omitted ⇒ the fields
+   * ride the char-distributed fallback width on every page.
+   */
+  fieldWidths?: DisplayListFieldWidths[];
+}
+
+/**
+ * Per-page widths of one PAGE/NUMPAGES field run in an HF part. `pmStart` is the
+ * field run's position in the header/footer document, and is the key the Rust
+ * builder matches on. `fallbackWidth` is the width the measure baked into `line.width`
+ * (the field's fallback text); `perPage[i]` is the width of the field's resolved
+ * text on layout page index `i` (PAGE → that page's number, NUMPAGES → total).
+ */
+export interface DisplayListFieldWidths {
+  pmStart: number;
+  fallbackWidth: number;
+  perPage: number[];
+}
+
+/**
+ * Optional header/footer payload of the builder envelope. Absent ⇒ the Rust
+ * output is byte-identical to the body-only build. Flags come off the section
+ * properties / settings the DOM painter uses; distances are the same px the
+ * painter resolves (`headerDistance ?? page.margins.header ?? 48`).
+ */
+export interface DisplayListHeadersFooters {
+  titlePg?: boolean;
+  evenAndOddHeaders?: boolean;
+  headerDistance?: number;
+  footerDistance?: number;
+  /** Page-level Word watermark, painted behind body/header/footer content. */
+  watermark?: DisplayListWatermark;
+  variants: DisplayListHfVariant[];
+  /** Stable section identity. Undefined ⇒ the envelope covers the whole document. */
+  sectionId?: string;
+  /** Zero-based section index. */
+  sectionIndex?: number;
+}
+
+export type DisplayListWatermark = DisplayListTextWatermark | DisplayListPictureWatermark;
+
+export interface DisplayListTextWatermark {
+  kind: 'text';
+  text: string;
+  font: string;
+  color: string;
+  semitransparent: boolean;
+  layout: 'diagonal' | 'horizontal';
+  fontSize?: number;
+  /** Undefined defaults to true for watermarks. */
+  decorative?: boolean;
+}
+
+export interface DisplayListPictureWatermark {
+  kind: 'picture';
+  relId?: string;
+  dataUrl?: string;
+  scale: number;
+  washout: boolean;
+  widthEmu?: number;
+  heightEmu?: number;
+  /** Undefined defaults to true for watermarks. */
+  decorative?: boolean;
+}
+
+/** One measured note in a page/section note area. */
+export interface DisplayListNoteItem {
+  kind?: 'footnote' | 'endnote';
+  id?: number;
+  displayLabel?: string;
+  measured?: MeasuredBlock[];
+  height?: number;
+  anchorDocStart?: number;
+  anchorDocEnd?: number;
+  customMarkFollows?: boolean;
+}
+
+/** Typed non-fragmented note-region input for the Rust display builder. */
+export interface DisplayListNoteArea {
+  pageIndex?: number;
+  sectionId?: string;
+  kind?: 'footnote' | 'endnote';
+  placement?: 'pageBottom' | 'beneathText' | 'sectEnd' | 'docEnd';
+  y?: number;
+  height?: number;
+  columns?: number;
+  separator?: DisplayListNoteItem;
+  notes?: DisplayListNoteItem[];
+}
+
+/** Stable reviewer palette entry for comments/revisions. */
+export interface DisplayListCommentAuthor {
+  id?: string;
+  name?: string;
+  paletteIndex?: number;
+  color?: string;
+}
+
+/** One reply of a comment thread (a11y announcement input). */
+export interface DisplayListCommentReply {
+  id?: number;
+  authorId?: string;
+  authorName?: string;
+  date?: string;
+  /** Plain-text body (the builder caps it before it reaches primitives). */
+  text?: string;
+}
+
+/**
+ * Per-comment thread metadata keyed by comment id, joined by the builder onto
+ * every primitive carrying that id in `commentIds` so the a11y mirror can
+ * announce the complete thread (author name, date, body, replies). All string
+ * values are file-derived/attacker-controlled; consumers must only ever
+ * assign them via textContent/setAttribute.
+ */
+export interface DisplayListCommentThread {
+  /** Comment id — matches the numeric ids in `resolvedCommentIds`/`commentIds`. */
+  id?: number;
+  authorId?: string;
+  authorName?: string;
+  date?: string;
+  /** Plain-text body (builder-capped before emission). */
+  text?: string;
+  /** Replies in thread order (builder-capped count and text). */
+  replies?: DisplayListCommentReply[];
+}
+
+/** The `{ measured, options, layout }` envelope the Rust builder consumes. */
+export interface DisplayListBuildInputs {
+  /** Serialization contract version. Undefined reads as version 0. */
+  contractVersion?: number;
+  measured: MeasuredBlock[];
+  options: unknown;
+  layout: Layout;
+  /** header/footer parts + section flags; omitted ⇒ body-only display list */
+  headersFooters?: DisplayListHeadersFooters;
+  /**
+   * Doc-wide font-id chains keyed `"<family lowercase>|<bold 0|1>|<italic 0|1>"`
+   * → measurement `FontStore` ids — the SAME map the measurement input carries.
+   * Present only under Rust measurement (the ids must belong to a populated
+   * store); its presence against that store is what gates GlyphRun emission.
+   * Omitted ⇒ every text run is emitted as a browser-measured
+   * `TextRunPrimitive` rather than a shaped `GlyphRun`.
+   */
+  fontChains?: Record<string, number[]>;
+  /** Page/section note regions. Undefined = no note emission. */
+  noteAreas?: DisplayListNoteArea[];
+  /** Resolved comments suppressed from active tint. Undefined = none known. */
+  resolvedCommentIds?: number[];
+  /** Stable reviewer palette. Undefined ⇒ the builder's built-in colors. */
+  commentAuthors?: DisplayListCommentAuthor[];
+  /** Per-comment thread metadata for a11y announcements. Undefined = none. */
+  commentThreads?: DisplayListCommentThread[];
+}
+
+/**
+ * Minimal build surface, injectable so tests can fake the wasm module. Only
+ * `buildDisplayListJson` is required; the optional members are what an engine
+ * that retains its own pagination and display state additionally offers.
+ */
+export interface RustDisplayListEngine {
+  buildDisplayListJson(input: string): string;
+  /** Binary FrameDelta build; the stateless layout wasm does not offer it. */
+  buildDisplayListFrame?(input: string, expectedFrameEpoch: number): Uint8Array;
+  /** Applies one keystroke and returns its frame, without a layout round trip. */
+  applyInput?(text: string, expectedFrameEpoch: number): Uint8Array;
+  displayHitTestRegionsJson?(pageIndex: number, x: number, y: number): string;
+  displayVerticalMoveJson?(
+    position: number,
+    direction: 'up' | 'down',
+    goalX: number
+  ): string;
+  displayRangeRectsJson?(from: number, to: number): string;
+  /** @internal */
+  displayRangeRectsOnPagesJson?(
+    from: number,
+    to: number,
+    firstPage: number,
+    lastPage: number
+  ): string;
+  displayRangeRectsRegionJson?(
+    region: string,
+    partId: string,
+    from: number,
+    to: number
+  ): string;
+  /** The bytes and media type of the part a `media:{n}` image source names. */
+  mediaSource?(token: string): { bytes: Uint8Array; mimeType: string } | null;
+  /** Changes whenever the package `mediaSource` reads changes. */
+  mediaScope?(): number;
+}
+
+export type RustDisplayListSourceErrorStage = 'load' | 'build' | 'parse' | 'decode' | 'apply';
+
+export interface RustDisplayFrameResult {
+  displayList: DisplayList;
+  /**
+   * The retained frame to pass as `previous` on the next build. Null when the
+   * engine answered over full JSON, which retains nothing.
+   */
+  frame: RetainedFrame | null;
+  transport: 'frame-delta-v1' | 'json';
+}
+
+/**
+ * Typed terminal error from the mandatory Rust display-list source. Hosts may
+ * surface this through their editor error boundary; it is never permission to
+ * silently substitute painter geometry.
+ */
+export class RustDisplayListSourceError extends Error {
+  readonly stage: RustDisplayListSourceErrorStage;
+
+  constructor(stage: RustDisplayListSourceErrorStage, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Rust display-list ${stage} failed: ${detail}`);
+    this.name = 'RustDisplayListSourceError';
+    this.stage = stage;
+  }
+}
+
+/**
+ * Query surface over an already-built display list, injectable so tests can
+ * fake the wasm module.
+ *
+ * The required `*Json` members take the display-list JSON as an argument and
+ * the Rust side re-parses it per query, so callers should cache the string.
+ * The OPTIONAL session-handle members parse the list once (`openDisplayList` →
+ * a handle) and answer many queries by handle with no re-serialization,
+ * reusing the same hit and range logic so results are byte-identical. They are
+ * optional because the embedded wasm may not carry them; `hasDisplayListSession`
+ * and `hasRangeRectsRegion` report what is present, and
+ * `createDisplayListQueries` falls back to the `*Json` path when it is not.
+ */
+export interface RustDisplayListQueryEngine {
+  /**
+   * region-aware hit test → `{"region","rId"?,"noteId"?,"pos","target"}` or
+   * `"null"` JSON
+   */
+  hitTestRegionsJson(displayList: string, pageIndex: number, x: number, y: number): string;
+  /** closest caret position on the adjacent visual line */
+  verticalMoveJson?(
+    displayList: string,
+    position: number,
+    direction: 'up' | 'down',
+    goalX: number
+  ): string;
+  /** body document range → JSON array of `{pageIndex,x,y,width,height}` rects */
+  rangeRectsJson(displayList: string, from: number, to: number): string;
+  /** @internal */
+  rangeRectsOnPagesJson?(
+    displayList: string,
+    from: number,
+    to: number,
+    firstPage: number,
+    lastPage: number
+  ): string;
+  /** @internal */
+  hasRangeRectsOnPages?(): boolean;
+  /**
+   * Region-aware document range → JSON array of rects. `region` is a
+   * `DisplayListHitRegion` discriminant; `partId` names the instance — a
+   * header/footer part (empty for body, or to match any band of the kind) or a
+   * note id. Optional — the facade returns `[]` when it is absent.
+   */
+  rangeRectsRegionJson?(
+    displayList: string,
+    region: string,
+    partId: string,
+    from: number,
+    to: number
+  ): string;
+  /** true when the embedded wasm carries the region-aware range-rect exports */
+  hasRangeRectsRegion?(): boolean;
+  /** true when the embedded wasm carries the session-handle exports below */
+  hasDisplayListSession?(): boolean;
+  /** parse a display list once, return a handle for the by-handle queries */
+  openDisplayList?(displayList: string): number;
+  /** free a handle's parsed display list */
+  closeDisplayList?(handle: number): void;
+  /** patch a stored display list's changed pages in place (see layout wasm) */
+  updateDisplayList?(handle: number, update: string): void;
+  /** true when the embedded wasm carries the page-delta update export */
+  hasDisplayListUpdate?(): boolean;
+  /** region-aware hit test against a stored display list (by handle) */
+  hitTestRegionsByHandle?(handle: number, pageIndex: number, x: number, y: number): string;
+  /** adjacent visual-line move against a stored display list */
+  verticalMoveByHandle?(
+    handle: number,
+    position: number,
+    direction: 'up' | 'down',
+    goalX: number
+  ): string;
+  /** body document range against a stored display list (by handle) */
+  rangeRectsByHandle?(handle: number, from: number, to: number): string;
+  /** @internal */
+  rangeRectsOnPagesByHandle?(
+    handle: number,
+    from: number,
+    to: number,
+    firstPage: number,
+    lastPage: number
+  ): string;
+  /** region-aware document range against a stored display list (by handle) */
+  rangeRectsRegionByHandle?(
+    handle: number,
+    region: string,
+    partId: string,
+    from: number,
+    to: number
+  ): string;
+}
+
+let enginePromise: Promise<RustDisplayListEngine & RustDisplayListQueryEngine> | null = null;
+let queryEnginePromise: Promise<RustDisplayListQueryEngine> | null = null;
+let loadedEngine: RustDisplayListQueryEngine | null = null;
+
+function loadEngine(): Promise<RustDisplayListEngine & RustDisplayListQueryEngine> {
+  enginePromise ??= import('../wasm/index').then(async (m) => {
+    await m.preloadLayoutWasm();
+    return { ...(await loadRustDisplayListQueryEngine()), buildDisplayListJson: m.buildDisplayListJson };
+  });
+  return enginePromise;
+}
+
+/** Load synchronous display-list queries. */
+export function loadRustDisplayListQueryEngine(): Promise<RustDisplayListQueryEngine> {
+  queryEnginePromise ??= import('../wasm/index').then(async (m) => {
+    await m.preloadDisplayListQueryWasm();
+    return (loadedEngine = {
+      hitTestRegionsJson: m.hitTestRegionsJson,
+      verticalMoveJson: m.verticalMoveJson,
+      rangeRectsJson: m.rangeRectsJson,
+      rangeRectsOnPagesJson: m.rangeRectsOnPagesJson,
+      hasRangeRectsOnPages: m.hasRangeRectsOnPages,
+      rangeRectsRegionJson: m.rangeRectsRegionJson,
+      hasRangeRectsRegion: m.hasRangeRectsRegion,
+      hasDisplayListSession: m.hasDisplayListSession,
+      openDisplayList: m.openDisplayList,
+      closeDisplayList: m.closeDisplayList,
+      updateDisplayList: m.updateDisplayList,
+      hasDisplayListUpdate: m.hasDisplayListUpdate,
+      hitTestRegionsByHandle: m.hitTestRegionsByHandle,
+      verticalMoveByHandle: m.verticalMoveByHandle,
+      rangeRectsByHandle: m.rangeRectsByHandle,
+      rangeRectsOnPagesByHandle: m.rangeRectsOnPagesByHandle,
+      rangeRectsRegionByHandle: m.rangeRectsRegionByHandle,
+    });
+  });
+  return queryEnginePromise;
+}
+
+/** The wasm query surface once {@link loadRustDisplayListQueryEngine} has loaded it, else null. */
+export function loadedRustDisplayListQueryEngine(): RustDisplayListQueryEngine | null {
+  return loadedEngine;
+}
+
+/**
+ * Serialize the `{ measured, options, layout, headersFooters }` envelope to the
+ * JSON string the wasm builder consumes, caching the serialized `measure`
+ * sub-object of each MeasuredBlock across passes.
+ *
+ * Why this is a per-keystroke win: on every layout pass the paginator rebuilds
+ * the block objects fresh from the resident engine, so the `block`
+ * side of each MeasuredBlock has no reference stability and re-serializes every
+ * pass. The `measure` side does NOT — the paragraph measure cache is keyed by a
+ * content hash (see `layout/measure/cache.ts`), so an *unchanged* paragraph
+ * gets back the *same* `BlockExtent` object it had last pass. A `measure` object
+ * is also the larger half of a MeasuredBlock (per-line/per-segment geometry).
+ * Keying the serialized measure by object identity therefore lets a keystroke
+ * re-encode only the one edited block's measure (a cache miss) plus the
+ * always-changing `layout`, skipping the re-serialization of every other
+ * block's geometry.
+ *
+ * The produced string is assembled to deserialize to the identical structure as
+ * `JSON.stringify(inputs)` (same key order; and serde_json is key-order /
+ * whitespace agnostic regardless), so the DisplayList the builder returns is
+ * byte-identical. `cache` is a WeakMap so entries die with their measure objects.
+ *
+ * Exported for the perf bench (`scripts/bench-displaylist.ts`); callers should
+ * use `buildRustDisplayList`, which owns the process-wide cache.
+ */
+export function encodeDisplayListInputs(
+  inputs: DisplayListBuildInputs,
+  cache?: WeakMap<object, string>
+): string {
+  const m = inputs.measured;
+  let measuredStr = '[';
+  for (let i = 0; i < m.length; i++) {
+    if (i > 0) measuredStr += ',';
+    const mb = m[i];
+    const measure = mb.measure as unknown;
+    let measureStr: string | undefined;
+    if (cache && measure !== null && typeof measure === 'object') {
+      const key = measure as object;
+      measureStr = cache.get(key);
+      if (measureStr === undefined) {
+        measureStr = JSON.stringify(mb.measure);
+        cache.set(key, measureStr);
+      }
+    } else {
+      measureStr = JSON.stringify(mb.measure);
+    }
+    measuredStr += '{"block":' + JSON.stringify(mb.block) + ',"measure":' + measureStr + '}';
+  }
+  measuredStr += ']';
+
+  let out =
+    '{"measured":' +
+    measuredStr +
+    ',"options":' +
+    JSON.stringify(inputs.options) +
+    ',"layout":' +
+    JSON.stringify(inputs.layout);
+  if (inputs.contractVersion !== undefined) {
+    out += ',"contractVersion":' + JSON.stringify(inputs.contractVersion);
+  }
+  if (inputs.headersFooters !== undefined) {
+    out += ',"headersFooters":' + JSON.stringify(inputs.headersFooters);
+  }
+  if (inputs.fontChains !== undefined) {
+    out += ',"fontChains":' + JSON.stringify(inputs.fontChains);
+  }
+  if (inputs.noteAreas !== undefined) {
+    out += ',"noteAreas":' + JSON.stringify(inputs.noteAreas);
+  }
+  if (inputs.resolvedCommentIds !== undefined) {
+    out += ',"resolvedCommentIds":' + JSON.stringify(inputs.resolvedCommentIds);
+  }
+  if (inputs.commentAuthors !== undefined) {
+    out += ',"commentAuthors":' + JSON.stringify(inputs.commentAuthors);
+  }
+  if (inputs.commentThreads !== undefined) {
+    out += ',"commentThreads":' + JSON.stringify(inputs.commentThreads);
+  }
+  out += '}';
+  return out;
+}
+
+/** Display-only fields sent to an engine that already retains pagination. */
+export function encodeDisplayListFrameExtras(inputs: DisplayListBuildInputs): string {
+  const extras: Omit<DisplayListBuildInputs, 'measured' | 'options' | 'layout'> = {};
+  if (inputs.contractVersion !== undefined) extras.contractVersion = inputs.contractVersion;
+  if (inputs.headersFooters !== undefined) extras.headersFooters = inputs.headersFooters;
+  if (inputs.fontChains !== undefined) extras.fontChains = inputs.fontChains;
+  if (inputs.noteAreas !== undefined) extras.noteAreas = inputs.noteAreas;
+  if (inputs.resolvedCommentIds !== undefined) {
+    extras.resolvedCommentIds = inputs.resolvedCommentIds;
+  }
+  if (inputs.commentAuthors !== undefined) extras.commentAuthors = inputs.commentAuthors;
+  if (inputs.commentThreads !== undefined) extras.commentThreads = inputs.commentThreads;
+  return JSON.stringify(extras);
+}
+
+// Process-wide cache of serialized MeasuredBlock `measure` fragments, keyed by
+// the measure object's identity. Reference-stable across layout passes for
+// unchanged paragraphs (the measure cache hands back the same object), so the
+// heaviest part of the per-keystroke encode is reused. WeakMap ⇒ entries are
+// collected with their measure objects; no lifecycle management needed.
+const measureFragmentCache = new WeakMap<object, string>();
+
+/**
+ * Build a DisplayList for a computed layout through the Rust engine. Throws
+ * {@link RustDisplayListSourceError} tagged with the failing stage — `load`,
+ * `build` or `parse` — when the wasm module cannot be loaded, the builder
+ * rejects the input, or its output does not parse.
+ */
+export async function buildRustDisplayList(
+  inputs: DisplayListBuildInputs,
+  engine?: RustDisplayListEngine
+): Promise<DisplayList> {
+  let eng: RustDisplayListEngine;
+  try {
+    eng = engine ?? (await loadEngine());
+  } catch (error) {
+    throw new RustDisplayListSourceError('load', error);
+  }
+  let inputJson: string;
+  let json: string;
+  try {
+    inputJson = encodeDisplayListInputs(inputs, measureFragmentCache);
+    json = eng.buildDisplayListJson(inputJson);
+  } catch (error) {
+    throw new RustDisplayListSourceError('build', error);
+  }
+  try {
+    // Rust serializes the display contract in camelCase. Parsing without a
+    // field-picking reviver is intentional: additive primitive metadata remains
+    // present for downstream canvas and accessibility consumers.
+    return JSON.parse(json) as DisplayList;
+  } catch (error) {
+    throw new RustDisplayListSourceError('parse', error);
+  }
+}
+
+/**
+ * Build one display frame. An engine that retains pagination returns a binary
+ * FrameDelta, decoded and applied on top of `previous` so unchanged pages keep
+ * object identity; `previous` also supplies the frame epoch the engine checks
+ * before sending a delta rather than a full frame, unless `expectedFrameEpoch`
+ * overrides it (the engine numbers its frame after that epoch). An engine without
+ * `buildDisplayListFrame` takes the full-JSON path, and its result carries
+ * `frame: null` and `transport: 'json'`.
+ *
+ * Throws {@link RustDisplayListSourceError} tagged with the failing stage:
+ * `load`, `build`, `decode` or `apply`.
+ */
+export async function buildRustDisplayFrame(
+  inputs: DisplayListBuildInputs,
+  engine?: RustDisplayListEngine,
+  previous: RetainedFrame | null = null,
+  expectedFrameEpoch = previous?.frameEpoch ?? 0
+): Promise<RustDisplayFrameResult> {
+  let eng: RustDisplayListEngine;
+  try {
+    eng = engine ?? (await loadEngine());
+  } catch (error) {
+    throw new RustDisplayListSourceError('load', error);
+  }
+  if (!eng.buildDisplayListFrame) {
+    return {
+      displayList: await buildRustDisplayList(inputs, eng),
+      frame: null,
+      transport: 'json',
+    };
+  }
+
+  const inputJson = encodeDisplayListFrameExtras(inputs);
+  let encoded: Uint8Array;
+  try {
+    encoded = eng.buildDisplayListFrame(inputJson, expectedFrameEpoch);
+  } catch (error) {
+    throw new RustDisplayListSourceError('build', error);
+  }
+  let delta;
+  try {
+    delta = decodeFrameDelta(encoded);
+  } catch (error) {
+    throw new RustDisplayListSourceError('decode', error);
+  }
+  let frame: RetainedFrame;
+  try {
+    frame = applyFrameDelta(previous, delta);
+  } catch (error) {
+    throw new RustDisplayListSourceError('apply', error);
+  }
+  return { displayList: frame.displayList, frame, transport: 'frame-delta-v1' };
+}

@@ -1,0 +1,174 @@
+import { useLayoutEffect, useMemo, useRef } from 'react';
+import type { Comment } from '@nimbleoffice/docx/types/content';
+import type { ReviewSidebarItem } from '../components/sidebar/trackedChanges';
+import type { TrackedChangeEntry } from '../components/sidebar/cardUtils';
+import { CommentCard } from '../components/sidebar/CommentCard';
+import { TrackedChangeCard } from '../components/sidebar/TrackedChangeCard';
+import { AddCommentCard } from '../components/sidebar/AddCommentCard';
+import { ResolvedCommentMarker } from '../components/sidebar/ResolvedCommentMarker';
+
+export interface CommentCallbacks {
+  onCommentReply?: (commentId: number, text: string) => void;
+  onCommentResolve?: (commentId: number) => void;
+  onCommentUnresolve?: (commentId: number) => void;
+  onCommentDelete?: (commentId: number) => void;
+  /** Resolving to false keeps the composer and its text. */
+  onAddComment?: (text: string) => void | Promise<boolean>;
+  onCancelAddComment?: () => void;
+  onAcceptChange?: (from: number, to: number) => void;
+  onRejectChange?: (from: number, to: number) => void;
+  /**
+   * Accept a structural revision (e.g. `pPrIns`/`pPrDel`) by its `w:id`.
+   * Required for entries whose `type` is `paragraphMarkInsertion` or
+   * `paragraphMarkDeletion`; ignored by inline-entry cards.
+   */
+  onAcceptChangeById?: (revisionId: number) => void;
+  /** See `onAcceptChangeById`. */
+  onRejectChangeById?: (revisionId: number) => void;
+  onTrackedChangeReply?: (revisionId: number, text: string) => void;
+}
+
+export interface UseCommentSidebarItemsProps {
+  comments: Comment[];
+  trackedChanges: TrackedChangeEntry[];
+  callbacks: CommentCallbacks;
+  /** When sidebar is open, include resolved comments */
+  showResolved?: boolean;
+  isAddingComment?: boolean;
+  addCommentYPosition?: number | null;
+}
+
+/** @internal */
+type CachedSidebarItem = { data: string | undefined; callbacks: CommentCallbacks; item: ReviewSidebarItem };
+
+export function useCommentSidebarItems({
+  comments,
+  trackedChanges,
+  callbacks,
+  showResolved = false,
+  isAddingComment = false,
+  addCommentYPosition = null,
+}: UseCommentSidebarItemsProps): ReviewSidebarItem[] {
+  const previous = useRef({ items: [] as ReviewSidebarItem[], entries: new Map<string, CachedSidebarItem>() });
+  // Active comments always, resolved only when showResolved
+  const visibleComments = useMemo(
+    () =>
+      comments.filter((c) => {
+        if (c.parentId != null) return false;
+        if (c.done && !showResolved) return false;
+        return true;
+      }),
+    [comments, showResolved]
+  );
+
+  // Pre-group replies by parentId
+  const repliesByParent = useMemo(() => {
+    const map = new Map<number, Comment[]>();
+    for (const c of comments) {
+      if (c.parentId != null) {
+        const arr = map.get(c.parentId);
+        if (arr) arr.push(c);
+        else map.set(c.parentId, [c]);
+      }
+    }
+    return map;
+  }, [comments]);
+
+  const result = useMemo(() => {
+    const items: ReviewSidebarItem[] = [];
+    const entries = new Map<string, CachedSidebarItem>();
+    const append = (id: string, value: unknown, create: () => ReviewSidebarItem) => {
+      const data = JSON.stringify(value);
+      const cached = previous.current.entries.get(id);
+      const sameCallbacks = cached && Object.keys(cached.callbacks).length === Object.keys(callbacks).length &&
+        (Object.keys(callbacks) as (keyof CommentCallbacks)[]).every(key => cached.callbacks[key] === callbacks[key]);
+      const entry = cached && cached.data === data && sameCallbacks ? cached : { data, callbacks, item: create() };
+      entries.set(id, entry);
+      items.push(entry.item);
+    };
+
+    // "Add comment" input (temporary item with pre-computed Y)
+    if (isAddingComment && addCommentYPosition != null) {
+      append('new-comment-input', addCommentYPosition, () => ({
+        id: 'new-comment-input',
+        anchorPos: 0,
+        fixedY: addCommentYPosition,
+        priority: -1000, // always first at its Y
+        isTemporary: true,
+        estimatedHeight: 120,
+        render: (props) => (
+          <AddCommentCard
+            {...props}
+            onSubmit={callbacks.onAddComment}
+            onCancel={callbacks.onCancelAddComment}
+          />
+        ),
+      }));
+    }
+
+    // Comment cards — resolved render as icon when collapsed, full card when expanded
+    for (const comment of visibleComments) {
+      const replies = repliesByParent.get(comment.id) ?? [];
+      append(`comment-${comment.id}`, [comment, replies], () => ({
+        id: `comment-${comment.id}`,
+        anchorPos: 0,
+        anchorKey: `comment-${comment.id}`,
+        priority: 0,
+        estimatedHeight: comment.done ? 28 : 80,
+        render: (props) =>
+          comment.done && !props.isExpanded ? (
+            <ResolvedCommentMarker {...props} comment={comment} />
+          ) : (
+            <CommentCard
+              {...props}
+              comment={comment}
+              replies={replies}
+              onReply={callbacks.onCommentReply}
+              onResolve={callbacks.onCommentResolve}
+              onUnresolve={callbacks.onCommentUnresolve}
+              onDelete={callbacks.onCommentDelete}
+            />
+          ),
+      }));
+    }
+
+    // Tracked change cards
+    trackedChanges.forEach((change, idx) => {
+      const replies = repliesByParent.get(change.revisionId) ?? [];
+      const id = `tc-${change.revisionId}-${idx}`;
+      append(id, [change, replies], () => ({
+        id,
+        review: { change, kind: 'human' },
+        anchorPos: change.from,
+        anchorKey: `revision-${change.revisionId}`,
+        priority: 1,
+        estimatedHeight: 80,
+        render: (props) => (
+          <TrackedChangeCard
+            {...props}
+            change={change}
+            reviewItemId={id}
+            replies={replies}
+            onAccept={callbacks.onAcceptChange}
+            onReject={callbacks.onRejectChange}
+            onAcceptById={callbacks.onAcceptChangeById}
+            onRejectById={callbacks.onRejectChangeById}
+            onReply={callbacks.onTrackedChangeReply}
+          />
+        ),
+      }));
+    });
+
+    return { entries, items: items.length === previous.current.items.length && items.every((item, index) => item === previous.current.items[index])
+      ? previous.current.items : items };
+  }, [
+    visibleComments,
+    trackedChanges,
+    repliesByParent,
+    callbacks,
+    isAddingComment,
+    addCommentYPosition,
+  ]);
+  useLayoutEffect(() => { previous.current = result; }, [result]);
+  return result.items;
+}

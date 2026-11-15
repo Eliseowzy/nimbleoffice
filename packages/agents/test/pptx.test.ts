@@ -1,0 +1,936 @@
+import { expect, test } from 'bun:test';
+import { createCanvas, loadImage } from '@napi-rs/canvas';
+import JSZip from 'jszip';
+import { createFontProvider } from '@nimbleoffice/fonts';
+import { openPresentation } from '@nimbleoffice/pptx';
+import { attachPptx, openPptx } from '../src/pptx';
+import type { PptxAgentPresentation } from '../src/pptx';
+import type { PptxAgentEdit } from '../src/pptx-schema';
+import { pptxFixture } from './format-fixtures';
+import { presentationFixture, layoutFixture, savedSlideIds, slideIdsFixture } from './pptx-fixture';
+
+const apply = (deck: PptxAgentPresentation, edits: PptxAgentEdit[]) => deck.edit({ version: deck.overview().version, edits });
+
+test('PPTX replacements compact 65 source runs and fall back within the run limit', async () => {
+  const zip = await JSZip.loadAsync(await presentationFixture());
+  const path = 'ppt/slides/slide1.xml';
+  const xml = await zip.file(path)!.async('string');
+  const runs = Array.from({ length: 65 }, (_, i) => `<a:r><a:rPr b="${i % 2}" sz="2400"/><a:t>x</a:t></a:r>`).join('');
+  zip.file(path, xml.replace(/<a:p>[\s\S]*?<\/a:p>/u, `<a:p>${runs}</a:p>`));
+  const bytes = await zip.generateAsync({ type: 'uint8array' });
+  for (const text of ['New text', 'x'.repeat(65), '']) {
+    const deck = await openPptx(bytes);
+    try {
+      const target = first(deck);
+      apply(deck, [{ op: 'replace_text', ...target, text: text === 'x'.repeat(65) ? 'y'.repeat(65) : text }]);
+      const paragraph = deck.readSlide({ slide: target.slide }).shapes[0].stories[0].paragraphs[0];
+      expect(paragraph.runs.length).toBeLessThanOrEqual(64);
+      expect(paragraph.runs.every(run => run.text.length > 0)).toBe(true);
+      if (text.length === 65) {
+        expect(paragraph.runs).toHaveLength(1);
+        expect(paragraph.runs[0].formatting).toMatchObject({ bold: false, fontSizePt: 24 });
+      }
+      const saved = await JSZip.loadAsync(await deck.export());
+      const paragraphXml = (await saved.file(path)!.async('string')).match(/<a:p(?:\s[^>]*)?(?:\/>|>[\s\S]*?<\/a:p>)/u)![0];
+      const savedText = [...paragraphXml.matchAll(/<a:t>([^<]*)<\/a:t>/gu)].map(match => match[1]).join('');
+      expect(savedText).toBe(text.length === 65 ? 'y'.repeat(65) : text);
+    } finally { deck.close(); }
+  }
+});
+function first(deck: PptxAgentPresentation) {
+  const slide = deck.outline().slides[0];
+  return { slide: slide.id, shape: slide.shapes.find(shape => shape.text.length > 0)!.id };
+}
+
+test('PPTX outline and slide read expose layouts, tree, points, runs, placeholders and notes', async () => {
+  const deck = await openPptx(await presentationFixture({ group: true }));
+  try {
+    const page = deck.outline({ shapeLimit: 1 });
+    expect(page.slides[0]).toMatchObject({ index: 1, layoutName: 'Blank', shapeCount: 2, nextShapeOffset: 1 });
+    expect(page.layouts[0]).toMatchObject({ id: 'ppt/slideLayouts/slideLayout1.xml', name: 'Blank' });
+    const next = deck.outline({ shapeOffset: 1, shapeLimit: 1 });
+    const shape = next.slides[0].shapes[0];
+    expect(shape.parentId).toBe(page.slides[0].shapes[0].id);
+    expect(shape.position.emu.x).toBe(100000);
+    expect(shape.position.points.x).toBe(100000 / 12700);
+    const read = deck.readSlide({ slide: page.slides[0].id, limit: 1 });
+    expect(read.nextOffset).toBe(1);
+    expect(read.notes.text).toBe('Present the quarterly result.');
+    const child = deck.readSlide({ slide: page.slides[0].id, offset: read.nextOffset! }).shapes[0];
+    expect(child.placeholder).toMatchObject({ placeholderType: 'title' });
+    expect(child.stories[0].paragraphs[0].runs[0].formatting).toMatchObject({ bold: true, fontSizePt: 24, color: '#1565C0' });
+    expect(child.stories[0].paragraphs).toHaveLength(2);
+    expect(child.stories[0].id).toBeString();
+  } finally { deck.close(); }
+});
+
+test('PPTX text, paragraph, bullet and notes edits preserve paragraph and run markup', async () => {
+  const zip = await JSZip.loadAsync(await presentationFixture());
+  const props = '<a:pPr algn="r" lvl="2" marL="3000" indent="-1000"><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buNone/></a:pPr>';
+  const end = '<a:endParaRPr lang="de-DE" sz="1700"/>';
+  for (const path of ['ppt/slides/slide1.xml', 'ppt/notesSlides/notesSlide1.xml']) {
+    let xml = await zip.file(path)!.async('string');
+    xml = xml.replaceAll('<a:p>', `<a:p>${props}`).replaceAll('</a:p>', `${end}</a:p>`);
+    zip.file(path, xml);
+  }
+  const deck = await openPptx(await zip.generateAsync({ type: 'uint8array' }));
+  try {
+    const target = first(deck);
+    apply(deck, [{ op: 'replace_text', ...target, text: 'First replacement\nSecond replacement' }, { op: 'find_replace', query: 'replacement', replacement: 'result' }, { op: 'set_notes', slide: target.slide, text: 'New notes' }]);
+    expect(deck.readSlide({ slide: target.slide }).shapes[0].stories[0].paragraphs[0].runs[0].formatting).toMatchObject({ bold: true, fontSizePt: 24 });
+    expect(deck.readSlide({ slide: target.slide }).shapes[0].stories[0].paragraphs[1].runs[0].formatting.bold).toBeNull();
+    let saved = await JSZip.loadAsync(await deck.export());
+    for (const path of ['ppt/slides/slide1.xml', 'ppt/notesSlides/notesSlide1.xml']) {
+      const xml = await saved.file(path)!.async('string');
+      for (const markup of ['algn="r"', 'lvl="2"', 'marL="3000"', 'indent="-1000"', '<a:spcBef><a:spcPts val="500"/></a:spcBef>', '<a:buNone/>', end]) expect(xml).toContain(markup);
+    }
+    apply(deck, [{ op: 'set_paragraphs', ...target, paragraphs: [{ bullet: true, runs: [{ text: 'Bullet one', bold: true }] }, { bullet: false, runs: [{ text: 'Plain two' }] }] }]);
+    saved = await JSZip.loadAsync(await deck.export());
+    const xml = await saved.file('ppt/slides/slide1.xml')!.async('string');
+    expect(xml).toContain('<a:buChar char="•"/>');
+    expect(xml).toContain('<a:buNone/>');
+    expect(xml.match(/<a:endParaRPr/g)).toHaveLength(2);
+    expect(xml.match(/indent="-1000"/g)).toHaveLength(2);
+  } finally { deck.close(); }
+});
+
+test('PPTX inserts a title and one body shape with three real bullet paragraphs', async () => {
+  const deck = await openPptx(await presentationFixture());
+  try {
+    const slide = apply(deck, [{ op: 'add_slide', index: 1, layout: deck.outline().layouts[0].id }]).results[0].slideId as string;
+    expect(deck.readSlide({ slide }).shapeCount).toBe(0);
+    const added = apply(deck, [
+      { op: 'add_text_box', slide, name: 'Title', rect: { x: 36, y: 36, width: 648, height: 54 }, text: 'Pilot plan' },
+      { op: 'add_text_box', slide, name: 'Body', rect: { x: 36, y: 126, width: 648, height: 270 }, text: '' },
+    ]);
+    apply(deck, [{ op: 'set_paragraphs', slide, shape: added.results[1].shapeId as string, paragraphs: ['Start with ten users', 'Collect feedback daily', 'Report results in two weeks'].map(text => ({ bullet: true, runs: [{ text }] })) }, { op: 'set_notes', slide, text: 'Keep the pilot to two weeks.' }]);
+    const read = deck.readSlide({ slide });
+    expect(read.shapeCount).toBe(2);
+    expect(read.shapes[1].stories[0].paragraphs.map(p => JSON.parse(p.bullet!))).toEqual(Array(3).fill({ type: 'character', value: '•' }));
+    const zip = await JSZip.loadAsync(await deck.export());
+    expect((await zip.file('ppt/slides/slide2.xml')!.async('string')).match(/<a:buChar/g)).toHaveLength(3);
+  } finally { deck.close(); }
+});
+
+test('PPTX replaces full text and sets formatted paragraphs with stable shape IDs', async () => {
+  const deck = await openPptx(await pptxFixture());
+  try {
+    const target = first(deck);
+    const replacement = apply(deck, [{ op: 'replace_text', ...target, text: 'First 😀\nSecond' }]);
+    expect(replacement.results[0]).toMatchObject({ changed: true, shapeId: target.shape, paragraphs: 2 });
+    let read = deck.readSlide({ slide: target.slide });
+    expect(read.shapes[0].stories[0].text).toBe('First 😀\nSecond');
+    expect(read.shapes[0].stories[0].paragraphs[0].runs[0].formatting.bold).toBe(true);
+    apply(deck, [{ op: 'set_paragraphs', ...target, paragraphs: [{ alignment: 'ctr', runs: [{ text: 'Blue', bold: false, italic: true, fontSizePt: 18, fontFamily: 'Arial', color: '#0000FF' }, { text: ' bold', bold: true, underline: 'sng' }] }, { runs: [{ text: 'Next' }] }] }]);
+    read = deck.readSlide({ slide: target.slide });
+    expect(read.shapes[0].id).toBe(target.shape);
+    expect(read.shapes[0].stories[0].paragraphs[0]).toMatchObject({ alignment: 'ctr', runs: [{ text: 'Blue', formatting: { bold: false, italic: true, fontSizePt: 18, color: '#0000FF' } }, { text: ' bold', formatting: { bold: true, underline: 'sng' } }] });
+    const reopened = await openPptx(await deck.export());
+    try { expect(reopened.readSlide({ slide: reopened.outline().slides[0].id }).shapes[0].stories[0].text).toBe('Blue bold\nNext'); }
+    finally { reopened.close(); }
+  } finally { deck.close(); }
+});
+
+test('PPTX find/replace edits the entire deck with counts and preserves run styles', async () => {
+  const deck = await openPptx(await pptxFixture());
+  try {
+    const target = first(deck);
+    apply(deck, [{ op: 'duplicate_slide', slide: target.slide }]);
+    const receipt = apply(deck, [{ op: 'find_replace', query: 'risk', replacement: 'growth' }]);
+    expect(receipt.results[0]).toMatchObject({ replacements: 4, changed: true });
+    for (const slide of deck.outline().slides) expect(deck.readSlide({ slide: slide.id }).shapes[0].stories[0].text).toContain('growth growth');
+    expect(apply(deck, [{ op: 'find_replace', query: 'GROWTH', replacement: 'x', caseSensitive: true }]).results[0].changed).toBe(false);
+    expect(deck.readSlide({ slide: target.slide }).shapes[0].stories[0].paragraphs[0].runs[0].formatting.bold).toBe(true);
+  } finally { deck.close(); }
+});
+
+test('PPTX adds, duplicates, moves and deletes slides with layout validation and persisted notes', async () => {
+  const deck = await openPptx(await presentationFixture({ group: true }));
+  try {
+    const original = deck.outline().slides[0];
+    const added = apply(deck, [{ op: 'add_slide', index: 1, layout: deck.outline().layouts[0].id }]).results[0].slideId as string;
+    expect(deck.outline().slides[0].id).toBe(added);
+    const clone = apply(deck, [{ op: 'duplicate_slide', slide: original.id, index: 1 }]).results[0].slideId as string;
+    expect(deck.readSlide({ slide: clone }).shapes).toHaveLength(2);
+    expect(deck.readSlide({ slide: clone }).notes.text).toBe('Present the quarterly result.');
+    apply(deck, [{ op: 'move_slide', slide: clone, index: 3 }, { op: 'set_notes', slide: clone, text: 'Cloned notes 😀' }, { op: 'delete_slide', slide: original.id }]);
+    expect(deck.outline().slides.map(s => s.id)).toEqual([added, clone]);
+    const bytes = await deck.export();
+    const zip = await JSZip.loadAsync(bytes);
+    const cloneXml = await zip.file('ppt/slides/slide3.xml')!.async('string');
+    expect(cloneXml).toContain('<p:grpSp>');
+    expect(cloneXml).toContain('<p:transition spd="slow">');
+    expect(await zip.file('customXml/item1.xml')!.async('string')).toBe('<custom>preserve me</custom>');
+    const reopened = await openPptx(bytes);
+    try {
+      expect(reopened.overview().slides).toBe(2);
+      expect(reopened.readSlide({ slide: reopened.outline().slides[1].id }).notes.text).toBe('Cloned notes 😀');
+    } finally { reopened.close(); }
+    expect(() => apply(deck, [{ op: 'add_slide', layout: 'missing' }])).toThrow('Copy a layout ID');
+  } finally { deck.close(); }
+});
+
+test('PPTX duplicate_slide after the first slide places the copy second', async () => {
+  const deck = await openPptx(await presentationFixture());
+  try {
+    const first = deck.outline().slides[0].id;
+    const last = apply(deck, [{ op: 'add_slide' }]).results[0].slideId as string;
+    const result = apply(deck, [{ op: 'duplicate_slide', slide: last, after: first }]).results[0];
+    expect(result.index).toBe(2);
+    expect(deck.outline().slides.map(slide => slide.id)).toEqual([first, result.slideId as string, last]);
+  } finally { deck.close(); }
+});
+
+test('PPTX duplicate_slide after the last slide appends the copy', async () => {
+  const deck = await openPptx(await presentationFixture());
+  try {
+    const first = deck.outline().slides[0].id;
+    const last = apply(deck, [{ op: 'add_slide' }]).results[0].slideId as string;
+    const result = apply(deck, [{ op: 'duplicate_slide', slide: first, after: last }]).results[0];
+    expect(result.index).toBe(3);
+    expect(deck.outline().slides.map(slide => slide.id)).toEqual([first, last, result.slideId as string]);
+  } finally { deck.close(); }
+});
+
+test('PPTX duplicate_slide refuses after with index or an unknown slide ID', async () => {
+  const deck = await openPptx(await presentationFixture());
+  try {
+    const slide = deck.outline().slides[0].id;
+    const version = deck.overview().version;
+    const before = await deck.export();
+    const refused = (edit: PptxAgentEdit) => {
+      try { apply(deck, [edit]); } catch (error) { return error as { code: string; details: { validSlides?: unknown } }; }
+      throw new Error('Expected the edit to be refused.');
+    };
+    expect(refused({ op: 'duplicate_slide', slide, after: slide, index: 1 }).code).toBe('INVALID_ARGUMENT');
+    const unknown = refused({ op: 'duplicate_slide', slide, after: 'missing' });
+    expect(unknown.code).toBe('UNKNOWN_SLIDE');
+    expect(unknown.details.validSlides).toEqual([{ id: slide, index: 1 }]);
+    expect(refused({ op: 'duplicate_slide', slide: 'missing' }).code).toBe(unknown.code);
+    expect(deck.overview().version).toBe(version);
+    expect(await deck.export()).toEqual(before);
+  } finally { deck.close(); }
+});
+
+test('PPTX slide IDs stay with their slides across reorders and saves', async () => {
+  const source = await slideIdsFixture([256, 300, 270, 290]);
+  const before = await savedSlideIds(source);
+  for (let run = 0; run < 20; run++) {
+    const deck = await openPptx(source);
+    try {
+      const [a, b, c, d] = deck.outline().slides.map(s => s.id);
+      const moved = apply(deck, [{ op: 'move_slide', slide: d, index: 1 }, { op: 'move_slide', slide: a, after: c }, { op: 'move_slide', slide: b, before: d }]);
+      expect(moved.results.map(result => result.index)).toEqual([1, 4, 1]);
+      expect(deck.outline().slides.map(s => s.id)).toEqual([b, d, c, a]);
+      const saved = await deck.export();
+      expect(await savedSlideIds(saved)).toEqual([before[1], before[3], before[2], before[0]]);
+      const reopened = await openPptx(saved);
+      try {
+        const [rb, rd, , ra] = reopened.outline().slides.map(s => s.id);
+        reopened.edit({ version: reopened.overview().version, edits: [{ op: 'move_slide', slide: ra, index: 1 }, { op: 'move_slide', slide: rb, after: ra }, { op: 'move_slide', slide: rd, index: 4 }] });
+        expect(await savedSlideIds(await reopened.export())).toEqual(before);
+      } finally { reopened.close(); }
+    } finally { deck.close(); }
+  }
+});
+
+test('PPTX inserted slides take fresh IDs above every existing slide ID', async () => {
+  const source = await slideIdsFixture([256, 300, 270, 290]);
+  const before = await savedSlideIds(source);
+  let first: string[] | undefined;
+  for (let run = 0; run < 20; run++) {
+    const deck = await openPptx(source);
+    try {
+      const [a, b] = deck.outline().slides.map(s => s.id);
+      apply(deck, [{ op: 'add_slide', index: 2, layout: deck.outline().layouts[0].id }, { op: 'duplicate_slide', slide: b, index: 5 }, { op: 'move_slide', slide: a, index: 6 }]);
+      const saved = await savedSlideIds(await deck.export());
+      expect(saved.filter(entry => before.includes(entry)).sort()).toEqual([...before].sort());
+      expect(saved.filter(entry => !before.includes(entry)).map(entry => entry.split('=')[1]).sort()).toEqual(['301', '302']);
+      expect(saved.at(-1)).toBe(before[0]);
+      first ??= saved;
+      expect(saved).toEqual(first);
+    } finally { deck.close(); }
+  }
+});
+
+test('PPTX move_slide takes exactly one of index, after or before', async () => {
+  const deck = await openPptx(await slideIdsFixture([256, 257, 258]));
+  try {
+    const [a, b] = deck.outline().slides.map(s => s.id);
+    expect(() => apply(deck, [{ op: 'move_slide', slide: a }])).toThrow('exactly one of index, after or before');
+    expect(() => apply(deck, [{ op: 'move_slide', slide: a, index: 2, after: b }])).toThrow('exactly one of index, after or before');
+    expect(() => apply(deck, [{ op: 'move_slide', slide: a, after: a }])).toThrow('different slide');
+    expect(apply(deck, [{ op: 'move_slide', slide: a, before: b }]).results[0]).toMatchObject({ changed: false, oldIndex: 1, index: 1 });
+  } finally { deck.close(); }
+});
+
+test('PPTX adds text boxes, preset shapes and images in points and exports them', async () => {
+  const deck = await openPptx(await pptxFixture());
+  const image = createCanvas(20, 20);
+  image.getContext('2d').fillStyle = '#ff0000';
+  image.getContext('2d').fillRect(0, 0, 20, 20);
+  try {
+    const slide = first(deck).slide;
+    const rect = { x: 20, y: 140, width: 80, height: 80 };
+    const receipt = apply(deck, [
+      { op: 'add_text_box', slide, name: 'Caption', rect, text: 'Added caption', style: { bold: true, fontSizePt: 16 } },
+      { op: 'add_shape', slide, name: 'Circle', rect, geometry: 'ellipse', fill: '#00FF00' },
+      { op: 'add_image', slide, name: 'Logo', rect: { ...rect, x: 140 }, contentType: 'image/png', base64: image.toBuffer('image/png').toString('base64') },
+    ]);
+    expect(receipt.results).toHaveLength(3);
+    const shapes = deck.readSlide({ slide }).shapes;
+    expect(shapes[1]).toMatchObject({ name: 'Caption', position: { emu: { x: 254000 }, points: rect } });
+    expect(shapes[2]).toMatchObject({ geometry: 'ellipse', fill: '#00FF00' });
+    expect(shapes[3].type).toBe('picture');
+    const reopened = await openPptx(await deck.export());
+    try { expect(reopened.readSlide({ slide: reopened.outline().slides[0].id }).shapes).toHaveLength(4); }
+    finally { reopened.close(); }
+    const png = await deck.preview(slide);
+    expect([...png.png.slice(0, 8)]).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
+    const pixels = createCanvas(png.width, png.height).getContext('2d');
+    pixels.drawImage(await loadImage(Buffer.from(png.png)), 0, 0);
+    const data = pixels.getImageData(0, 0, png.width, png.height).data;
+    let red = 0;
+    for (let i = 0; i < data.length; i += 4) if (data[i] > 240 && data[i + 1] < 10 && data[i + 2] < 10) red++;
+    expect(red).toBeGreaterThan(1000);
+  } finally { deck.close(); }
+});
+
+test('PPTX rejects a failed batch without applying earlier items and returns exact repair IDs', async () => {
+  const deck = await openPptx(await pptxFixture());
+  try {
+    const target = first(deck);
+    const before = await deck.export();
+    const version = deck.overview().version;
+    let failure: any;
+    try { apply(deck, [{ op: 'set_notes', slide: target.slide, text: 'Should roll back' }, { op: 'replace_text', slide: target.slide, shape: target.shape + 'x', text: 'invalid' }]); }
+    catch (error) { failure = error; }
+    expect(failure.code).toBe('UNKNOWN_SHAPE');
+    expect(failure.details.failedIndex).toBe(1);
+    expect(failure.details.nearestShapeIds[0].id).toBe(target.shape);
+    expect(failure.details.results.map((item: any) => item.status)).toEqual(['rolled_back', 'failed']);
+    expect(deck.overview().version).toBe(version);
+    expect(await deck.export()).toEqual(before);
+    expect(() => apply(deck, [{ op: 'delete_slide', slide: target.slide }])).toThrow('last slide');
+    expect(() => apply(deck, [{ op: 'set_notes', slide: 'missing', text: '' }])).toThrow('Copy a slide ID');
+    apply(deck, [{ op: 'set_notes', slide: target.slide, text: 'Changed' }]);
+    expect(() => deck.edit({ version, edits: [{ op: 'set_notes', slide: target.slide, text: 'Stale' }] })).toThrow('Deck changed');
+  } finally { deck.close(); }
+});
+
+test('PPTX attaches to a live handle, commits one update, sees host changes and leaves ownership intact', async () => {
+  const source = await pptxFixture();
+  const seed = await openPptx(source);
+  seed.close();
+  const handle = openPresentation(source);
+  handle.setSlideNotes(handle.snapshot().slides[0].id, 'Before attachment');
+  const deck = attachPptx(handle, { name: 'Live deck' });
+  let updates = 0;
+  const off = handle.onUpdate(() => { updates++; });
+  try {
+    const target = first(deck);
+    apply(deck, [{ op: 'replace_text', ...target, text: 'Live content' }, { op: 'set_notes', slide: target.slide, text: 'Live notes' }]);
+    expect(updates).toBe(1);
+    expect(handle.snapshot().slides[0].notes).toBe('Live notes');
+    handle.setSlideNotes(target.slide, 'Host edit');
+    expect(deck.readSlide({ slide: target.slide }).notes.text).toBe('Host edit');
+    expect((await deck.verify()).reopened).toBe(true);
+    deck.close();
+    expect(handle.snapshot().slides).toHaveLength(1);
+    expect(() => deck.outline()).toThrow('closed');
+  } finally { off(); deck.close(); handle.dispose(); }
+});
+
+test('PPTX refuses unsafe Unicode, images, text fields and oversized find/replace batches', async () => {
+  const deck = await openPptx(await pptxFixture('risk '.repeat(200)));
+  try {
+    const target = first(deck);
+    expect(() => apply(deck, [{ op: 'replace_text', ...target, text: '\ud800' }])).toThrow('complete Unicode');
+    expect(() => apply(deck, [{ op: 'find_replace', query: 'risk', replacement: 'x' }])).toThrow('128 occurrences');
+    expect(deck.readSlide({ slide: target.slide }).shapes[0].stories[0].text).toContain('risk');
+    expect(() => apply(deck, [{ op: 'add_image', slide: target.slide, name: 'Bad', rect: { x: 0, y: 0, width: 1, height: 1 }, contentType: 'image/png', base64: 'a===' }])).toThrow('canonical base64');
+    expect(() => apply(deck, [{ op: 'set_paragraphs', ...target, paragraphs: [{ runs: [{ text: 'bad\nrun' }] }] }])).toThrow('one paragraph');
+  } finally { deck.close(); }
+  const fields = await openPptx(await presentationFixture({ fields: true }));
+  try { expect(() => apply(fields, [{ op: 'replace_text', ...first(fields), text: 'Would remove field' }])).toThrow('text fields'); }
+  finally { fields.close(); }
+});
+
+test('PPTX paginates long run/text/notes reads without silently dropping formatting', async () => {
+  const deck = await openPptx(await presentationFixture({ runs: 100 }));
+  try {
+    const target = first(deck);
+    apply(deck, [{ op: 'set_notes', slide: target.slide, text: 'x'.repeat(6000) }]);
+    const read = deck.readSlide({ slide: target.slide, paragraphOffset: 1, textLength: 4000 });
+    const paragraph = read.shapes[0].stories[0].paragraphs[0];
+    expect(paragraph.nextRunOffset).toBe(8);
+    const next = deck.readSlide({ slide: target.slide, paragraphOffset: 1, runOffset: paragraph.nextRunOffset! });
+    expect(next.shapes[0].stories[0].paragraphs[0].runs[0].text).not.toBe(paragraph.runs[0].text);
+    expect(read.notes.nextStart).toBe(4000);
+    expect(deck.readSlide({ slide: target.slide, notesStart: 4000 }).notes.text.length).toBe(2000);
+    expect(JSON.stringify(read).length).toBeLessThan(30000);
+  } finally { deck.close(); }
+});
+
+test('PPTX previews pending proposals without mutating the presentation', async () => {
+  const deck = await openPptx(await pptxFixture());
+  try {
+    const hit = deck.grep({ query: 'Risk' }).matches[0];
+    const pending = deck.propose({ author: 'test', edits: [{ match: hit.match, newText: 'Opportunity' }] });
+    const before = await deck.render(1);
+    const after = await deck.render(1, pending.id);
+    expect(after.png).not.toEqual(before.png);
+    expect(deck.grep({ query: 'Opportunity' }).matches).toHaveLength(0);
+    await expect(deck.render(2)).rejects.toThrow('Choose a slide index');
+  } finally { deck.close(); }
+});
+
+test('PPTX shape-heavy outlines remain bounded and paginate every shape', async () => {
+  const source = await pptxFixture();
+  const initialized = await openPptx(source);
+  initialized.close();
+  const handle = openPresentation(source);
+  const slide = handle.snapshot().slides[0].id;
+  for (let i = 0; i < 80; i++) handle.addShape(slide, { name: `Shape ${i} ${'x'.repeat(180)}`, geometry: 'rect', rect: { x: i * 100, y: 0, width: 10000, height: 10000 } });
+  const deck = attachPptx(handle);
+  try {
+    let offset = 0;
+    const ids = new Set<string>();
+    while (true) {
+      const page = deck.outline({ limit: 100, shapeLimit: 100, shapeOffset: offset });
+      expect(JSON.stringify(page).length).toBeLessThan(17000);
+      for (const shape of page.slides[0].shapes) ids.add(shape.id);
+      const next = page.slides[0].nextShapeOffset;
+      if (next === null) break;
+      expect(next).toBeGreaterThan(offset);
+      offset = next;
+    }
+    expect(ids.size).toBe(81);
+  } finally { deck.close(); handle.dispose(); }
+});
+
+test('PPTX duplication preserves added images and edits the copy independently', async () => {
+  const deck = await openPptx(await presentationFixture({ group: true }));
+  try {
+    const slide = deck.outline().slides[0];
+    const image = createCanvas(2, 2).toBuffer('image/png').toString('base64');
+    apply(deck, [{ op: 'add_image', slide: slide.id, name: 'Picture', rect: { x: 5, y: 5, width: 10, height: 10 }, contentType: 'image/png', base64: image }]);
+    const clone = apply(deck, [{ op: 'duplicate_slide', slide: slide.id }]).results[0].slideId as string;
+    const shape = deck.readSlide({ slide: clone }).shapes.find(shape => shape.name === 'Revenue')!.id;
+    apply(deck, [{ op: 'replace_text', slide: clone, shape, text: 'Independent clone' }]);
+    expect(deck.outline().slides[0].title).toContain('Revenue');
+    expect(deck.outline().slides[1].title).toBe('Independent clone');
+    const reopened = await openPptx(await deck.export());
+    try {
+      for (const slide of reopened.outline().slides) expect(reopened.readSlide({ slide: slide.id }).shapes.some(shape => shape.type === 'picture')).toBe(true);
+      expect(reopened.outline().slides[1].title).toBe('Independent clone');
+    } finally { reopened.close(); }
+  } finally { deck.close(); }
+});
+
+test('PPTX maps layout placeholders atomically and preview matches export', async () => {
+  const deck = await openPptx(await layoutFixture());
+  try {
+    const outline = deck.outline();
+    const layout = outline.layouts.find(layout => layout.name === 'Title Only')!;
+    expect(layout.placeholders).toEqual([{ id: '8', name: 'Heading', nameTruncated: false, type: 'title', idx: 4 }]);
+    expect(layout.masterId).toBe('ppt/slideMasters/slideMaster1.xml');
+    const target = first(deck);
+    expect(() => apply(deck, [{ op: 'set_notes', slide: target.slide, text: 'rollback' }, { op: 'set_slide_layout', slide: target.slide, layout: layout.id, placeholders: [{ shape: target.shape, layoutPlaceholder: 'missing' }] }])).toThrow();
+    expect(deck.overview().version).toBe(outline.version);
+    const result = apply(deck, [{ op: 'set_slide_layout', slide: target.slide, layout: 'Title Only', placeholders: [{ shape: target.shape, layoutPlaceholder: 'Heading' }] }]);
+    expect(result.results[0]).toMatchObject({ layoutId: layout.id, layoutName: 'Title Only', placeholders: [{ shape: target.shape, layoutPlaceholder: '8' }] });
+    expect(() => deck.edit({ version: outline.version, edits: [{ op: 'set_slide_layout', slide: target.slide, layout: layout.id }] })).toThrow('Deck changed');
+    const preview = await deck.preview(target.slide);
+    const reopened = await openPptx(await deck.export());
+    try {
+      const slide = reopened.outline().slides[0];
+      expect(slide.layoutId).toBe(layout.id);
+      expect(reopened.readSlide({ slide: slide.id }).shapes[0].placeholder).toMatchObject({ index: 4 });
+      expect((await reopened.preview(slide.id)).png).toEqual(preview.png);
+    } finally { reopened.close(); }
+  } finally { deck.close(); }
+});
+
+for (const mapped of [false, true]) {
+  test(`PPTX export fits an overflowing autofit title the same with or without a preview (${mapped ? 'mapped' : 'unmapped'} layout change)`, async () => {
+    const zip = await JSZip.loadAsync(await layoutFixture());
+    const a = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+    const master = 'ppt/slideMasters/slideMaster1.xml';
+    zip.file(master, (await zip.file(master)!.async('string')).replace('<p:sldMaster ', `<p:sldMaster xmlns:a="${a}" `).replace('<p:spTree/>', '<p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr><a:normAutofit/></a:bodyPr><a:p/></p:txBody></p:sp></p:spTree>'));
+    const path = 'ppt/slides/slide1.xml';
+    zip.file(path, (await zip.file(path)!.async('string')).replace('<a:ext cx="8000000" cy="1000000"/>', '<a:ext cx="8000000" cy="360000"/>'));
+    const bytes = await zip.generateAsync({ type: 'uint8array' });
+    const saved: string[] = [];
+    for (const preview of [false, true]) {
+      const deck = await openPptx(bytes);
+      try {
+        const target = first(deck);
+        apply(deck, [
+          { op: 'set_slide_layout', slide: target.slide, layout: 'Title Only', ...(mapped ? { placeholders: [{ shape: target.shape, layoutPlaceholder: 'Heading' }] } : {}) },
+          { op: 'replace_text', slide: target.slide, shape: target.shape, text: 'Punishments: 2011 to 2018 '.repeat(4).trim() },
+        ]);
+        if (preview) await deck.preview(target.slide);
+        const exported = await JSZip.loadAsync(await deck.export());
+        saved.push(await exported.file(path)!.async('string'));
+      } finally { deck.close(); }
+    }
+    expect(saved[1]).toBe(saved[0]);
+    expect(saved[0]).toMatch(/<a:bodyPr><a:normAutofit fontScale="\d+"/);
+  });
+}
+
+for (const previewed of [false, true]) test(`PPTX export falls back to a plain save when the edited text exceeds render limits (${previewed ? 'after' : 'without'} a preview)`, async () => {
+  const zip = await JSZip.loadAsync(await presentationFixture());
+  const path = 'ppt/slides/slide1.xml';
+  const xml = await zip.file(path)!.async('string');
+  const title = xml.match(/<a:p>[\s\S]*?<\/a:p>/u)![0];
+  zip.file(path, xml.replace('<a:bodyPr/>', '<a:bodyPr><a:normAutofit/></a:bodyPr>').replace(title, `<a:p><a:r><a:rPr lang="en-US"/><a:t>Quarterly</a:t></a:r></a:p>${'<a:p/>'.repeat(20_000)}`));
+  const bytes = await zip.generateAsync({ type: 'uint8array' });
+  const deck = await openPptx(bytes);
+  const handle = openPresentation(bytes);
+  const plain = attachPptx(handle);
+  try {
+    if (previewed) await deck.preview(apply(deck, [{ op: 'add_slide', layout: deck.outline().layouts[0].id }]).results[0].slideId as string);
+    for (const presentation of [deck, plain]) apply(presentation, [{ op: 'find_replace', query: 'Quarterly', replacement: 'Annual' }]);
+    const expected = await (await JSZip.loadAsync(handle.save())).file(path)!.async('string');
+    const exported = await (await JSZip.loadAsync(await deck.export())).file(path)!.async('string');
+    expect(exported).toBe(expected);
+    expect(exported).toContain('<a:t>Annual</a:t>');
+    expect(exported).toContain('<a:normAutofit/>');
+  } finally { deck.close(); plain.close(); handle.dispose(); }
+}, 60_000);
+
+test('PPTX attached export fits inherited theme fonts with the live renderer', async () => {
+  const zip = await JSZip.loadAsync(await layoutFixture());
+  const a = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+  const r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const rels = 'ppt/slideMasters/_rels/slideMaster1.xml.rels';
+  zip.file(rels, (await zip.file(rels)!.async('string')).replace('</Relationships>', `<Relationship Id="theme" Type="${r}/theme" Target="../theme/theme1.xml"/></Relationships>`));
+  zip.file('ppt/theme/theme1.xml', `<a:theme xmlns:a="${a}"><a:themeElements><a:fontScheme name="s"><a:majorFont><a:latin typeface="Times New Roman"/></a:majorFont><a:minorFont><a:latin typeface="Times New Roman"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>`);
+  zip.file('[Content_Types].xml', (await zip.file('[Content_Types].xml')!.async('string')).replace('</Types>', '<Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/></Types>'));
+  const path = 'ppt/slides/slide1.xml';
+  zip.file(path, (await zip.file(path)!.async('string')).replace('<a:ext cx="8000000" cy="1000000"/>', '<a:ext cx="8000000" cy="360000"/>').replace('<a:bodyPr/>', '<a:bodyPr><a:normAutofit/></a:bodyPr>').replace('b="1" sz="2400"', 'sz="2400"'));
+  const bytes = await zip.generateAsync({ type: 'uint8array' });
+  const seed = await openPptx(bytes);
+  seed.close();
+  const load = createFontProvider().resolve('Times New Roman', false, false)!;
+  const font = new Uint8Array(await load());
+  const handle = openPresentation(bytes);
+  handle.registerFont({ family: 'Times New Roman', bold: false, italic: false, bytes: font });
+  const deck = attachPptx(handle);
+  try {
+    const target = first(deck);
+    apply(deck, [{ op: 'replace_text', ...target, text: 'Punishments: 2011 to 2018 '.repeat(4).trim() }]);
+    expect(deck.readSlide({ slide: target.slide }).shapes[0].stories[0].paragraphs[0].runs[0].formatting.fontFamily).toBeFalsy();
+    const expected = await (await JSZip.loadAsync(handle.save())).file(path)!.async('string');
+    const exported = await (await JSZip.loadAsync(await deck.export())).file(path)!.async('string');
+    expect(expected).toMatch(/<a:normAutofit fontScale="\d+"/);
+    expect(Number(expected.match(/fontScale="(\d+)"/)?.[1])).toBeLessThan(100000);
+    expect(exported).toBe(expected);
+  } finally { deck.close(); handle.dispose(); }
+});
+
+test('PPTX export saves the version it fitted and refuses a document closed while fonts load', async () => {
+  const closing = await openPptx(await presentationFixture());
+  const target = first(closing);
+  apply(closing, [{ op: 'replace_text', slide: target.slide, shape: target.shape, text: 'First edit' }]);
+  const refused = closing.export();
+  closing.close();
+  await expect(refused).rejects.toThrow('closed');
+  const zip = await JSZip.loadAsync(await layoutFixture());
+  const a = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+  const master = 'ppt/slideMasters/slideMaster1.xml';
+  zip.file(master, (await zip.file(master)!.async('string')).replace('<p:sldMaster ', `<p:sldMaster xmlns:a="${a}" `).replace('<p:spTree/>', '<p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr><a:normAutofit/></a:bodyPr><a:p/></p:txBody></p:sp></p:spTree>'));
+  const path = 'ppt/slides/slide1.xml';
+  zip.file(path, (await zip.file(path)!.async('string')).replace('<a:ext cx="8000000" cy="1000000"/>', '<a:ext cx="8000000" cy="360000"/>'));
+  const bytes = await zip.generateAsync({ type: 'uint8array' });
+  const title = 'Punishments: 2011 to 2018 '.repeat(4).trim();
+  const firstEdit = (deck: PptxAgentPresentation) => { const target = first(deck); apply(deck, [{ op: 'set_slide_layout', slide: target.slide, layout: 'Title Only' }, { op: 'replace_text', slide: target.slide, shape: target.shape, text: title }]); };
+  const secondEdit = (deck: PptxAgentPresentation) => { const target = first(deck); apply(deck, [{ op: 'set_paragraphs', slide: target.slide, shape: target.shape, paragraphs: [{ runs: [{ text: title, fontFamily: 'Times New Roman' }] }] }]); };
+  const savedXml = async (saved: Promise<Uint8Array>) => await (await JSZip.loadAsync(await saved)).file(path)!.async('string');
+  const exportWith = async (second: boolean, raced: boolean) => { const deck = await openPptx(bytes); try { firstEdit(deck); if (!second) return await savedXml(deck.export()); if (!raced) { secondEdit(deck); return await savedXml(deck.export()); } const pending = deck.export(); secondEdit(deck); return await savedXml(pending); } finally { deck.close(); } };
+  const raced = await exportWith(true, true);
+  const fitted = await exportWith(true, false);
+  const plain = await exportWith(false, false);
+  expect(raced).toBe(fitted);
+  expect(raced).toMatch(/<a:bodyPr><a:normAutofit fontScale="\d+"/);
+  expect(raced).not.toBe(plain);
+  expect(fitted).not.toBe(plain);
+  expect(raced.match(/<a:normAutofit fontScale="(\d+)"/)?.[1]).not.toBe(plain.match(/<a:normAutofit fontScale="(\d+)"/)?.[1]);
+});
+
+test('PPTX layout placeholder inventories paginate within the outline budget', async () => {
+  const zip = await JSZip.loadAsync(await layoutFixture());
+  const path = 'ppt/slideLayouts/slideLayout2.xml';
+  const shapes = Array.from({ length: 80 }, (_, index) => `<p:sp><p:nvSpPr><p:cNvPr id="${100 + index}" name="Slot ${index} ${'x'.repeat(180)}"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="${index}"/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>`).join('');
+  zip.file(path, (await zip.file(path)!.async('string')).replace('</p:spTree>', `${shapes}</p:spTree>`));
+  const deck = await openPptx(await zip.generateAsync({ type: 'uint8array' }));
+  try {
+    const ids = new Set<string>();
+    let offset = 0;
+    while (true) {
+      const outline = deck.outline({ layoutPlaceholderOffset: offset });
+      expect(JSON.stringify(outline).length).toBeLessThan(17000);
+      const layout = outline.layouts.find(layout => layout.id === path)!;
+      for (const placeholder of layout.placeholders) ids.add(placeholder.id);
+      if (layout.nextPlaceholderOffset === null) break;
+      expect(layout.nextPlaceholderOffset).toBeGreaterThan(offset);
+      offset = layout.nextPlaceholderOffset;
+    }
+    expect(ids.size).toBe(81);
+  } finally { deck.close(); }
+});
+
+test('slide proposals reach an attached canvas handle and keep refs through review and acceptance', async () => {
+  const opened = await openPptx(await presentationFixture());
+  opened.close();
+  const handle = openPresentation(await presentationFixture());
+  const deck = attachPptx(handle);
+  try {
+    const before = handle.snapshot();
+    const proposal = deck.propose({ author: 'agent', edits: [
+      { type: 'insertSlide', ref: 'draft', afterSlideId: null },
+      { type: 'duplicateSlide', ref: 'copy', slideId: '@draft' },
+      { type: 'moveSlide', slideId: '@copy', afterSlideId: before.slides[0]!.id },
+      { type: 'deleteSlide', slideId: '@draft' },
+    ] });
+    expect(handle.listProposals()).toHaveLength(1);
+    const pending = handle.listProposals()[0]!;
+    expect(handle.proposalSlideStrip(pending.id).some(entry => entry.status === 'inserted')).toBe(true);
+    expect(deck.review(proposal.id).stale).toBe(false);
+    expect(handle.snapshot()).toEqual(before);
+    const preview = await deck.export(proposal.id);
+    const reopened = openPresentation(preview);
+    expect(reopened.snapshot().slides).toHaveLength(before.slides.length + 1);
+    reopened.dispose();
+    await deck.accept(proposal.id);
+    expect(handle.listProposals()).toHaveLength(0);
+    expect(handle.snapshot().slides).toHaveLength(before.slides.length + 1);
+    handle.undo();
+    expect(handle.snapshot()).toEqual(before);
+    const rejected = deck.propose({ author: 'agent', edits: [{ type: 'insertSlide', afterSlideId: null }] });
+    deck.reject(rejected.id);
+    expect(handle.listProposals()).toHaveLength(0);
+  } finally { deck.close(); handle.dispose(); }
+});
+
+test('mixed slide proposals replace disjoint matches like the text batch path', async () => {
+  const bytes = await presentationFixture();
+  const batch = await openPptx(bytes);
+  const mixed = await openPptx(bytes);
+  try {
+    for (const deck of [batch, mixed]) {
+      const story = deck.list().items[0].story;
+      const first = deck.grep({ query: 'Keep', story }).matches[0];
+      const second = deck.grep({ query: 'paragraph', story }).matches[0];
+      const proposal = deck.propose({ author: 'agent', edits: [
+        { match: first.match, newText: 'Preserve all of' },
+        ...(deck === mixed ? [{ type: 'insertSlide' as const, afterSlideId: null }] : []),
+        { match: second.match, newText: 'text' },
+      ] });
+      await deck.accept(proposal.id);
+    }
+    const expected = batch.read(batch.grep({ query: 'Preserve' }).matches[0].ref).text;
+    expect(expected).toBe('Preserve all of this text.');
+    expect(mixed.read(mixed.grep({ query: 'Preserve' }).matches[0].ref).text).toBe(expected);
+  } finally { batch.close(); mixed.close(); }
+});
+
+test('mixed slide proposals refuse overlapping matches atomically', async () => {
+  const deck = await openPptx(await presentationFixture());
+  try {
+    const story = deck.list().items[0].story;
+    const first = deck.grep({ query: 'Keep this', story }).matches[0];
+    const second = deck.grep({ query: 'this paragraph', story }).matches[0];
+    const version = deck.overview().version;
+    expect(() => deck.propose({ author: 'agent', edits: [
+      { match: first.match, newText: 'Preserve' },
+      { type: 'insertSlide', afterSlideId: null },
+      { match: second.match, newText: 'text' },
+    ] })).toThrow('conflicts with step');
+    expect(deck.listProposals()).toEqual([]);
+    expect(deck.overview().version).toBe(version);
+    expect(deck.read(first.ref).text).toBe('Keep this paragraph.');
+  } finally { deck.close(); }
+});
+
+test('agent slide proposals drop editor decisions before listing and staging limits', async () => {
+  const bytes = await presentationFixture();
+  const initialized = await openPptx(bytes);
+  initialized.close();
+  const handle = openPresentation(bytes);
+  const deck = attachPptx(handle);
+  try {
+    for (let index = 0; index < 65; index++) {
+      deck.propose({ author: 'agent', edits: [{ type: 'insertSlide', afterSlideId: null }] });
+      const pending = handle.listProposals()[0]!;
+      if (index % 2 === 0) handle.acceptProposal(pending.id);
+      else handle.rejectProposal(pending.id);
+    }
+    expect(deck.listProposals()).toEqual([]);
+    const pending = deck.propose({ author: 'agent', edits: [{ type: 'insertSlide', afterSlideId: null }] });
+    expect(deck.listProposals()).toMatchObject([{ id: pending.id, status: 'pending' }]);
+  } finally { deck.close(); handle.dispose(); }
+});
+
+test('mixed shape proposals preserve sequential typed story edits alongside batch matches', async () => {
+  const bytes = await presentationFixture();
+  const initialized = await openPptx(bytes);
+  initialized.close();
+  const handle = openPresentation(bytes);
+  const deck = attachPptx(handle);
+  try {
+    const before = handle.snapshot();
+    const story = deck.list().items[0].story;
+    const first = deck.grep({ query: 'Keep', story }).matches[0];
+    const second = deck.grep({ query: 'paragraph', story }).matches[0];
+    const proposal = deck.propose({ author: 'agent', edits: [
+      { match: first.match, newText: 'Preserve all of' },
+      { type: 'insertSlide', ref: 'slide', afterSlideId: null },
+      { type: 'addTextBox', ref: 'box', slideId: '@slide', draft: { name: 'Sequential box', rect: { x: 0, y: 0, width: 1000000, height: 500000 }, text: '', style: {} } },
+      { type: 'replaceText', storyId: '@box', start: 0, end: 0, text: 'First' },
+      { type: 'formatText', storyId: '@box', start: 0, end: 5, patch: { bold: true } },
+      { match: second.match, newText: 'text' },
+      { type: 'replaceText', storyId: '@box', start: 5, end: 5, text: ' second' },
+    ] });
+    expect(handle.snapshot()).toEqual(before);
+    await deck.accept(proposal.id);
+    const box = handle.snapshot().slides[0]!.shapes.find(shape => shape.name === 'Sequential box')!;
+    const runs = box.textStories[0]!.paragraphs[0]!.runs;
+    expect(runs.map(run => run.text).join('')).toBe('First second');
+    expect(runs[0]!.style.bold).toBe(true);
+    expect(deck.read(deck.grep({ query: 'Preserve' }).matches[0].ref).text).toBe('Preserve all of this text.');
+    handle.undo();
+    expect(handle.snapshot()).toEqual(before);
+  } finally { deck.close(); handle.dispose(); }
+});
+
+for (const matchFirst of [false, true]) {
+  test(`mixed story proposals remap grep matches with typed inserts, match first: ${matchFirst}`, async () => {
+    const deck = await openPptx(await pptxFixture('abc def'));
+    try {
+      const hit = deck.grep({ query: 'def' }).matches[0]!;
+      const typed = { type: 'replaceText' as const, storyId: hit.story, start: 0, end: 0, text: 'X' };
+      const match = { match: hit.match, newText: 'replacement' };
+      const version = deck.overview().version;
+      const proposal = deck.propose({ author: 'agent', edits: matchFirst ? [match, typed] : [typed, match] });
+      expect(deck.overview().version).toBe(version);
+      expect(deck.read(hit.ref).text).toBe('abc def');
+      const preview = await openPptx(await deck.export(proposal.id));
+      try { expect(preview.read(preview.grep({ query: 'replacement' }).matches[0]!.ref).text).toBe('Xabc replacement'); }
+      finally { preview.close(); }
+      await deck.accept(proposal.id);
+      expect(deck.read(hit.ref).text).toBe('Xabc replacement');
+    } finally { deck.close(); }
+  });
+}
+
+for (const [matchFirst, end] of [[false, 5], [true, 5], [false, 6], [true, 6]] as const) {
+  test(`mixed story proposals refuse overlapping typed and match edits, match first: ${matchFirst}, typed end: ${end}`, async () => {
+    const deck = await openPptx(await pptxFixture('abc def'));
+    try {
+      const hit = deck.grep({ query: 'def' }).matches[0]!;
+      const typed = { type: 'replaceText' as const, storyId: hit.story, start: 5, end, text: 'X' };
+      const match = { match: hit.match, newText: 'replacement' };
+      const version = deck.overview().version;
+      let refusal: unknown;
+      try { deck.propose({ author: 'agent', edits: matchFirst ? [match, typed] : [typed, match] }); }
+      catch (error) { refusal = error; }
+      expect(refusal).toMatchObject({ name: 'DocumentToolError', code: 'OVERLAPPING_EDITS' });
+      expect(deck.listProposals()).toEqual([]);
+      expect(deck.overview().version).toBe(version);
+      expect(deck.read(hit.ref).text).toBe('abc def');
+    } finally { deck.close(); }
+  });
+}
+
+for (const matchFirst of [false, true]) {
+  test(`mixed story proposals refuse replacement of deleted match text, match first: ${matchFirst}`, async () => {
+    const deck = await openPptx(await pptxFixture('abc def'));
+    try {
+      const hit = deck.grep({ query: 'abc ' }).matches[0]!;
+      const match = { match: hit.match, newText: '' };
+      const typed = { type: 'replaceText' as const, storyId: hit.story, start: 0, end: 3, text: 'replacement' };
+      const version = deck.overview().version;
+      let refusal: unknown;
+      try { deck.propose({ author: 'agent', edits: matchFirst ? [match, typed] : [typed, match] }); }
+      catch (error) { refusal = error; }
+      expect(refusal).toMatchObject({ name: 'DocumentToolError', code: 'OVERLAPPING_EDITS' });
+      expect(deck.listProposals()).toEqual([]);
+      expect(deck.overview().version).toBe(version);
+      expect(deck.read(hit.ref).text).toBe('abc def');
+    } finally { deck.close(); }
+  });
+
+  for (const [query, start, end, text, expected] of [
+    ['abc ', 0, 0, 'X', 'Xdef'],
+    ['def', 0, 4, 'prefix ', 'prefix '],
+    ['def', 4, 4, 'X', 'abc X'],
+  ] as const) {
+    test(`mixed story proposals allow deletion boundary edits for ${query} at [${start},${end}], match first: ${matchFirst}`, async () => {
+      const deck = await openPptx(await pptxFixture('abc def'));
+      try {
+        const hit = deck.grep({ query }).matches[0]!;
+        const match = { match: hit.match, newText: '' };
+        const typed = { type: 'replaceText' as const, storyId: hit.story, start, end, text };
+        const version = deck.overview().version;
+        const proposal = deck.propose({ author: 'agent', edits: matchFirst ? [match, typed] : [typed, match] });
+        expect(deck.overview().version).toBe(version);
+        expect(deck.read(hit.ref).text).toBe('abc def');
+        const preview = await openPptx(await deck.export(proposal.id));
+        try { expect(preview.read(preview.grep({ query: expected }).matches[0]!.ref).text).toBe(expected); }
+        finally { preview.close(); }
+        await deck.accept(proposal.id);
+        expect(deck.read(hit.ref).text).toBe(expected);
+      } finally { deck.close(); }
+    });
+  }
+}
+
+test('mixed story proposals keep typed offsets and local refs in staging order across length-changing matches', async () => {
+  const deck = await openPptx(await pptxFixture('abc def ghi'));
+  try {
+    const first = deck.grep({ query: 'abc' }).matches[0]!;
+    const last = deck.grep({ query: 'ghi' }).matches[0]!;
+    const proposal = deck.propose({ author: 'agent', edits: [
+      { match: first.match, newText: 'alphabet' },
+      { type: 'addTextBox', ref: 'box', slideId: first.slideId, draft: { name: 'Local box', rect: { x: 0, y: 0, width: 1000000, height: 500000 }, text: '', style: {} } },
+      { type: 'replaceText', storyId: '@box', start: 0, end: 0, text: 'Local' },
+      { type: 'replaceText', storyId: first.story, start: 9, end: 12, text: 'DEF' },
+      { match: last.match, newText: 'GHI' },
+      { type: 'replaceText', storyId: '@box', start: 5, end: 5, text: ' story' },
+    ] });
+    await deck.accept(proposal.id);
+    expect(deck.read(first.ref).text).toBe('alphabet DEF GHI');
+    expect(deck.read(deck.grep({ query: 'Local story' }).matches[0]!.ref).text).toBe('Local story');
+  } finally { deck.close(); }
+});
+
+test('mixed slide proposals preserve adjacent matches when an earlier match is deleted', async () => {
+  const deck = await openPptx(await pptxFixture('abc def'));
+  try {
+    const first = deck.grep({ query: 'abc ' }).matches[0]!;
+    const second = deck.grep({ query: 'def' }).matches[0]!;
+    const proposal = deck.propose({ author: 'agent', edits: [
+      { match: first.match, newText: '' },
+      { type: 'insertSlide', afterSlideId: null },
+      { match: second.match, newText: 'replacement' },
+    ] });
+    await deck.accept(proposal.id);
+    expect(deck.read(first.ref).text).toBe('replacement');
+  } finally { deck.close(); }
+});
+
+test('PPTX shape proposals expose refs, story targeting, previews, acceptance, and rejection', async () => {
+  const handle = openPresentation(await presentationFixture(), { clientId: 732 });
+  const deck = attachPptx(handle);
+  try {
+    const before = handle.snapshot();
+    const slide = before.slides[0]!;
+    const rect = { x: 100000, y: 100000, width: 1000000, height: 500000 };
+    const proposal = deck.propose({ author: 'agent', edits: [
+      { type: 'insertSlide', ref: 'slide', afterSlideId: null },
+      { type: 'addTextBox', ref: 'box', slideId: '@slide', draft: { name: 'Box', rect, text: '', style: {} } },
+      { type: 'replaceText', storyId: '@box', start: 0, end: 0, text: 'Filled' },
+      { type: 'formatText', storyId: '@box', start: 0, end: 6, patch: { bold: true } },
+      { type: 'setShapeFill', slideId: '@slide', shapeId: '@box', color: '#123456' },
+      { type: 'addShape', ref: 'shape', slideId: '@slide', draft: { name: 'Card', rect, geometry: 'rect' } },
+      { type: 'addPicture', ref: 'image', slideId: '@slide', draft: { name: 'Pixel', rect, contentType: 'image/png', mediaBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' } },
+      { type: 'removeShape', slideId: slide.id, shapeId: slide.shapes[0]!.id },
+    ] });
+    expect(proposal.changes.some(change => change.kind === 'deleted')).toBe(true);
+    expect(handle.snapshot()).toEqual(before);
+    const preview = openPresentation(await deck.export(proposal.id));
+    try { expect(preview.snapshot().slides[0]!.shapes.some(shape => shape.name === 'Box')).toBe(true); }
+    finally { preview.dispose(); }
+    await deck.accept(proposal.id);
+    expect(handle.snapshot().slides[0]!.shapes).toHaveLength(3);
+    handle.undo();
+    expect(handle.snapshot()).toEqual(before);
+    const rejected = deck.propose({ author: 'agent', edits: [{ type: 'addShape', slideId: slide.id, draft: { name: 'Rejected', rect, geometry: 'rect' } }] });
+    deck.reject(rejected.id);
+    expect(handle.listProposals()).toHaveLength(0);
+  } finally { deck.close(); handle.dispose(); }
+});
+
+test('PPTX paragraph proposals preserve rich paragraphs, created story refs and review lifecycle', async () => {
+  const handle = openPresentation(await presentationFixture(), { clientId: 733 });
+  const deck = attachPptx(handle);
+  try {
+    const before = handle.snapshot();
+    const slide = before.slides[0]!;
+    const shape = slide.shapes[0]!;
+    const proposal = deck.propose({ author: 'agent', edits: [
+      { type: 'setStoryParagraphs', storyId: shape.textStories[0]!.id, paragraphs: [
+        { alignment: 'ctr', bullet: true, runs: [{ text: 'First ', style: { bold: true } }, { text: 'point', style: { italic: true } }] },
+        { alignment: 'r', bullet: false, runs: [{ text: 'Second point', style: {} }] },
+      ] },
+      { type: 'addTextBox', ref: 'box', slideId: slide.id, draft: { name: 'Proposed bullets', rect: { x: 0, y: 0, width: 2000000, height: 1000000 }, text: '', style: {} } },
+      { type: 'setStoryParagraphs', storyId: '@box', paragraphs: [{ bullet: true, runs: [{ text: 'From ref', style: {} }] }] },
+    ] });
+    expect(proposal.changes.some(change => change.newText === 'First point\nSecond point')).toBe(true);
+    expect(handle.snapshot()).toEqual(before);
+    const preview = openPresentation(await deck.export(proposal.id));
+    try {
+      const story = preview.snapshot().slides[0]!.shapes[0]!.textStories[0]!;
+      expect(story.paragraphs.map(p => p.runs.map(r => r.text).join(''))).toEqual(['First point', 'Second point']);
+      expect(story.paragraphs[0]!.alignment).toBe('ctr');
+      expect(JSON.parse(story.paragraphs[0]!.bulletJson!)).toEqual({ type: 'character', value: '•' });
+      expect(story.paragraphs[0]!.runs[0]!.style.bold).toBe(true);
+    } finally { preview.dispose(); }
+    await deck.accept(proposal.id);
+    expect(handle.snapshot().slides[0]!.shapes.find(s => s.name === 'Proposed bullets')!.textStories[0]!.paragraphs[0]!.runs[0]!.text).toBe('From ref');
+    expect(handle.undo().snapshot).toEqual(before);
+    const rejected = deck.propose({ author: 'agent', edits: [{ type: 'setStoryParagraphs', storyId: shape.textStories[0]!.id, paragraphs: [{ runs: [] }] }] });
+    deck.reject(rejected.id);
+    expect(handle.snapshot()).toEqual(before);
+    expect(handle.listProposals()).toEqual([]);
+    expect(() => deck.propose({ author: 'agent', edits: [{ type: 'setStoryParagraphs', storyId: shape.textStories[0]!.id, paragraphs: [] }] })).toThrow();
+    expect(handle.listProposals()).toEqual([]);
+  } finally { deck.close(); handle.dispose(); }
+});
+
+test('PPTX slide property proposals expose layout mappings, backgrounds, refs and atomic review', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const bytes = await readFile(new URL('../../../crates/pptx-edit/tests/fixtures/proposal-slide-props.pptx', import.meta.url));
+  const initialized = await openPptx(bytes);
+  initialized.close();
+  const handle = openPresentation(bytes);
+  const deck = attachPptx(handle);
+  try {
+    const before = handle.snapshot();
+    const slide = before.slides[0]!;
+    const background = { type: 'gradient' as const, gradient: { type: 'linear', angle: 90, stops: [
+      { position: 0, color: { rgb: '123456' } }, { position: 100000, color: { rgb: 'ABCDEF' } },
+    ] } };
+    const proposal = deck.propose({ author: 'agent', edits: [
+      { type: 'setSlideLayout', slideId: slide.id, layoutPartPath: 'ppt/slideLayouts/slideLayout2.xml', mapping: [[slide.shapes[0]!.id, 8]] },
+      { type: 'insertSlide', ref: 'new', afterSlideId: null, layoutPartPath: slide.layoutPartPath! },
+      { type: 'setSlideLayout', slideId: '@new', layoutPartPath: 'ppt/slideLayouts/slideLayout2.xml' },
+      { type: 'setSlideBackground', slideId: '@new', background },
+    ] });
+    expect(proposal.changes.some(change => change.slideId === slide.id && change.kind === 'content')).toBe(true);
+    expect(handle.snapshot()).toEqual(before);
+    const preview = openPresentation(await deck.export(proposal.id));
+    try {
+      expect(preview.snapshot().slides[0]!.background).toEqual(background);
+      expect(preview.snapshot().slides[1]!.layoutPartPath).toBe('ppt/slideLayouts/slideLayout2.xml');
+    } finally { preview.dispose(); }
+    await deck.accept(proposal.id);
+    expect(handle.snapshot().slides[0]!.background).toEqual(background);
+    handle.undo();
+    expect(handle.snapshot()).toEqual(before);
+    const rejected = deck.propose({ author: 'agent', edits: [{ type: 'setSlideBackground', slideId: slide.id, background: null }] });
+    deck.reject(rejected.id);
+    expect(handle.snapshot()).toEqual(before);
+    for (const edit of [
+      { type: 'setSlideLayout' as const, slideId: slide.id, layoutPartPath: 'unknown.xml' },
+      { type: 'setSlideBackground' as const, slideId: slide.id, background: { type: 'solid' as const, color: { rgb: 'bad' } } },
+    ]) {
+      expect(() => deck.propose({ author: 'agent', edits: [edit] })).toThrow();
+      expect(handle.listProposals()).toEqual([]);
+      expect(handle.snapshot()).toEqual(before);
+    }
+  } finally { deck.close(); handle.dispose(); }
+});

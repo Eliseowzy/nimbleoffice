@@ -1,0 +1,756 @@
+/**
+ * HorizontalRuler Component — Google Docs style
+ *
+ * 3 handles only:
+ * - Left side: first-line indent (▼ down at top) + left indent (▲ up at bottom)
+ * - Right side: right indent (▼ down at top)
+ *
+ * Margins shown as gray zones on the ruler edges.
+ * Drag the boundary between gray/white to adjust page margins.
+ * A tooltip names the hovered, focused or dragged marker and its value.
+ */
+
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import type { CSSProperties } from 'react';
+import type { SectionProperties, TabStop, TabStopAlignment } from '@nimbleoffice/docx/types/document';
+import { twipsToPixels, pixelsToTwips, formatPx } from '@nimbleoffice/docx/utils';
+import { useTranslation } from '../../i18n';
+import { createT, en } from '@nimbleoffice/docx-i18n';
+import type { TFunction, TranslationKey } from '@nimbleoffice/docx-i18n';
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+export interface HorizontalRulerProps {
+  sectionProps?: SectionProperties | null;
+  zoom?: number;
+  editable?: boolean;
+  paragraphEditable?: boolean;
+  onDragStart?: () => void;
+  onDragEnd?: () => void;
+  onLeftMarginChange?: (marginTwips: number) => void;
+  onRightMarginChange?: (marginTwips: number) => void;
+  onFirstLineIndentChange?: (indentTwips: number) => void;
+  showFirstLineIndent?: boolean;
+  firstLineIndent?: number;
+  hangingIndent?: boolean;
+  indentLeft?: number;
+  indentRight?: number;
+  onIndentLeftChange?: (indentTwips: number) => void;
+  onIndentRightChange?: (indentTwips: number) => void;
+  unit?: 'inch' | 'cm';
+  className?: string;
+  style?: CSSProperties;
+  tabStops?: TabStop[] | null;
+  onTabStopRemove?: (positionTwips: number) => void;
+  onTabStopsChange?: (tabs: TabStop[]) => void;
+}
+
+type MarkerType = 'leftMargin' | 'rightMargin' | 'firstLineIndent' | 'leftIndent' | 'rightIndent';
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const DEFAULT_PAGE_WIDTH_TWIPS = 12240;
+const DEFAULT_MARGIN_TWIPS = 1440;
+const TWIPS_PER_INCH = 1440;
+const TWIPS_PER_CM = 567;
+
+const RULER_HEIGHT = 22;
+const RULER_TEXT_COLOR = 'var(--doc-text-muted)';
+const RULER_TICK_COLOR = 'var(--doc-text-subtle)';
+const MARGIN_ZONE_COLOR = 'var(--doc-shadow-subtle)';
+const INDENT_COLOR = 'var(--doc-primary)';
+const INDENT_HOVER_COLOR = 'var(--doc-primary-hover)';
+const INDENT_ACTIVE_COLOR = 'var(--doc-primary-hover)';
+
+const TRI_SIZE = 5; // triangle half-width in px
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+function formatValueForTooltip(
+  twips: number,
+  unit: 'inch' | 'cm',
+  lang = 'en',
+  t: TFunction = createT(en)
+): string {
+  if (unit === 'inch') {
+    return (
+      new Intl.NumberFormat(lang, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(twips / TWIPS_PER_INCH) +
+      t('common.units.inchMark')
+    );
+  }
+  return (
+    new Intl.NumberFormat(lang, { minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(twips / TWIPS_PER_CM) +
+    ' ' +
+    t('common.units.cm')
+  );
+}
+
+// ============================================================================
+// MAIN COMPONENT
+// ============================================================================
+
+export function HorizontalRuler({
+  sectionProps,
+  zoom = 1,
+  editable = false,
+  paragraphEditable = editable,
+  onDragStart,
+  onDragEnd,
+  onLeftMarginChange,
+  onRightMarginChange,
+  onFirstLineIndentChange,
+  showFirstLineIndent = false,
+  firstLineIndent = 0,
+  hangingIndent = false,
+  indentLeft = 0,
+  indentRight = 0,
+  onIndentLeftChange,
+  onIndentRightChange,
+  unit = 'inch',
+  className = '',
+  style,
+  tabStops,
+  onTabStopRemove,
+  onTabStopsChange,
+}: HorizontalRulerProps): React.ReactElement {
+  const { t, lang } = useTranslation();
+  const [dragging, setDragging] = useState<MarkerType | null>(null);
+  const [hoveredMarker, setHoveredMarker] = useState<MarkerType | null>(null);
+  const [focusedMarker, setFocusedMarker] = useState<MarkerType | null>(null);
+  const [dragValue, setDragValue] = useState<number | null>(null);
+  const [dragPositionPx, setDragPositionPx] = useState<number | null>(null);
+  const [tabDrag, setTabDrag] = useState<{ tab: TabStop; position: number; tabs: TabStop[] } | null>(null);
+  const tabPosition = useRef<number | null>(null);
+  const rulerRef = useRef<HTMLDivElement>(null);
+
+  // Page dimensions
+  const pageWidthTwips = sectionProps?.pageWidth ?? DEFAULT_PAGE_WIDTH_TWIPS;
+  const leftMarginTwips = sectionProps?.marginLeft ?? DEFAULT_MARGIN_TWIPS;
+  const rightMarginTwips = sectionProps?.marginRight ?? DEFAULT_MARGIN_TWIPS;
+  const contentTwips = pageWidthTwips - leftMarginTwips - rightMarginTwips;
+
+  // Pixel conversions
+  const pageWidthPx = twipsToPixels(pageWidthTwips) * zoom;
+  const leftMarginPx = twipsToPixels(leftMarginTwips) * zoom;
+  const rightMarginPx = twipsToPixels(rightMarginTwips) * zoom;
+  const indentLeftPx = twipsToPixels(indentLeft) * zoom;
+  const indentRightPx = twipsToPixels(indentRight) * zoom;
+
+  // First line indent: hanging goes left, normal goes right
+  const effectiveFirstLineIndent = hangingIndent ? -firstLineIndent : firstLineIndent;
+  const firstLineIndentPx = twipsToPixels(effectiveFirstLineIndent) * zoom;
+
+  // Handle positions (in px from ruler left edge)
+  const leftIndentPosPx = leftMarginPx + indentLeftPx;
+  const rightIndentPosPx = pageWidthPx - rightMarginPx - indentRightPx;
+  const firstLinePosPx = leftMarginPx + indentLeftPx + firstLineIndentPx;
+
+  const handleDragStart = useCallback(
+    (e: React.MouseEvent, marker: MarkerType) => {
+      if (!(marker === 'leftMargin' || marker === 'rightMargin' ? editable : paragraphEditable)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      onDragStart?.();
+      setDragging(marker);
+    },
+    [editable, paragraphEditable, onDragStart]
+  );
+
+  const handleDrag = useCallback(
+    (e: MouseEvent) => {
+      if (!dragging || !rulerRef.current) return;
+
+      const rect = rulerRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      setDragPositionPx(x);
+      const positionTwips = pixelsToTwips(x / zoom);
+
+      if (dragging === 'leftMargin') {
+        const maxMargin = pageWidthTwips - rightMarginTwips - 720;
+        const rounded = Math.round(Math.max(0, Math.min(positionTwips, maxMargin)));
+        setDragValue(rounded);
+        onLeftMarginChange?.(rounded);
+      } else if (dragging === 'rightMargin') {
+        const fromRight = pageWidthTwips - positionTwips;
+        const maxMargin = pageWidthTwips - leftMarginTwips - 720;
+        const rounded = Math.round(Math.max(0, Math.min(fromRight, maxMargin)));
+        setDragValue(rounded);
+        onRightMarginChange?.(rounded);
+      } else if (dragging === 'firstLineIndent') {
+        const base = leftMarginTwips + indentLeft;
+        const indentFromBase = positionTwips - base;
+        const maxIndent = contentTwips - indentLeft - indentRight - 720;
+        const rounded = Math.round(Math.max(-indentLeft, Math.min(indentFromBase, maxIndent)));
+        setDragValue(rounded);
+        onFirstLineIndentChange?.(rounded);
+      } else if (dragging === 'leftIndent') {
+        const indentFromMargin = positionTwips - leftMarginTwips;
+        const maxIndent = contentTwips - indentRight - 720;
+        const rounded = Math.round(Math.max(0, Math.min(indentFromMargin, maxIndent)));
+        setDragValue(rounded);
+        onIndentLeftChange?.(rounded);
+      } else if (dragging === 'rightIndent') {
+        const rightEdge = pageWidthTwips - rightMarginTwips;
+        const indentFromRight = rightEdge - positionTwips;
+        const maxIndent = contentTwips - indentLeft - 720;
+        const rounded = Math.round(Math.max(0, Math.min(indentFromRight, maxIndent)));
+        setDragValue(rounded);
+        onIndentRightChange?.(rounded);
+      }
+    },
+    [
+      dragging,
+      zoom,
+      pageWidthTwips,
+      leftMarginTwips,
+      rightMarginTwips,
+      contentTwips,
+      indentLeft,
+      indentRight,
+      onLeftMarginChange,
+      onRightMarginChange,
+      onFirstLineIndentChange,
+      onIndentLeftChange,
+      onIndentRightChange,
+    ]
+  );
+
+  const handleDragEnd = useCallback(() => {
+    onDragEnd?.();
+    setDragging(null);
+    setDragValue(null);
+    setDragPositionPx(null);
+  }, [onDragEnd]);
+
+  useEffect(() => {
+    if (dragging) {
+      document.addEventListener('mousemove', handleDrag);
+      document.addEventListener('mouseup', handleDragEnd);
+      return () => {
+        document.removeEventListener('mousemove', handleDrag);
+        document.removeEventListener('mouseup', handleDragEnd);
+      };
+    }
+  }, [dragging, handleDrag, handleDragEnd]);
+
+  useEffect(() => {
+    if (!tabDrag || !paragraphEditable || !onTabStopsChange) return;
+    const move = (event: MouseEvent) => {
+      const box = rulerRef.current?.getBoundingClientRect();
+      if (!box) return;
+      const position = Math.round(Math.max(0, Math.min(contentTwips, pixelsToTwips((event.clientX - box.left) / zoom) - leftMarginTwips)));
+      tabPosition.current = position;
+      setTabDrag(current => current ? { ...current, position } : null);
+    };
+    const end = () => {
+      const position = tabPosition.current ?? tabDrag.tab.position;
+      if (position !== tabDrag.tab.position) onTabStopsChange(tabDrag.tabs.filter(tab => tab.position !== tabDrag.tab.position && tab.position !== position)
+        .concat({ ...tabDrag.tab, position }).sort((a, b) => a.position - b.position));
+      onDragEnd?.();
+      tabPosition.current = null;
+      setTabDrag(null);
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', end);
+    return () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', end); };
+  }, [tabDrag, paragraphEditable, onTabStopsChange, onDragEnd, contentTwips, zoom, leftMarginTwips]);
+
+  const ticks = generateTicks(pageWidthTwips, zoom, unit);
+
+  const markerTip = (marker: MarkerType): { text: string; positionPx: number } | null => {
+    const live = dragging === marker ? dragValue : null;
+    const tip = (key: TranslationKey, twips: number, positionPx: number) => ({
+      text: t('ruler.markerValue', { name: t(key), value: formatValueForTooltip(twips, unit, lang, t) }),
+      positionPx: dragging === marker && dragPositionPx !== null ? dragPositionPx : positionPx,
+    });
+    switch (marker) {
+      case 'leftMargin':
+        return tip('ruler.leftMargin', live ?? leftMarginTwips, leftMarginPx);
+      case 'rightMargin':
+        return tip('ruler.rightMargin', live ?? rightMarginTwips, pageWidthPx - rightMarginPx);
+      case 'firstLineIndent': {
+        if (!showFirstLineIndent) return null;
+        const signed = live ?? effectiveFirstLineIndent;
+        return tip(signed < 0 ? 'ruler.hangingIndent' : 'ruler.firstLineIndent', Math.abs(signed), firstLinePosPx);
+      }
+      case 'leftIndent':
+        return paragraphEditable && onIndentLeftChange ? tip('ruler.leftIndent', live ?? indentLeft, leftIndentPosPx) : null;
+      case 'rightIndent':
+        return paragraphEditable && onIndentRightChange ? tip('ruler.rightIndent', live ?? indentRight, rightIndentPosPx) : null;
+    }
+  };
+  const activeMarker = dragging ?? hoveredMarker ?? focusedMarker;
+  const activeTip = activeMarker ? markerTip(activeMarker) : null;
+  const hoverMargin = (marker: MarkerType) => ({
+    onMouseEnter: () => setHoveredMarker(marker),
+    onMouseLeave: () => setHoveredMarker((current) => (current === marker ? null : current)),
+  });
+
+  return (
+    <div
+      ref={rulerRef}
+      className={`docx-horizontal-ruler ${className}`}
+      onDoubleClick={event => {
+        if (!paragraphEditable || !onTabStopsChange || event.target !== event.currentTarget) return;
+        const box = event.currentTarget.getBoundingClientRect();
+        const position = Math.round(pixelsToTwips((event.clientX - box.left) / zoom) - leftMarginTwips);
+        if (position < 0 || position > contentTwips) return;
+        onTabStopsChange([...(tabStops ?? []).filter(tab => tab.position !== position), { position, alignment: 'left' as const }].sort((a, b) => a.position - b.position));
+      }}
+      style={{
+        position: 'relative',
+        width: formatPx(pageWidthPx),
+        height: RULER_HEIGHT,
+        backgroundColor: 'transparent',
+        overflow: 'visible',
+        userSelect: 'none',
+        cursor: dragging ? 'ew-resize' : 'default',
+        ...style,
+      }}
+      role="slider"
+      aria-label={t('ruler.horizontal')}
+      aria-valuemin={0}
+      aria-valuemax={pageWidthTwips}
+    >
+      {/* Gray margin zones — click & drag anywhere in the gray area to adjust margin */}
+      <div
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          width: formatPx(leftMarginPx),
+          height: RULER_HEIGHT,
+          backgroundColor: MARGIN_ZONE_COLOR,
+          borderRight: '1px solid var(--doc-shadow-subtle)',
+          cursor: editable ? 'ew-resize' : 'default',
+          zIndex: 1,
+        }}
+        {...hoverMargin('leftMargin')}
+        onMouseDown={
+          editable && onLeftMarginChange ? (e) => handleDragStart(e, 'leftMargin') : undefined
+        }
+      />
+      <div
+        style={{
+          position: 'absolute',
+          top: 0,
+          right: 0,
+          width: formatPx(rightMarginPx),
+          height: RULER_HEIGHT,
+          backgroundColor: MARGIN_ZONE_COLOR,
+          borderLeft: '1px solid var(--doc-shadow-subtle)',
+          cursor: editable ? 'ew-resize' : 'default',
+          zIndex: 1,
+        }}
+        {...hoverMargin('rightMargin')}
+        onMouseDown={
+          editable && onRightMarginChange ? (e) => handleDragStart(e, 'rightMargin') : undefined
+        }
+      />
+
+      {/* Tick marks */}
+      <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+        {ticks.map((tick, i) => (
+          <RulerTick key={i} tick={tick} />
+        ))}
+      </div>
+
+      {/* === 3 INDENT HANDLES (Google Docs style) === */}
+
+      {/* First-line indent — ▼ down triangle at top-left */}
+      {showFirstLineIndent && (
+        <IndentTriangle
+          direction="down"
+          positionPx={firstLinePosPx}
+          editable={paragraphEditable}
+          isDragging={dragging === 'firstLineIndent'}
+          isHovered={hoveredMarker === 'firstLineIndent'}
+          onMouseEnter={() => setHoveredMarker('firstLineIndent')}
+          onMouseLeave={() => setHoveredMarker(null)}
+          onFocus={() => setFocusedMarker('firstLineIndent')}
+          onBlur={() => setFocusedMarker(null)}
+          onMouseDown={(e) => handleDragStart(e, 'firstLineIndent')}
+          valueText={markerTip('firstLineIndent')?.text}
+          label={t('ruler.firstLineIndent')}
+        />
+      )}
+
+      {/* Left indent — ▲ up triangle at bottom-left */}
+      {paragraphEditable && onIndentLeftChange && (
+        <IndentTriangle
+          direction="up"
+          positionPx={leftIndentPosPx}
+          editable={paragraphEditable}
+          isDragging={dragging === 'leftIndent'}
+          isHovered={hoveredMarker === 'leftIndent'}
+          onMouseEnter={() => setHoveredMarker('leftIndent')}
+          onMouseLeave={() => setHoveredMarker(null)}
+          onFocus={() => setFocusedMarker('leftIndent')}
+          onBlur={() => setFocusedMarker(null)}
+          onMouseDown={(e) => handleDragStart(e, 'leftIndent')}
+          valueText={markerTip('leftIndent')?.text}
+          label={t('ruler.leftIndent')}
+        />
+      )}
+
+      {/* Right indent — ▼ down triangle at top-right */}
+      {paragraphEditable && onIndentRightChange && (
+        <IndentTriangle
+          direction="down"
+          positionPx={rightIndentPosPx}
+          editable={paragraphEditable}
+          isDragging={dragging === 'rightIndent'}
+          isHovered={hoveredMarker === 'rightIndent'}
+          onMouseEnter={() => setHoveredMarker('rightIndent')}
+          onMouseLeave={() => setHoveredMarker(null)}
+          onFocus={() => setFocusedMarker('rightIndent')}
+          onBlur={() => setFocusedMarker(null)}
+          onMouseDown={(e) => handleDragStart(e, 'rightIndent')}
+          valueText={markerTip('rightIndent')?.text}
+          label={t('ruler.rightIndent')}
+        />
+      )}
+
+      {/* Tab stop markers (display only) */}
+      {tabStops?.map((tab) => (
+        <TabStopMarker
+          key={tab.position}
+          tabStop={tab}
+          unit={unit}
+          positionPx={(onTabStopsChange ? leftMarginPx : 0) + twipsToPixels(tabDrag?.tab.position === tab.position ? tabDrag.position : tab.position) * zoom}
+          onMouseDown={paragraphEditable && onTabStopsChange ? event => {
+            event.preventDefault(); event.stopPropagation(); onDragStart?.();
+            tabPosition.current = tab.position; setTabDrag({ tab, position: tab.position, tabs: [...(tabStops ?? [])] });
+          } : undefined}
+          onDoubleClick={() => { if (!onTabStopsChange || paragraphEditable) onTabStopRemove?.(tab.position); }}
+        />
+      ))}
+
+      {activeTip && <MarkerTooltip value={activeTip.text} positionPx={activeTip.positionPx} />}
+    </div>
+  );
+}
+
+// ============================================================================
+// SUB-COMPONENTS
+// ============================================================================
+
+interface TickData {
+  position: number;
+  height: number;
+  label?: string;
+}
+
+function RulerTick({ tick }: { tick: TickData }): React.ReactElement {
+  return (
+    <>
+      <div
+        style={{
+          position: 'absolute',
+          left: formatPx(tick.position),
+          bottom: 0,
+          width: 1,
+          height: tick.height,
+          backgroundColor: RULER_TICK_COLOR,
+        }}
+      />
+      {tick.label && (
+        <div
+          style={{
+            position: 'absolute',
+            left: formatPx(tick.position),
+            top: 3,
+            transform: 'translateX(-50%)',
+            fontSize: '9px',
+            color: RULER_TEXT_COLOR,
+            fontFamily: 'sans-serif',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {tick.label}
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * Indent triangle handle — Google Docs style.
+ * direction="down": ▼ anchored at top (first-line indent, right indent)
+ * direction="up":   ▲ anchored at bottom (left indent)
+ */
+interface IndentTriangleProps {
+  direction: 'up' | 'down';
+  positionPx: number;
+  editable: boolean;
+  isDragging: boolean;
+  isHovered: boolean;
+  onMouseEnter: () => void;
+  onMouseLeave: () => void;
+  onFocus: () => void;
+  onBlur: () => void;
+  onMouseDown: (e: React.MouseEvent) => void;
+  label: string;
+  valueText?: string;
+}
+
+function IndentTriangle({
+  direction,
+  positionPx,
+  editable,
+  isDragging,
+  isHovered,
+  onMouseEnter,
+  onMouseLeave,
+  onFocus,
+  onBlur,
+  onMouseDown,
+  label,
+  valueText,
+}: IndentTriangleProps): React.ReactElement {
+  const color = isDragging ? INDENT_ACTIVE_COLOR : isHovered ? INDENT_HOVER_COLOR : INDENT_COLOR;
+  const triHeight = Math.round(TRI_SIZE * 1.6);
+
+  const containerStyle: CSSProperties = {
+    position: 'absolute',
+    left: formatPx(positionPx - TRI_SIZE),
+    width: TRI_SIZE * 2,
+    height: triHeight + 2,
+    cursor: editable ? 'ew-resize' : 'default',
+    zIndex: isDragging ? 10 : 4,
+    ...(direction === 'down' ? { top: 0 } : { bottom: 0 }),
+  };
+
+  const triangleStyle: CSSProperties =
+    direction === 'down'
+      ? {
+          position: 'absolute',
+          top: 1,
+          left: 0,
+          width: 0,
+          height: 0,
+          borderLeft: `${TRI_SIZE}px solid transparent`,
+          borderRight: `${TRI_SIZE}px solid transparent`,
+          borderTop: `${triHeight}px solid ${color}`,
+          transition: 'border-top-color 0.1s',
+        }
+      : {
+          position: 'absolute',
+          bottom: 1,
+          left: 0,
+          width: 0,
+          height: 0,
+          borderLeft: `${TRI_SIZE}px solid transparent`,
+          borderRight: `${TRI_SIZE}px solid transparent`,
+          borderBottom: `${triHeight}px solid ${color}`,
+          transition: 'border-bottom-color 0.1s',
+        };
+
+  return (
+    <div
+      className="docx-ruler-indent"
+      style={containerStyle}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      onFocus={onFocus}
+      onBlur={onBlur}
+      onMouseDown={onMouseDown}
+      role="slider"
+      aria-label={label}
+      aria-valuetext={valueText}
+      aria-orientation="horizontal"
+      tabIndex={editable ? 0 : -1}
+    >
+      <div style={triangleStyle} />
+    </div>
+  );
+}
+
+function MarkerTooltip({
+  value,
+  positionPx,
+}: {
+  value: string;
+  positionPx: number;
+}): React.ReactElement {
+  return (
+    <div
+      role="tooltip"
+      className="docx-ruler-tooltip"
+      style={{
+        position: 'absolute',
+        left: formatPx(positionPx),
+        top: RULER_HEIGHT + 4,
+        transform: 'translateX(-50%)',
+        backgroundColor: 'var(--doc-text)',
+        color: 'var(--doc-on-primary)',
+        fontSize: '10px',
+        fontFamily: 'sans-serif',
+        padding: '2px 6px',
+        borderRadius: 3,
+        whiteSpace: 'nowrap',
+        pointerEvents: 'none',
+        zIndex: 20,
+      }}
+    >
+      {value}
+    </div>
+  );
+}
+
+interface TabStopMarkerProps {
+  onMouseDown?: React.MouseEventHandler<HTMLDivElement>;
+  tabStop: TabStop;
+  unit: 'inch' | 'cm';
+  positionPx: number;
+  onDoubleClick: () => void;
+}
+
+const TAB_SYMBOLS: Record<string, string> = {
+  left: 'L',
+  center: 'C',
+  right: 'R',
+  decimal: 'D',
+  bar: '|',
+};
+
+const TAB_ALIGNMENT_KEYS: Record<TabStopAlignment, TranslationKey> = {
+  left: 'ruler.tabAlignments.left',
+  center: 'ruler.tabAlignments.center',
+  right: 'ruler.tabAlignments.right',
+  decimal: 'ruler.tabAlignments.decimal',
+  bar: 'ruler.tabAlignments.bar',
+  clear: 'ruler.tabAlignments.clear',
+  num: 'ruler.tabAlignments.num',
+};
+
+function TabStopMarker({
+  tabStop,
+  unit,
+  positionPx,
+  onDoubleClick,
+  onMouseDown,
+}: TabStopMarkerProps): React.ReactElement {
+  const { t, lang } = useTranslation();
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        left: formatPx(positionPx - 5),
+        bottom: 0,
+        width: 10,
+        height: 12,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: 8,
+        fontWeight: 700,
+        color: 'var(--doc-text-muted)',
+        cursor: 'pointer',
+        userSelect: 'none',
+      }}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        onDoubleClick();
+      }}
+      onMouseDown={onMouseDown}
+      title={t('ruler.tabStop', {
+        alignment: t(TAB_ALIGNMENT_KEYS[tabStop.alignment]),
+        position: formatValueForTooltip(tabStop.position, unit, lang, t),
+      })}
+    >
+      {TAB_SYMBOLS[tabStop.alignment] || 'L'}
+    </div>
+  );
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+function generateTicks(pageWidthTwips: number, zoom: number, unit: 'inch' | 'cm'): TickData[] {
+  const ticks: TickData[] = [];
+
+  if (unit === 'inch') {
+    const eighthInchTwips = TWIPS_PER_INCH / 8;
+    const totalEighths = Math.ceil(pageWidthTwips / eighthInchTwips);
+    for (let i = 0; i <= totalEighths; i++) {
+      const twipsPos = i * eighthInchTwips;
+      if (twipsPos > pageWidthTwips) break;
+      const pxPos = twipsToPixels(twipsPos) * zoom;
+      if (i % 8 === 0) {
+        ticks.push({ position: pxPos, height: 10, label: i / 8 > 0 ? String(i / 8) : undefined });
+      } else if (i % 4 === 0) {
+        ticks.push({ position: pxPos, height: 6 });
+      } else if (i % 2 === 0) {
+        ticks.push({ position: pxPos, height: 4 });
+      } else {
+        ticks.push({ position: pxPos, height: 2 });
+      }
+    }
+  } else {
+    const mmTwips = TWIPS_PER_CM / 10;
+    const totalMm = Math.ceil(pageWidthTwips / mmTwips);
+    for (let i = 0; i <= totalMm; i++) {
+      const twipsPos = i * mmTwips;
+      if (twipsPos > pageWidthTwips) break;
+      const pxPos = twipsToPixels(twipsPos) * zoom;
+      if (i % 10 === 0) {
+        ticks.push({ position: pxPos, height: 10, label: i / 10 > 0 ? String(i / 10) : undefined });
+      } else if (i % 5 === 0) {
+        ticks.push({ position: pxPos, height: 6 });
+      } else {
+        ticks.push({ position: pxPos, height: 3 });
+      }
+    }
+  }
+
+  return ticks;
+}
+
+export function positionToMargin(
+  positionPx: number,
+  side: 'left' | 'right',
+  pageWidthPx: number,
+  zoom: number
+): number {
+  const positionTwips = pixelsToTwips(positionPx / zoom);
+  if (side === 'left') return Math.max(0, positionTwips);
+  return Math.max(0, pixelsToTwips(pageWidthPx / zoom) - positionTwips);
+}
+
+export function getRulerDimensions(
+  sectionProps?: SectionProperties | null,
+  zoom: number = 1
+): { width: number; leftMargin: number; rightMargin: number; contentWidth: number } {
+  const pw = sectionProps?.pageWidth ?? DEFAULT_PAGE_WIDTH_TWIPS;
+  const lm = sectionProps?.marginLeft ?? DEFAULT_MARGIN_TWIPS;
+  const rm = sectionProps?.marginRight ?? DEFAULT_MARGIN_TWIPS;
+  const width = twipsToPixels(pw) * zoom;
+  const leftMargin = twipsToPixels(lm) * zoom;
+  const rightMargin = twipsToPixels(rm) * zoom;
+  return { width, leftMargin, rightMargin, contentWidth: width - leftMargin - rightMargin };
+}
+
+export function getMarginInUnits(
+  marginTwips: number,
+  unit: 'inch' | 'cm',
+  lang = 'en',
+  t: TFunction = createT(en)
+): string {
+  return formatValueForTooltip(marginTwips, unit, lang, t);
+}
+
+export function parseMarginFromUnits(value: string, unit: 'inch' | 'cm'): number | null {
+  const num = parseFloat(value.replace(/[^\d.]/g, ''));
+  if (isNaN(num)) return null;
+  return Math.round(num * (unit === 'inch' ? TWIPS_PER_INCH : TWIPS_PER_CM));
+}
+
+export default HorizontalRuler;

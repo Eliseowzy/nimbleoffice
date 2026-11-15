@@ -1,0 +1,123 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { createYrsSession } from "../packages/docx/src/yrs/index.ts";
+import { preloadEditWasm } from "../packages/docx/src/wasm/edit.ts";
+import {
+  initWasm as initXlsxWasm,
+  openWorkbook,
+} from "../packages/xlsx/src/index.ts";
+import {
+  initWasm as initPptxWasm,
+  openPresentation,
+} from "../packages/pptx/src/index.ts";
+import { initWasm as initVsdxWasm, openDiagram } from "../packages/vsdx/src/index.ts";
+
+const root = resolve(import.meta.dir, "..");
+const defaultSeeds = resolve(root, "fixtures/demo/seeds");
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return (
+    left.byteLength === right.byteLength &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
+export async function buildCollaborationSeeds(
+  seeds: string = defaultSeeds,
+): Promise<void> {
+  await mkdir(seeds, { recursive: true });
+
+  await preloadEditWasm(
+    await readFile(
+      resolve(root, "packages/docx/src/wasm/generated/edit/docx_edit_bg.wasm"),
+    ),
+  );
+
+  const docxBytes = new Uint8Array(
+    await readFile(resolve(root, "fixtures/demo/nimbleoffice-demo.docx")),
+  );
+  const docxSession = await createYrsSession({ clientId: 1 });
+  // Matches BROWSER_SEED_GENERATION in apps/native-viewer/src/collaboration.rs.
+  docxSession.seedFromDocx(docxBytes, { generation: 'nimbleoffice-demo' });
+  const docxSeed = docxSession.encodeState();
+  const docxStateVector = docxSession.encodeStateVector();
+  docxSession.destroy();
+  const docxVerification = await createYrsSession({ clientId: 2 });
+  docxVerification.loadState(docxSeed);
+  if (!equalBytes(docxVerification.encodeStateVector(), docxStateVector)) {
+    throw new Error("DOCX collaboration seed did not round-trip");
+  }
+  docxVerification.destroy();
+  await writeFile(resolve(seeds, "docx.bin"), docxSeed);
+
+  await initXlsxWasm(
+    await readFile(
+      resolve(root, "packages/xlsx/src/wasm/generated/xlsx_wasm_bg.wasm"),
+    ),
+  );
+  const xlsxBytes = new Uint8Array(
+    await readFile(resolve(root, "fixtures/demo/showcase.xlsx")),
+  );
+  const workbook = openWorkbook(xlsxBytes, {
+    collaborative: true,
+    clientId: 1,
+  });
+  const xlsxSeed = workbook.encodeStateAsUpdate();
+  const xlsxStateVector = workbook.encodeStateVector();
+  workbook.dispose();
+  const xlsxVerification = openWorkbook(xlsxBytes, {
+    collaborative: true,
+    clientId: 2,
+  });
+  xlsxVerification.applyUpdate(xlsxSeed);
+  if (!equalBytes(xlsxVerification.encodeStateVector(), xlsxStateVector)) {
+    throw new Error("XLSX collaboration seed did not round-trip");
+  }
+  xlsxVerification.dispose();
+  await writeFile(resolve(seeds, "xlsx.bin"), xlsxSeed);
+
+  await initPptxWasm(
+    await readFile(
+      resolve(root, "packages/pptx/src/wasm/generated/pptx_wasm_bg.wasm"),
+    ),
+  );
+  const pptxBytes = new Uint8Array(
+    await readFile(resolve(root, "fixtures/demo/nimbleoffice-demo.pptx")),
+  );
+  const presentation = openPresentation(pptxBytes, { clientId: 1 });
+  const pptxSeed = presentation.encodeStateAsUpdate();
+  const pptxStateVector = presentation.encodeStateVector();
+  presentation.dispose();
+  const pptxVerification = openPresentation(pptxBytes, {
+    clientId: 2,
+    initialUpdate: pptxSeed,
+  });
+  if (!equalBytes(pptxVerification.encodeStateVector(), pptxStateVector)) {
+    throw new Error("PPTX collaboration seed did not round-trip");
+  }
+  if (!equalBytes(pptxVerification.encodeStateAsUpdate(), pptxSeed)) {
+    throw new Error("PPTX collaboration seed changed during round-trip");
+  }
+  pptxVerification.dispose();
+  await writeFile(resolve(seeds, "pptx.bin"), pptxSeed);
+
+  await initVsdxWasm(await readFile(resolve(root, "packages/vsdx/src/wasm/generated/vsdx_wasm_bg.wasm")));
+  const vsdxBytes = new Uint8Array(await readFile(resolve(root, "fixtures/demo/nimbleoffice-demo.vsdx")));
+  const diagram = openDiagram(vsdxBytes, { clientId: 1 });
+  const vsdxSeed = diagram.encodeStateAsUpdate();
+  const vsdxStateVector = diagram.encodeStateVector();
+  diagram.dispose();
+  const vsdxVerification = openDiagram(vsdxBytes, { clientId: 2, initialUpdate: vsdxSeed });
+  if (!equalBytes(vsdxVerification.encodeStateVector(), vsdxStateVector)) throw new Error("VSDX collaboration seed did not round-trip");
+  if (!equalBytes(vsdxVerification.encodeStateAsUpdate(), vsdxSeed)) throw new Error("VSDX collaboration seed changed during round-trip");
+  vsdxVerification.dispose();
+  await writeFile(resolve(seeds, "vsdx.bin"), vsdxSeed);
+
+  console.log(
+    `Wrote DOCX (${docxSeed.byteLength} bytes), XLSX (${xlsxSeed.byteLength} bytes), PPTX (${pptxSeed.byteLength} bytes), and VSDX (${vsdxSeed.byteLength} bytes) collaboration seeds`,
+  );
+}
+
+if (import.meta.main) {
+  await buildCollaborationSeeds();
+}

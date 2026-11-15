@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "strict": true,
+    "ignoreDeprecations": "6.0",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "types": ["bun", "node"],
+    "paths": {
+      "#session-worker": ["../docx/src/yrs/sessionWorker.node.ts"],
+      "@nimbleoffice/docx/yrs": ["../docx/src/yrs/index.ts"],
+      "@nimbleoffice/docx/editor": ["../docx/src/editor/index.ts"],
+      "@nimbleoffice/docx/layout": ["../docx/src/layout/index.ts"],
+      "@nimbleoffice/docx/layout/render": ["../docx/src/layout/render/index.ts"],
+      "@nimbleoffice/docx/types/document": ["../docx/src/types/document.ts"],
+      "@nimbleoffice/docx/utils": ["../docx/src/utils/index.ts"],
+      "@nimbleoffice/xlsx": ["../xlsx/src/index.ts"],
+      "@nimbleoffice/xlsx/worker": ["../xlsx/src/worker.ts"],
+      "@nimbleoffice/pptx": ["../pptx/src/index.ts"],
+      "@nimbleoffice/fonts": ["../fonts/src/index.ts"],
+      "@nimbleoffice/fonts/progressive": ["../fonts/src/progressive-entry.ts"]
+    }
+  },
+  "include": ["src", "test"]
+}

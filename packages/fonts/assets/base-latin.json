@@ -1,0 +1,48 @@
+{
+  "format": 1,
+  "schema": 1,
+  "pack": "base-latin",
+  "version": "1",
+  "faces": [
+    {
+      "file": "NimbleOfficeBaseLatin-Regular.ttf.zst",
+      "source": "NimbleOfficeBaseLatin-Regular.ttf",
+      "family": "NimbleOffice Base Latin",
+      "codec": "zstd",
+      "dict": null,
+      "encodedLength": 48737,
+      "byteLength": 85920,
+      "sha256": "a3d918850740ab44103dd497d8ef330a3a3312e09e4cdf6ad6ea332d16805be3"
+    },
+    {
+      "file": "NimbleOfficeBaseLatin-Bold.ttf.zst",
+      "source": "NimbleOfficeBaseLatin-Bold.ttf",
+      "family": "NimbleOffice Base Latin",
+      "codec": "zstd",
+      "dict": null,
+      "encodedLength": 18849,
+      "byteLength": 34548,
+      "sha256": "554bfd76b7c694273b86e179d1ba86f44711523093073e64664f2b57fdcf2cdb"
+    },
+    {
+      "file": "NimbleOfficeBaseLatin-Italic.ttf.zst",
+      "source": "NimbleOfficeBaseLatin-Italic.ttf",
+      "family": "NimbleOffice Base Latin",
+      "codec": "zstd",
+      "dict": null,
+      "encodedLength": 19854,
+      "byteLength": 35704,
+      "sha256": "97f80711cabbb6a1c992ff951fb3e3077991453c339f36c425dd69fc6b1d280c"
+    },
+    {
+      "file": "NimbleOfficeBaseLatin-BoldItalic.ttf.zst",
+      "source": "NimbleOfficeBaseLatin-BoldItalic.ttf",
+      "family": "NimbleOffice Base Latin",
+      "codec": "zstd",
+      "dict": null,
+      "encodedLength": 19799,
+      "byteLength": 35616,
+      "sha256": "1600a8809cc1dcf2873d419759b6c0b718ccc3d584f0f94794fe81a62d8b3bb1"
+    }
+  ]
+}

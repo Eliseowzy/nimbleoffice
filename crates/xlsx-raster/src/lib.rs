@@ -1,0 +1,1578 @@
+//! native raster backend: paints a display list to a png via tiny-skia.
+//! server-side twin of the browser's canvas backend; never enters the wasm build.
+
+mod fmath;
+mod font;
+use std::collections::{HashMap, hash_map::Entry};
+
+pub use font::measure_text;
+
+use tiny_skia::{
+    Color, FillRule, IntRect, Mask, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, StrokeDash,
+    Transform,
+};
+
+use xlsx_render::{Align, DisplayList, DrawCmd, GeometryPathCommand, Rect as DlRect};
+#[cfg(not(feature = "fonts"))]
+/// paint a display list and encode it as png bytes.
+pub fn render_png(dl: &DisplayList) -> Result<Vec<u8>, String> {
+    let w = (dl.width.ceil() as u32).max(1);
+    let h = (dl.height.ceil() as u32).max(1);
+    let mut pixmap = Pixmap::new(w, h).ok_or_else(|| "invalid pixmap size".to_string())?;
+    pixmap.fill(Color::WHITE);
+    let mut clip_surface = ClipSurface::default();
+    let mut patterns = HashMap::new();
+
+    for cmd in &dl.commands {
+        match cmd {
+            DrawCmd::PatternFill {
+                x,
+                y,
+                w,
+                h,
+                pattern,
+                fg,
+                bg,
+                origin_x,
+                origin_y,
+                clip,
+            } => {
+                let tile = match patterns.entry((*pattern, fg.clone(), bg.clone())) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let mut tile =
+                            Pixmap::new(8, 8).ok_or_else(|| "invalid pattern tile".to_string())?;
+                        tile.fill(parse_color(bg)?);
+                        let foreground = parse_color(fg)?.to_color_u8().premultiply();
+                        for (y, row) in pattern.mask().into_iter().enumerate() {
+                            for x in 0..8 {
+                                if row & (1 << x) != 0 {
+                                    tile.pixels_mut()[y * 8 + x] = foreground;
+                                }
+                            }
+                        }
+                        entry.insert(tile)
+                    }
+                };
+                let Some(rect) = Rect::from_xywh(
+                    pixel_round(*x),
+                    pixel_round(*y),
+                    pixel_round(x + w) - pixel_round(*x),
+                    pixel_round(y + h) - pixel_round(*y),
+                ) else {
+                    continue;
+                };
+                let paint = Paint {
+                    shader: tiny_skia::Pattern::new(
+                        tile.as_ref(),
+                        tiny_skia::SpreadMode::Repeat,
+                        tiny_skia::FilterQuality::Nearest,
+                        1.0,
+                        Transform::from_translate(pixel_round(*origin_x), pixel_round(*origin_y)),
+                    ),
+                    anti_alias: false,
+                    ..Paint::default()
+                };
+                if let Some(clip) = clip {
+                    let bounds = reach(rect.left(), rect.top(), rect.right(), rect.bottom(), 1.0);
+                    clip_surface.paint(&mut pixmap, *clip, bounds, |target, transform, mask| {
+                        target.fill_rect(rect, &paint, transform, mask);
+                        Ok(())
+                    })?;
+                } else {
+                    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+                }
+            }
+            DrawCmd::FillRect {
+                x,
+                y,
+                w,
+                h,
+                color,
+                clip,
+            } => {
+                let rect = Rect::from_xywh(*x, *y, *w, *h)
+                    .ok_or_else(|| "invalid fill rectangle".to_string())?;
+                let mut paint = Paint::default();
+                paint.set_color(parse_color(color)?);
+                paint.anti_alias = true;
+                if let Some(clip) = clip {
+                    let bounds = reach(rect.left(), rect.top(), rect.right(), rect.bottom(), 1.0);
+                    clip_surface.paint(&mut pixmap, *clip, bounds, |target, transform, mask| {
+                        target.fill_rect(rect, &paint, transform, mask);
+                        Ok(())
+                    })?;
+                } else {
+                    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+                }
+            }
+            DrawCmd::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                width,
+                color,
+                style,
+                rail,
+                clip,
+            } => {
+                let paint =
+                    |target: &mut Pixmap, transform: Transform, mask: Option<&Mask>| match rail {
+                        Some(rail) if style.as_deref() == Some("double") => paint_double(
+                            target, *x1, *y1, *x2, *y2, *width, *rail, color, transform, mask,
+                        ),
+                        _ => paint_line(
+                            target, *x1, *y1, *x2, *y2, *width, color, style, transform, mask,
+                        ),
+                    };
+                if let Some(clip) = clip {
+                    let pen = width.abs().max(rail.map_or(0.0, f32::abs)).max(1.0);
+                    let bounds = reach(*x1, *y1, *x2, *y2, 2.0 * pen + 2.0);
+                    clip_surface.paint(&mut pixmap, *clip, bounds, paint)?;
+                } else {
+                    paint(&mut pixmap, Transform::identity(), None)?;
+                }
+            }
+            DrawCmd::Path {
+                commands,
+                fill,
+                stroke,
+                clip,
+            } => {
+                let path = build_path(commands)?;
+                let mut paint = Paint::default();
+                paint.set_color(parse_color(fill)?);
+                paint.anti_alias = true;
+                let stroke = if let Some(stroke) = stroke {
+                    let mut paint = Paint::default();
+                    paint.set_color(parse_color(&stroke.color)?);
+                    paint.anti_alias = true;
+                    Some((paint, stroke.width))
+                } else {
+                    None
+                };
+                let paint_path =
+                    |target: &mut Pixmap, transform: Transform, mask: Option<&Mask>| {
+                        target.fill_path(&path, &paint, FillRule::Winding, transform, mask);
+                        if let Some((stroke_paint, width)) = &stroke {
+                            target.stroke_path(
+                                &path,
+                                stroke_paint,
+                                &Stroke {
+                                    width: *width,
+                                    ..Stroke::default()
+                                },
+                                transform,
+                                mask,
+                            );
+                        }
+                        Ok(())
+                    };
+                if let Some(clip) = clip {
+                    let pen = stroke.as_ref().map_or(0.0, |(_, width)| width.abs());
+                    let area = path.bounds();
+                    let bounds = reach(
+                        area.left(),
+                        area.top(),
+                        area.right(),
+                        area.bottom(),
+                        2.0 * pen + 2.0,
+                    );
+                    clip_surface.paint(&mut pixmap, *clip, bounds, paint_path)?;
+                } else {
+                    pixmap.fill_path(
+                        &path,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                    if let Some((stroke_paint, width)) = &stroke {
+                        pixmap.stroke_path(
+                            &path,
+                            stroke_paint,
+                            &Stroke {
+                                width: *width,
+                                ..Stroke::default()
+                            },
+                            Transform::identity(),
+                            None,
+                        );
+                    }
+                }
+            }
+            DrawCmd::Text {
+                x,
+                y,
+                text,
+                font_size,
+                color,
+                clip,
+                align,
+                bold,
+                italic,
+                underline,
+                strike,
+                highlight,
+                dashed_underline,
+                font_family: _,
+                number_format,
+                ghost: _,
+                chart: _,
+                rotation_deg,
+                rotation_box,
+                rotation_valign,
+                stacked,
+                wrap,
+            } => {
+                let run = font::TextRun {
+                    x: *x,
+                    y: *y,
+                    text,
+                    font_size_pt: *font_size,
+                    color: parse_color(color)?,
+                    align: *align,
+                    clip,
+                    bold: *bold,
+                    italic: *italic,
+                    underline: *underline,
+                    strike: *strike,
+                    highlight: highlight.as_deref().map(parse_color).transpose()?,
+                    dashed_underline: *dashed_underline,
+                };
+                if *stacked {
+                    let cell = rotation_box.as_ref().unwrap_or(clip);
+                    font::paint_stacked_text(
+                        &mut pixmap,
+                        &run,
+                        cell,
+                        (*rotation_valign).unwrap_or(xlsx_render::TextValign::Bottom),
+                    );
+                } else if let Some(deg) = rotation_deg {
+                    let cell = rotation_box.as_ref().unwrap_or(clip);
+                    font::paint_rotated_text(
+                        &mut pixmap,
+                        &run,
+                        *deg,
+                        cell,
+                        (*rotation_valign).unwrap_or(xlsx_render::TextValign::Bottom),
+                        number_format.as_ref(),
+                    );
+                } else if let Some(layout) = number_format {
+                    xlsx_render::paint_number_format(
+                        text,
+                        layout,
+                        *align,
+                        |literal| font::measure_text(literal, *font_size),
+                        |literal, x| {
+                            font::paint_text(
+                                &mut pixmap,
+                                &font::TextRun {
+                                    x,
+                                    text: literal,
+                                    align: Align::Left,
+                                    ..run
+                                },
+                            )
+                        },
+                    );
+                } else if let Some(wrap) = wrap {
+                    let lines = xlsx_render::wrap::wrap_lines(text, wrap.width, |line| {
+                        font::measure_text(line, *font_size)
+                    });
+                    for (index, line) in lines.iter().enumerate() {
+                        font::paint_text(
+                            &mut pixmap,
+                            &font::TextRun {
+                                y: xlsx_render::wrap::wrapped_line_y(*y, index, lines.len(), wrap),
+                                text: line,
+                                ..run
+                            },
+                        );
+                    }
+                } else {
+                    font::paint_text(&mut pixmap, &run);
+                }
+            }
+        }
+    }
+
+    ooxml_raster::encode_png(pixmap, w, h)
+}
+
+/// paint a line honoring its dash/double style; a `double` without a rail width
+/// keeps the legacy approximation: two thin passes around the unsnapped line.
+#[allow(clippy::too_many_arguments)]
+fn paint_line(
+    pixmap: &mut Pixmap,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    width: f32,
+    color: &str,
+    style: &Option<std::sync::Arc<str>>,
+    transform: Transform,
+    mask: Option<&Mask>,
+) -> Result<(), String> {
+    let color = parse_color(color)?;
+    match style.as_deref() {
+        Some("double") => {
+            let off = (width * 0.8).max(0.8);
+            let horizontal = (y1 - y2).abs() <= (x1 - x2).abs();
+            let (dx, dy) = if horizontal { (0.0, off) } else { (off, 0.0) };
+            let w = (width * 0.6).max(0.5);
+            stroke_seg(
+                pixmap,
+                x1 - dx,
+                y1 - dy,
+                x2 - dx,
+                y2 - dy,
+                w,
+                color,
+                None,
+                transform,
+                mask,
+            );
+            stroke_seg(
+                pixmap,
+                x1 + dx,
+                y1 + dy,
+                x2 + dx,
+                y2 + dy,
+                w,
+                color,
+                None,
+                transform,
+                mask,
+            );
+        }
+        Some(style) if !xlsx_render::border_dash(style).is_empty() => {
+            let pen = width.round().max(1.0);
+            let (x1, y1, x2, y2) = snap(x1, y1, x2, y2, pen);
+            let scale = if style.starts_with("medium") {
+                width / 2.0
+            } else {
+                width
+            };
+            let dash = StrokeDash::new(
+                xlsx_render::border_dash(style)
+                    .iter()
+                    .map(|run| run * scale)
+                    .collect(),
+                0.0,
+            );
+            stroke_seg(pixmap, x1, y1, x2, y2, pen, color, dash, transform, mask);
+        }
+        _ => stroke_seg(pixmap, x1, y1, x2, y2, width, color, None, transform, mask),
+    }
+    Ok(())
+}
+
+/// paint a double line as two `rail`-wide passes on the outer edges of `width`.
+#[allow(clippy::too_many_arguments)]
+fn paint_double(
+    pixmap: &mut Pixmap,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    width: f32,
+    rail: f32,
+    color: &str,
+    transform: Transform,
+    mask: Option<&Mask>,
+) -> Result<(), String> {
+    let color = parse_color(color)?;
+    let (x1, y1, x2, y2) = snap(x1, y1, x2, y2, width.round().max(1.0));
+    let off = (width - rail) / 2.0;
+    let (dx, dy) = if (y1 - y2).abs() <= (x1 - x2).abs() {
+        (0.0, off)
+    } else {
+        (off, 0.0)
+    };
+    for sign in [-1.0, 1.0] {
+        stroke_seg(
+            pixmap,
+            x1 + sign * dx,
+            y1 + sign * dy,
+            x2 + sign * dx,
+            y2 + sign * dy,
+            rail,
+            color,
+            None,
+            transform,
+            mask,
+        );
+    }
+    Ok(())
+}
+
+/// centre an axis-aligned line on device pixels for a pen `pen` pixels wide.
+fn snap(x1: f32, y1: f32, x2: f32, y2: f32, pen: f32) -> (f32, f32, f32, f32) {
+    let offset = (pen as u32 % 2) as f32 / 2.0;
+    if y1 == y2 {
+        let y = y1.floor() + offset;
+        (x1.round(), y, x2.round(), y)
+    } else if x1 == x2 {
+        let x = x1.floor() + offset;
+        (x, y1.round(), x, y2.round())
+    } else {
+        (x1, y1, x2, y2)
+    }
+}
+
+/// stroke a single segment with an optional dash pattern.
+#[allow(clippy::too_many_arguments)]
+fn stroke_seg(
+    pixmap: &mut Pixmap,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    width: f32,
+    color: Color,
+    dash: Option<StrokeDash>,
+    transform: Transform,
+    mask: Option<&Mask>,
+) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(x1, y1);
+    pb.line_to(x2, y2);
+    let Some(path) = pb.finish() else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    paint.anti_alias = true;
+    let stroke = Stroke {
+        width,
+        dash,
+        ..Stroke::default()
+    };
+    pixmap.stroke_path(&path, &paint, &stroke, transform, mask);
+}
+
+#[derive(Default)]
+struct ClipSurface {
+    rect: Option<DlRect>,
+    origin: (i32, i32),
+    pixmap: Option<Pixmap>,
+    mask: Option<Mask>,
+    dirty: Option<IntRect>,
+}
+
+fn pixel_round(value: f32) -> f32 {
+    (value + 0.5).floor()
+}
+
+/// past this many pixels f32 pixel centers and the tiler's rect translations
+/// stop being exact, so a cropped composite could shift; such targets
+/// composite the whole surface.
+const F32_EXACT_PIXELS: u32 = 1 << 23;
+
+/// target-space edges (left, top, right, bottom) of a segment or rectangle,
+/// grown by `pad` on every side; `None`, meaning the whole clip, when any input
+/// is non-finite.
+fn reach(x1: f32, y1: f32, x2: f32, y2: f32, pad: f32) -> Option<[f64; 4]> {
+    if ![x1, y1, x2, y2, pad].iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let (x1, y1, x2, y2) = (f64::from(x1), f64::from(y1), f64::from(x2), f64::from(y2));
+    let pad = f64::from(pad).abs();
+    Some([
+        x1.min(x2) - pad,
+        y1.min(y2) - pad,
+        x1.max(x2) + pad,
+        y1.max(y2) + pad,
+    ])
+}
+
+impl ClipSurface {
+    /// paint through the clip mask, then composite onto `target`. `bounds` must
+    /// cover every pixel the painter can touch: only that part of the surface is
+    /// cleared and blitted, and the untouched rest would composite as a no-op.
+    fn paint<F>(
+        &mut self,
+        target: &mut Pixmap,
+        clip: DlRect,
+        bounds: Option<[f64; 4]>,
+        painter: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&mut Pixmap, Transform, Option<&Mask>) -> Result<(), String>,
+    {
+        let Some(clip) = clipped_to_target(clip, target.width(), target.height()) else {
+            return Ok(());
+        };
+        if self.rect != Some(clip) {
+            let origin_x = clip.x.floor() as i32;
+            let origin_y = clip.y.floor() as i32;
+            let width = ((clip.x + clip.w).ceil() as i32 - origin_x) as u32;
+            let height = ((clip.y + clip.h).ceil() as i32 - origin_y) as u32;
+            let mut mask =
+                Mask::new(width, height).ok_or_else(|| "invalid clip mask size".to_string())?;
+            let rect = Rect::from_xywh(
+                clip.x - origin_x as f32,
+                clip.y - origin_y as f32,
+                clip.w,
+                clip.h,
+            )
+            .ok_or_else(|| "invalid clip rectangle".to_string())?;
+            let path = PathBuilder::from_rect(rect);
+            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            self.rect = Some(clip);
+            self.origin = (origin_x, origin_y);
+            self.pixmap =
+                Some(Pixmap::new(width, height).ok_or_else(|| "invalid clip size".to_string())?);
+            self.mask = Some(mask);
+            self.dirty = None;
+        }
+        let pixmap = self
+            .pixmap
+            .as_mut()
+            .ok_or_else(|| "clip surface is unavailable".to_string())?;
+        if let Some(dirty) = self.dirty.take() {
+            clear(pixmap, dirty);
+        }
+        let exact = target.width().max(target.height()) <= F32_EXACT_PIXELS;
+        let bounds = bounds.filter(|_| exact);
+        let dirty = surface_rect(bounds, self.origin, pixmap.width(), pixmap.height());
+        self.dirty = dirty;
+        let transform = Transform::from_translate(-(self.origin.0 as f32), -(self.origin.1 as f32));
+        painter(pixmap, transform, self.mask.as_ref())?;
+        let Some(dirty) = dirty else {
+            return Ok(());
+        };
+        let rect = Rect::from_xywh(
+            (dirty.x() + self.origin.0) as f32,
+            (dirty.y() + self.origin.1) as f32,
+            dirty.width() as f32,
+            dirty.height() as f32,
+        )
+        .ok_or_else(|| "invalid clip composite".to_string())?;
+        let paint = Paint {
+            shader: tiny_skia::Pattern::new(
+                pixmap.as_ref(),
+                tiny_skia::SpreadMode::Pad,
+                tiny_skia::FilterQuality::Nearest,
+                1.0,
+                Transform::from_translate(self.origin.0 as f32, self.origin.1 as f32),
+            ),
+            anti_alias: false,
+            ..Paint::default()
+        };
+        target.fill_rect(rect, &paint, Transform::identity(), None);
+        Ok(())
+    }
+}
+
+/// the part of a `width` x `height` surface at `origin` that `bounds` covers;
+/// `None` covers all of it.
+fn surface_rect(
+    bounds: Option<[f64; 4]>,
+    origin: (i32, i32),
+    width: u32,
+    height: u32,
+) -> Option<IntRect> {
+    let Some([left, top, right, bottom]) = bounds else {
+        return IntRect::from_xywh(0, 0, width, height);
+    };
+    let (x, y) = (f64::from(origin.0), f64::from(origin.1));
+    let (w, h) = (f64::from(width), f64::from(height));
+    let left = (left.floor() - x).clamp(0.0, w);
+    let top = (top.floor() - y).clamp(0.0, h);
+    let right = (right.ceil() - x).clamp(0.0, w);
+    let bottom = (bottom.ceil() - y).clamp(0.0, h);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    IntRect::from_ltrb(left as i32, top as i32, right as i32, bottom as i32)
+}
+
+fn clear(pixmap: &mut Pixmap, rect: IntRect) {
+    let stride = pixmap.width() as usize * 4;
+    let (left, right) = (rect.left() as usize * 4, rect.right() as usize * 4);
+    let data = pixmap.data_mut();
+    for row in rect.top() as usize..rect.bottom() as usize {
+        data[row * stride + left..row * stride + right].fill(0);
+    }
+}
+
+fn clipped_to_target(clip: DlRect, width: u32, height: u32) -> Option<DlRect> {
+    ooxml_raster::clipped_to_target(
+        ooxml_raster::RasterRect {
+            x: clip.x,
+            y: clip.y,
+            w: clip.w,
+            h: clip.h,
+        },
+        width,
+        height,
+    )
+    .map(|clip| DlRect {
+        x: clip.x,
+        y: clip.y,
+        w: clip.w,
+        h: clip.h,
+    })
+}
+
+fn build_path(commands: &[GeometryPathCommand]) -> Result<Path, String> {
+    ooxml_raster::try_path_from_commands(commands, |x, y| {
+        Ok::<_, String>((path_coord(x)?, path_coord(y)?))
+    })?
+    .ok_or_else(|| "path has no drawable commands".to_string())
+}
+
+fn path_coord(value: f64) -> Result<f32, String> {
+    let value = value as f32;
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or_else(|| "path contains a non-finite coordinate".to_string())
+}
+
+/// parse a `#rrggbb` string into a tiny-skia color.
+fn parse_color(s: &str) -> Result<Color, String> {
+    let hex = s
+        .strip_prefix('#')
+        .ok_or_else(|| format!("bad color: {s}"))?;
+    if hex.len() != 6 && hex.len() != 8 {
+        return Err(format!("bad color: {s}"));
+    }
+    ooxml_raster::parse_hex_color(hex).ok_or_else(|| format!("bad color: {s}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pattern_border_pixels_follow_device_mask_and_dash_runs() {
+        let mut workbook = xlsx_model::Workbook::default();
+        let mut sheet = xlsx_model::Sheet::new("Sheet1");
+        sheet.col_widths.insert(0, 8.0 / 7.0);
+        sheet.row_heights.insert(0, 6.0);
+        let mut format = workbook.styles.cell_format(None);
+        format.fill = serde_json::from_value(serde_json::json!({"Pattern": {
+            "pattern": "lightUp", "fg": {"Rgb": "#000000"}, "bg": {"Rgb": "#ffffff"}
+        }}))
+        .unwrap();
+        let style = workbook.styles.intern_cell_format(&format).unwrap();
+        for col in 0..3 {
+            sheet.set_cell(
+                xlsx_model::CellRef::new(0, col),
+                xlsx_model::Cell {
+                    style,
+                    ..Default::default()
+                },
+            );
+        }
+        workbook.sheets.push(sheet);
+        let mut dl = xlsx_render::build_display_list(
+            &workbook,
+            xlsx_model::SheetId(0),
+            &xlsx_render::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 32.0,
+                height: 16.0,
+            },
+        )
+        .unwrap();
+        dl.commands
+            .retain(|cmd| !matches!(cmd, DrawCmd::Line { .. }));
+        dl.commands.push(DrawCmd::Line {
+            x1: 0.0,
+            y1: 12.5,
+            x2: 32.0,
+            y2: 12.5,
+            width: 1.0,
+            color: "#000000".into(),
+            style: Some("dashDot".into()),
+            rail: None,
+            clip: None,
+        });
+        let pixels = Pixmap::decode_png(&render_png(&dl).unwrap()).unwrap();
+        for y in 0..8 {
+            for x in 0..32 {
+                let expected = if (x + y) % 4 == 0 { 0 } else { 255 };
+                assert_eq!(pixels.pixel(x, y).unwrap().red(), expected, "{x},{y}");
+            }
+        }
+        for x in 0..32 {
+            let expected = if matches!(x % 9, 0..=3 | 6) { 0 } else { 255 };
+            assert_eq!(pixels.pixel(x, 12).unwrap().red(), expected, "dash at {x}");
+        }
+        let zoomed = xlsx_render::scaled(dl, 2.0);
+        let pixels = Pixmap::decode_png(&render_png(&zoomed).unwrap()).unwrap();
+        for y in 0..16 {
+            for x in 0..64 {
+                assert_eq!(
+                    pixels.pixel(x, y).unwrap().red(),
+                    if (x + y) % 4 == 0 { 0 } else { 255 },
+                    "zoomed {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_border_all_dash_runs_and_double_pixels() {
+        for (style, width, runs) in [
+            ("dashed", 1.0, vec![4, 2]),
+            ("dotted", 1.0, vec![1, 2]),
+            ("mediumDashed", 2.0, vec![8, 4]),
+            ("dashDot", 1.0, vec![4, 2, 1, 2]),
+            ("mediumDashDot", 2.0, vec![8, 4, 2, 4]),
+            ("dashDotDot", 1.0, vec![4, 2, 1, 2, 1, 2]),
+            ("mediumDashDotDot", 2.0, vec![8, 4, 2, 4, 2, 4]),
+            ("slantDashDot", 1.0, vec![4, 2, 1, 2]),
+        ] {
+            let mut pixmap = Pixmap::new(64, 8).unwrap();
+            pixmap.fill(Color::WHITE);
+            let y = if width == 1.0 { 4.5 } else { 4.0 };
+            paint_line(
+                &mut pixmap,
+                0.0,
+                y,
+                64.0,
+                y,
+                width,
+                "#000000",
+                &Some(style.into()),
+                Transform::identity(),
+                None,
+            )
+            .unwrap();
+            let period: u32 = runs.iter().sum();
+            for x in 0..64 {
+                let mut offset = x % period;
+                let mut on = true;
+                for run in &runs {
+                    if offset < *run {
+                        break;
+                    }
+                    offset -= *run;
+                    on = !on;
+                }
+                assert_eq!(
+                    pixmap.pixel(x, 4).unwrap().red(),
+                    if on { 0 } else { 255 },
+                    "{style} at {x}"
+                );
+            }
+        }
+        let mut pixmap = Pixmap::new(16, 8).unwrap();
+        pixmap.fill(Color::WHITE);
+        paint_double(
+            &mut pixmap,
+            0.0,
+            4.5,
+            16.0,
+            4.5,
+            3.0,
+            1.0,
+            "#000000",
+            Transform::identity(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pixmap.pixel(8, 3).unwrap().red(), 0);
+        assert_eq!(pixmap.pixel(8, 4).unwrap().red(), 255);
+        assert_eq!(pixmap.pixel(8, 5).unwrap().red(), 0);
+    }
+
+    #[test]
+    fn double_line_without_rail_keeps_released_rails() {
+        let black = parse_color("#000000").unwrap();
+        for width in [0.5_f32, 1.0, 2.0] {
+            for (x1, y1, x2, y2) in [(0.0, 8.0, 24.0, 8.0), (12.0, 0.0, 12.0, 16.0)] {
+                let blank = || {
+                    let mut pixmap = Pixmap::new(24, 16).unwrap();
+                    pixmap.fill(Color::WHITE);
+                    pixmap
+                };
+                let mut actual = blank();
+                paint_line(
+                    &mut actual,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    width,
+                    "#000000",
+                    &Some("double".into()),
+                    Transform::identity(),
+                    None,
+                )
+                .unwrap();
+                let mut expected = blank();
+                let (rail, offset) = ((width * 0.6).max(0.5), (width * 0.8).max(0.8));
+                let (dx, dy) = if y1 == y2 {
+                    (0.0, offset)
+                } else {
+                    (offset, 0.0)
+                };
+                for sign in [-1.0, 1.0] {
+                    stroke_seg(
+                        &mut expected,
+                        x1 + sign * dx,
+                        y1 + sign * dy,
+                        x2 + sign * dx,
+                        y2 + sign * dy,
+                        rail,
+                        black,
+                        None,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+                assert!(actual.data() == expected.data(), "{width} {x1},{y1}");
+            }
+        }
+    }
+
+    #[test]
+    fn produced_double_border_paints_rail_gap_rail() {
+        let mut workbook = xlsx_model::Workbook::default();
+        let mut sheet = xlsx_model::Sheet::new("Sheet1");
+        let mut format = workbook.styles.cell_format(None);
+        format.border.bottom = Some(xlsx_model::BorderEdge {
+            style: xlsx_model::BorderStyle::Double,
+            color: Some(xlsx_model::Color::Rgb("#ff0000".into())),
+        });
+        let style = workbook.styles.intern_cell_format(&format).unwrap();
+        sheet.set_cell(
+            xlsx_model::CellRef::new(0, 0),
+            xlsx_model::Cell {
+                style,
+                ..Default::default()
+            },
+        );
+        workbook.sheets.push(sheet);
+        let dl = xlsx_render::build_display_list(
+            &workbook,
+            xlsx_model::SheetId(0),
+            &xlsx_render::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 48.0,
+                height: 40.0,
+            },
+        )
+        .unwrap();
+        for factor in [1.0, 2.0] {
+            let pixels =
+                Pixmap::decode_png(&render_png(&xlsx_render::scaled(dl.clone(), factor)).unwrap())
+                    .unwrap();
+            let ink: Vec<u32> = (0..pixels.height())
+                .filter(|&y| {
+                    let pixel = pixels.pixel(16, y).unwrap();
+                    pixel.red() == 255 && pixel.green() == 0
+                })
+                .collect();
+            let rail = factor as u32;
+            assert_eq!(ink.len() as u32, 2 * rail, "{factor}: {ink:?}");
+            assert_eq!(ink[rail as usize] - ink[0], 2 * rail, "{factor}: {ink:?}");
+            for y in ink[0]..ink[0] + 3 * rail {
+                let pixel = pixels.pixel(16, y).unwrap();
+                assert!(
+                    ink.contains(&y) || pixel.green() > 128,
+                    "{factor}: gap at {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dashed_line_below_one_pixel_is_centred_on_its_clamped_width() {
+        let mut pixmap = Pixmap::new(32, 8).unwrap();
+        pixmap.fill(Color::WHITE);
+        paint_line(
+            &mut pixmap,
+            0.0,
+            4.0,
+            32.0,
+            4.0,
+            0.25,
+            "#000000",
+            &Some("dashed".into()),
+            Transform::identity(),
+            None,
+        )
+        .unwrap();
+        for x in 0..32 {
+            assert_eq!(pixmap.pixel(x, 3).unwrap().red(), 255, "above at {x}");
+            assert_eq!(pixmap.pixel(x, 5).unwrap().red(), 255, "below at {x}");
+        }
+        assert_eq!(pixmap.pixel(0, 4).unwrap().red(), 0);
+    }
+    use super::*;
+    use serde::Deserialize;
+    use tiny_skia::PathSegment;
+    use xlsx_render::Rect as DlRect;
+
+    #[derive(Deserialize)]
+    struct AgreementFixture {
+        commands: Vec<GeometryPathCommand>,
+        trace: Vec<PathTrace>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct PathTrace {
+        verb: String,
+        points: Vec<f32>,
+    }
+
+    #[test]
+    fn renders_png_with_magic_bytes() {
+        let dl = DisplayList {
+            truncated: false,
+            width: 40.0,
+            height: 20.0,
+            commands: vec![
+                DrawCmd::FillRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 40.0,
+                    h: 20.0,
+                    color: "#ffffff".into(),
+                    clip: None,
+                },
+                DrawCmd::Line {
+                    x1: 0.0,
+                    y1: 10.0,
+                    x2: 40.0,
+                    y2: 10.0,
+                    width: 1.0,
+                    color: "#d4d4d4".into(),
+                    style: None,
+                    rail: None,
+                    clip: None,
+                },
+                DrawCmd::Text {
+                    x: 2.0,
+                    y: 12.0,
+                    text: "painted".into(),
+                    font_size: 11.0,
+                    color: "#000000".into(),
+                    clip: DlRect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 40.0,
+                        h: 20.0,
+                    },
+                    align: xlsx_render::Align::Left,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strike: false,
+                    highlight: None,
+                    dashed_underline: false,
+                    font_family: None,
+                    number_format: None,
+                    ghost: false,
+                    chart: false,
+                    rotation_deg: None,
+                    rotation_box: None,
+                    rotation_valign: None,
+                    stacked: false,
+                    wrap: None,
+                },
+            ],
+            grid: xlsx_render::GridMeta::default(),
+            hyperlinks: Vec::new(),
+            charts: Vec::new(),
+        };
+
+        let png = render_png(&dl).unwrap();
+        assert!(png.len() > 8);
+        assert_eq!(
+            &png[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+    }
+
+    #[test]
+    fn rotated_header_paints_taller_than_wide_inside_cell() {
+        let cell = DlRect {
+            x: 0.0,
+            y: 0.0,
+            w: 30.0,
+            h: 120.0,
+        };
+        let dl = DisplayList {
+            truncated: false,
+            width: 30.0,
+            height: 120.0,
+            commands: vec![DrawCmd::Text {
+                x: 15.0,
+                y: 60.0,
+                text: "Header".into(),
+                font_size: 11.0,
+                color: "#000000".into(),
+                clip: cell,
+                align: xlsx_render::Align::Left,
+                bold: false,
+                italic: false,
+                underline: false,
+                strike: false,
+                highlight: None,
+                dashed_underline: false,
+                font_family: None,
+                number_format: None,
+                ghost: false,
+                chart: false,
+                rotation_deg: Some(90.0),
+                rotation_box: Some(cell),
+                rotation_valign: Some(xlsx_render::TextValign::Bottom),
+                stacked: false,
+                wrap: None,
+            }],
+            grid: xlsx_render::GridMeta::default(),
+            hyperlinks: Vec::new(),
+            charts: Vec::new(),
+        };
+        let pixels = Pixmap::decode_png(&render_png(&dl).unwrap()).unwrap();
+        let mut ink: Vec<(u32, u32)> = Vec::new();
+        for y in 0..pixels.height() {
+            for x in 0..pixels.width() {
+                if pixels.pixel(x, y).unwrap().red() < 128 {
+                    ink.push((x, y));
+                }
+            }
+        }
+        assert!(!ink.is_empty());
+        let min_x = ink.iter().map(|p| p.0).min().unwrap();
+        let max_x = ink.iter().map(|p| p.0).max().unwrap();
+        let min_y = ink.iter().map(|p| p.1).min().unwrap();
+        let max_y = ink.iter().map(|p| p.1).max().unwrap();
+        assert!(max_x < 30 && max_y < 120);
+        assert!(
+            max_y - min_y > max_x - min_x,
+            "ink {}x{} should be taller than wide",
+            max_x - min_x + 1,
+            max_y - min_y + 1
+        );
+    }
+
+    fn text_dl(
+        text: &str,
+        cell: DlRect,
+        stacked: bool,
+        rotation_deg: Option<f32>,
+        underline: bool,
+    ) -> DisplayList {
+        DisplayList {
+            truncated: false,
+            width: cell.x + cell.w,
+            height: cell.y + cell.h,
+            commands: vec![DrawCmd::Text {
+                x: cell.x + cell.w / 2.0,
+                y: cell.y + cell.h / 2.0,
+                text: text.into(),
+                font_size: 11.0,
+                color: "#000000".into(),
+                clip: cell,
+                align: xlsx_render::Align::Center,
+                bold: false,
+                italic: false,
+                underline,
+                strike: underline,
+                highlight: None,
+                dashed_underline: false,
+                font_family: None,
+                number_format: None,
+                ghost: false,
+                chart: false,
+                rotation_deg,
+                rotation_box: Some(cell),
+                rotation_valign: Some(xlsx_render::TextValign::Top),
+                stacked,
+                wrap: None,
+            }],
+            grid: xlsx_render::GridMeta::default(),
+            hyperlinks: Vec::new(),
+            charts: Vec::new(),
+        }
+    }
+
+    fn ink_row_bands(dl: &DisplayList) -> Vec<(u32, u32)> {
+        let pixels = Pixmap::decode_png(&render_png(dl).unwrap()).unwrap();
+        let mut bands: Vec<(u32, u32)> = Vec::new();
+        for y in 0..pixels.height() {
+            let dark = (0..pixels.width()).any(|x| pixels.pixel(x, y).unwrap().red() < 128);
+            if dark {
+                match bands.last_mut() {
+                    Some((_, end)) if y == *end + 1 => *end = y,
+                    _ => bands.push((y, y)),
+                }
+            }
+        }
+        bands
+    }
+
+    fn ink_bounds(dl: &DisplayList) -> (u32, u32, u32, u32) {
+        let pixels = Pixmap::decode_png(&render_png(dl).unwrap()).unwrap();
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 0..pixels.height() {
+            for x in 0..pixels.width() {
+                if pixels.pixel(x, y).unwrap().red() < 128 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(min_x <= max_x, "no ink");
+        (min_x, min_y, max_x, max_y)
+    }
+
+    #[test]
+    fn vertical_header_defaults_to_the_padded_right_edge() {
+        let mut bounds = Vec::new();
+        for horizontal in [
+            None,
+            Some(xlsx_model::HAlign::Left),
+            Some(xlsx_model::HAlign::Center),
+            Some(xlsx_model::HAlign::Right),
+        ] {
+            let mut workbook = xlsx_model::Workbook::default();
+            workbook.styles.cell_xfs.push(xlsx_model::Xf {
+                alignment: Some(xlsx_model::Alignment {
+                    h: horizontal,
+                    text_rotation: Some(90),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let mut sheet = xlsx_model::Sheet::new("Sheet1");
+            sheet.col_widths.insert(0, 3.54296875);
+            sheet.row_heights.insert(0, 213.5);
+            sheet.set_cell(
+                xlsx_model::CellRef::new(0, 0),
+                xlsx_model::Cell {
+                    value: xlsx_model::CellValue::Text {
+                        value: "Fundplatz".into(),
+                    },
+                    style: Some(0),
+                    ..Default::default()
+                },
+            );
+            workbook.sheets.push(sheet);
+            let dl = xlsx_render::build_display_list(
+                &workbook,
+                xlsx_model::SheetId(0),
+                &xlsx_render::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 30.0,
+                    height: 285.0,
+                },
+            )
+            .unwrap();
+            bounds.push(ink_bounds(&dl));
+        }
+        assert_eq!(bounds[0], bounds[3]);
+        assert!(
+            bounds[1].0 < bounds[2].0 && bounds[2].0 < bounds[3].0,
+            "{bounds:?}"
+        );
+        assert!(
+            bounds[0].0 + bounds[0].2 > 30 && bounds[0].2 < 28,
+            "{bounds:?}"
+        );
+        assert!(bounds.iter().all(|b| b.3 < 283), "{bounds:?}");
+        assert!(
+            bounds
+                .iter()
+                .all(|b| b.1 == bounds[0].1 && b.3 == bounds[0].3),
+            "{bounds:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_cell_paints_each_line_centred_in_the_cell() {
+        let mut workbook = xlsx_model::Workbook::default();
+        workbook.styles.cell_xfs.push(xlsx_model::Xf {
+            alignment: Some(xlsx_model::Alignment {
+                h: Some(xlsx_model::HAlign::Center),
+                v: Some(xlsx_model::VAlign::Center),
+                wrap_text: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut sheet = xlsx_model::Sheet::new("Sheet1");
+        sheet.col_widths.insert(0, 10.0);
+        sheet.row_heights.insert(0, 28.8);
+        sheet.set_cell(
+            xlsx_model::CellRef::new(0, 0),
+            xlsx_model::Cell {
+                value: xlsx_model::CellValue::Text {
+                    value: "PURCHASE \nTARGET".into(),
+                },
+                style: Some(0),
+                ..Default::default()
+            },
+        );
+        workbook.sheets.push(sheet);
+        let dl = xlsx_render::build_display_list(
+            &workbook,
+            xlsx_model::SheetId(0),
+            &xlsx_render::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 60.0,
+            },
+        )
+        .unwrap();
+        let pixels = Pixmap::decode_png(&render_png(&dl).unwrap()).unwrap();
+        let bands = ink_row_bands(&dl);
+        assert_eq!(bands.len(), 2, "{bands:?}");
+        let cell_w = xlsx_render::geometry::col_chars_to_px(10.0);
+        for ((top, bottom), word) in bands.into_iter().zip(["PURCHASE", "TARGET"]) {
+            let ink: Vec<u32> = (0..pixels.width())
+                .filter(|&x| (top..=bottom).any(|y| pixels.pixel(x, y).unwrap().red() < 128))
+                .collect();
+            let (left, right) = (ink[0] as f32, *ink.last().unwrap() as f32 + 1.0);
+            let width = font::measure_text(word, 11.0);
+            assert!(
+                (right - left - width).abs() < 3.0,
+                "{word}: {left}..{right}"
+            );
+            assert!(((left + right) / 2.0 - cell_w / 2.0).abs() < 2.0, "{word}");
+        }
+    }
+
+    #[test]
+    fn rotated_number_overflow_paints_hashes_along_its_direction() {
+        let cell = DlRect {
+            x: 0.0,
+            y: 0.0,
+            w: 30.0,
+            h: 40.0,
+        };
+        let mut dl = text_dl("1234567890", cell, false, Some(90.0), false);
+        if let DrawCmd::Text { number_format, .. } = &mut dl.commands[0] {
+            *number_format = Some(xlsx_render::NumberFormatLayout {
+                left: 0.0,
+                width: 30.0,
+                parts: Vec::new(),
+                general: None,
+                overflow: true,
+            });
+        }
+        let (min_x, min_y, max_x, max_y) = ink_bounds(&dl);
+        assert!(
+            max_y - min_y < 40,
+            "hashes should fit the 40px direction, ink {}..{} tall",
+            min_y,
+            max_y
+        );
+        assert!(max_y - min_y > max_x - min_x);
+    }
+
+    #[test]
+    fn stacked_text_uses_shared_line_height_and_graphemes() {
+        let cell = DlRect {
+            x: 0.0,
+            y: 0.0,
+            w: 30.0,
+            h: 120.0,
+        };
+        let bands = ink_row_bands(&text_dl("ABC", cell, true, None, false));
+        assert_eq!(bands.len(), 3, "{bands:?}");
+        let spacing = bands[1].0 as f32 - bands[0].0 as f32;
+        let expected = font::stacked_line_height(11.0);
+        assert!(
+            (spacing - expected).abs() <= 1.5,
+            "spacing {spacing} vs {expected}"
+        );
+        let (_, top, _, bottom) = ink_bounds(&text_dl("e\u{301}B", cell, true, None, false));
+        assert!(
+            bottom - top < 40,
+            "combined cluster should occupy two lines, ink {top}..{bottom}"
+        );
+    }
+
+    #[test]
+    fn stacked_text_keeps_decorations() {
+        let cell = DlRect {
+            x: 0.0,
+            y: 0.0,
+            w: 30.0,
+            h: 120.0,
+        };
+        let plain = ink_bounds(&text_dl("A", cell, true, None, false));
+        let decorated = ink_bounds(&text_dl("A", cell, true, None, true));
+        assert!(
+            decorated.3 > plain.3 || decorated.1 < plain.1,
+            "decorations should add ink outside the glyph box"
+        );
+        let plain_dl = text_dl("A", cell, true, None, false);
+        let decorated_dl = text_dl("A", cell, true, None, true);
+        let plain_pixels = Pixmap::decode_png(&render_png(&plain_dl).unwrap()).unwrap();
+        let decorated_pixels = Pixmap::decode_png(&render_png(&decorated_dl).unwrap()).unwrap();
+        let count = |p: &Pixmap| {
+            (0..p.height())
+                .flat_map(|y| (0..p.width()).map(move |x| (x, y)))
+                .filter(|&(x, y)| p.pixel(x, y).unwrap().red() < 128)
+                .count()
+        };
+        assert!(count(&decorated_pixels) > count(&plain_pixels));
+    }
+
+    #[test]
+    fn long_stack_paints_only_visible_lines() {
+        let cell = DlRect {
+            x: 0.0,
+            y: 0.0,
+            w: 30.0,
+            h: 60.0,
+        };
+        let text = "A".repeat(1000);
+        let bands = ink_row_bands(&text_dl(&text, cell, true, None, false));
+        assert!(!bands.is_empty());
+        assert!(bands.len() <= 5, "painted {} bands", bands.len());
+    }
+
+    #[test]
+    fn rejects_malformed_color() {
+        let dl = DisplayList {
+            truncated: false,
+            width: 10.0,
+            height: 10.0,
+            commands: vec![DrawCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+                color: "red".into(),
+                clip: None,
+            }],
+            grid: xlsx_render::GridMeta::default(),
+            hyperlinks: Vec::new(),
+            charts: Vec::new(),
+        };
+        assert!(render_png(&dl).is_err());
+    }
+
+    #[test]
+    fn path_backends_follow_shared_trace_contract() {
+        let fixture: AgreementFixture = serde_json::from_str(include_str!(
+            "../../../packages/xlsx/test-fixtures/path-backend-agreement.json"
+        ))
+        .unwrap();
+        let path = build_path(&fixture.commands).unwrap();
+        let trace = path
+            .segments()
+            .map(|segment| match segment {
+                PathSegment::MoveTo(point) => PathTrace {
+                    verb: "move".into(),
+                    points: vec![point.x, point.y],
+                },
+                PathSegment::LineTo(point) => PathTrace {
+                    verb: "line".into(),
+                    points: vec![point.x, point.y],
+                },
+                PathSegment::QuadTo(control, point) => PathTrace {
+                    verb: "quad".into(),
+                    points: vec![control.x, control.y, point.x, point.y],
+                },
+                PathSegment::CubicTo(first, second, point) => PathTrace {
+                    verb: "cubic".into(),
+                    points: vec![first.x, first.y, second.x, second.y, point.x, point.y],
+                },
+                PathSegment::Close => PathTrace {
+                    verb: "close".into(),
+                    points: Vec::new(),
+                },
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(trace, fixture.trace);
+    }
+
+    fn page(width: f32, height: f32, commands: Vec<DrawCmd>) -> DisplayList {
+        DisplayList {
+            truncated: false,
+            width,
+            height,
+            commands,
+            grid: xlsx_render::GridMeta::default(),
+            hyperlinks: Vec::new(),
+            charts: Vec::new(),
+        }
+    }
+
+    fn clipped_fill(x: f32, clip: DlRect) -> DrawCmd {
+        DrawCmd::FillRect {
+            x,
+            y: 2.0,
+            w: 6.0,
+            h: 6.0,
+            color: "#00000080".into(),
+            clip: Some(clip),
+        }
+    }
+
+    #[test]
+    fn a_shared_clip_composites_each_command_once() {
+        let clip = DlRect {
+            x: 0.0,
+            y: 0.0,
+            w: 40.0,
+            h: 20.0,
+        };
+        let alone = render_png(&page(40.0, 20.0, vec![clipped_fill(2.0, clip)])).unwrap();
+        let alone = Pixmap::decode_png(&alone).unwrap();
+        let commands = vec![
+            clipped_fill(2.0, clip),
+            clipped_fill(20.0, clip),
+            clipped_fill(30.0, clip),
+        ];
+        let shared = Pixmap::decode_png(&render_png(&page(40.0, 20.0, commands)).unwrap()).unwrap();
+        assert!(alone.pixel(4, 4).unwrap().red() < 255);
+        assert_eq!(shared.pixel(4, 4), alone.pixel(4, 4));
+        assert_eq!(shared.pixel(22, 4), alone.pixel(4, 4));
+        assert_eq!(shared.pixel(32, 4), alone.pixel(4, 4));
+    }
+
+    #[test]
+    fn a_mitered_stroke_tip_outside_its_path_bounds_is_composited() {
+        let clip = DlRect {
+            x: 0.0,
+            y: 0.0,
+            w: 60.0,
+            h: 64.0,
+        };
+        let path = DrawCmd::Path {
+            commands: vec![
+                GeometryPathCommand::Move { x: 19.3, y: 60.0 },
+                GeometryPathCommand::Line { x: 30.0, y: 20.0 },
+                GeometryPathCommand::Line { x: 40.7, y: 60.0 },
+            ],
+            fill: "#ffffff00".into(),
+            stroke: Some(xlsx_render::PathStroke {
+                color: "#000000".into(),
+                width: 8.0,
+            }),
+            clip: Some(clip),
+        };
+        let pixels =
+            Pixmap::decode_png(&render_png(&page(60.0, 64.0, vec![path])).unwrap()).unwrap();
+        assert_eq!(pixels.pixel(30, 10).unwrap().red(), 0);
+        assert_eq!(pixels.pixel(30, 1).unwrap().red(), 255);
+    }
+
+    #[test]
+    fn extreme_and_negative_geometry_keeps_its_pixels() {
+        let full = |w: f32, h: f32| DlRect {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+        };
+        let render = |w: f32, h: f32, command: DrawCmd| {
+            Pixmap::decode_png(&render_png(&page(w, h, vec![command])).unwrap()).unwrap()
+        };
+        let far_line = DrawCmd::Line {
+            x1: -268_435_456.0,
+            y1: 4.5,
+            x2: 10.0,
+            y2: 4.5,
+            width: 1.0,
+            color: "#000000".into(),
+            style: None,
+            rail: None,
+            clip: Some(full(20.0, 10.0)),
+        };
+        assert_eq!(render(20.0, 10.0, far_line).pixel(5, 4).unwrap().red(), 0);
+        let far_fill = DrawCmd::FillRect {
+            x: -1e20,
+            y: 2.0,
+            w: 1e20,
+            h: 6.0,
+            color: "#000000".into(),
+            clip: Some(DlRect {
+                x: 1.0,
+                y: 0.0,
+                w: 9.0,
+                h: 10.0,
+            }),
+        };
+        assert_eq!(render(10.0, 10.0, far_fill).pixel(5, 5).unwrap().red(), 255);
+        let square = DrawCmd::Path {
+            commands: vec![
+                GeometryPathCommand::Move { x: 2.0, y: 2.0 },
+                GeometryPathCommand::Line { x: 18.0, y: 2.0 },
+                GeometryPathCommand::Line { x: 18.0, y: 18.0 },
+                GeometryPathCommand::Line { x: 2.0, y: 18.0 },
+                GeometryPathCommand::Close,
+            ],
+            fill: "#000000".into(),
+            stroke: Some(xlsx_render::PathStroke {
+                color: "#000000".into(),
+                width: -2.0,
+            }),
+            clip: Some(full(20.0, 20.0)),
+        };
+        assert_eq!(render(20.0, 20.0, square).pixel(3, 10).unwrap().red(), 0);
+        let rails = DrawCmd::Line {
+            x1: 5.0,
+            y1: 15.0,
+            x2: 30.0,
+            y2: 15.0,
+            width: -20.0,
+            color: "#000000".into(),
+            style: Some("double".into()),
+            rail: Some(2.0),
+            clip: Some(full(40.0, 40.0)),
+        };
+        assert_eq!(render(40.0, 40.0, rails).pixel(10, 4).unwrap().red(), 0);
+    }
+}
+
+#[cfg(feature = "fonts")]
+mod native;
+#[cfg(feature = "fonts")]
+pub use native::{RasterFonts, render_png, render_png_with_fonts};
+
+#[cfg(test)]
+mod shared_helper_tests {
+    use super::*;
+
+    #[test]
+    fn color_keeps_long_hex_only_grammar() {
+        for value in ["#abcdef", "#abcdef01"] {
+            assert!(parse_color(value).is_ok());
+        }
+        for value in [
+            "#abc",
+            "#abcd",
+            "transparent",
+            "rgb(1,2,3)",
+            "abcdef",
+            "#gggggg",
+        ] {
+            assert_eq!(parse_color(value), Err(format!("bad color: {value}")));
+        }
+    }
+
+    #[test]
+    fn path_keeps_empty_and_non_finite_errors() {
+        assert_eq!(
+            build_path(&[]).unwrap_err(),
+            "path has no drawable commands"
+        );
+        for value in [f64::NAN, f64::INFINITY, f64::MAX] {
+            assert_eq!(
+                build_path(&[GeometryPathCommand::Move { x: value, y: 0.0 }]).unwrap_err(),
+                "path contains a non-finite coordinate"
+            );
+        }
+    }
+}

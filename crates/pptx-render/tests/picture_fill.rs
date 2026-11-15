@@ -1,0 +1,369 @@
+use ooxml_drawingml::GeometryPathCommand as C;
+use pptx_edit::DeckSession;
+use pptx_render::{Primitive, SlideRenderer};
+
+const FIXTURE: &[u8] = include_bytes!("../../pptx-parse/tests/fixtures/picture-fill.pptx");
+
+#[test]
+fn a_tiled_picture_fill_outset_keeps_the_whole_shape_destination() {
+    assert_tiled_picture_fill_outset(false);
+}
+
+#[test]
+fn a_tiled_background_outset_keeps_the_whole_slide_destination() {
+    assert_tiled_picture_fill_outset(true);
+}
+
+fn assert_tiled_picture_fill_outset(background: bool) {
+    let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+    let pptx_parse::ShapeNode::Shape(shape) = &mut package.slides[0].shapes[2] else {
+        panic!()
+    };
+    let picture = shape.picture_fill.as_mut().unwrap();
+    assert!(picture.tile.is_some());
+    picture.crop = pptx_parse::PictureCrop {
+        top: -50_000,
+        ..Default::default()
+    };
+    if background {
+        package.slides[0].background_picture = Some(picture.clone());
+        package.slides[0].shapes.clear();
+    } else {
+        package.slides[0].shapes.drain(..2);
+    }
+    let session = DeckSession::from_package_with_source(package, FIXTURE, 647).unwrap();
+    let rendered = SlideRenderer::new()
+        .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+        .unwrap();
+    let Primitive::Image {
+        crop,
+        destination,
+        tile,
+        ..
+    } = &rendered.display_list.primitives[0]
+    else {
+        panic!()
+    };
+    assert!(tile.is_some());
+    assert_eq!(*destination, None);
+    assert!(crop.is_whole());
+}
+
+#[test]
+fn a_picture_fill_outset_preserves_its_custom_geometry_frame() {
+    let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+    package.slides[0].shapes.truncate(1);
+    let pptx_parse::ShapeNode::Shape(shape) = &mut package.slides[0].shapes[0] else {
+        panic!()
+    };
+    shape.picture_fill.as_mut().unwrap().crop = pptx_parse::PictureCrop {
+        top: -50_000,
+        bottom: 50_000,
+        ..Default::default()
+    };
+    let session = DeckSession::from_package_with_source(package, FIXTURE, 646).unwrap();
+    let rendered = SlideRenderer::new()
+        .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+        .unwrap();
+    let image = &rendered.display_list.primitives[0];
+    let Primitive::Image {
+        x,
+        y,
+        w,
+        h,
+        path,
+        crop,
+        destination,
+        ..
+    } = image
+    else {
+        panic!()
+    };
+    assert_eq!((*x, *y, *w, *h), (20.0, 20.0, 200.0, 200.0));
+    let destination = destination.unwrap();
+    assert_eq!(
+        (destination.x, destination.y, destination.w, destination.h),
+        (20.0, 120.0, 200.0, 100.0)
+    );
+    assert_eq!((crop.top, crop.bottom), (0.0, 0.5));
+    assert_eq!(path.as_ref().unwrap()[2], C::Line { x: 1.0, y: 1.0 });
+}
+
+#[test]
+fn picture_fills_keep_fallback_diagnostics_through_layout_and_hydration() {
+    for geometry in ["custom", "ellipse", "cube", "rect", "unknownPreset"] {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        package.slides[0].shapes.truncate(1);
+        let pptx_parse::ShapeNode::Shape(shape) = &mut package.slides[0].shapes[0] else {
+            panic!()
+        };
+        shape.geometry = geometry.into();
+        let session = DeckSession::from_package_with_source(package, FIXTURE, 644).unwrap();
+        let renderer = SlideRenderer::new();
+        let before = renderer
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap()
+            .display_list;
+        let images: Vec<_> = before
+            .primitives
+            .iter()
+            .filter(|p| matches!(p, Primitive::Image { .. }))
+            .collect();
+        assert!(!images.is_empty(), "{geometry}");
+        for image in images {
+            let Primitive::Image {
+                geometry_fallback,
+                path,
+                shape_id,
+                ..
+            } = image
+            else {
+                panic!()
+            };
+            assert_eq!(
+                *geometry_fallback,
+                geometry == "unknownPreset",
+                "{geometry}"
+            );
+            assert!(shape_id.is_some());
+            if *geometry_fallback {
+                assert_eq!(
+                    path.as_ref().unwrap(),
+                    &ooxml_drawingml::preset_geometry_to_path("rect", &Default::default(), 1.0)
+                        .unwrap()
+                );
+            }
+            let json = serde_json::to_value(image).unwrap();
+            assert_eq!(json.get("geometryFallback").is_some(), *geometry_fallback);
+        }
+        let restored =
+            DeckSession::open_from_update(&session.encode_state_as_update_v1(), 645).unwrap();
+        let after = renderer
+            .layout_slide(restored.package(), &restored.snapshot().unwrap(), 0)
+            .unwrap()
+            .display_list;
+        assert_eq!(before, after, "{geometry}");
+    }
+}
+
+#[test]
+fn a_picture_filled_shape_paints_its_blip_through_its_own_outline() {
+    let session = DeckSession::open(FIXTURE, 286).unwrap();
+    let renderer = SlideRenderer::new();
+    let deck = session.snapshot().unwrap();
+    let rendered = renderer.layout_slide(session.package(), &deck, 0).unwrap();
+    let primitives = &rendered.display_list.primitives;
+    assert_eq!(primitives.len(), 3);
+
+    let Primitive::Image {
+        x,
+        y,
+        w,
+        h,
+        asset_id,
+        crop,
+        path,
+        stroke,
+        ..
+    } = &primitives[0]
+    else {
+        panic!("the freeform paints its picture fill")
+    };
+    assert_eq!((*x, *y, *w, *h), (20.0, 20.0, 200.0, 200.0));
+    assert_eq!(asset_id.as_deref(), Some("ppt/media/image1.png"));
+    assert!(crop.is_whole());
+    assert!(stroke.is_none());
+    assert_eq!(
+        path.as_deref(),
+        Some(
+            [
+                C::Move { x: 0.0, y: 0.0 },
+                C::Line { x: 1.0, y: 0.0 },
+                C::Line { x: 1.0, y: 1.0 },
+                C::Line { x: 0.0, y: 1.0 },
+                C::Close,
+                C::Move { x: 0.25, y: 0.25 },
+                C::Line { x: 0.25, y: 0.75 },
+                C::Line { x: 0.75, y: 0.75 },
+                C::Line { x: 0.75, y: 0.25 },
+                C::Close,
+            ]
+            .as_slice()
+        )
+    );
+
+    let Primitive::Image {
+        x,
+        crop,
+        path,
+        stroke,
+        ..
+    } = &primitives[1]
+    else {
+        panic!("the ellipse paints its picture fill")
+    };
+    assert!((*x - 250.0).abs() < 0.01);
+    assert!((crop.left - (0.1 + 0.7 / 3.0)).abs() < 1e-6);
+    assert!((crop.right - 0.2).abs() < 1e-6);
+    assert_eq!((crop.top, crop.bottom), (0.0, 0.0));
+    assert_eq!(
+        stroke.as_ref().map(|stroke| stroke.color.as_str()),
+        Some("#2563EB")
+    );
+    assert_eq!(
+        path.as_deref(),
+        Some(
+            ooxml_drawingml::preset_geometry_to_path("ellipse", &Default::default(), 1.0)
+                .unwrap()
+                .as_slice()
+        )
+    );
+
+    let Primitive::Image { tile, .. } = &primitives[2] else {
+        panic!("the tiled shape paints its picture fill")
+    };
+    assert!(tile.is_some(), "and paints it as a tile");
+}
+
+#[test]
+fn positive_fill_insets_keep_the_shape_picture_destination_unchanged() {
+    let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+    let pptx_parse::ShapeNode::Shape(shape) = &mut package.slides[0].shapes[0] else {
+        panic!("expected a shape")
+    };
+    shape.picture_fill.as_mut().unwrap().fill_rect = pptx_parse::PictureCrop {
+        left: 25_000,
+        right: 25_000,
+        ..Default::default()
+    };
+    let session = DeckSession::from_package_with_source(package, FIXTURE, 646).unwrap();
+    let rendered = SlideRenderer::new()
+        .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+        .unwrap();
+    let Primitive::Image {
+        x, y, w, h, crop, ..
+    } = &rendered.display_list.primitives[0]
+    else {
+        panic!("expected a shape image")
+    };
+    assert_eq!((*x, *y, *w, *h), (20.0, 20.0, 200.0, 200.0));
+    assert!(crop.is_whole());
+}
+
+#[test]
+fn a_picture_fill_survives_a_snapshot_round_trip() {
+    let session = DeckSession::open(FIXTURE, 286).unwrap();
+    let renderer = SlideRenderer::new();
+    let before = renderer
+        .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+        .unwrap()
+        .display_list;
+    assert_eq!(
+        before
+            .primitives
+            .iter()
+            .filter(|primitive| matches!(primitive, Primitive::Image { .. }))
+            .count(),
+        3
+    );
+    let restored =
+        DeckSession::open_from_update(&session.encode_state_as_update_v1(), 287).unwrap();
+    let after = renderer
+        .layout_slide(restored.package(), &restored.snapshot().unwrap(), 0)
+        .unwrap()
+        .display_list;
+    assert_eq!(before, after);
+}
+
+#[test]
+fn an_explicit_tiled_fill_blocks_a_placeholders_inherited_picture() {
+    let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+    let demo = pptx_parse::parse_pptx(include_bytes!(
+        "../../../fixtures/demo/nimbleoffice-demo.pptx"
+    ))
+    .unwrap();
+    let pptx_parse::ShapeNode::Shape(mut inherited) = package.slides[0].shapes[0].clone() else {
+        panic!("expected ring")
+    };
+    let pptx_parse::ShapeNode::Shape(mut tiled) = package.slides[0].shapes[2].clone() else {
+        panic!("expected tiled shape")
+    };
+    let placeholder = pptx_parse::Placeholder {
+        placeholder_type: Some("body".to_owned()),
+        index: Some(33),
+        orientation: None,
+        size: None,
+    };
+    inherited.base.placeholder = Some(placeholder.clone());
+    tiled.base.placeholder = Some(placeholder);
+    let mut layout = demo.layouts[0].clone();
+    layout.shapes = vec![pptx_parse::ShapeNode::Shape(inherited)];
+    package.slides[0].layout_part_path = Some(layout.part_path.clone());
+    package.layouts = vec![layout];
+    let mut drawn = Vec::new();
+    for explicit in [false, true] {
+        let mut shape = tiled.clone();
+        if !explicit {
+            shape.fill = None;
+        }
+        package.slides[0].shapes = vec![pptx_parse::ShapeNode::Shape(shape)];
+        let session =
+            DeckSession::from_package_with_source(package.clone(), FIXTURE, 33610).unwrap();
+        let rendered = SlideRenderer::new()
+            .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+            .unwrap();
+        assert_eq!(rendered.display_list.primitives.len(), 1);
+        let Primitive::Image { tile, .. } = &rendered.display_list.primitives[0] else {
+            panic!("expected a picture")
+        };
+        drawn.push((0, tile.is_some()));
+    }
+    assert_eq!(
+        [drawn[0].1, drawn[1].1],
+        [false, true],
+        "the shape's own tile paints instead of the placeholder's stretched picture"
+    );
+}
+
+#[test]
+fn background_and_shape_picture_images_keep_their_effects_and_geometry() {
+    let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+    package.slides[0].shapes.truncate(1);
+    let pptx_parse::ShapeNode::Shape(shape) = &mut package.slides[0].shapes[0] else {
+        panic!("expected a shape")
+    };
+    shape.geometry = "rect".to_owned();
+    shape.has_preset_geometry = true;
+    shape.paths.clear();
+    let picture = shape.picture_fill.as_mut().unwrap();
+    picture.effects = vec![
+        pptx_parse::BlipEffect::Alpha { amount: 0.2 },
+        pptx_parse::BlipEffect::Grayscale,
+    ];
+    picture.fill_rect = pptx_parse::PictureCrop {
+        left: 25_000,
+        right: 25_000,
+        ..Default::default()
+    };
+    package.slides[0].background_picture = Some(picture.clone());
+    let session = DeckSession::from_package_with_source(package, FIXTURE, 647).unwrap();
+    let rendered = SlideRenderer::new()
+        .layout_slide(session.package(), &session.snapshot().unwrap(), 0)
+        .unwrap();
+    let expected: Vec<Primitive> = serde_json::from_value(serde_json::json!([
+        {
+            "kind": "image", "objectId": 0, "name": "Background",
+            "x": 0.0, "y": 0.0, "w": 480.0, "h": 270.66666,
+            "assetId": "ppt/media/image1.png",
+            "effects": [{"kind": "alpha", "amount": 0.2}, {"kind": "grayscale"}]
+        },
+        {
+            "kind": "image", "objectId": 2, "shapeId": "slide:0:256:shape:0", "name": "Ring",
+            "x": 20.0, "y": 20.0, "w": 200.0, "h": 200.0,
+            "assetId": "ppt/media/image1.png",
+            "effects": [{"kind": "alpha", "amount": 0.2}, {"kind": "grayscale"}]
+        }
+    ]))
+    .unwrap();
+    assert_eq!(rendered.display_list.primitives, expected);
+}

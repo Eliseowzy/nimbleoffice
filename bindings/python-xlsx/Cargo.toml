@@ -1,0 +1,19 @@
+[package]
+name = "nimbleoffice-xlsx-python"
+version = "0.2.2"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Eliseowzy/nimbleoffice"
+description = "Python bindings for the NimbleOffice XLSX engine."
+publish = false
+
+[lib]
+name = "_nimbleoffice_xlsx"
+crate-type = ["cdylib"]
+
+[dependencies]
+nimbleoffice-xlsx = { path = "../../crates/nimbleoffice-xlsx", default-features = false, features = ["fonts", "raster"] }
+pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }
+python-common = { package = "nimbleoffice-python-common", path = "../python-common" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

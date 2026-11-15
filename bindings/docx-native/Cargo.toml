@@ -1,0 +1,29 @@
+[package]
+name = "nimbleoffice-docx-native"
+version = "0.5.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Eliseowzy/nimbleoffice"
+description = "Node.js bindings for the NimbleOffice DOCX engine."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+test-hooks = []
+
+[dependencies]
+mimalloc = { version = "0.1.52", optional = true, default-features = false, features = ["v2", "local_dynamic_tls"] }
+nimbleoffice-fonts = { path = "../../crates/nimbleoffice-fonts" }
+ooxml-font-preflight = { package = "nimbleoffice-ooxml-font-preflight", path = "../../crates/ooxml-font-preflight" }
+docx-engine = { package = "nimbleoffice-docx-engine", path = "../../crates/docx-engine" }
+getrandom = "0.3"
+napi = { version = "3.12.4", features = ["napi8", "serde-json"] }
+napi-derive = "3.6.5"
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2.4.2"

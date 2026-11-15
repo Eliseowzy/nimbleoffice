@@ -1,0 +1,247 @@
+import { expect, test } from 'bun:test';
+import { createPeerlessViewStore, geometryMatchesDocument, type PeerlessFrameGeometry } from './viewStore';
+
+test('d2a_ack_selection_waits_for_matching_frame_geometry', () => {
+  const identity = { session: 'view', incarnation: 1, epoch: 1 };
+  const selection = (offset: number) => ({
+    anchor: { story: 'body', paraId: 'p', offset, sticky: new Uint8Array([offset, 1]) },
+    focus: { story: 'body', paraId: 'p', offset, sticky: new Uint8Array([offset, 2]) },
+  });
+  const geometry = (coversThroughSeq: number, frameEpoch: number): PeerlessFrameGeometry => ({
+    identity, coversThroughSeq, frameEpoch, layoutRevision: frameEpoch,
+    pages: [], caret: { x: frameEpoch, y: 0, width: 1, height: 12 }, selectionRects: [],
+  });
+  const old = geometry(1, 1);
+  const store = createPeerlessViewStore({
+    identity, version: 1, throughSeq: 1, presentedThroughSeq: 1,
+    workerSelection: selection(1), anchors: null, editState: undefined, geometry: old,
+  });
+  let notifications = 0;
+  store.subscribe(() => notifications++);
+  const confirmed = selection(2);
+  store.acceptWorkerState(identity, { epoch: 1, version: 2, throughSeq: 2, presentedThroughSeq: 1, selection: confirmed, editState: undefined });
+  expect(store.getSnapshot()).toMatchObject({ throughSeq: 2, presentedThroughSeq: 1, workerSelection: confirmed, geometry: old });
+  expect(store.getSnapshot().anchors).toEqual({ anchor: confirmed.anchor.sticky, focus: confirmed.focus.sticky });
+  const matching = geometry(2, 2);
+  store.installFrameGeometry(matching);
+  expect(store.getSnapshot().geometry).toEqual(matching);
+  expect(store.getSnapshot().presentedThroughSeq).toBe(2);
+  const stable = store.getSnapshot();
+  store.acceptWorkerState(identity, { epoch: 1, version: 1, throughSeq: 1, presentedThroughSeq: 1, selection: selection(0), editState: undefined });
+  store.installFrameGeometry(old);
+  store.installFrameGeometry({ ...geometry(3, 3), identity: { ...identity, incarnation: 0 } });
+  expect(store.getSnapshot()).toBe(stable);
+  store.installFrameGeometry(geometry(2, 3));
+  expect(store.getSnapshot().geometry?.frameEpoch).toBe(3);
+  expect(store.getSnapshot().workerSelection).toEqual(confirmed);
+  store.acceptWorkerState(identity, { epoch: 1, version: 2, throughSeq: 3, presentedThroughSeq: 2, selection: undefined, editState: undefined });
+  expect(store.getSnapshot().workerSelection).toEqual(confirmed);
+  expect(store.getServerSnapshot()).toBe(store.getSnapshot());
+  store.dispose();
+  const count = notifications;
+  store.installFrameGeometry(geometry(3, 4));
+  expect(notifications).toBe(count);
+});
+
+test('provisional caret follows its ticket sequence and retires at covering geometry', () => {
+  const identity = { session: 'view', incarnation: 1, epoch: 1 };
+  const geometry: PeerlessFrameGeometry = {
+    identity, coversThroughSeq: 0, frameEpoch: 1, layoutRevision: 1,
+    pages: [], caret: null, selectionRects: [],
+  };
+  const store = createPeerlessViewStore({ identity, version: 0, throughSeq: 0, presentedThroughSeq: 0,
+    workerSelection: null, anchors: null, editState: undefined, geometry });
+  let seq: number | undefined;
+  const caret = { get throughSeq() { return seq; }, pageIndex: 7, rect: { x: 30, y: 1200, width: 1, height: 18 } };
+  store.setProvisionalCaret(caret);
+  expect(store.getSnapshot().provisionalCaret).toBe(caret);
+  store.installFrameGeometry({ ...geometry, frameEpoch: 2 });
+  expect(store.getSnapshot().provisionalCaret).toBe(caret);
+  seq = 1;
+  store.acceptWorkerState(identity, { epoch: 1, version: 0, throughSeq: 1, presentedThroughSeq: 0,
+    selection: undefined, editState: undefined });
+  expect(store.getSnapshot().provisionalCaret?.throughSeq).toBe(1);
+  store.installFrameGeometry({ ...geometry, frameEpoch: 3, coversThroughSeq: 1 });
+  expect(store.getSnapshot().provisionalCaret).toBeNull();
+  store.setProvisionalCaret(caret);
+  expect(store.getSnapshot().provisionalCaret).toBeNull();
+  seq = 2;
+  store.setProvisionalCaret(caret);
+  store.acceptWorkerState({ ...identity, incarnation: 2 }, { epoch: 1, version: 0, throughSeq: 0,
+    presentedThroughSeq: -1, selection: null, editState: undefined });
+  expect(store.getSnapshot().provisionalCaret).toBeNull();
+  store.dispose();
+});
+
+test('predicted caret hands off to covering geometry without an intermediate caret', () => {
+  const identity = { session: 'view', incarnation: 1, epoch: 1 };
+  const old = { x: 0, y: 0, width: 1, height: 20 };
+  const predicted = { x: 30, y: 0, width: 1, height: 20 };
+  const geometry = (coversThroughSeq: number, frameEpoch: number, caret: typeof old) => ({
+    identity, coversThroughSeq, frameEpoch, layoutRevision: 1, pages: [], caret, selectionRects: [],
+  });
+  const store = createPeerlessViewStore({ identity, version: 0, throughSeq: 0, presentedThroughSeq: 0,
+    workerSelection: null, anchors: null, editState: undefined, geometry: geometry(0, 1, old) });
+  const shown: string[] = [];
+  const record = () => {
+    const snapshot = store.getSnapshot();
+    const caret = snapshot.provisionalCaret?.rect ?? snapshot.geometry?.caret ?? null;
+    const value = caret ? `${caret.x},${caret.y},${caret.width},${caret.height}` : 'null';
+    if (shown.at(-1) !== value) shown.push(value);
+  };
+  store.subscribe(record);
+  record();
+  store.setProvisionalCaret({ source: 'echo', throughSeq: 5, pageIndex: 0, rect: predicted });
+  store.setProvisionalCaret({ source: 'echo', throughSeq: 4, pageIndex: 0, rect: { ...predicted, x: 20 } });
+  expect(store.getSnapshot().provisionalCaret?.throughSeq).toBe(5);
+  expect(store.getSnapshot().provisionalCaret?.rect).toBe(predicted);
+  store.installFrameGeometry(geometry(5, 2, { ...predicted }));
+  expect(store.getSnapshot().provisionalCaret).toBeNull();
+  expect(shown).toEqual(['0,0,1,20', '30,0,1,20']);
+  const snapped = { x: 44, y: 0, width: 1, height: 20 };
+  store.setProvisionalCaret({ source: 'echo', throughSeq: 6, pageIndex: 0, rect: predicted });
+  store.installFrameGeometry(geometry(6, 3, snapped));
+  expect(shown).toEqual(['0,0,1,20', '30,0,1,20', '44,0,1,20']);
+  store.setProvisionalCaret({ source: 'echo', throughSeq: 6, pageIndex: 0, rect: predicted });
+  store.setProvisionalCaret({ source: 'echo', throughSeq: 5, pageIndex: 0, rect: predicted });
+  expect(store.getSnapshot().provisionalCaret).toBeNull();
+  expect(shown).toEqual(['0,0,1,20', '30,0,1,20', '44,0,1,20']);
+  store.dispose();
+});
+
+test('echo caret survives worker version and layout bumps until covering geometry', () => {
+  const identity = { session: 'view', incarnation: 1, epoch: 1 };
+  const predicted = { x: 70, y: 0, width: 1, height: 20 };
+  const geometry = (coversThroughSeq: number, frameEpoch: number, documentVersion: string, layoutRevision: number,
+    caret: { x: number; y: number; width: number; height: number }) => ({
+    identity, documentVersion, coversThroughSeq, frameEpoch, layoutRevision, pages: [], caret, selectionRects: [],
+  });
+  const store = createPeerlessViewStore({ identity, version: 0, throughSeq: 0, presentedThroughSeq: 0,
+    workerSelection: null, anchors: null, editState: undefined,
+    geometry: geometry(0, 1, 'doc-1', 1, { x: 0, y: 0, width: 1, height: 20 }) });
+  const shown = () => {
+    const snapshot = store.getSnapshot();
+    return snapshot.provisionalCaret?.rect ?? snapshot.geometry?.caret ?? null;
+  };
+  const caret = { source: 'echo' as const, throughSeq: 7, pageIndex: 0, rect: predicted };
+  store.setProvisionalCaret(caret);
+  expect(store.getSnapshot().provisionalCaret).toBe(caret);
+  store.acceptWorkerState(identity, { epoch: 1, version: 1, throughSeq: 7, presentedThroughSeq: 0,
+    selection: undefined, editState: undefined });
+  expect(store.getSnapshot().provisionalCaret).toBe(caret);
+  expect(shown()).toBe(predicted);
+  store.installFrameGeometry(geometry(6, 2, 'doc-2', 2, { x: 60, y: 0, width: 1, height: 20 }));
+  expect(store.getSnapshot().provisionalCaret).toBe(caret);
+  expect(shown()).toBe(predicted);
+  store.installFrameGeometry(geometry(7, 3, 'doc-2', 2, { ...predicted }));
+  expect(store.getSnapshot().provisionalCaret).toBeNull();
+  expect(shown()).toEqual(predicted);
+  store.dispose();
+});
+
+test('echo caret publishes only to caret subscribers', () => {
+  const identity = { session: 'view', incarnation: 1, epoch: 1 };
+  const geometry: PeerlessFrameGeometry = {
+    identity, coversThroughSeq: 0, frameEpoch: 1, layoutRevision: 1,
+    pages: [], caret: null, selectionRects: [],
+  };
+  const store = createPeerlessViewStore({ identity, version: 0, throughSeq: 0, presentedThroughSeq: 0,
+    workerSelection: null, anchors: null, editState: undefined, geometry });
+  let main = 0;
+  let caretCount = 0;
+  store.subscribe(() => { main += 1; });
+  store.subscribeProvisionalCaret?.(() => { caretCount += 1; });
+  const caret = { source: 'echo' as const, throughSeq: 3, pageIndex: 0, rect: { x: 30, y: 0, width: 1, height: 20 } };
+  store.setProvisionalCaret(caret);
+  expect(main).toBe(0);
+  expect(caretCount).toBe(1);
+  expect(store.getProvisionalCaret?.()).toBe(caret);
+  expect(store.getSnapshot().provisionalCaret).toBe(caret);
+  store.setProvisionalCaret(null);
+  expect(main).toBe(0);
+  expect(caretCount).toBe(2);
+  store.setProvisionalCaret({ source: 'click', throughSeq: 4, pageIndex: 0, rect: { x: 9, y: 0, width: 1, height: 20 } });
+  expect(main).toBe(1);
+  expect(caretCount).toBe(3);
+  store.dispose();
+});
+
+for (const change of ['document version', 'layout revision', 'frame document version']) {
+  test(`a newer ${change} retires a provisional caret without covering its sequence`, () => {
+    const identity = { session: 'view', incarnation: 1, epoch: 1 };
+    const geometry: PeerlessFrameGeometry = {
+      identity, documentVersion: 'doc-1', coversThroughSeq: 0, frameEpoch: 1, layoutRevision: 1,
+      pages: [], caret: null, selectionRects: [],
+    };
+    const store = createPeerlessViewStore({ identity, version: 0, throughSeq: 0, presentedThroughSeq: 0,
+      workerSelection: null, anchors: null, editState: undefined, geometry });
+    const caret = { throughSeq: 2, pageIndex: 0, rect: { x: 30, y: 0, width: 1, height: 18 } };
+    store.setProvisionalCaret(caret);
+    if (change === 'document version') {
+      store.acceptWorkerState(identity, { epoch: 1, version: 1, throughSeq: 0, presentedThroughSeq: 0,
+        selection: undefined, editState: undefined });
+    } else {
+      store.installFrameGeometry({ ...geometry, frameEpoch: 2,
+        ...(change === 'layout revision' ? { layoutRevision: 2 } : { documentVersion: 'doc-2' }) });
+    }
+    expect(store.getSnapshot().provisionalCaret).toBeNull();
+    expect(store.getSnapshot().presentedThroughSeq).toBe(0);
+    store.setProvisionalCaret(caret);
+    store.installFrameGeometry({ ...store.getSnapshot().geometry!, frameEpoch: 3 });
+    expect(store.getSnapshot().provisionalCaret).toBe(caret);
+    store.dispose();
+  });
+}
+
+test('selection acks ahead of their deferred frames keep the installed selection displayable', () => {
+  const identity = { session: 'view', incarnation: 1, epoch: 1 };
+  const geometry = (coversThroughSeq: number, frameEpoch: number): PeerlessFrameGeometry => ({
+    identity, coversThroughSeq, frameEpoch, layoutRevision: 1, pages: [], caret: null,
+    selectionRects: [{ x: 0, y: 0, width: frameEpoch, height: 12 }],
+  });
+  const store = createPeerlessViewStore({ identity, version: 4, throughSeq: 1, presentedThroughSeq: 1,
+    workerSelection: null, anchors: null, editState: undefined, geometry: geometry(1, 1) });
+  const ack = (throughSeq: number, version = 4) => store.acceptWorkerState(identity,
+    { epoch: 1, version, throughSeq, presentedThroughSeq: 1, selection: undefined, editState: undefined });
+  expect(geometryMatchesDocument(store.getSnapshot())).toBe(true);
+  for (let seq = 2; seq <= 4; seq += 1) {
+    ack(seq);
+    expect(geometryMatchesDocument(store.getSnapshot())).toBe(true);
+    store.installFrameGeometry(geometry(seq - 1 > 1 ? seq - 1 : 1, seq));
+    expect(geometryMatchesDocument(store.getSnapshot())).toBe(true);
+  }
+  ack(5, 5);
+  expect(geometryMatchesDocument(store.getSnapshot())).toBe(false);
+  ack(6, 5);
+  expect(geometryMatchesDocument(store.getSnapshot())).toBe(false);
+  store.installFrameGeometry(geometry(5, 6));
+  expect(geometryMatchesDocument(store.getSnapshot())).toBe(true);
+  ack(7, 5);
+  expect(geometryMatchesDocument(store.getSnapshot())).toBe(true);
+  store.installFrameGeometry(geometry(4, 7));
+  expect(store.getSnapshot().geometry?.coversThroughSeq).toBe(5);
+  store.acceptWorkerState({ ...identity, incarnation: 2 }, { epoch: 1, version: 5, throughSeq: 0,
+    presentedThroughSeq: -1, selection: null, editState: undefined });
+  expect(geometryMatchesDocument(store.getSnapshot())).toBe(false);
+  store.dispose();
+});
+
+test('a rescaled geometry replaces only the installed frame', () => {
+  const identity = { session: 'view', incarnation: 1, epoch: 1 };
+  const geometry = (frameEpoch: number, rasterScale: number): PeerlessFrameGeometry => ({
+    identity, coversThroughSeq: frameEpoch, frameEpoch, layoutRevision: frameEpoch, rasterScale,
+    pages: [], caret: null, selectionRects: [],
+  });
+  const installed = geometry(2, 1);
+  const store = createPeerlessViewStore({ identity, version: 2, throughSeq: 2, presentedThroughSeq: 2,
+    workerSelection: undefined, anchors: null, editState: undefined, geometry: installed });
+  store.rescaleFrameGeometry!(geometry(1, 2));
+  store.rescaleFrameGeometry!(geometry(3, 2));
+  store.rescaleFrameGeometry!({ ...geometry(2, 2), identity: { ...identity, epoch: 2 } });
+  expect(store.getSnapshot().geometry).toBe(installed);
+  const rescaled = geometry(2, 1.5);
+  store.rescaleFrameGeometry!(rescaled);
+  expect(store.getSnapshot().geometry).toBe(rescaled);
+  expect(store.getSnapshot().presentedThroughSeq).toBe(2);
+  store.dispose();
+});

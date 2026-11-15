@@ -1,0 +1,33 @@
+[package]
+name = "nimbleoffice-vsdx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Typed native facade for inspecting VSDX diagrams."
+readme = "README.md"
+keywords = ["vsdx", "visio", "shapesheet"]
+categories = ["parser-implementations"]
+
+[dependencies]
+nimbleoffice-fonts = { workspace = true }
+vsdx-parse.workspace = true
+vsdx-resolve.workspace = true
+vsdx-validate = { workspace = true }
+vsdx-eval.workspace = true
+vsdx-edit.workspace = true
+vsdx-render.workspace = true
+vsdx-raster = { workspace = true, optional = true }
+
+[features]
+default = ["fonts", "raster", "fonts-latin", "fonts-intl", "fonts-cjk"]
+fonts = ["nimbleoffice-fonts/manager"]
+fonts-latin = ["fonts", "nimbleoffice-fonts/fonts-latin"]
+fonts-intl = ["fonts", "nimbleoffice-fonts/fonts-intl"]
+fonts-cjk = ["fonts", "nimbleoffice-fonts/fonts-cjk"]
+raster = ["dep:vsdx-raster"]
+
+[dev-dependencies]
+ooxml-opc.workspace = true
+vsdx-resolve.workspace = true

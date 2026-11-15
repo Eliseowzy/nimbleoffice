@@ -1,0 +1,149 @@
+{
+  "name": "@nimbleoffice/xlsx-i18n",
+  "version": "0.5.1",
+  "description": "Shared UI locale strings and types for the @nimbleoffice/xlsx React editor.",
+  "sideEffects": false,
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs",
+      "default": "./dist/index.mjs"
+    },
+    "./en": {
+      "types": "./dist/en.d.mts",
+      "import": "./dist/en.mjs",
+      "default": "./dist/en.mjs"
+    },
+    "./ar": {
+      "types": "./dist/ar.d.mts",
+      "import": "./dist/ar.mjs",
+      "default": "./dist/ar.mjs"
+    },
+    "./de": {
+      "types": "./dist/de.d.mts",
+      "import": "./dist/de.mjs",
+      "default": "./dist/de.mjs"
+    },
+    "./es": {
+      "types": "./dist/es.d.mts",
+      "import": "./dist/es.mjs",
+      "default": "./dist/es.mjs"
+    },
+    "./fr": {
+      "types": "./dist/fr.d.mts",
+      "import": "./dist/fr.mjs",
+      "default": "./dist/fr.mjs"
+    },
+    "./he": {
+      "types": "./dist/he.d.mts",
+      "import": "./dist/he.mjs",
+      "default": "./dist/he.mjs"
+    },
+    "./hi": {
+      "types": "./dist/hi.d.mts",
+      "import": "./dist/hi.mjs",
+      "default": "./dist/hi.mjs"
+    },
+    "./id": {
+      "types": "./dist/id.d.mts",
+      "import": "./dist/id.mjs",
+      "default": "./dist/id.mjs"
+    },
+    "./it": {
+      "types": "./dist/it.d.mts",
+      "import": "./dist/it.mjs",
+      "default": "./dist/it.mjs"
+    },
+    "./ja": {
+      "types": "./dist/ja.d.mts",
+      "import": "./dist/ja.mjs",
+      "default": "./dist/ja.mjs"
+    },
+    "./ko": {
+      "types": "./dist/ko.d.mts",
+      "import": "./dist/ko.mjs",
+      "default": "./dist/ko.mjs"
+    },
+    "./nl": {
+      "types": "./dist/nl.d.mts",
+      "import": "./dist/nl.mjs",
+      "default": "./dist/nl.mjs"
+    },
+    "./pl": {
+      "types": "./dist/pl.d.mts",
+      "import": "./dist/pl.mjs",
+      "default": "./dist/pl.mjs"
+    },
+    "./pt-BR": {
+      "types": "./dist/pt-BR.d.mts",
+      "import": "./dist/pt-BR.mjs",
+      "default": "./dist/pt-BR.mjs"
+    },
+    "./ru": {
+      "types": "./dist/ru.d.mts",
+      "import": "./dist/ru.mjs",
+      "default": "./dist/ru.mjs"
+    },
+    "./tr": {
+      "types": "./dist/tr.d.mts",
+      "import": "./dist/tr.mjs",
+      "default": "./dist/tr.mjs"
+    },
+    "./uk": {
+      "types": "./dist/uk.d.mts",
+      "import": "./dist/uk.mjs",
+      "default": "./dist/uk.mjs"
+    },
+    "./vi": {
+      "types": "./dist/vi.d.mts",
+      "import": "./dist/vi.mjs",
+      "default": "./dist/vi.mjs"
+    },
+    "./zh-CN": {
+      "types": "./dist/zh-CN.d.mts",
+      "import": "./dist/zh-CN.mjs",
+      "default": "./dist/zh-CN.mjs"
+    },
+    "./zh-TW": {
+      "types": "./dist/zh-TW.d.mts",
+      "import": "./dist/zh-TW.mjs",
+      "default": "./dist/zh-TW.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.1",
+    "typescript": "^6.0.3"
+  },
+  "keywords": [
+    "xlsx",
+    "editor",
+    "i18n",
+    "locales",
+    "translations"
+  ],
+  "author": "NimbleOffice",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eliseowzy/nimbleoffice.git",
+    "directory": "packages/xlsx-i18n"
+  },
+  "bugs": {
+    "url": "https://github.com/Eliseowzy/nimbleoffice/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

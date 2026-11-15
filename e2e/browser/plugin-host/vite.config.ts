@@ -1,0 +1,107 @@
+import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
+import { defineConfig, type Plugin } from 'vite';
+
+const root = resolve(import.meta.dirname, '../../..');
+const fromReact = createRequire(resolve(root, 'packages/docx-react/package.json'));
+const tailwind = fromReact('tailwindcss');
+const autoprefixer = fromReact('autoprefixer');
+
+const sourceSessionWorker: Plugin = {
+  name: 'source-session-worker',
+  enforce: 'pre',
+  resolveId(source, importer) {
+    if (source !== '#session-worker' || !importer) return null;
+    const format = /\/packages\/(docx|pptx|xlsx)\/src\//.exec(importer)?.[1];
+    if (!format) return null;
+    return resolve(root, 'packages', format, 'src', format === 'docx' ? 'yrs' : 'session', 'sessionWorker.missing.ts');
+  },
+};
+
+/** Serves the plugin-host harnesses against the package sources. */
+export default defineConfig({
+  root: import.meta.dirname,
+  optimizeDeps: { entries: ['*.html'] },
+  define: { 'globalThis.__DOCX_PEERLESS_HARNESS__': JSON.stringify(process.env.DOCX_PEERLESS_HARNESS === '1') },
+  plugins: [
+    sourceSessionWorker,
+    {
+      name: 'main-document-load-probe',
+      enforce: 'pre',
+      transform(source, id) {
+        const file = id.split('?')[0];
+        if (file.endsWith('/pptx/src/wasm/loader.ts')) {
+          const construction = 'renderer = construct(() => new PptxRenderer());';
+          if (!source.includes(construction)) this.error('Update the main-thread presentation engine capture');
+          return source.replace(construction, `${construction} globalThis.__pptxMainEngineProbe?.capture();`);
+        }
+        if (file.endsWith('/xlsx/src/wasm/loader.ts')) {
+          const wrapping = /(function wrapWorkbookDocument\([\s\S]*?\): WorkbookHandle \{)/;
+          if (!wrapping.test(source)) this.error('Update the main-thread workbook capture for loader.ts');
+          return source.replace(wrapping, '$1 globalThis.__xlsxMainEngineProbe?.capture();');
+        }
+        if (file.endsWith('/DocxEditor/hooks/useYrsCoreSession.ts')) {
+          const creation = /const (\w+) = await yrs\.createYrsSession\([^;]+\);/g;
+          if (!creation.test(source)) {
+            this.error('Update the main-document session capture for useYrsCoreSession.ts');
+          }
+          return source.replace(creation, (statement, session) =>
+            `${statement} globalThis.__workerProposalTest?.captureSession(${session});`
+          );
+        }
+      },
+    },
+  ],
+  resolve: {
+    alias: [
+      {
+        find: /^@nimbleoffice\/docx-react$/,
+        replacement: resolve(root, 'packages/docx-react/src/index.ts'),
+      },
+      {
+        find: /^@nimbleoffice\/docx-react\/styles\.css$/,
+        replacement: resolve(root, 'packages/docx-react/src/styles/editor.css'),
+      },
+      {
+        find: /^@nimbleoffice\/docx-i18n$/,
+        replacement: resolve(root, 'packages/docx-i18n/src/index.ts'),
+      },
+      { find: /^@nimbleoffice\/docx$/, replacement: resolve(root, 'packages/docx/src/core.ts') },
+      { find: /^@nimbleoffice\/docx\/(.*)$/, replacement: resolve(root, 'packages/docx/src/$1') },
+      {
+        find: /^@nimbleoffice\/pptx-react$/,
+        replacement: resolve(root, 'packages/pptx-react/src/index.ts'),
+      },
+      {
+        find: /^@nimbleoffice\/pptx-i18n$/,
+        replacement: resolve(root, 'packages/pptx-i18n/src/index.ts'),
+      },
+      {
+        find: /^@nimbleoffice\/pptx-i18n\/(editor|proposals)$/,
+        replacement: resolve(root, 'packages/pptx-i18n/src/$1.ts'),
+      },
+      { find: /^@nimbleoffice\/pptx$/, replacement: resolve(root, 'packages/pptx/src/index.ts') },
+      { find: /^@nimbleoffice\/pptx\/(.*)$/, replacement: resolve(root, 'packages/pptx/src/$1') },
+      {
+        find: /^@nimbleoffice\/xlsx-react$/,
+        replacement: resolve(root, 'packages/xlsx-react/src/index.ts'),
+      },
+      {
+        find: /^@nimbleoffice\/xlsx-i18n$/,
+        replacement: resolve(root, 'packages/xlsx-i18n/src/index.ts'),
+      },
+      { find: /^@nimbleoffice\/xlsx$/, replacement: resolve(root, 'packages/xlsx/src/index.ts') },
+      { find: /^@nimbleoffice\/xlsx\/(.*)$/, replacement: resolve(root, 'packages/xlsx/src/$1') },
+    ],
+  },
+  css: {
+    postcss: {
+      plugins: [
+        tailwind({ config: resolve(root, 'packages/docx-react/tailwind.config.js') }),
+        autoprefixer(),
+      ],
+    },
+  },
+  server: { fs: { allow: [root] } },
+  worker: { format: 'es', plugins: () => [sourceSessionWorker] },
+});

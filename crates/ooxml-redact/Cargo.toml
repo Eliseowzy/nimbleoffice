@@ -1,0 +1,27 @@
+[package]
+name = "nimbleoffice-redact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Structure-preserving redaction for DOCX, XLSX, PPTX, and Visio packages."
+
+[lib]
+name = "ooxml_redact"
+
+[dependencies]
+getrandom = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff"] }
+tiff = { version = "0.11", default-features = false, features = ["deflate"] }
+ooxml-opc.workspace = true
+quick-xml = "0.41"
+thiserror = "2"
+unicode-script = "0.5"
+vsdx-parse.workspace = true
+
+[dev-dependencies]
+docx-parse.workspace = true
+pptx-parse.workspace = true
+xlsx-parse.workspace = true
+vsdx-render.workspace = true

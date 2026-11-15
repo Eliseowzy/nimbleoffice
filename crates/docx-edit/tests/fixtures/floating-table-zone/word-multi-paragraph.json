@@ -1,0 +1,29 @@
+{
+  "source": "Microsoft Word for Mac 16.114 build 26110224, PDF export",
+  "cases": {
+    "multi-s12": {
+      "page": 1,
+      "y": 166.08,
+      "x0": 331.5,
+      "prefix": "wrapword13"
+    },
+    "multi-s20": {
+      "page": 1,
+      "y": 221.28,
+      "x0": 331.5,
+      "prefix": "wrapword21"
+    },
+    "multi-s28": {
+      "page": 1,
+      "y": 248.88,
+      "x0": 72.0,
+      "prefix": "wrapword29"
+    },
+    "multi-s4": {
+      "page": 1,
+      "y": 110.88,
+      "x0": 331.5,
+      "prefix": "wrapword05"
+    }
+  }
+}

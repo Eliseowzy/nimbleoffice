@@ -1,0 +1,684 @@
+export interface TextStyle {
+  bold?: boolean;
+  italic?: boolean;
+  fontSizePt?: number;
+  color?: string;
+  fontFamily?: string;
+  underline?: string;
+  strike?: string;
+  spacingPt?: number;
+  baselinePct?: number;
+}
+
+export type TextStylePatch = TextStyle;
+
+export interface TextStyleSnapshot {
+  bold: boolean | null;
+  italic: boolean | null;
+  fontSizePt: number | null;
+  color: string | null;
+  fontFamily: string | null;
+  underline: string | null;
+  strike?: string | null;
+  spacingPt?: number | null;
+  baselinePct?: number | null;
+  /** `a:rPr@kern`: the smallest size, in points, the run is kerned at. */
+  kernPt?: number | null;
+  /** `a:rPr@cap`: how the run is cased when drawn, never in the stored text. */
+  caps?: 'none' | 'small' | 'all' | null;
+  /** Resolved formatting only: the theme slot `fontFamily` comes from, `null` for a literal family. */
+  fontTheme?: PptxThemeFontSlot | null;
+  /** Resolved formatting only: the theme slot of the inherited East Asian font. */
+  eastAsianFontTheme?: PptxThemeFontSlot | null;
+}
+
+/** A theme font slot: the heading (`major`, `+mj-lt`) or body (`minor`, `+mn-lt`) font. */
+export type PptxThemeFontSlot = 'major' | 'minor';
+
+/** One theme font slot's typefaces. */
+export interface PptxThemeFontFace {
+  latin: string;
+  /** `null` when the theme leaves the East Asian face empty. */
+  eastAsian: string | null;
+}
+
+/** The heading and body fonts of a slide's theme. */
+export interface PptxThemeFonts {
+  major: PptxThemeFontFace;
+  minor: PptxThemeFontFace;
+}
+
+export interface TextRunSnapshot {
+  text: string;
+  style: TextStyleSnapshot;
+}
+
+/** OOXML `a:pPr@algn` token. */
+export type ParagraphAlignment = 'l' | 'ctr' | 'r' | 'just';
+
+export interface ParagraphSnapshot {
+  id: string;
+  alignment: string | null;
+  level: number;
+  bulletJson: string | null;
+  runs: TextRunSnapshot[];
+}
+
+export interface StorySnapshot {
+  id: string;
+  length: number;
+  paragraphs: ParagraphSnapshot[];
+}
+
+export interface PptxTextSearchOptions {
+  /** Defaults to false. */
+  caseSensitive?: boolean;
+  /** Maximum matches; unlimited by default. */
+  limit?: number;
+}
+
+/**
+ * A caret position in a story that later edits, undo, redo and remote updates
+ * move along with the text. Plain data; `position` is opaque.
+ */
+export interface PptxCaretAnchor {
+  storyId: string;
+  position: string;
+}
+
+/** Zero-based slide index; story-local UTF-16 offsets. */
+export interface PptxTextMatch {
+  slideIndex: number;
+  slideId: string;
+  shapeId: string;
+  storyId: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+export type ShapeKind = 'shape' | 'picture' | 'graphicFrame' | 'group';
+
+/** Hue and hue offsets use turns; other values use fractions. */
+export type ColorTransform =
+  | {
+      kind:
+        | 'tint' | 'shade'
+        | 'hue' | 'hueMod' | 'hueOff'
+        | 'sat' | 'satMod' | 'satOff'
+        | 'lum' | 'lumMod' | 'lumOff'
+        | 'red' | 'redMod' | 'redOff'
+        | 'green' | 'greenMod' | 'greenOff'
+        | 'blue' | 'blueMod' | 'blueOff'
+        | 'alpha' | 'alphaMod' | 'alphaOff';
+      value: number;
+    }
+  | { kind: 'comp' | 'inv' | 'gray' | 'gamma' | 'invGamma' };
+
+export interface ColorValue {
+  rgb?: string;
+  themeColor?: string;
+  themeTint?: string;
+  themeShade?: string;
+  auto?: boolean;
+  luminanceModulation?: number;
+  luminanceOffset?: number;
+  saturationModulation?: number;
+  alpha?: number;
+  /** Overrides legacy colour modifiers; legacy alpha applies without an alpha step. */
+  transforms?: ColorTransform[];
+}
+
+export interface ShapeGradient {
+  type: string;
+  angle?: number;
+  stops: Array<{ position: number; color: ColorValue }>;
+}
+
+/** An authored fill as the deck stores it. */
+export interface ShapeFill {
+  type: string;
+  color?: ColorValue;
+  gradient?: ShapeGradient;
+}
+
+export interface ShapeLineEnd {
+  type: string;
+  width: string | null;
+  length: string | null;
+}
+
+/** An authored outline as the deck stores it; `width` is EMU. */
+export interface ShapeOutline {
+  width?: number;
+  color?: ColorValue;
+  gradient?: ShapeGradient;
+  style?: string;
+  cap?: string;
+  join?: string;
+  headEnd?: ShapeLineEnd;
+  tailEnd?: ShapeLineEnd;
+}
+
+export type BlipEffect =
+  | { type: 'biLevel'; threshold: number }
+  | { type: 'grayscale' }
+  | { type: 'luminance'; brightness: number; contrast: number }
+  | { type: 'duotone'; shadow: ColorValue | null; highlight: ColorValue | null }
+  | { type: 'colorChange'; from: ColorValue | null; to: ColorValue | null; useAlpha?: boolean };
+
+export interface ShapeSnapshot {
+  id: string;
+  sourceId: number;
+  kind: ShapeKind;
+  name: string;
+  /** `p:cNvPr/@title`, the alternative-text title. */
+  title?: string;
+  /** `p:cNvPr/@descr`, the alternative-text description. */
+  description?: string;
+  /** True when `p:cNvPr` carries the a16 decorative extension; omitted when false. */
+  decorative?: boolean;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotationDeg: number;
+  flipH: boolean;
+  flipV: boolean;
+  /** The geometry the shape draws at, present only while it has none of its own. */
+  inherited?: InheritedGeometry | null;
+  /** Hides this shape and its descendants; omitted when false. */
+  hidden?: boolean;
+  textBox?: boolean;
+  aspectRatioLocked?: boolean;
+  geometry: string;
+  adjustValues: Record<string, number>;
+  placeholder: unknown | null;
+  fill: ShapeFill | null;
+  resolvedFillColor: string | null;
+  outline: ShapeOutline | null;
+  resolvedOutlineColor: string | null;
+  mediaPartPath: string | null;
+  /** Image data added to this session, retained across saves. */
+  pendingMedia?: { contentType: string; base64: string } | null;
+  blipEffects?: BlipEffect[];
+  graphic: unknown | null;
+  textStories: StorySnapshot[];
+  children: ShapeSnapshot[];
+}
+
+/** The transform a placeholder takes from its layout or master. */
+export interface InheritedGeometry {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotationDeg: number;
+  flipH: boolean;
+  flipV: boolean;
+}
+
+/** Stored layout or master settings; omitted boolean attributes default to true and do not gate slide placeholders. */
+export interface HeaderFooterSettings {
+  slideNumber: boolean;
+  footer: boolean;
+  date: boolean;
+  header: boolean;
+}
+
+/** Session shape id and text of the first visible slide placeholder in shape order, including groups; text joins stories with newlines and preserves empty text.
+ * Slide number fields use firstSlideNum (default 1) plus deck index, counting hidden slides; fixed text stays unchanged. */
+export interface SlideHeaderFooterText {
+  shapeId: string;
+  text: string;
+}
+
+/** Stored date text; field is the first datetime* field type (updates on display), or null for fixed text. */
+export interface SlideDateText extends SlideHeaderFooterText {
+  field: string | null;
+}
+
+/** Visible placeholders from the slide itself, independent of stored settings; missing placeholders are null. */
+export interface SlideHeaderFooter {
+  footer: SlideHeaderFooterText | null;
+  slideNumber: SlideHeaderFooterText | null;
+  date: SlideDateText | null;
+}
+
+export interface SlideLayoutSnapshot {
+  /** Layout settings, falling back to the master; null when neither stores p:hf. */
+  headerFooter?: HeaderFooterSettings | null;
+  name: string | null;
+  type: string | null;
+}
+
+export interface SlideSnapshot {
+  headerFooter?: SlideHeaderFooter | null;
+  title?: string | null;
+  hidden?: boolean | null;
+  layout?: SlideLayoutSnapshot | null;
+  id: string;
+  sourcePartPath: string | null;
+  layoutPartPath: string | null;
+  name: string | null;
+  /** Speaker notes as plain text; absent when the slide has none. */
+  notes?: string;
+  /** The slide's own background; absent when it inherits the layout's. */
+  background?: ShapeFill;
+  /** `true` once an edit changed the background from the one the file declares. */
+  backgroundEdited?: boolean;
+  shapes: ShapeSnapshot[];
+}
+
+export interface DeckSnapshot {
+  widthEmu: number;
+  heightEmu: number;
+  slides: SlideSnapshot[];
+  commentFlavor?: CommentFlavor;
+  comments?: CommentSnapshot[];
+}
+
+/** Legacy comments or modern threads. */
+export type CommentFlavor = 'legacy' | 'modern';
+
+export interface CommentSnapshot {
+  id: string;
+  slideId: string;
+  author: string;
+  initials: string;
+  text: string;
+  created: string | null;
+  xEmu: number;
+  yEmu: number;
+  /** Set on a reply; names the thread root. */
+  parentId: string | null;
+  resolved: boolean;
+}
+
+export interface CommentReceipt {
+  commentId: string;
+  slideId: string;
+  parentId: string | null;
+  resolved: boolean;
+}
+
+export interface SlideReceipt {
+  slideId: string;
+  fromIndex: number | null;
+  toIndex: number | null;
+}
+
+export interface ShapeReceipt {
+  slideId: string;
+  shapeId: string;
+  index: number;
+}
+
+export interface ShapeZOrderReceipt {
+  slideId: string;
+  shapeId: string;
+  fromIndex: number;
+  toIndex: number;
+}
+
+export interface ShapeRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface TransformReceipt {
+  slideId: string;
+  shapeId: string;
+  before: ShapeRect;
+  after: ShapeRect;
+}
+
+export interface TextReceipt {
+  storyId: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface ShapeDraft {
+  name: string;
+  rect: ShapeRect;
+  text: string;
+  style: TextStyle;
+}
+
+export interface PresetShapeDraft {
+  name: string;
+  geometry: string;
+  rect: ShapeRect;
+  fill?: string | null;
+}
+
+export interface PictureDraft {
+  name: string;
+  rect: ShapeRect;
+  /** The image's MIME type, e.g. `image/png`. */
+  contentType: string;
+  /** The image bytes, base64-encoded. */
+  mediaBase64: string;
+}
+
+export interface ShapeStroke {
+  color?: string;
+  widthPt?: number;
+}
+
+export interface ShapeFillReceipt {
+  slideId: string;
+  shapeId: string;
+  before: string | null;
+  after: string | null;
+}
+
+export interface ShapeStrokeReceipt {
+  slideId: string;
+  shapeId: string;
+  before: ShapeStroke | null;
+  after: ShapeStroke | null;
+}
+
+export interface ShapeAdjustReceipt {
+  slideId: string;
+  shapeId: string;
+  before: Record<string, number>;
+  after: Record<string, number>;
+}
+
+export interface HistoryResult {
+  applied: boolean;
+  snapshot: DeckSnapshot;
+}
+
+/** Renderer stage latencies of one profiled slide layout, in ms. */
+export interface LayoutProfile {
+  scopeMs: number;
+  layoutMs: number;
+  serializeMs: number;
+}
+
+export interface ProfiledLayout {
+  layout: SlideDisplayList;
+  profile: LayoutProfile;
+}
+
+/** Boundary stage latencies of one profiled edit, in ms. */
+export interface EditProfile {
+  parseMs: number;
+  applyMs: number;
+  serializeMs: number;
+}
+
+export interface HistoryProfile {
+  undoMs: number;
+  snapshotMs: number;
+  serializeMs: number;
+}
+
+export interface Profiled<T, P = EditProfile> {
+  receipt: T;
+  profile: P;
+}
+
+export interface PptxFontFace {
+  family: string;
+  bold?: boolean;
+  italic?: boolean;
+  bytes: Uint8Array;
+}
+
+export type GeometryPathCommand =
+  | { type: 'move'; x: number; y: number }
+  | { type: 'line'; x: number; y: number }
+  | { type: 'quad'; cpx: number; cpy: number; x: number; y: number }
+  | {
+      type: 'cubic';
+      cp1x: number;
+      cp1y: number;
+      cp2x: number;
+      cp2y: number;
+      x: number;
+      y: number;
+    }
+  | { type: 'close' };
+
+export type Paint =
+  | { kind: 'solid'; color: string }
+  | {
+      kind: 'gradient';
+      gradientType: 'linear' | 'radial' | 'rectangular' | 'path';
+      angleDeg?: number;
+      stops: Array<{ position: number; color: string }>;
+    };
+
+export interface StrokeEnd {
+  kind: string;
+  width: number;
+  length: number;
+}
+
+export interface Stroke {
+  /** Solid colour or first gradient stop. */
+  color: string;
+  width: number;
+  dashed?: boolean;
+  paint?: Paint;
+  join?: 'round' | 'bevel' | 'miter';
+  headEnd?: StrokeEnd;
+  tailEnd?: StrokeEnd;
+}
+
+/** An `a:outerShdw`: a blurred copy of the shape's own path, offset and tinted. */
+export interface Shadow {
+  paths?: Array<{ path: GeometryPathCommand[]; fill: boolean; stroke?: Stroke }>;
+  color: string;
+  blur?: number;
+  dx?: number;
+  dy?: number;
+  scaleX?: number;
+  scaleY?: number;
+}
+
+export interface PrimitiveTransform {
+  rotationDeg?: number;
+  flipH?: boolean;
+  flipV?: boolean;
+}
+
+interface PrimitiveBase {
+  objectId: number;
+  shapeId?: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  transform?: PrimitiveTransform;
+}
+
+export interface ShapePrimitive extends PrimitiveBase {
+  kind: 'shape';
+  name: string;
+  geometry: string;
+  path: GeometryPathCommand[];
+  /** A rectangle substitutes for the authored outline or clip. */
+  geometryFallback?: boolean;
+  clip?: GeometryPathCommand[];
+  evenOdd?: boolean;
+  adjustValues?: Record<string, number>;
+  fill?: Paint;
+  stroke?: Stroke;
+  shadow?: Shadow;
+}
+
+/** An `a:blip` colour transform, colours already resolved to `#rrggbbaa`. */
+export type ImageEffect =
+  | { kind: 'biLevel'; threshold: number }
+  | { kind: 'grayscale' }
+  | { kind: 'alpha'; amount: number }
+  | { kind: 'luminance'; brightness: number; contrast: number }
+  | { kind: 'duotone'; shadow: string; highlight: string }
+  | { kind: 'colorChange'; from: string; to: string; useAlpha?: boolean };
+export interface ImageCrop {
+  left?: number;
+  top?: number;
+  right?: number;
+  bottom?: number;
+}
+
+export interface ImagePrimitive extends PrimitiveBase {
+  kind: 'image';
+  name: string;
+  assetId?: string;
+  /** Applied to the bitmap in order before it is drawn. */
+  effects?: ImageEffect[];
+  /** Fraction of the source discarded per edge, from `a:srcRect`. */
+  crop?: ImageCrop;
+  /** Bitmap destination within the picture frame. */
+  destination?: { x: number; y: number; w: number; h: number };
+  /** `a:tile`: repeat the picture at its own size, scaled by these fractions. */
+  tile?: { scaleX: number; scaleY: number };
+  /** Outline the picture is masked to, when its `spPr` gives it one. */
+  path?: GeometryPathCommand[];
+  /** A rectangle substitutes for the authored mask. */
+  geometryFallback?: boolean;
+  stroke?: Stroke;
+  shadow?: Shadow;
+}
+
+export interface CaretStop {
+  position: number;
+  x: number;
+}
+
+export interface PositionedGlyph {
+  glyphId: number;
+  cluster: number;
+  x: number;
+  advance: number;
+  xOffset: number;
+  yOffset: number;
+}
+
+export interface PositionedTextRun {
+  text: string;
+  start: number;
+  end: number;
+  x: number;
+  width: number;
+  fontId: number;
+  fontFamily: string;
+  fontSizePx: number;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  strike?: string;
+  color: string;
+  letterSpacingPx?: number;
+  baselineOffsetPx?: number;
+  glyphs: PositionedGlyph[];
+}
+
+export interface PositionedTextLine {
+  columnOffset?: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  baseline: number;
+  start: number;
+  end: number;
+  runs: PositionedTextRun[];
+  caretStops: CaretStop[];
+}
+
+export interface TextBoxPrimitive extends PrimitiveBase {
+  kind: 'textBox';
+  storyId?: string;
+  anchor: 'top' | 'center' | 'bottom';
+  paragraphs: Array<{
+    align?: 'left' | 'center' | 'right' | 'justify';
+    level: number;
+    runs: Array<{
+      text: string;
+      fontFamily: string;
+      fontSizePt: number;
+      bold?: boolean;
+      italic?: boolean;
+      underline?: boolean;
+      color: string;
+    }>;
+  }>;
+  lines: PositionedTextLine[];
+  overflow?: boolean;
+  /** `a:rPr/a:effectLst`: the shadow the box's glyphs are drawn with. */
+  textShadow?: Shadow;
+}
+
+export interface PlaceholderPrimitive extends PrimitiveBase {
+  kind: 'placeholder';
+  name: string;
+  label?: string;
+}
+
+/** A plotted chart. Its parts paint clipped to the chart rectangle, and
+ *  `label` is the screen-reader summary of the whole chart. */
+export interface ChartPrimitive extends PrimitiveBase {
+  kind: 'chart';
+  name: string;
+  label: string;
+  primitives: SlidePrimitive[];
+}
+
+/** A laid-out table. Its cells paint clipped to the table rectangle, and
+ *  `label` is the screen-reader summary of the whole table. */
+export interface TablePrimitive extends PrimitiveBase {
+  kind: 'table';
+  name: string;
+  label: string;
+  primitives: SlidePrimitive[];
+}
+
+export type SlidePrimitive =
+  | ShapePrimitive
+  | ImagePrimitive
+  | TextBoxPrimitive
+  | PlaceholderPrimitive
+  | ChartPrimitive
+  | TablePrimitive;
+
+export interface SlideDisplayList {
+  contractVersion: number;
+  width: number;
+  height: number;
+  background?: Paint;
+  primitives: SlidePrimitive[];
+}
+
+export type HitTestResult =
+  | { kind: 'shape'; shapeId: string }
+  | { kind: 'text'; shapeId: string; storyId: string; position: number };
+
+export interface UpdateEvent {
+  origin: 'local' | 'remote';
+  update: Uint8Array;
+}
+
+export interface TextParagraphDraft {
+  bullet?: boolean;
+  alignment?: ParagraphAlignment | 'justLow' | 'dist' | 'thaiDist' | null;
+  runs: Array<{ text: string; style?: TextStyle }>;
+}
+
+export interface TableReceipt {
+  slideId: string;
+  shapeId: string;
+  rowCount: number;
+  columnCount: number;
+  newCellRefs: string[];
+}

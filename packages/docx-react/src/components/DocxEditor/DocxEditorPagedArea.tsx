@@ -1,0 +1,643 @@
+import { useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
+import type { ReactNode } from 'react';
+import type {
+  Document,
+  Theme,
+  SectionProperties,
+  HeaderFooter,
+} from '@nimbleoffice/docx/types/document';
+import type { Comment } from '@nimbleoffice/docx/types/content';
+import { type BundledFontProvider } from '@nimbleoffice/docx/layout';
+import { PagedEditor, type PagedEditorProps, type PagedEditorRef } from './PagedEditor';
+import type { PagedEditorCommandBridge } from './hooks/usePagedEditorRefApi';
+import type { RustFontChainsProvider } from './hooks/useRustMeasurement';
+import type { Layout } from '@nimbleoffice/docx/layout/pagination';
+import type { DisplayList, DisplayListQueries } from '@nimbleoffice/docx/layout/render';
+import type { DocxReservationsPayload, DocxResolvedReservations, YrsResidentCaretSnapshot } from '@nimbleoffice/docx/yrs';
+import type {
+  DisplayPageNavigation,
+  FontRequirementsInWorker,
+  LayoutInWorker,
+  ResidentFrameApplyResult,
+} from './hooks/useDisplayList';
+import type { ResolveDisplayListQueries } from './hooks/displayListQueryEpochGate';
+import {
+  InlineHeaderFooterEditor,
+} from '../InlineHeaderFooterEditor';
+import { UnifiedSidebar } from '../UnifiedSidebar';
+import { CommentMarginMarkers } from '../CommentMarginMarkers';
+import { useCanvasOverlayTarget } from './internals/useCanvasOverlayTarget';
+import { CanvasCellSelectionOverlay } from './overlays/CanvasCellSelectionOverlay';
+import { CanvasPartSelectionOverlay } from './overlays/CanvasPartSelectionOverlay';
+import { projectPageLocalRect } from './internals/canvasProjection';
+import { Tooltip } from '../ui/Tooltip';
+import { MaterialSymbol } from '../ui/Icons';
+import type { HyperlinkPopupData } from '../ui/HyperlinkPopup';
+import type { WrapType } from '@nimbleoffice/docx/docx/wrapTypes';
+import type { ReactSidebarItem } from '../../plugin-api/types';
+import type { RenderedDomContext } from '../../plugin-api/types';
+import type { YrsToolbarSelection } from './yrsToolbar';
+import type { TrackedChangesResult } from '@nimbleoffice/docx/layout/render';
+import type { DocxEditorCollaborationOptions } from './types';
+import type { YrsCoreSession } from './hooks/useYrsCoreSession';
+import { partEditStory, type NoteEdit, type PartEdit, type PartEditTarget } from './partEdit';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
+import type { ViewerSelectionChange } from './internals/viewerSelectionController';
+import { useTranslation } from '../../i18n';
+
+/**
+ * Body of the editor: the paged editor host, its sidebar overlay
+ * (UnifiedSidebar + comment margin markers), the floating "Add comment"
+ * button anchored to a non-empty selection, and the inline header/footer
+ * editor that appears when a user double-clicks an H/F slot.
+ *
+ * The floating button dispatches a pending comment mark inline rather
+ * than going through onAddComment — same shape as the right-click menu's
+ * addComment branch.
+ */
+export function DocxEditorPagedArea({
+  // PagedEditor refs + state
+  pagedEditorRef,
+  commandBridgeRef,
+  scrollContainerRef,
+  editorContentRef,
+  reviewOverlay,
+  // Document + section
+  document,
+  yrsCore,
+  pluginHostOpen,
+  reservations,
+  reservationSets,
+  collaboration,
+  theme,
+  initialSectionProperties,
+  finalSectionProperties,
+  // Header/footer
+  headerContent,
+  footerContent,
+  firstPageHeaderContent,
+  firstPageFooterContent,
+  partEditTarget,
+  setPartEditTarget,
+  onHeaderFooterDoubleClick,
+  onNoteClick,
+  onRemoveHeaderFooter,
+  onBodyClick,
+  // Editor
+  zoom,
+  readOnly,
+  holdInput,
+  inputScope,
+  inputQueries,
+  viewerDocumentRead,
+  showHiddenText = false,
+  onYrsContentChange,
+  onYrsHistoryChange,
+  onPagedSelectionChange,
+  onYrsSelectionChange,
+  onViewerSelectionChange,
+  onRenderedDomContextReady,
+  pluginOverlays,
+  onHyperlinkClick,
+  hyperlinkPopupData,
+  onHyperlinkPopupNavigate,
+  onHyperlinkPopupCopy,
+  onHyperlinkPopupEdit,
+  onHyperlinkPopupRemove,
+  onHyperlinkPopupClose,
+  onContextMenu,
+  // Sidebar
+  sidebarOpen,
+  sidebarItems,
+  anchorPositions,
+  onAnchorPositionsChange,
+  onYrsTrackedChangesChange,
+  onViewerCommentRangesChange,
+  viewerSidebarActive,
+  pluginRenderedDomContext,
+  pageWidthPx,
+  expandedSidebarItem,
+  setExpandedSidebarItem,
+  comments,
+  resolvedCommentIds,
+  resolvedIdsForRender,
+  setShowCommentsSidebar,
+  // Scroll page indicator
+  onTotalPagesChange,
+  onLayoutComputed,
+  layoutInWorker,
+  fontRequirementsInWorker,
+  onError,
+  applyResidentInput,
+  applyResidentDelete,
+  displayListQueries,
+  resolveDisplayListQueries,
+  pageNavigation,
+  canvasDisplayList,
+  displayListFrameEpoch,
+  residentCaret,
+  residentCaretAuthoritative,
+  paintedCaretActive,
+  onCaretInput,
+  onCaretInputDispatched,
+  onCaretInterrupt,
+  canvasHostRef,
+  // Floating comment button
+  floatingCommentBtn,
+  isAddingComment,
+  setCommentSelectionRange,
+  setAddCommentYPosition,
+  setIsAddingComment,
+  setFloatingCommentBtn,
+  commentSidebarOverflow,
+  selectionEndX,
+  isSuggesting = false,
+  author = 'User',
+  measurementFontProvider,
+  rustFontChainsProviderRef,
+}: {
+  pagedEditorRef: React.RefObject<PagedEditorRef | null>;
+  commandBridgeRef: React.MutableRefObject<PagedEditorCommandBridge | null>;
+  scrollContainerRef: React.RefObject<HTMLDivElement | null>;
+  editorContentRef: React.RefObject<HTMLDivElement | null>;
+  /** Wraps the canvas-mode sidebar overlay with the tracked-change review layer, hosted in `hostRef`. */
+  reviewOverlay?: { hostRef: React.RefObject<HTMLDivElement | null>; wrap(node: React.ReactNode): React.ReactNode };
+  document: Document | null;
+  yrsCore: YrsCoreSession;
+  pluginHostOpen?: boolean;
+  reservations?: DocxResolvedReservations | null;
+  reservationSets?: DocxReservationsPayload | null;
+  collaboration?: DocxEditorCollaborationOptions;
+  theme: Theme | null | undefined;
+  initialSectionProperties: SectionProperties | undefined;
+  finalSectionProperties: SectionProperties | undefined;
+  headerContent: HeaderFooter | null | undefined;
+  footerContent: HeaderFooter | null | undefined;
+  firstPageHeaderContent: HeaderFooter | null | undefined;
+  firstPageFooterContent: HeaderFooter | null | undefined;
+  partEditTarget: PartEditTarget | null;
+  setPartEditTarget: React.Dispatch<React.SetStateAction<PartEditTarget | null>>;
+  onHeaderFooterDoubleClick: (position: 'header' | 'footer', pageNumber?: number) => void;
+  onNoteClick: (note: NoteEdit) => void;
+  onRemoveHeaderFooter: () => void;
+  onBodyClick: () => void;
+  zoom: number;
+  readOnly: boolean;
+  holdInput?: boolean;
+  inputScope?: number;
+  inputQueries?: DisplayListQueries | null;
+  /** A viewer session's document reads; see {@link PagedEditorProps.viewerDocumentRead}. */
+  viewerDocumentRead?: PagedEditorProps['viewerDocumentRead'];
+  showHiddenText?: boolean;
+  onYrsContentChange: () => void;
+  onYrsHistoryChange?: (canUndo: boolean, canRedo: boolean) => void;
+  onPagedSelectionChange: NonNullable<PagedEditorProps['onSelectionChange']>;
+  onYrsSelectionChange: (selection: YrsToolbarSelection) => void;
+  onViewerSelectionChange?: (selection: ViewerSelectionChange) => void;
+  onRenderedDomContextReady:
+    | ((ctx: RenderedDomContext, queries: DisplayListQueries) => void)
+    | undefined;
+  pluginOverlays: ReactNode;
+  onHyperlinkClick: (data: HyperlinkPopupData) => void;
+  hyperlinkPopupData: HyperlinkPopupData | null;
+  onHyperlinkPopupNavigate: (href: string) => void;
+  onHyperlinkPopupCopy: (href: string) => void;
+  onHyperlinkPopupEdit: (displayText: string, href: string) => void;
+  onHyperlinkPopupRemove: () => void;
+  onHyperlinkPopupClose: () => void;
+  onContextMenu: (data: {
+    x: number;
+    y: number;
+    hasSelection: boolean;
+    image?: {
+      pos: number;
+      wrapType: WrapType;
+      cssFloat?: 'left' | 'right' | 'none' | null;
+      inlinePositionEmu?: { horizontalEmu: number; verticalEmu: number };
+    } | null;
+  }) => void;
+  sidebarOpen: boolean;
+  sidebarItems: ReactSidebarItem[];
+  anchorPositions: Map<string, number>;
+  onAnchorPositionsChange: (positions: Map<string, number>) => void;
+  onYrsTrackedChangesChange: (result: TrackedChangesResult) => void;
+  onViewerCommentRangesChange?: PagedEditorProps['onViewerCommentRangesChange'];
+  viewerSidebarActive?: boolean;
+  pluginRenderedDomContext: RenderedDomContext | null | undefined;
+  pageWidthPx: number;
+  expandedSidebarItem: string | null;
+  setExpandedSidebarItem: React.Dispatch<React.SetStateAction<string | null>>;
+  comments: Comment[];
+  resolvedCommentIds: Set<number>;
+  resolvedIdsForRender: Set<number>;
+  setShowCommentsSidebar: React.Dispatch<React.SetStateAction<boolean>>;
+  onTotalPagesChange: (totalPages: number) => void;
+  /** Receives each computed layout. */
+  onError?: (error: Error, session?: unknown) => void;
+  onLayoutComputed?: (layout: Layout | null) => void;
+  /** Hands layout passes to the resident worker. */
+  layoutInWorker?: LayoutInWorker;
+  fontRequirementsInWorker?: FontRequirementsInWorker;
+  applyResidentInput?: (text: string) => Promise<ResidentFrameApplyResult | null>;
+  applyResidentDelete?: (
+    direction: 'backward' | 'forward'
+  ) => Promise<ResidentFrameApplyResult | null>;
+  /** Display-list query source while the canvas renderer paints (null on the DOM-painter path). */
+  displayListQueries?: DisplayListQueries | null;
+  resolveDisplayListQueries?: ResolveDisplayListQueries;
+  pageNavigation?: DisplayPageNavigation | null;
+  canvasDisplayList?: DisplayList | null;
+  displayListFrameEpoch?: number | null;
+  residentCaret?: YrsResidentCaretSnapshot | null;
+  residentCaretAuthoritative?: boolean;
+  /** Worker-painted caret line is on screen; hide the DOM blink caret. */
+  paintedCaretActive?: boolean;
+  onCaretInput?: () => void;
+  onCaretInputDispatched?: () => void;
+  onCaretInterrupt?: () => void;
+  /** `.canvas-pages` host element — canvas-path pointer events attach here. */
+  canvasHostRef?: React.RefObject<HTMLDivElement | null>;
+  floatingCommentBtn: { top: number; left: number } | null;
+  isAddingComment: boolean;
+  setCommentSelectionRange: React.Dispatch<
+    React.SetStateAction<{ from: number; to: number } | null>
+  >;
+  setAddCommentYPosition: React.Dispatch<React.SetStateAction<number | null>>;
+  setIsAddingComment: React.Dispatch<React.SetStateAction<boolean>>;
+  commentSidebarOverflow?: 'clip' | 'inset';
+  selectionEndX?: number | null;
+  setFloatingCommentBtn: React.Dispatch<React.SetStateAction<{ top: number; left: number } | null>>;
+  isSuggesting?: boolean;
+  author?: string;
+  /** Bundled metric-compatible font provider for Rust measurement. */
+  measurementFontProvider?: BundledFontProvider;
+  /**
+   * Host slot the Rust measure source fills with the merged doc-wide font
+   * chains — forwarded to PagedEditor and read by the canvas display-list
+   * build to gate GlyphRun emission.
+   */
+  rustFontChainsProviderRef?: React.RefObject<RustFontChainsProvider | null>;
+}) {
+  const { t } = useTranslation();
+  const sidebarCommentIds = useMemo(() => comments.map((comment) => comment.id), [comments]);
+
+  // The open part, split into the two shapes its consumers address it by.
+  const bandEdit =
+    partEditTarget?.kind === 'header' || partEditTarget?.kind === 'footer'
+      ? partEditTarget
+      : null;
+
+  // Resolve the active HF block for the inline editor — first-page variant
+  // wins when `titlePg` is set and the user double-clicked page 1.
+  const activeHf = bandEdit
+    ? bandEdit.isFirstPage
+      ? bandEdit.kind === 'header'
+        ? firstPageHeaderContent
+        : firstPageFooterContent
+      : bandEdit.kind === 'header'
+        ? headerContent
+        : footerContent
+    : null;
+
+  // Relationship id of the active HF part, resolved the way `getHfView` and the
+  // display-list HF variant builder (`buildDisplayListHeadersFooters`) both do:
+  // off the section's header/footer references. The first-page variant wins when
+  // the user is editing page 1 of a titlePg section. This keys the region-aware
+  // range-rect query so a first-page vs default variant on another page never
+  // contributes stray rects.
+  const activeHfRid = bandEdit
+    ? (() => {
+        const refs =
+          bandEdit.kind === 'header'
+            ? finalSectionProperties?.headerReferences
+            : finalSectionProperties?.footerReferences;
+        if (!refs) return null;
+        const wantType = bandEdit.isFirstPage ? 'first' : 'default';
+        const entry =
+          refs.find((r) => r.type === wantType) ??
+          refs.find((r) => r.type === 'default') ??
+          refs.find((r) => r.type === 'first') ??
+          null;
+        return entry?.rId ?? null;
+      })()
+    : null;
+
+  const noteEdit =
+    partEditTarget?.kind === 'footnote' || partEditTarget?.kind === 'endnote'
+      ? partEditTarget
+      : null;
+  // Memoised: consumers key effects on this identity, and a band that rebuilt
+  // it per render would re-run them for nothing.
+  const partEdit = useMemo<PartEdit | null>(
+    () => (bandEdit ? { kind: bandEdit.kind, rId: activeHfRid } : noteEdit),
+    [bandEdit, activeHfRid, noteEdit]
+  );
+
+  // Live Yrs selection inside that part, captured on every selection change.
+  const [partSelection, setPartSelection] = useState<{ from: number; to: number } | null>(null);
+  const partStory = partEditStory(partEdit, yrsCore.session);
+  // Cleared during render, not in an effect: the click that opens a note
+  // publishes its caret from a child effect, which React flushes first, and an
+  // effect here would then wipe the very selection that click asked for.
+  const [selectionStory, setSelectionStory] = useState(partStory);
+  if (selectionStory !== partStory) {
+    setSelectionStory(partStory);
+    setPartSelection(null);
+  }
+
+  useEscapeKey(partEditTarget != null, () => setPartEditTarget(null));
+
+  // UI chrome is independent of renderer readiness and always portals onto
+  // the positioned editor-content host.
+  const canvasOverlayTarget = useCanvasOverlayTarget(true, editorContentRef);
+
+  const activeHfPage =
+    displayListQueries && bandEdit
+      ? (displayListQueries.displayList.pages[bandEdit.pageIndex] ??
+        displayListQueries.displayList.pages.find(
+          (page) => page[bandEdit.kind]?.rId === activeHfRid
+        ))
+      : null;
+  const activeHfBand = activeHfPage && bandEdit ? activeHfPage[bandEdit.kind] : null;
+  const hfChromeRect =
+    activeHfPage &&
+    activeHfBand &&
+    displayListQueries &&
+    canvasOverlayTarget &&
+    canvasHostRef?.current
+      ? projectPageLocalRect(
+          canvasHostRef.current,
+          canvasOverlayTarget,
+          displayListQueries,
+          activeHfPage.pageIndex,
+          0,
+          activeHfBand.y,
+          activeHfPage.width,
+          activeHfBand.height
+        )
+      : null;
+
+  const sidebarOverlayNode = (
+    <>
+      {sidebarItems.length > 0 && (
+        <UnifiedSidebar
+          items={sidebarItems}
+          anchorPositions={anchorPositions}
+          renderedDomContext={pluginRenderedDomContext ?? null}
+          pageWidth={pageWidthPx}
+          zoom={zoom}
+          editorContainerRef={scrollContainerRef}
+          onExpandedItemChange={setExpandedSidebarItem}
+          activeItemId={expandedSidebarItem}
+          overflow={commentSidebarOverflow}
+          selectionEndX={selectionEndX}
+        />
+      )}
+      <CommentMarginMarkers
+        comments={comments}
+        anchorPositions={anchorPositions}
+        zoom={zoom}
+        pageWidth={pageWidthPx}
+        sidebarOpen={sidebarOpen}
+        resolvedCommentIds={resolvedCommentIds}
+        onMarkerClick={() => setShowCommentsSidebar(true)}
+      />
+    </>
+  );
+
+  const floatingCommentButton =
+    partEditTarget == null &&
+    floatingCommentBtn != null &&
+    !isAddingComment &&
+    !readOnly &&
+    yrsCore.replicaReady ? (
+      <Tooltip content={t('editor.addComment')} side="bottom" delayMs={300}>
+        <button
+          type="button"
+          className="docx-comment-button"
+          data-docx-comment-button=""
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const selection = pagedEditorRef.current?.getSelectionRange();
+            if (selection && selection.from !== selection.to) {
+              setCommentSelectionRange(selection);
+              pagedEditorRef.current?.setSelection(selection.to);
+            }
+            setAddCommentYPosition(floatingCommentBtn.top / zoom);
+            setShowCommentsSidebar(true);
+            setIsAddingComment(true);
+            setFloatingCommentBtn(null);
+          }}
+          style={{
+            position: 'absolute',
+            top: floatingCommentBtn.top,
+            left: floatingCommentBtn.left,
+            transform: 'translate(-50%, -50%)',
+            zIndex: 50,
+            width: 28,
+            height: 28,
+            borderRadius: 6,
+            border: '1px solid var(--doc-focus-ring)',
+            backgroundColor: 'var(--doc-surface)',
+            color: 'var(--doc-primary)',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            boxShadow: '0 1px 3px var(--doc-shadow)',
+            transition: 'background-color 0.15s ease, box-shadow 0.15s ease',
+          }}
+          onMouseOver={(e) => {
+            (e.currentTarget as HTMLButtonElement).style.backgroundColor =
+              'var(--doc-primary-light)';
+            (e.currentTarget as HTMLButtonElement).style.boxShadow =
+              '0 1px 4px var(--doc-focus-ring)';
+          }}
+          onMouseOut={(e) => {
+            (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'var(--doc-surface)';
+            (e.currentTarget as HTMLButtonElement).style.boxShadow = '0 1px 3px var(--doc-shadow)';
+          }}
+        >
+          <MaterialSymbol name="add_comment" size={16} />
+        </button>
+      </Tooltip>
+    ) : null;
+
+  return (
+    <>
+      <PagedEditor
+        ref={pagedEditorRef}
+        commandBridgeRef={commandBridgeRef}
+        document={document}
+        yrsCore={yrsCore}
+        pluginHostOpen={pluginHostOpen}
+        reservations={reservations}
+        reservationSets={reservationSets}
+        collaboration={collaboration}
+        styles={document?.package.styles}
+        theme={document?.package.theme || theme}
+        sectionProperties={initialSectionProperties}
+        finalSectionProperties={finalSectionProperties}
+        headerContent={headerContent}
+        footerContent={footerContent}
+        firstPageHeaderContent={firstPageHeaderContent}
+        firstPageFooterContent={firstPageFooterContent}
+        onHeaderFooterDoubleClick={onHeaderFooterDoubleClick}
+        onNoteClick={onNoteClick}
+        partEdit={partEdit}
+        onBodyClick={onBodyClick}
+        isSuggesting={isSuggesting}
+        author={author}
+        measurementFontProvider={measurementFontProvider}
+        rustFontChainsProviderRef={rustFontChainsProviderRef}
+        zoom={zoom}
+        readOnly={readOnly}
+        holdInput={holdInput}
+        inputScope={inputScope}
+        inputQueries={inputQueries}
+        viewerDocumentRead={viewerDocumentRead}
+        showHiddenText={showHiddenText}
+        onYrsContentChange={onYrsContentChange}
+        onYrsHistoryChange={onYrsHistoryChange}
+        onSelectionChange={onPagedSelectionChange}
+        onYrsSelectionChange={onYrsSelectionChange}
+        onViewerSelectionChange={onViewerSelectionChange}
+        onYrsPartSelectionChange={(part, selection) => {
+          if (partEditStory(part, yrsCore.session) === partStory) setPartSelection(selection);
+        }}
+        onRenderedDomContextReady={onRenderedDomContextReady}
+        pluginOverlays={pluginOverlays}
+        onHyperlinkClick={onHyperlinkClick}
+        hyperlinkPopupData={hyperlinkPopupData}
+        onHyperlinkPopupNavigate={onHyperlinkPopupNavigate}
+        onHyperlinkPopupCopy={onHyperlinkPopupCopy}
+        onHyperlinkPopupEdit={onHyperlinkPopupEdit}
+        onHyperlinkPopupRemove={onHyperlinkPopupRemove}
+        onHyperlinkPopupClose={onHyperlinkPopupClose}
+        onContextMenu={onContextMenu}
+        commentsSidebarOpen={sidebarOpen}
+        onAnchorPositionsChange={onAnchorPositionsChange}
+        sidebarCommentIds={sidebarCommentIds}
+        onYrsTrackedChangesChange={onYrsTrackedChangesChange}
+        onViewerCommentRangesChange={onViewerCommentRangesChange}
+        viewerSidebarActive={viewerSidebarActive}
+        onTotalPagesChange={onTotalPagesChange}
+        onLayoutComputed={onLayoutComputed}
+        layoutInWorker={layoutInWorker}
+        fontRequirementsInWorker={fontRequirementsInWorker}
+        onError={onError}
+        applyResidentInput={applyResidentInput}
+        applyResidentDelete={applyResidentDelete}
+        displayListQueries={displayListQueries}
+        resolveDisplayListQueries={resolveDisplayListQueries}
+        pageNavigation={pageNavigation}
+        canvasDisplayList={canvasDisplayList}
+        displayListFrameEpoch={displayListFrameEpoch}
+        residentCaret={residentCaret}
+        residentCaretAuthoritative={residentCaretAuthoritative}
+        paintedCaretActive={paintedCaretActive}
+        onCaretInput={onCaretInput}
+        onCaretInputDispatched={onCaretInputDispatched}
+        onCaretInterrupt={onCaretInterrupt}
+        canvasHostRef={canvasHostRef}
+        canvasOverlayTarget={canvasOverlayTarget}
+        resolvedCommentIds={resolvedIdsForRender}
+        scrollContainerRef={scrollContainerRef}
+        sidebarOverlay={canvasOverlayTarget ? null : sidebarOverlayNode}
+      />
+
+      {/* Canvas mode: the sidebar overlay + floating button portal onto the
+          visible canvas pages (their offset origin is `editorContentRef`, which
+          shares the `.canvas-pages` host's top-left). The wrapper mirrors the
+          one PagedEditor renders in default mode. */}
+      {canvasOverlayTarget &&
+        createPortal(
+          <div
+            ref={reviewOverlay?.hostRef}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              right: 0,
+              height: '100%',
+              pointerEvents: 'none',
+              overflow: 'visible',
+            }}
+          >
+            <div
+              style={{ pointerEvents: 'auto' }}
+              // In default mode the sidebar lives inside `.paged-editor`, whose
+              // mousedown handling keeps the hidden input focused when its chrome is
+              // clicked. Portalled out for canvas mode it loses that, so a bare
+              // click on a card would blur the input and move the caret. Re-assert
+              // it here in the capture phase (before the card's own
+              // stopPropagation): preventDefault keeps the input's selection for
+              // non-interactive clicks, while inputs/buttons still focus.
+              onMouseDownCapture={(e) => {
+                const target = e.target as HTMLElement;
+                if (!target.closest('input, textarea, select, button, a, [contenteditable]')) {
+                  e.preventDefault();
+                }
+              }}
+            >
+              {reviewOverlay ? reviewOverlay.wrap(sidebarOverlayNode) : sidebarOverlayNode}
+              {floatingCommentButton}
+            </div>
+          </div>,
+          canvasOverlayTarget
+        )}
+
+      {!canvasOverlayTarget && floatingCommentButton}
+
+      {/* Cell selection is indexed by band, so only an open band offers it. */}
+      {canvasOverlayTarget &&
+        displayListQueries &&
+        bandEdit &&
+        activeHfRid &&
+        canvasHostRef && (
+          <CanvasCellSelectionOverlay
+            session={pagedEditorRef.current?.getYrsSession() ?? null}
+            positionProjection={null}
+            overlayTarget={canvasOverlayTarget}
+            canvasHostRef={canvasHostRef}
+            displayListQueries={displayListQueries}
+            region={{ kind: bandEdit.kind, rId: activeHfRid }}
+            sidebarOpen={sidebarOpen}
+            zoom={zoom}
+          />
+        )}
+
+      {canvasOverlayTarget && displayListQueries && partEdit && canvasHostRef && (
+        <CanvasPartSelectionOverlay
+          part={partEdit}
+          selection={partSelection}
+          overlayTarget={canvasOverlayTarget}
+          canvasHostRef={canvasHostRef}
+          displayListQueries={displayListQueries}
+          activePageIndex={activeHfPage?.pageIndex}
+          sidebarOpen={sidebarOpen}
+          zoom={zoom}
+        />
+      )}
+
+      {bandEdit &&
+        activeHf &&
+        hfChromeRect &&
+        (() => {
+          const editor = (
+            <InlineHeaderFooterEditor
+              position={bandEdit.kind}
+              targetRect={hfChromeRect}
+              onClose={() => {
+                setPartEditTarget(null);
+              }}
+              onRemove={onRemoveHeaderFooter}
+            />
+          );
+          return canvasOverlayTarget ? createPortal(editor, canvasOverlayTarget) : editor;
+        })()}
+    </>
+  );
+}

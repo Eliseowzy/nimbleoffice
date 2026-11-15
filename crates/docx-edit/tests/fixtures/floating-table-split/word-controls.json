@@ -1,0 +1,89 @@
+{
+  "source": "Microsoft Word for Mac 16.114 build 26110224, PDF export",
+  "cases": {
+    "control-keep": [
+      {
+        "page": 2,
+        "text": "Aftertablewordswraparoundthefinalrowsofthisfloatingtableandcontinueonthe",
+        "x0": 72.0,
+        "y": 83.28
+      },
+      {
+        "page": 2,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 96.96
+      }
+    ],
+    "control-widow0": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 1,
+        "text": "continueonthe",
+        "x0": 431.5,
+        "y": 138.48
+      },
+      {
+        "page": 2,
+        "text": "page.",
+        "x0": 72.0,
+        "y": 83.28
+      }
+    ],
+    "control-widow1": [
+      {
+        "page": 1,
+        "text": "Aftertablewords",
+        "x0": 431.5,
+        "y": 83.28
+      },
+      {
+        "page": 1,
+        "text": "wraparoundthe",
+        "x0": 431.5,
+        "y": 96.96
+      },
+      {
+        "page": 1,
+        "text": "finalrowsofthis",
+        "x0": 431.5,
+        "y": 110.88
+      },
+      {
+        "page": 1,
+        "text": "floatingtableand",
+        "x0": 431.5,
+        "y": 124.56
+      },
+      {
+        "page": 2,
+        "text": "continueonthepage.",
+        "x0": 72.0,
+        "y": 83.28
+      }
+    ]
+  }
+}

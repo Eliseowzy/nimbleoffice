@@ -1,0 +1,1651 @@
+import type { ChartInfo, ChartMutation } from '../charts';
+/**
+ * Wasm loader for the xlsx-wasm core.
+ *
+ * Call {@link initWasm} once before opening workbooks. The default browser path
+ * streams the packaged wasm asset; non-fetch environments can pass bytes or a
+ * precompiled module. Callers never see the JSON-string boundary.
+ */
+
+import type { XlsxDefinedNamesRequest, XlsxDefinedNamesResult } from '../definedNames';
+import initWasmModule, {
+  XlsxDocument,
+  XlsxSnapshotBuilder,
+  allocationFailure,
+  decodeFontFace as decodePackedFontFace,
+  displayListCellLimit,
+  engineKind,
+  exportXlsxMarkdownJson,
+  exportXlsxStructuredJson,
+  renderXlsxMarkdownJson,
+} from './engine';
+import type { Direction, SelectionData } from '../selection/types';
+import type { InitInput } from './generated/xlsx_wasm.js';
+import { copyDecodedFace, fontBytes, type FontDecoder } from '../../../../shared/office-session/fontDecoder';
+import { isEngineTrap } from '../../../../shared/office-session/trap';
+
+export const decodeFontFace: FontDecoder = async (bytes, { codec, dict, maxOutput }) => {
+  await initWasm();
+  return copyDecodedFace(decodePackedFontFace(fontBytes(bytes), codec,
+    dict === undefined ? undefined : fontBytes(dict), maxOutput));
+};
+import { wasmAssetUrl } from './asset';
+import { pngFontReaders, pngRasterizers, workbookPngFonts } from './pngDisplayList';
+import { renderPng as renderEnginePng, type XlsxPngEngine } from './enginePng';
+import { pngDisplayList, resolvePngTarget, type ResolvedPngTarget } from './pngResolve';
+import type { XlsxPngFont, XlsxPngOptions, XlsxPngTarget } from './pngTarget';
+import { canvasPngAvailable, sheetFonts } from '../render/png';
+export type { XlsxFontFace, XlsxPngFont, XlsxPngOptions, XlsxPngTarget, XlsxRangeAddress, XlsxSheetRef } from './pngTarget';
+import { OPEN_SYNC_CLIENT } from '../collaboration/validation';
+import type { CollaborationReplica, CollaborationUpdateOrigin } from '../collaboration/types';
+import type { ChartRegion, DisplayList, Rect } from '../display-list/types';
+import type {
+  XlsxCellAddress,
+  XlsxEditRequest,
+  XlsxEditResult,
+  XlsxFindRequest,
+  XlsxFindResult,
+  XlsxReadRequest,
+  XlsxReadResult,
+  XlsxValidationResult,
+} from '../edits';
+import type {
+  XlsxExportOptions,
+  XlsxExportResult,
+  XlsxMarkdownContent,
+  XlsxMarkdownOptions,
+  XlsxStructuredContent,
+} from '../exports';
+
+/**
+ * A scrolled window into a sheet. `x`/`y` are content-pixel offsets into the
+ * non-frozen body. Mirrors the Rust `Viewport`.
+ */
+export interface Viewport {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PrintMetrics {
+  dpi: number;
+  maxDigitWidth: number;
+  defaultRowHeightPt: number;
+  defaultColumnWidth?: number;
+  fontSizePt: number;
+  fontFamily: string;
+  fontAscent: number;
+  fontDescent: number;
+}
+
+export type XlsxAutoFilterOp = { type: 'setAutoFilter'; sheet: number; range: string | null };
+
+/**
+ * Chrome-facing sheet metadata: stable IDs, tab names, active index, and the
+ * scrollable content extent of the active sheet. Mirrors the Rust `SheetInfo`.
+ */
+export interface SheetInfo {
+  autoFilter?: string | null;
+  sheetIds: string[];
+  sheetNames: string[];
+  activeSheet: number;
+  contentWidth: number;
+  contentHeight: number;
+  frozenRows: number;
+  frozenCols: number;
+  initialScrollX: number;
+  initialScrollY: number;
+}
+
+export interface CellPosition {
+  x: number;
+  y: number;
+}
+
+/**
+ * Result of any mutating call: whether it changed the workbook and the
+ * (possibly grown) sheet metadata. Mirrors the Rust `EditResult`.
+ *
+ * `changed` lists the a1 addresses (on the active sheet) of *other* cells whose
+ * displayed value moved as a fallout of the edit — the dependents the recalc
+ * pass recomputed. It excludes the directly edited cell(s) and is omitted by
+ * cores built before the recalc engine, so treat it as additive.
+ */
+export interface EditResult {
+  applied: boolean;
+  sheetInfo: SheetInfo;
+  changed?: string[];
+  limitedCells?: string[];
+}
+
+/** Facade stage latencies of one profiled mutation, in ms. */
+export interface EditProfile {
+  validateMs: number;
+  applyMs: number;
+  recalcMs: number;
+  resultMs: number;
+}
+
+export interface ProfiledEditResult extends EditResult {
+  profile: EditProfile;
+}
+
+export interface DisplayListProfile {
+  buildMs: number;
+  encodeMs: number;
+}
+
+export interface ProfiledDisplayList {
+  displayList: DisplayList;
+  profile: DisplayListProfile;
+}
+
+export interface CalculationStatus {
+  limitedCells: string[];
+  /** The last recalculation ran out of its budget; the cells it could not evaluate keep their saved values. */
+  budgetExhausted?: boolean;
+  /** Formula cells the engine could not compute, at most 10,000; omitted by cores built before the list. */
+  unevaluatedCells?: UnevaluatedCellStatus[];
+}
+
+/**
+ * A formula cell the engine could not compute: it keeps Excel's saved value,
+ * or stays blank when the file saved none, unless only an engine gap was
+ * involved, which shows its error.
+ */
+export interface UnevaluatedCellStatus {
+  /** The cell, qualified by its sheet when that is not the active one. */
+  address: string;
+  /** Uncomputable functions involved (`WEBSERVICE`, `RTD`, an add-in), sorted; empty when only engine gaps were. */
+  functions: string[];
+}
+
+export type NumberFormat =
+  | 'automatic'
+  | 'plainText'
+  | 'number'
+  | 'percent'
+  | 'scientific'
+  | 'currency'
+  | 'date'
+  | 'time'
+  | 'custom';
+
+export type BorderPreset =
+  | 'all'
+  | 'inner'
+  | 'horizontal'
+  | 'vertical'
+  | 'outer'
+  | 'left'
+  | 'top'
+  | 'right'
+  | 'bottom'
+  | 'none';
+
+export type BorderStyle = 'solid' | 'dashed' | 'dotted' | 'double';
+export type HorizontalAlignment = 'left' | 'center' | 'right';
+export type VerticalAlignment = 'top' | 'middle' | 'bottom';
+export type TextWrapping = 'overflow' | 'wrap' | 'clip';
+export type StyleProperty =
+  | 'bold'
+  | 'italic'
+  | 'strikethrough'
+  | 'fontFamily'
+  | 'fontSize'
+  | 'textColor'
+  | 'fillColor'
+  | 'borders'
+  | 'horizontalAlignment'
+  | 'verticalAlignment'
+  | 'textWrapping';
+
+export interface BorderPatch {
+  preset?: BorderPreset;
+  style?: BorderStyle;
+  color?: string;
+}
+
+export interface RangeStylePatch {
+  bold?: boolean;
+  italic?: boolean;
+  strikethrough?: boolean;
+  fontFamily?: string;
+  fontSize?: number;
+  textColor?: string;
+  fillColor?: string;
+  border?: BorderPatch;
+  horizontalAlignment?: HorizontalAlignment;
+  verticalAlignment?: VerticalAlignment;
+  textWrapping?: TextWrapping;
+  clear?: StyleProperty[];
+}
+
+export type NumberFormatMutation =
+  | Exclude<NumberFormat, 'custom'>
+  | 'increaseDecimal'
+  | 'decreaseDecimal'
+  | { type: 'custom'; pattern: string };
+
+export interface SelectionFormatting {
+  numberFormat?: NumberFormat;
+  numberFormatPattern?: string;
+  fontFamily?: string;
+  fontSize?: number;
+  bold?: boolean;
+  italic?: boolean;
+  strikethrough?: boolean;
+  textColor?: string;
+  fillColor?: string;
+  borderPreset?: BorderPreset;
+  borderStyle?: BorderStyle;
+  borderColor?: string;
+  horizontalAlignment?: HorizontalAlignment;
+  verticalAlignment?: VerticalAlignment;
+  textWrapping?: TextWrapping;
+}
+
+export interface CapturedFormat<TFormat = unknown> {
+  rows: number;
+  columns: number;
+  formats: TFormat[];
+  sourceStyles?: (number | null)[];
+  sourceFormats?: unknown[];
+}
+
+export type CapturedColor = 'Auto' | { Rgb: string } | { Indexed: number }
+  | { Theme: { idx: number; tint: number } };
+
+export type CapturedFill = 'None' | { Solid: CapturedColor } | {
+  Pattern: { pattern: import('../display-list/types').PatternType; fg?: CapturedColor | null; bg?: CapturedColor | null };
+};
+
+export type CapturedBorderStyle = 'Thin' | 'Medium' | 'Thick' | 'Dashed' | 'Dotted' | 'Double' | 'Hair'
+  | 'MediumDashed' | 'DashDot' | 'MediumDashDot' | 'DashDotDot' | 'MediumDashDotDot' | 'SlantDashDot';
+
+export interface CapturedBorderEdge {
+  style: CapturedBorderStyle;
+  color?: CapturedColor | null;
+}
+
+export interface CapturedCellFormat {
+  font: {
+    name?: string | null;
+    size_pt?: number | null;
+    bold?: boolean;
+    italic?: boolean;
+    underline?: boolean;
+    strike?: boolean;
+    color?: CapturedColor | null;
+  };
+  fill: CapturedFill;
+  border: {
+    left?: CapturedBorderEdge | null;
+    right?: CapturedBorderEdge | null;
+    top?: CapturedBorderEdge | null;
+    bottom?: CapturedBorderEdge | null;
+  };
+  numberFormat: { kind: 'builtin'; id: number } | { kind: 'custom'; pattern: string };
+  alignment: {
+    h?: 'General' | 'Left' | 'Center' | 'Right' | 'Fill' | 'Justify' | 'CenterContinuous' | 'Distributed' | null;
+    v?: 'Top' | 'Center' | 'Bottom' | 'Justify' | 'Distributed' | null;
+    wrap_text?: boolean;
+    shrink_to_fit?: boolean;
+  };
+}
+
+export interface CellPoint {
+  row: number;
+  col: number;
+}
+
+export interface MergedRange {
+  start: CellPoint;
+  end: CellPoint;
+}
+
+export interface WorkbookHyperlink {
+  range: MergedRange;
+  externalTarget?: string;
+  location?: string;
+  tooltip?: string;
+  display?: string;
+}
+
+export interface DifferentialFormatInput {
+  fontColor?: string;
+  bold?: boolean;
+  italic?: boolean;
+  fill?: string;
+}
+
+export interface ConditionalFormatRuleInput {
+  type: 'cellIs' | 'expression';
+  operator?: string;
+  formulas: string[];
+}
+
+export interface ConditionalFormatInfo {
+  id: string;
+  range: string;
+  type: string;
+  operator?: string;
+  formulas: string[];
+  priority: number;
+  dxfId?: number;
+  format: DifferentialFormatInput;
+  editable: boolean;
+}
+
+export type ConditionalFormatOp =
+  | { type: 'addConditionalFormat'; sheet: number; range: MergedRange; kind: 'cellIs' | 'expression'; operator?: string; formulas: string[]; format: DifferentialFormatInput }
+  | { type: 'removeConditionalFormat'; sheet: number; id: string };
+
+export interface HistoryState {
+  canUndo: boolean;
+  canRedo: boolean;
+  undoDepth: number;
+  redoDepth: number;
+}
+
+export type WorkbookUpdateOrigin = CollaborationUpdateOrigin;
+/**
+ * `fromPeer` is true for every event a peer update caused through `applyUpdate`, including
+ * the `'local'` re-encoding a replica forwards after adopting a whole-document state.
+ */
+export interface WorkbookUpdateInfo {
+  fromPeer: boolean;
+}
+export type WorkbookUpdateListener = (
+  update: Uint8Array,
+  origin: WorkbookUpdateOrigin,
+  info: WorkbookUpdateInfo
+) => void;
+
+export interface WorkbookCalculationContext {
+  /** Current local date and time as a 1900 date-system serial (days since 1899-12-30), also in 1904 workbooks. */
+  nowSerial: number;
+  randSeed: number;
+}
+
+export interface OpenWorkbookOptions {
+  /** Open a Yrs-backed replica that can accept peer updates. */
+  collaborative?: boolean;
+  /** Peer-unique positive safe integer. Generated securely when omitted. */
+  clientId?: number;
+  calculation?: WorkbookCalculationContext;
+}
+
+/**
+ * The editable view of one cell: A1 address, the exact string the user would
+ * edit (formulas as `=...`, guarded literals with a leading `'`), and whether
+ * that string is a formula. Mirrors the Rust `CellEdit`.
+ */
+export interface CellEdit {
+  a1: string;
+  input: string;
+  isFormula: boolean;
+  isArrayFormula?: boolean;
+}
+
+export interface XlsxTextSearchOptions {
+  /** Defaults to false. */
+  caseSensitive?: boolean;
+  /** Maximum matches; defaults to 1000. */
+  limit?: number;
+}
+
+/** Zero-based sheet, row, and column. */
+export interface XlsxTextMatch {
+  sheet: number;
+  sheetId: string;
+  sheetName: string;
+  row: number;
+  col: number;
+  a1: string;
+  /** Formatted display text. */
+  text: string;
+}
+
+/** One cell of a batch edit: target coordinates plus the raw user input. */
+export interface CellInputEdit {
+  row: number;
+  col: number;
+  input: string;
+  copyFrom?: CellPoint;
+}
+
+/**
+ * One edit inside a proposal. Same shape as {@link CellInputEdit} plus the
+ * sheet index — a proposal's cells carry their own sheet on the wire, so it
+ * can span sheets rather than being pinned to the active one.
+ */
+export interface ProposalEdit extends CellInputEdit {
+  sheet: number;
+  numberFormat?: NumberFormatMutation;
+}
+
+/**
+ * One cell of a pending proposal: where it lands and the *formatted display
+ * texts* before/after applying it. `oldText`/`newText` are what the grid shows,
+ * not the raw input — the ghost decoration paints `newText` directly. Mirrors
+ * the Rust proposal cell.
+ */
+export interface ProposalCell {
+  sheet: number;
+  row: number;
+  col: number;
+  a1: string;
+  oldText: string;
+  newText: string;
+  stale?: boolean;
+}
+
+/**
+ * A pending, un-applied set of cell changes an agent has staged for human
+ * review. `note` is the agent's rationale (may be null); `cells` are the
+ * per-cell before/after previews. Applying it is one undo step.
+ */
+export interface Proposal {
+  id: string;
+  agentId: string;
+  note: string | null;
+  cells: ProposalCell[];
+  forceBlocked?: boolean;
+}
+
+/** A drifted proposal cell: its sheet index and catalog id beside the coordinates. */
+export interface StaleProposalTarget extends XlsxCellAddress {
+  sheet: number;
+}
+
+/**
+ * Thrown by {@link WorkbookHandle.acceptProposal} when the workbook changed
+ * under a proposal since it was staged (an edit touched one of its base cells)
+ * and `force` was not set. `cells` are the a1 addresses that moved, so the UI
+ * can name them and offer a force-apply; `targets` also carry each one's sheet.
+ */
+export class StaleProposalError extends Error {
+  readonly cells: string[];
+  readonly targets: StaleProposalTarget[];
+  constructor(cells: string[], targets: StaleProposalTarget[] = []) {
+    super(`stale: ${cells.join(', ')}`);
+    this.name = 'StaleProposalError';
+    this.cells = cells;
+    this.targets = targets;
+  }
+}
+
+/** A display-list viewport exceeds the counted cell limit. */
+export class DisplayTooLargeError extends Error {
+  readonly code = 'displayTooLarge';
+  constructor(readonly cells: number, readonly maxCells: number) {
+    super(`requested viewport spans ${cells} cells, exceeds the ${maxCells}-cell display-list cap`);
+    this.name = 'DisplayTooLargeError';
+  }
+}
+
+function displayErrorFrom(message: string): DisplayTooLargeError | null {
+  if (!message.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(message) as {
+      code?: unknown;
+      cells?: unknown;
+      maxCells?: unknown;
+    };
+    if (
+      parsed.code !== 'displayTooLarge' ||
+      typeof parsed.cells !== 'number' || !Number.isSafeInteger(parsed.cells) ||
+      typeof parsed.maxCells !== 'number' || !Number.isSafeInteger(parsed.maxCells) ||
+      parsed.maxCells <= 0 || parsed.cells <= parsed.maxCells
+    ) return null;
+    return new DisplayTooLargeError(parsed.cells, parsed.maxCells);
+  } catch {
+    return null;
+  }
+}
+
+// the wasm reports a stale accept as a JSON error naming each drifted cell.
+function staleErrorFrom(message: string): StaleProposalError | null {
+  if (message.startsWith('Stale proposal:')) return new StaleProposalError([]);
+  if (!message.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(message) as {
+      code?: unknown;
+      cells?: unknown;
+      targets?: unknown;
+    };
+    if (parsed.code !== 'staleProposal' || !Array.isArray(parsed.cells)) return null;
+    return new StaleProposalError(
+      parsed.cells as string[],
+      Array.isArray(parsed.targets) ? (parsed.targets as StaleProposalTarget[]) : []
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A typed handle over an open workbook, hiding the wasm object and its JSON
+ * boundary. Call {@link WorkbookHandle.dispose} to free the wasm memory.
+ */
+export interface WorkbookHandle extends CollaborationReplica {
+  readonly clientId: number;
+  setCalculationContext(context: WorkbookCalculationContext | null): void;
+  /** Available in both modes; encodes this handle's current Yrs state vector. */
+  encodeStateVector(): Uint8Array;
+  /** Available in both modes; pass a peer vector to encode only the missing state. */
+  encodeStateAsUpdate(remoteStateVector?: Uint8Array): Uint8Array;
+  /** Apply a peer update. Standalone handles throw the Rust `NotCollaborative` error. */
+  applyUpdate(update: Uint8Array): EditResult;
+  /** Observe owned update bytes from local commits and accepted remote updates. */
+  onUpdate(listener: WorkbookUpdateListener): () => void;
+  sheetInfo(): SheetInfo;
+  sheetCount(): number;
+  /** Metadata for `sheet`, with that index in `activeSheet`; leaves the workbook unchanged. */
+  sheetInfoFor(sheet: number): SheetInfo;
+  calculationStatus(): CalculationStatus;
+  /**
+   * Recalculate every formula with the handle's calculation context (or the host clock).
+   * The next `save()` writes the recalculated values; a formula the engine cannot evaluate
+   * keeps the result the file stored.
+   */
+  recalculate(): CalculationStatus;
+  /** Clamps tracks to the grid and truncates oversized frames at the scroll origin. */
+  displayList(viewport: Viewport): DisplayList;
+  /** `displayList` with build and encode time measured inside the core. */
+  displayListProfiled(viewport: Viewport): ProfiledDisplayList;
+  printDisplayList(
+    sheet: number, range: string, metrics: PrintMetrics, gridlines: boolean
+  ): DisplayList;
+  /**
+   * the chart under a viewport-local point on the active sheet, or `null`,
+   * resolved against the current model from the same anchor geometry the
+   * display list is built from. the returned `label` is always empty: a hit
+   * test resolves anchors only and never reads a chart part.
+   *
+   * this answers for the model as it is now. chrome painting a frame should
+   * hit-test that frame's own `charts` with `chartRegionAtPoint` instead, or a
+   * mutation the canvas has not drawn yet will move the answer off the pixels.
+   */
+  chartAtPoint(viewport: Viewport, x: number, y: number): ChartRegion | null;
+  /**
+   * slide the chart frame `chart` names — a {@link ChartRegion} id — by a
+   * content-pixel delta, clamped to the grid, as one undo step. the new anchor
+   * is written back on save. throws for a chart pinned to the sheet by an
+   * absolute anchor.
+   */
+  moveChart(sheet: number, chart: string, dx: number, dy: number): EditResult;
+  setActiveSheet(index: number): void;
+  /**
+   * apply one user input to a cell (parses number/bool/formula/text) and
+   * recalc its transitive dependents. one undo step; moved dependents come back
+   * in `EditResult.changed`.
+   */
+  editCell(sheet: number, row: number, col: number, input: string): EditResult;
+  /** `editCell` with the facade's stage timings attached. */
+  editCellProfiled(sheet: number, row: number, col: number, input: string): ProfiledEditResult;
+  /** apply a batch of inputs (paste path) as one undo step; dependents recalc. */
+  editCells(sheet: number, edits: CellInputEdit[]): EditResult;
+  /** Move a range within one sheet and rewrite references in one native undo step. */
+  moveRange(sheet: number, source: string, destination: string): EditResult;
+  setHyperlink(sheet: number, hyperlink: WorkbookHyperlink): EditResult;
+  removeHyperlink(sheet: number, range: MergedRange): EditResult;
+  charts(sheet: number): ChartInfo[];
+  editCharts(edits: ChartMutation[]): EditResult;
+  conditionalFormats(sheet: number): ConditionalFormatInfo[];
+  /** raw op-list escape hatch for structural ops (insert/delete rows, merges…). */
+  applyOps(ops: unknown[]): EditResult;
+  /** `applyOps` with the facade's stage timings attached. */
+  applyOpsProfiled(ops: unknown[]): ProfiledEditResult;
+  undo(): EditResult;
+  redo(): EditResult;
+  /** the editable view of one cell (formula bar / in-cell editor prefill). */
+  cell(sheet: number, row: number, col: number): CellEdit;
+  /** Searches formatted text in sheet and row order. */
+  searchText(query: string, options?: XlsxTextSearchOptions): XlsxTextMatch[];
+  cellPosition(sheet: number, row: number, col: number): CellPosition;
+  /** Absolute sheet rectangle in unzoomed pixels. */
+  cellRect(sheet: number, row: number, col: number): Rect;
+  selectionData(sheet: number, row: number, col: number, direction?: Direction | 'usedRange' | 'rowEnd' | 'merge'): SelectionData;
+  /** row-major editable views for a range, e.g. "A1:C3" (clipboard copy). */
+  rangeCells(sheet: number, range: string): CellEdit[][];
+  patchRangeStyle(sheet: number, range: string, patch: RangeStylePatch): EditResult;
+  setNumberFormat(sheet: number, range: string, format: NumberFormatMutation): EditResult;
+  selectionFormatting(sheet: number, range: string): SelectionFormatting;
+  captureFormat(sheet: number, range: string): CapturedFormat;
+  applyFormat(sheet: number, range: string, format: CapturedFormat): EditResult;
+  mergedRanges(sheet: number, range: string): MergedRange[];
+  visibleMergedRanges(sheet: number, viewport: Viewport): MergedRange[];
+  historyState(): HistoryState;
+  /**
+   * Draws a viewport or a cell range of a sheet as PNG bytes, with the
+   * editor's painter on a canvas. Rejects with `PngExportError` rather than
+   * paint a substitute font, and where no canvas exists names
+   * `@nimbleoffice/xlsx-native`.
+   */
+  renderPng(target: XlsxPngTarget, options?: XlsxPngOptions): Promise<Uint8Array>;
+  /**
+   * The fonts `renderPng` would paint for the same target. The editors use it to forward the faces they paint with; not public until every format has it.
+   * @internal
+   */
+  renderPngFonts(target: XlsxPngTarget, options?: XlsxPngOptions): XlsxPngFont[];
+  /** serialize the workbook back to .xlsx bytes. */
+  save(): Uint8Array;
+  /**
+   * stage an agent's proposed edits for human review without applying them.
+   * returns the {@link Proposal} with per-cell formatted before/after previews.
+   * throws if the embedded wasm predates proposals; guard with
+   * {@link WorkbookHandle.isProposalsAvailable}.
+   */
+  propose(agentId: string, note: string | null, edits: ProposalEdit[]): Proposal;
+  /** every pending proposal, oldest first. empty when none or unsupported. */
+  listProposals(): Proposal[];
+  /** The pending state or the last decision made through this handle. */
+  getProposalStatus(id: string): 'pending' | 'accepted' | 'rejected' | undefined;
+  isProposalStale(id: string): boolean;
+  /** Observe proposals created or decided through this handle. */
+  onProposalChange(listener: (proposals: Proposal[]) => void): () => void;
+  /**
+   * apply a pending proposal as one undo step and recalc dependents. throws
+   * {@link StaleProposalError} when the base changed since it was staged and
+   * `force` is not set; pass `{ force: true }` to apply anyway.
+   */
+  acceptProposal(id: string, opts?: { force?: boolean }): EditResult & { proposalId: string };
+  /** drop a pending proposal without applying it; false when the id was unknown. */
+  rejectProposal(id: string): boolean;
+  /** whether the embedded wasm core was built with the proposals api. */
+  isProposalsAvailable(): boolean;
+  /**
+   * The session-scoped version of the committed workbook. Committed edits, peer updates, undo,
+   * redo and a recalculation that changes values or what an export reports about results move
+   * it; selection, the active sheet and proposals do not.
+   */
+  version(): string;
+  listDefinedNames(request?: XlsxDefinedNamesRequest): XlsxDefinedNamesResult;
+  /** Cells with the version they were read at; empty `ranges` reads the sheet catalog. */
+  readCells(request: XlsxReadRequest): XlsxReadResult;
+  /** Exact, case-sensitive search over display text, one match per cell. */
+  findText(request: XlsxFindRequest): XlsxFindResult;
+  /** Resolves, stages and rehearses a batch like `applyEdits`, changing nothing. */
+  validateEdits(request: XlsxEditRequest): XlsxValidationResult;
+  /**
+   * Applies every step as one committed, recalculated change, or refuses with nothing changed.
+   * Update listeners run once, after the call returns. Malformed requests throw.
+   */
+  applyEdits(request: XlsxEditRequest): XlsxEditResult;
+  /**
+   * Exports the committed workbook with the version it was read at: sparse cells with values,
+   * formulas and display text, plus sheet metadata and diagnostics. Nothing is recalculated,
+   * flushed or published. Options it cannot honor refuse; malformed ones throw.
+   */
+  exportStructured(options?: XlsxExportOptions): XlsxExportResult<XlsxStructuredContent>;
+  /** {@link WorkbookHandle.exportStructured} rendered as Markdown from the same read. */
+  exportMarkdown(
+    options?: XlsxExportOptions,
+    markdownOptions?: XlsxMarkdownOptions
+  ): XlsxExportResult<XlsxMarkdownContent>;
+  dispose(): void;
+}
+
+let initialized = false;
+let engineMemory: WebAssembly.Memory | undefined;
+let initialization: Promise<void> | undefined;
+let pngExportAvailable = true;
+const displayListJsonReaders = new WeakMap<
+  WorkbookHandle, (viewport: Viewport, sheet?: number) => string
+>();
+
+/** @experimental */
+export function workbookDisplayListJson(
+  handle: WorkbookHandle, viewport: Viewport, sheet?: number
+): string {
+  const read = displayListJsonReaders.get(handle);
+  if (!read) throw new Error('Workbook display list is unavailable');
+  return read(viewport, sheet);
+}
+
+export type WasmInitInput = InitInput | Promise<InitInput>;
+
+export interface WasmInitOptions {
+  png?: boolean;
+}
+
+async function compileWasmInput(input: WasmInitInput): Promise<WebAssembly.Module> {
+  let source = await input;
+  if (source instanceof WebAssembly.Module ||
+    Object.prototype.toString.call(source) === '[object WebAssembly.Module]') return source as WebAssembly.Module;
+  if (typeof source === 'string' || source instanceof URL ||
+    (typeof Request === 'function' && source instanceof Request)) source = await fetch(source);
+  if (typeof Response === 'function' && source instanceof Response) {
+    if (typeof WebAssembly.compileStreaming === 'function') {
+      try { return await WebAssembly.compileStreaming(source.clone()); }
+      catch (error) {
+        if (!source.ok || !['basic', 'cors', 'default'].includes(source.type) ||
+          source.headers.get('Content-Type') === 'application/wasm') throw error;
+      }
+    }
+    source = await source.arrayBuffer();
+  }
+  return WebAssembly.compile(source as BufferSource);
+}
+
+/** Initialize the workbook engine. Concurrent calls share the same attempt. */
+export function initWasm(
+  input?: WasmInitInput,
+  options: WasmInitOptions = {}
+): Promise<void> {
+  if (initialized) return Promise.resolve();
+  if (initialization) return initialization;
+  const png = options.png !== false;
+  let module: WebAssembly.Module | undefined;
+  const source = engineKind === 'native' || (input === undefined && png)
+    ? input ?? wasmAssetUrl()
+    : compileWasmInput(input ?? wasmAssetUrl(png)).then((compiled) => {
+      module = compiled;
+      return compiled;
+    });
+  initialization = initWasmModule({ module_or_path: source }).then(
+    (output) => {
+      engineMemory = output.memory;
+      pngExportAvailable = engineKind === 'native' || module === undefined ||
+        WebAssembly.Module.customSections(module, 'nimbleoffice.xlsx.no-png').length === 0;
+      initialized = true;
+    },
+    (error: unknown) => {
+      initialization = undefined;
+      throw toError(error);
+    }
+  );
+  return initialization;
+}
+
+function requireInitialized(): void {
+  if (!initialized) throw new Error('xlsx wasm is not initialized; call initWasm() first');
+}
+
+// wasm rejects throw strings; normalize them (and anything else) to Error.
+function toError(e: unknown): Error {
+  if (e instanceof Error) return e;
+  const message = typeof e === 'string' ? e : String(e);
+  return displayErrorFrom(message) ?? new Error(message);
+}
+
+/**
+ * The allocation the engine could not get, if any. The core aborts when an
+ * allocation fails, so a trap after one means the engine ran out of memory.
+ */
+export function engineAllocationFailure(): { bytes: number; memoryBytes: number } | null {
+  if (!initialized) return null;
+  const bytes = allocationFailure();
+  return bytes > 0 ? { bytes, memoryBytes: engineMemory?.buffer.byteLength ?? 0 } : null;
+}
+
+/** Maximum counted cells per frame, including boundary and frozen tracks; call after `initWasm`. */
+export function getDisplayListCellLimit(): number {
+  requireInitialized();
+  return displayListCellLimit();
+}
+
+/**
+ * Whether this environment exposes the WebAssembly runtime required by the core.
+ */
+export function isWasmAvailable(): boolean {
+  return typeof WebAssembly === 'object';
+}
+
+/** Whether the embedded wasm core still carries the rasterizer (the `raster` cargo feature). */
+function rasterPngAvailable(): boolean {
+  return pngExportAvailable &&
+    typeof (XlsxDocument.prototype as { renderPng?: unknown }).renderPng === 'function';
+}
+
+/**
+ * Whether `renderPng` can draw here: through a canvas, through the native
+ * engine, or through a wasm build that still carries the rasterizer. Chrome can
+ * disable an export control instead of calling and catching.
+ */
+export function isPngExportAvailable(): boolean {
+  return engineKind === 'native' || canvasPngAvailable() || rasterPngAvailable();
+}
+
+/**
+ * Whether the embedded wasm core exposes the proposals api (propose / accept /
+ * reject / list). The methods only exist on the class when compiled in, so the
+ * UI can hide proposal chrome and degrade gracefully against an older module.
+ */
+export function isProposalsAvailable(): boolean {
+  return typeof (XlsxDocument.prototype as { proposeJson?: unknown }).proposeJson === 'function';
+}
+
+/**
+ * Open a workbook from raw `.xlsx` bytes, initializing the core if needed.
+ * Throws an `Error` if the bytes are not a readable workbook.
+ */
+export function openWorkbook(
+  bytes: Uint8Array,
+  options: OpenWorkbookOptions = {}
+): WorkbookHandle {
+  return openWorkbookInternal(bytes, options);
+}
+
+const peerHydrationReaders = new WeakMap<WorkbookHandle, () => string>();
+const recoveryReaders = new WeakMap<WorkbookHandle, (throughSeq: number, preserveHistory: boolean) => Uint8Array>();
+
+/** Checkpoints are only restorable by the same engine version and codec. */
+export function workbookRecoveryCheckpoint(handle: WorkbookHandle, throughSeq: number, preserveHistory = false): Uint8Array {
+  const capture = recoveryReaders.get(handle);
+  if (!capture) throw new TypeError('Workbook does not support recovery checkpoints');
+  return capture(throughSeq, preserveHistory);
+}
+
+/** Checkpoints are only restorable by the same engine version and codec. */
+export function openWorkbookRecoveryCheckpoint(bytes: Uint8Array, throughSeq: number,
+  options: OpenWorkbookOptions = {}): WorkbookHandle {
+  requireInitialized();
+  try {
+    const doc = (XlsxDocument as typeof XlsxDocument & {
+      openRecoveryCheckpoint(bytes: Uint8Array, throughSeq: number): XlsxDocument;
+    }).openRecoveryCheckpoint(bytes, throughSeq);
+    return wrapWorkbookDocument(doc, options, true);
+  } catch (error) { throw toError(error); }
+}
+const peerVersionAdopters = new WeakMap<WorkbookHandle, (version: string) => void>();
+const peerSnapshotAccess = new WeakMap<WorkbookHandle, {
+  begin(records: number, bytes: number): void;
+  next(): Uint8Array | undefined;
+  end(): void;
+}>();
+
+export function workbookPeerSnapshot(handle: WorkbookHandle) {
+  const snapshot = peerSnapshotAccess.get(handle);
+  if (!snapshot) throw new TypeError('Workbook does not support peer snapshots');
+  return snapshot;
+}
+
+type SnapshotBuilder = {
+  push(chunk: Uint8Array): void;
+  advance(records: number, bytes: number): boolean;
+  finish(): XlsxDocument;
+  free(): void;
+};
+
+export function createWorkbookSnapshotBuilder(options: OpenWorkbookOptions) {
+  requireInitialized();
+  const Constructor = XlsxSnapshotBuilder as unknown as (new () => SnapshotBuilder) | undefined;
+  if (!Constructor) throw new Error('Workbook wasm does not support peer snapshots');
+  let builder: SnapshotBuilder | undefined = new Constructor();
+  function active(): SnapshotBuilder {
+    if (!builder) throw new Error('Workbook snapshot builder is disposed');
+    return builder;
+  }
+  return {
+    push(chunk: Uint8Array): void {
+      try { active().push(chunk); } catch (error) { throw toError(error); }
+    },
+    advance(records: number, bytes: number): boolean {
+      try { return active().advance(records, bytes); } catch (error) { throw toError(error); }
+    },
+    finish(): WorkbookHandle {
+      const finishing = active();
+      builder = undefined;
+      try { return wrapWorkbookDocument(finishing.finish(), options, true); }
+      catch (error) { throw toError(error); }
+    },
+    dispose(): void {
+      const disposing = builder;
+      builder = undefined;
+      disposing?.free();
+    },
+  };
+}
+
+export function workbookPeerHydration(handle: WorkbookHandle): string {
+  const read = peerHydrationReaders.get(handle);
+  if (!read) throw new TypeError('Workbook does not support peer hydration');
+  return read();
+}
+
+export function adoptWorkbookPeerVersion(handle: WorkbookHandle, version: string): void {
+  const adopt = peerVersionAdopters.get(handle);
+  if (!adopt) throw new TypeError('Workbook does not support peer version adoption');
+  adopt(version);
+}
+
+export function openWorkbookPeer(
+  bytes: Uint8Array, options: OpenWorkbookOptions, hydration: string
+): WorkbookHandle {
+  return openWorkbookInternal(bytes, options, hydration);
+}
+
+function openWorkbookInternal(
+  bytes: Uint8Array, options: OpenWorkbookOptions, hydration?: string
+): WorkbookHandle {
+  if (options.calculation !== undefined) {
+    validateCalculationContext(options.calculation);
+    if (options.collaborative === true) {
+      throw new TypeError('calculation context is unavailable for collaborative workbooks');
+    }
+  }
+  requireInitialized();
+  const collaborativeClientId = resolveCollaborativeClientId(options);
+  let doc: XlsxDocument;
+  try {
+    if (hydration !== undefined) {
+      doc = (XlsxDocument as PeerDocumentConstructor).openWithPeerHydrationJson(bytes, hydration);
+    } else if (options.calculation !== undefined) {
+      doc = (XlsxDocument as CalculationDocumentConstructor).openWithCalculationJson(
+        bytes, JSON.stringify(options.calculation)
+      );
+    } else {
+      doc = collaborativeClientId === undefined
+        ? XlsxDocument.open(bytes)
+        : XlsxDocument.openCollaborative(bytes, collaborativeClientId);
+    }
+  } catch (e) {
+    throw toError(e);
+  }
+
+  return wrapWorkbookDocument(doc, options, hydration !== undefined);
+}
+
+function wrapWorkbookDocument(
+  doc: XlsxDocument, options: OpenWorkbookOptions, hydrated: boolean
+): WorkbookHandle {
+  const collaborativeClientId = resolveCollaborativeClientId(options);
+  const listeners = new Map<number, WorkbookUpdateListener>();
+  const proposalDecisions = new Map<string, 'accepted' | 'rejected'>();
+  const proposalListeners = new Set<(proposals: Proposal[]) => void>();
+  const pendingUpdates: Array<{ update: Uint8Array; origin: WorkbookUpdateOrigin; fromPeer: boolean }> = [];
+  let applyingPeerUpdate = 0;
+  let nextListenerId = 0;
+  let disposed = false;
+  let hasCalculationContext = options.calculation !== undefined ||
+    (hydrated && collaborativeClientId === undefined);
+  let observerInstalled = false;
+  let wasmCallDepth = 0;
+  let flushingUpdates = false;
+  let displayCapWarned = false;
+
+  function notifyProposals(): void {
+    if (!proposalListeners.size) return;
+    const proposals = handle.listProposals();
+    for (const listener of proposalListeners) {
+      try { listener(structuredClone(proposals)); }
+      catch (error) { console.error('xlsx proposal listener failed', error); }
+    }
+  }
+
+  function reportDisplayLimit(frame: DisplayList): void {
+    if (!frame.truncated || displayCapWarned) return;
+    displayCapWarned = true;
+    console.warn('xlsx: displayTooLarge: frame truncated at the display cell limit');
+  }
+
+  function assertAlive(): void {
+    if (disposed) throw new Error('workbook handle is disposed');
+  }
+
+  function flushUpdates(): void {
+    if (disposed || flushingUpdates || wasmCallDepth !== 0) return;
+    flushingUpdates = true;
+    try {
+      while (!disposed && pendingUpdates.length > 0) {
+        const event = pendingUpdates.shift();
+        if (!event) break;
+        for (const [id, listener] of [...listeners]) {
+          if (disposed) return;
+          if (listeners.get(id) !== listener) continue;
+          try {
+            listener(event.update.slice(), event.origin, { fromPeer: event.fromPeer });
+          } catch {}
+        }
+      }
+    } finally {
+      flushingUpdates = false;
+      if (disposed) pendingUpdates.length = 0;
+    }
+  }
+
+  function drainWasmUpdates(): void {
+    if (!observerInstalled || disposed) return;
+    while (true) {
+      const encoded = doc.drainUpdateEvent();
+      if (encoded.byteLength === 0) return;
+      const origin = encoded[0];
+      if (origin !== 0 && origin !== 1) {
+        throw new Error(`xlsx wasm returned unknown update origin ${origin}`);
+      }
+      pendingUpdates.push({
+        update: encoded.subarray(1),
+        origin: origin === 0 ? 'local' : 'remote',
+        fromPeer: origin === 1 || applyingPeerUpdate > 0,
+      });
+    }
+  }
+
+  function wasmCall<T>(operation: () => T, drainUpdates = false): T {
+    assertAlive();
+    wasmCallDepth += 1;
+    try {
+      let result: T | undefined;
+      let failure: unknown;
+      let failed = false;
+      try {
+        result = operation();
+      } catch (error) {
+        failure = error;
+        failed = true;
+      }
+      if (drainUpdates && !(failed && isEngineTrap(failure))) {
+        try {
+          drainWasmUpdates();
+        } catch (error) {
+          if (!failed) {
+            failure = error;
+            failed = true;
+          }
+        }
+      }
+      if (failed) throw toError(failure);
+      return result as T;
+    } finally {
+      wasmCallDepth -= 1;
+      if (wasmCallDepth === 0) flushUpdates();
+    }
+  }
+
+  function mutatingWasmCall<T>(operation: () => T): T {
+    return wasmCall(operation, true);
+  }
+
+  function parseJson<T>(operation: () => string, drainUpdates = false): T {
+    return wasmCall(() => JSON.parse(operation()) as T, drainUpdates);
+  }
+
+  function pngEngine(): XlsxPngEngine {
+    return {
+      doc: doc as unknown as XlsxPngEngine['doc'],
+      rasterAvailable: rasterPngAvailable(),
+      rasterize: pngRasterizers.get(handle),
+      onSheet: (sheet, read) => {
+        const active = parseJson<SheetInfo>(() => doc.sheetInfoJson()).activeSheet;
+        if (sheet === active) return wasmCall(read);
+        mutatingWasmCall(() => doc.setActiveSheet(sheet));
+        try { return wasmCall(read); } finally { mutatingWasmCall(() => doc.setActiveSheet(active)); }
+      },
+    };
+  }
+
+  function displayListJson(viewport: Viewport, sheet?: number): string {
+    const json = JSON.stringify(viewport);
+    return sheet === undefined ? doc.displayListJson(json) : doc.displayListForJson(sheet, json);
+  }
+
+  function ensureUpdateObserver(): void {
+    if (observerInstalled) return;
+    wasmCall(() => doc.startUpdateObservation());
+    observerInstalled = true;
+  }
+
+  function clearUnusedUpdateObserver(): void {
+    if (!observerInstalled || listeners.size > 0 || disposed) return;
+    pendingUpdates.length = 0;
+    wasmCall(() => doc.clearUpdateObservation());
+    observerInstalled = false;
+  }
+
+  const handle: WorkbookHandle = {
+    get clientId(): number {
+      return wasmCall(() => doc.clientId);
+    },
+    setCalculationContext(context: WorkbookCalculationContext | null): void {
+      assertAlive();
+      if (context !== null) {
+        validateCalculationContext(context);
+        if (collaborativeClientId !== undefined) {
+          throw new TypeError('calculation context is unavailable for collaborative workbooks');
+        }
+      }
+      wasmCall(() => (doc as CalculationDocument).setCalculationContextJson(JSON.stringify(context)));
+      hasCalculationContext = context !== null;
+    },
+    encodeStateVector(): Uint8Array {
+      return wasmCall(() => doc.encodeStateVector());
+    },
+    encodeStateAsUpdate(remoteStateVector?: Uint8Array): Uint8Array {
+      return wasmCall(() =>
+        remoteStateVector === undefined
+          ? doc.encodeStateAsUpdate()
+          : doc.encodeDiff(remoteStateVector)
+      );
+    },
+    applyUpdate(update: Uint8Array): EditResult {
+      applyingPeerUpdate += 1;
+      try {
+        return parseJson(() => doc.applyUpdateJson(update), true);
+      } finally {
+        applyingPeerUpdate -= 1;
+      }
+    },
+    onUpdate(listener: WorkbookUpdateListener): () => void {
+      assertAlive();
+      if (typeof listener !== 'function') throw new TypeError('update listener must be a function');
+      const id = nextListenerId++;
+      listeners.set(id, listener);
+      try {
+        ensureUpdateObserver();
+      } catch (error) {
+        listeners.delete(id);
+        throw error;
+      }
+      let subscribed = true;
+      return () => {
+        if (!subscribed) return;
+        subscribed = false;
+        listeners.delete(id);
+        clearUnusedUpdateObserver();
+      };
+    },
+    sheetInfo(): SheetInfo {
+      return parseJson(() => doc.sheetInfoJson());
+    },
+    sheetCount(): number {
+      return wasmCall(() => doc.sheetCount());
+    },
+    sheetInfoFor(sheet: number): SheetInfo {
+      if (!Number.isInteger(sheet) || sheet < 0 || sheet >= handle.sheetCount()) {
+        throw new RangeError('Sheet index is out of range');
+      }
+      return parseJson(() => doc.sheetInfoForJson(sheet));
+    },
+    recalculate(): CalculationStatus {
+      assertAlive();
+      return parseJson<CalculationStatus>(() => doc.recalculateJson(), true);
+    },
+    calculationStatus(): CalculationStatus {
+      return wasmCall(() => {
+        const fn = (doc as { calculationStatusJson?: () => string }).calculationStatusJson;
+        if (typeof fn !== 'function') return { limitedCells: [], unevaluatedCells: [] };
+        return JSON.parse(fn.call(doc)) as CalculationStatus;
+      });
+    },
+    displayList(viewport: Viewport): DisplayList {
+      const frame = parseJson<DisplayList>(() => displayListJson(viewport));
+      reportDisplayLimit(frame);
+      return frame;
+    },
+    displayListProfiled(viewport: Viewport): ProfiledDisplayList {
+      const result = parseJson<ProfiledDisplayList>(() => doc.displayListProfiledJson(JSON.stringify(viewport)));
+      reportDisplayLimit(result.displayList);
+      return result;
+    },
+    printDisplayList(sheet: number, range: string, metrics: PrintMetrics, gridlines: boolean): DisplayList {
+      return parseJson(() =>
+        doc.printDisplayListJson(JSON.stringify({ sheet, range, metrics, gridlines }))
+      );
+    },
+    chartAtPoint(viewport: Viewport, x: number, y: number): ChartRegion | null {
+      return parseJson(() => doc.chartAtPointJson(JSON.stringify({ viewport, x, y })));
+    },
+    moveChart(sheet: number, chart: string, dx: number, dy: number): EditResult {
+      return parseJson(() => doc.moveChartJson(JSON.stringify({ sheet, chart, dx, dy })), true);
+    },
+    setActiveSheet(index: number): void {
+      mutatingWasmCall(() => doc.setActiveSheet(index));
+    },
+    editCell(sheet: number, row: number, col: number, input: string): EditResult {
+      return parseJson(() => doc.editCellJson(JSON.stringify({ sheet, row, col, input })), true);
+    },
+    editCellProfiled(sheet: number, row: number, col: number, input: string): ProfiledEditResult {
+      return parseJson(
+        () => doc.editCellProfiledJson(JSON.stringify({ sheet, row, col, input })),
+        true
+      );
+    },
+    editCells(sheet: number, edits: CellInputEdit[]): EditResult {
+      return parseJson(() => doc.editCellsJson(JSON.stringify({ sheet, edits })), true);
+    },
+    moveRange(sheet: number, source: string, destination: string): EditResult {
+      return parseJson(() => doc.moveRangeJson(JSON.stringify({ sheet, source, destination })), true);
+    },
+    setHyperlink(sheet: number, hyperlink: WorkbookHyperlink): EditResult {
+      return parseJson(() => doc.applyOpsJson(JSON.stringify({ ops: [{
+        type: 'setHyperlink', sheet, hyperlink: {
+          range: hyperlink.range,
+          external_target: hyperlink.externalTarget ?? null,
+          location: hyperlink.location ?? null,
+          tooltip: hyperlink.tooltip ?? null,
+          display: hyperlink.display ?? null,
+        },
+      }] })), true);
+    },
+    removeHyperlink(sheet: number, range: MergedRange): EditResult {
+      return parseJson(() => doc.applyOpsJson(JSON.stringify({ ops: [{ type: 'removeHyperlink', sheet, range }] })), true);
+    },
+    charts(sheet: number): ChartInfo[] {
+      return parseJson(() => doc.chartsJson(sheet));
+    },
+    editCharts(edits: ChartMutation[]): EditResult {
+      return parseJson(() => doc.editChartsJson(JSON.stringify(edits)), true);
+    },
+    conditionalFormats(sheet: number): ConditionalFormatInfo[] {
+      return parseJson(() => doc.conditionalFormatsJson(sheet));
+    },
+    applyOps(ops: unknown[]): EditResult {
+      return parseJson(() => doc.applyOpsJson(JSON.stringify({ ops })), true);
+    },
+    applyOpsProfiled(ops: unknown[]): ProfiledEditResult {
+      return parseJson(() => doc.applyOpsProfiledJson(JSON.stringify({ ops })), true);
+    },
+    undo(): EditResult {
+      return parseJson(() => doc.undoJson(), true);
+    },
+    redo(): EditResult {
+      return parseJson(() => doc.redoJson(), true);
+    },
+    cell(sheet: number, row: number, col: number): CellEdit {
+      return parseJson(() => doc.cellJson(JSON.stringify({ sheet, row, col })));
+    },
+    searchText(query, options): XlsxTextMatch[] {
+      if (!query) return [];
+      const limit = options?.limit;
+      if (
+        limit !== undefined &&
+        (!Number.isSafeInteger(limit) || limit < 0 || limit > 0xffff_ffff)
+      ) {
+        throw new RangeError('search limit must be an unsigned 32-bit integer');
+      }
+      return parseJson(() =>
+        doc.searchTextJson(
+          JSON.stringify({
+            query,
+            caseSensitive: options?.caseSensitive ?? false,
+            ...(limit === undefined ? {} : { limit }),
+          })
+        )
+      );
+    },
+    cellPosition(sheet: number, row: number, col: number): CellPosition {
+      return parseJson(() => doc.cellPositionJson(JSON.stringify({ sheet, row, col })));
+    },
+    selectionData(sheet: number, row: number, col: number, direction?: Direction | 'usedRange' | 'rowEnd' | 'merge'): SelectionData {
+      return parseJson(() => doc.selectionDataJson(JSON.stringify({ sheet, row, col, direction })));
+    },
+    cellRect(sheet: number, row: number, col: number): Rect {
+      return parseJson(() => doc.cellRectJson(JSON.stringify({ sheet, row, col })));
+    },
+    rangeCells(sheet: number, range: string): CellEdit[][] {
+      const parsed = parseJson<{ cells: CellEdit[][] }>(() =>
+        doc.rangeCellsJson(JSON.stringify({ sheet, range }))
+      );
+      return parsed.cells;
+    },
+    patchRangeStyle(sheet: number, range: string, patch: RangeStylePatch): EditResult {
+      return parseJson(
+        () => doc.patchRangeStyleJson(JSON.stringify({ sheet, range, patch })),
+        true
+      );
+    },
+    setNumberFormat(
+      sheet: number,
+      range: string,
+      format: NumberFormatMutation
+    ): EditResult {
+      const wire = typeof format === 'string' ? { type: format } : format;
+      return parseJson(
+        () => doc.setRangeNumberFormatJson(JSON.stringify({ sheet, range, format: wire })),
+        true
+      );
+    },
+    selectionFormatting(sheet: number, range: string): SelectionFormatting {
+      return parseJson(() => doc.selectionFormattingJson(JSON.stringify({ sheet, range })));
+    },
+    captureFormat(sheet: number, range: string): CapturedFormat {
+      return parseJson(() => doc.captureFormatJson(JSON.stringify({ sheet, range })));
+    },
+    applyFormat(sheet: number, range: string, format: CapturedFormat): EditResult {
+      return parseJson(
+        () => doc.applyFormatJson(JSON.stringify({ sheet, range, format })),
+        true
+      );
+    },
+    mergedRanges(sheet: number, range: string): MergedRange[] {
+      const parsed = parseJson<{ ranges: MergedRange[] }>(() =>
+        doc.mergedRangesJson(JSON.stringify({ sheet, range }))
+      );
+      return parsed.ranges;
+    },
+    visibleMergedRanges(sheet: number, viewport: Viewport): MergedRange[] {
+      if (!Number.isInteger(sheet) || sheet < 0 || sheet >= handle.sheetCount()) {
+        throw new RangeError('Sheet index is out of range');
+      }
+      const parsed = parseJson<{ ranges: MergedRange[] }>(() =>
+        doc.visibleMergedRangesJson(sheet, JSON.stringify(viewport))
+      );
+      return parsed.ranges;
+    },
+    historyState(): HistoryState {
+      return parseJson(() => doc.historyStateJson());
+    },
+    renderPng(target: XlsxPngTarget, options: XlsxPngOptions = {}): Promise<Uint8Array> {
+      let resolved: ResolvedPngTarget;
+      try {
+        resolved = resolvePngTarget(target, options, parseJson<SheetInfo>(() => doc.sheetInfoJson()).sheetNames);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return renderEnginePng(pngEngine(), resolved, options);
+    },
+    renderPngFonts: (target: XlsxPngTarget, options: XlsxPngOptions = {}): XlsxPngFont[] => workbookPngFonts(handle, target, options),
+    save(): Uint8Array {
+      return wasmCall(() => doc.saveBytes());
+    },
+    propose(agentId: string, note: string | null, edits: ProposalEdit[]): Proposal {
+      const proposal = mutatingWasmCall(() => {
+        const fn = (doc as { proposeJson?: (a: string) => string }).proposeJson;
+        if (typeof fn !== 'function') throw new Error('proposals not in this build');
+        const wireEdits = edits.map(({ numberFormat, ...edit }) => ({
+          ...edit,
+          ...(numberFormat === undefined
+            ? {}
+            : { numberFormat: typeof numberFormat === 'string' ? { type: numberFormat } : numberFormat }),
+        }));
+        return JSON.parse(
+          fn.call(doc, JSON.stringify({ agentId, note, edits: wireEdits }))
+        ) as Proposal;
+      });
+      notifyProposals();
+      return proposal;
+    },
+    listProposals(): Proposal[] {
+      return wasmCall(() => {
+        const fn = (doc as { listProposalsJson?: () => string }).listProposalsJson;
+        if (typeof fn !== 'function') return [];
+        return (JSON.parse(fn.call(doc)) as { proposals: Proposal[] }).proposals;
+      });
+    },
+    onProposalChange(listener) {
+      assertAlive();
+      if (typeof listener !== 'function') throw new TypeError('proposal listener must be a function');
+      proposalListeners.add(listener);
+      return () => { proposalListeners.delete(listener); };
+    },
+    getProposalStatus(id: string) {
+      if (handle.listProposals().some(proposal => proposal.id === id)) return 'pending';
+      return proposalDecisions.get(id);
+    },
+    isProposalStale(id: string) {
+      const draft = openWorkbookRecoveryCheckpoint(workbookRecoveryCheckpoint(handle, 0), 0);
+      try {
+        draft.acceptProposal(id);
+        return false;
+      } catch (error) {
+        if (error instanceof StaleProposalError) return true;
+        throw error;
+      } finally { draft.dispose(); }
+    },
+    acceptProposal(id: string, opts?: { force?: boolean }): EditResult & { proposalId: string } {
+      try {
+        const accepted = mutatingWasmCall(() => {
+          const fn = (doc as { acceptProposalJson?: (a: string) => string }).acceptProposalJson;
+          if (typeof fn !== 'function') throw new Error('proposals not in this build');
+          const result = JSON.parse(
+            fn.call(doc, JSON.stringify({ id, force: opts?.force ?? false }))
+          ) as EditResult & { proposalId: string };
+          proposalDecisions.set(id, 'accepted');
+          return result;
+        });
+        notifyProposals();
+        return accepted;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : typeof e === 'string' ? e : String(e);
+        throw staleErrorFrom(message) ?? toError(e);
+      }
+    },
+    rejectProposal(id: string): boolean {
+      const rejected = mutatingWasmCall(() => {
+        const fn = (doc as { rejectProposalJson?: (a: string) => string }).rejectProposalJson;
+        if (typeof fn !== 'function') return false;
+        const removed = (JSON.parse(fn.call(doc, JSON.stringify({ id }))) as { removed: boolean }).removed;
+        if (removed) proposalDecisions.set(id, 'rejected');
+        return removed;
+      });
+      if (rejected) notifyProposals();
+      return rejected;
+    },
+    isProposalsAvailable(): boolean {
+      return wasmCall(() => typeof (doc as { proposeJson?: unknown }).proposeJson === 'function');
+    },
+    version(): string {
+      return wasmCall(() => doc.documentVersion());
+    },
+    listDefinedNames(request: XlsxDefinedNamesRequest = {}): XlsxDefinedNamesResult {
+      return parseJson(() => doc.listDefinedNamesJson(JSON.stringify(request)));
+    },
+    readCells(request: XlsxReadRequest): XlsxReadResult {
+      return parseJson(() => doc.readCellsJson(JSON.stringify(request)));
+    },
+    findText(request: XlsxFindRequest): XlsxFindResult {
+      return parseJson(() => doc.findTextJson(JSON.stringify(request)));
+    },
+    validateEdits(request: XlsxEditRequest): XlsxValidationResult {
+      if (hasCalculationContext && request.calculation !== undefined) {
+        validateCalculationOverride(request.calculation);
+      }
+      return parseJson(() => doc.validateEditsJson(JSON.stringify(request)));
+    },
+    applyEdits(request: XlsxEditRequest): XlsxEditResult {
+      if (hasCalculationContext && request.calculation !== undefined) {
+        validateCalculationOverride(request.calculation);
+      }
+      return parseJson(() => doc.applyEditsJson(JSON.stringify(request)), true);
+    },
+    exportStructured(options: XlsxExportOptions = {}): XlsxExportResult<XlsxStructuredContent> {
+      return parseJson(() => doc.exportStructuredJson(JSON.stringify(options)));
+    },
+    exportMarkdown(
+      options: XlsxExportOptions = {},
+      markdownOptions: XlsxMarkdownOptions = {}
+    ): XlsxExportResult<XlsxMarkdownContent> {
+      return parseJson(() =>
+        doc.exportMarkdownJson(JSON.stringify(options), JSON.stringify(markdownOptions))
+      );
+    },
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      proposalDecisions.clear();
+      proposalListeners.clear();
+      listeners.clear();
+      pendingUpdates.length = 0;
+      let disposalError: unknown;
+      if (observerInstalled) {
+        try {
+          doc.clearUpdateObservation();
+        } catch (error) {
+          disposalError = error;
+        }
+        observerInstalled = false;
+      }
+      try {
+        doc.free();
+      } catch (error) {
+        disposalError ??= error;
+      }
+      if (disposalError !== undefined) throw toError(disposalError);
+    },
+  };
+  displayListJsonReaders.set(handle, (viewport, sheet) => {
+    const json = wasmCall(() => displayListJson(viewport, sheet));
+    if (!displayCapWarned && json.includes('"truncated":true')) {
+      reportDisplayLimit(JSON.parse(json) as DisplayList);
+    }
+    return json;
+  });
+  pngFontReaders.set(handle, (target, options) => sheetFonts(pngDisplayList(pngEngine(),
+    resolvePngTarget(target, options, parseJson<SheetInfo>(() => doc.sheetInfoJson()).sheetNames), options).list));
+  recoveryReaders.set(handle, (throughSeq, preserveHistory) => wasmCall(() => doc.recoveryCheckpoint(throughSeq, preserveHistory)));
+  peerHydrationReaders.set(handle, () => wasmCall(() => (doc as PeerDocument).peerHydrationJson()));
+  peerVersionAdopters.set(handle, (version) => wasmCall(() => (doc as PeerDocument).adoptPeerVersion(version)));
+  peerSnapshotAccess.set(handle, {
+    begin: (records, bytes) => wasmCall(() => (doc as SnapshotDocument).beginPeerSnapshot(records, bytes)),
+    next: () => wasmCall(() => (doc as SnapshotDocument).nextPeerSnapshotChunk()),
+    end: () => wasmCall(() => (doc as SnapshotDocument).endPeerSnapshot()),
+  });
+  formulaMovers.set(handle, (items) => parseJson(() => doc.translateFormulasJson(JSON.stringify(items))));
+  return handle;
+}
+
+type FormulaMoves = readonly { formula: string; from: CellPoint; to: CellPoint }[];
+type MovedFormulas = ({ ok: true; formula: string } | { ok: false; error: string })[];
+
+const formulaMovers = new WeakMap<WorkbookHandle, (items: FormulaMoves) => MovedFormulas>();
+
+/**
+ * @internal Formulas, without their `=`, moved from one cell to another as a paste moves them, by
+ * the engine of `handle`; per item the moved formula, or why a paste would refuse it.
+ */
+export function translateFormulasOn(
+  handle: WorkbookHandle, items: readonly { formula: string; from: CellPoint; to: CellPoint }[]
+): ({ ok: true; formula: string } | { ok: false; error: string })[] {
+  const move = formulaMovers.get(handle);
+  if (!move) throw new TypeError('translateFormulasOn needs a workbook this package opened');
+  return move(items);
+}
+
+type SnapshotDocument = XlsxDocument & {
+  beginPeerSnapshot(records: number, bytes: number): void;
+  nextPeerSnapshotChunk(): Uint8Array | undefined;
+  endPeerSnapshot(): void;
+};
+
+type PeerDocument = XlsxDocument & {
+  peerHydrationJson(): string;
+  adoptPeerVersion(version: string): void;
+};
+
+type PeerDocumentConstructor = typeof XlsxDocument & {
+  openWithPeerHydrationJson(bytes: Uint8Array, hydration: string): PeerDocument;
+};
+
+type CalculationDocument = XlsxDocument & {
+  setCalculationContextJson(context: string): void;
+};
+
+type CalculationDocumentConstructor = typeof XlsxDocument & {
+  openWithCalculationJson(bytes: Uint8Array, context: string): CalculationDocument;
+};
+
+function validateCalculationContext(context: unknown): void {
+  if (
+    typeof context !== 'object' || context === null || Array.isArray(context) ||
+    Object.keys(context).some((key) => key !== 'nowSerial' && key !== 'randSeed')
+  ) {
+    throw new TypeError('calculation must be an object with nowSerial and randSeed');
+  }
+  const { nowSerial, randSeed } = context as Partial<WorkbookCalculationContext>;
+  if (typeof nowSerial !== 'number' || !Number.isFinite(nowSerial)) {
+    throw new TypeError('nowSerial must be a finite number');
+  }
+  if (
+    typeof randSeed !== 'number' || !Number.isInteger(randSeed) || randSeed < 0 || randSeed > 0xffff_ffff
+  ) {
+    throw new TypeError('randSeed must be an integer from 0 to 4294967295');
+  }
+}
+
+function validateCalculationOverride(calculation: unknown): void {
+  if (
+    typeof calculation !== 'object' || calculation === null || Array.isArray(calculation) ||
+    Object.keys(calculation).some((key) => key !== 'nowSerial')
+  ) {
+    throw new TypeError('calculation must be an object with an optional nowSerial');
+  }
+  const { nowSerial } = calculation as { nowSerial?: number };
+  if (nowSerial !== undefined && (typeof nowSerial !== 'number' || !Number.isFinite(nowSerial))) {
+    throw new TypeError('nowSerial must be a finite number');
+  }
+}
+
+function resolveCollaborativeClientId(options: OpenWorkbookOptions): number | undefined {
+  if (!options.collaborative) {
+    if (options.clientId !== undefined) {
+      throw new TypeError('clientId requires collaborative mode');
+    }
+    return undefined;
+  }
+  if (options.clientId !== undefined) {
+    if (
+      !Number.isSafeInteger(options.clientId) ||
+      options.clientId <= 0 ||
+      options.clientId >= OPEN_SYNC_CLIENT
+    ) {
+      throw new RangeError('clientId must be a nonzero safe integer below Number.MAX_SAFE_INTEGER - 1');
+    }
+    return options.clientId;
+  }
+
+  const random = globalThis.crypto;
+  if (!random || typeof random.getRandomValues !== 'function') {
+    throw new Error('crypto.getRandomValues is required to generate a collaboration client ID');
+  }
+  const words = new Uint32Array(2);
+  let value: number;
+  do {
+    random.getRandomValues(words);
+    value = (words[0] & 0x1fffff) * 0x1_0000_0000 + words[1];
+  } while (value === 0 || value >= OPEN_SYNC_CLIENT);
+  return value;
+}
+
+function exported<T>(operation: () => string): T {
+  try {
+    return JSON.parse(operation()) as T;
+  } catch (error) {
+    throw toError(error);
+  }
+}
+
+/**
+ * Exports `.xlsx` bytes as read, initializing the core if needed. Formula results are the
+ * stored ones: nothing is recalculated and no clock is read, so the same bytes and options
+ * always give the same content. Unreadable bytes and unusable options reject.
+ */
+export async function exportXlsxStructured(
+  bytes: Uint8Array,
+  options: XlsxExportOptions = {}
+): Promise<XlsxStructuredContent> {
+  await initWasm();
+  return exported(() => exportXlsxStructuredJson(bytes, JSON.stringify(options)));
+}
+
+/** {@link exportXlsxStructured} rendered as Markdown. */
+export async function exportXlsxMarkdown(
+  bytes: Uint8Array,
+  options: XlsxExportOptions = {},
+  markdownOptions: XlsxMarkdownOptions = {}
+): Promise<XlsxMarkdownContent> {
+  await initWasm();
+  return exported(() =>
+    exportXlsxMarkdownJson(bytes, JSON.stringify(options), JSON.stringify(markdownOptions))
+  );
+}
+
+/** Renders structured content as Markdown; content that does not validate rejects. */
+export async function renderXlsxMarkdown(
+  content: XlsxStructuredContent,
+  options: XlsxMarkdownOptions = {}
+): Promise<XlsxMarkdownContent> {
+  await initWasm();
+  return exported(() => renderXlsxMarkdownJson(JSON.stringify(content), JSON.stringify(options)));
+}
+
+/**
+ * The crate version string, for asserting wasm/js parity.
+ */
+export function wasmVersion(): string {
+  requireInitialized();
+  return XlsxDocument.version();
+}

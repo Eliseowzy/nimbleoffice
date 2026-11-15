@@ -1,0 +1,19 @@
+[package]
+name = "nimbleoffice-fonts-cjk"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0 AND OFL-1.1"
+repository.workspace = true
+publish = ["crates-io"]
+description = "Bundled cjk font pack bytes for native font resolution"
+include = ["src/**", "build.rs", "assets/**", "LICENSE", "LICENSES/**"]
+
+[dependencies]
+nimbleoffice-fonts-cjk-sc.workspace = true
+nimbleoffice-fonts-cjk-tc.workspace = true
+nimbleoffice-fonts-cjk-jp.workspace = true
+nimbleoffice-fonts-cjk-kr.workspace = true
+nimbleoffice-fonts-cjk-serif-sc.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

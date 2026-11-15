@@ -1,0 +1,18688 @@
+//! Display-list builder: `{ measured, options } + Layout -> DisplayList`.
+//!
+//! Takes the same measured/options envelope pagination consumes plus the
+//! finished [`crate::types::Layout`], and compiles one [`DisplayPage`] of
+//! renderer-agnostic paint primitives per laid-out page. A display list is
+//! always derived from a `Layout`; nothing here decides where content goes.
+//!
+//! Every text-bearing primitive carries `docStart` / `docEnd` and its block
+//! identity. That is what hit testing, selection and the accessibility mirror
+//! resolve against, so a primitive without those is invisible to interaction.
+//!
+//! # Paint order
+//!
+//! A page's `primitives` are emitted back to front: watermark, behind-document
+//! floating images, the layout's fragments in order, in-front floating images,
+//! then column separators. Inside a fragment the order is shading, borders,
+//! then line content. The `watermark_primitive_count` prefix paints below the
+//! header and footer; the remaining body primitives paint above them.
+//!
+//! `background`, `page_borders`, `header`, `footer` and `note_areas` are
+//! separate fields rather than entries in that stream, so the consumer places
+//! them. Page borders are not one layer: each carries a `z_order` of `back` or
+//! `front` taken from `w:pgBorders/@zOrder` (anything but `back` is `front`),
+//! so a border may sit behind page content or over it.
+//!
+//! # Text
+//!
+//! Run positions come from resolved line segments, and decorations — underline,
+//! strike, highlight, comment range, revision washes — ride with the run they
+//! belong to. A run becomes a [`GlyphRunPrimitive`] when the input supplies
+//! font chains and the run's chain resolves against the measurement font store;
+//! any miss (no fonts, no chain, empty text, a shaping failure) falls back to a
+//! [`TextRunPrimitive`] carrying a CSS font shorthand. A glyph run is
+//! single-font by contract, so a run spanning fallback fonts splits into one
+//! glyph run per maximal same-font subrange.
+//!
+//! Rows measured with authoritative run, cluster and bidi metadata use it
+//! directly. Rows without it fall back to a deterministic proportional split:
+//! fixed-width items (tabs, inline images) claim their width first, and the
+//! line's remaining measured width is distributed across the text-ish segments
+//! by character count.
+//!
+//! PAGE and NUMPAGES fields whose per-page resolved widths the input supplies
+//! leave that pool and become fixed-width at the page's own width, with the
+//! fallback width they contributed to the measure subtracted from the pool
+//! baseline — which is what lets a centred or right-aligned field line
+//! re-centre per page instead of tracking the once-measured fallback. DATE and
+//! TIME fields always render their stored fallback text rather than the current
+//! clock, so a display list is reproducible. A field's instruction is carried
+//! for announcement only and is never evaluated.
+//!
+//! Justified lines (`jc` of `both` or `distribute`) spread the line's slack
+//! evenly across U+0020 clusters. Glyph positions already fold that stretch in,
+//! so the emitted `wordSpacing` is an interchange hint, not something a
+//! renderer re-applies. On the first line the hanging or first-line indent
+//! shifts the text; when a visible list marker is present it occupies the hang,
+//! and body text starts at the text indent instead of being pulled left.
+//!
+//! # Tables
+//!
+//! A table fragment paints the row window its page shows, stacking a repeated
+//! header band above it. Vertically merged cells are re-emitted as continuation
+//! slices on later pages: those are re-paints, so they carry no document
+//! positions and are not selectable. Repeated header rows are literal re-paints
+//! and are deliberately *not* flagged as continuations. Shared cell edges
+//! collapse to a single border, and a fragment cut by a page break is closed
+//! with its own cut edges.
+//!
+//! Inside a cell, paragraph spacing collapses as it does in body flow, drawn
+//! border widths and padding inset the content box, and `w:vAlign` offsets the
+//! leftover slack — except that content which fills or overflows the box stays
+//! top-aligned, matching where the paginator broke it. Text boxes nested inside
+//! table cells emit nothing.
+//!
+//! # Numbers
+//!
+//! Coordinates round to three decimals, and integral floats are canonicalized
+//! to integers so the fields typed as integers survive a round trip through a
+//! host with a single number type.
+
+use crate::fmath;
+use crate::line_geometry::{HorizontalLineGeometry, horizontal_line_box, runs_base_is_rtl};
+use ooxml_drawingml::GeometryPathCommand;
+use ooxml_drawingml::chart::{
+    PlotAxis, PlotAxisKind, PlotAxisRange, PlotAxisTitles, PlotChart, PlotChartText,
+    PlotDataLabels, PlotGroup, PlotLegend, PlotLine, PlotMarker, PlotMarkerSymbol, PlotOp,
+    PlotPoint, PlotRect, PlotSeries, PlotSink, PlotTextAlign, PlotTextStyle, blank_numbers,
+    chart_aria_label, fallback_label_width, plot_chart_into,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{Number, Value};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+
+/// A compiled document: one entry per laid-out page, in document order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayList {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
+    pub pages: Vec<DisplayPage>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayPage {
+    pub page_index: u64,
+    pub width: Number,
+    pub height: Number,
+    /// Authored body content box and column boxes. These are explicit display
+    /// metadata because interaction code must not infer Word margins from the
+    /// minimum coordinates of whichever primitives happen to paint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_bounds: Option<DisplayBounds>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_bounds: Vec<DisplayBounds>,
+    /// Effective section and page-number state from pagination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_page_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_page_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
+    /// paint order
+    pub primitives: Vec<Primitive>,
+    /// Leading primitives painted beneath the header and footer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_primitive_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub page_borders: Vec<PageBorderPrimitive>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<HfRegion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<HfRegion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_areas: Vec<NoteRegion>,
+    /// Where host layout reservations landed on this page; never painted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reservations: Vec<DisplayReservation>,
+    /// Table cell edges without a visible border, for a view-only overlay;
+    /// never painted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub table_gridlines: Vec<DisplayGridline>,
+    /// Geometry only: the page's content is built when a host asks for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unbuilt: bool,
+    /// For an unbuilt page, the lowest and highest body position its layout
+    /// places, so a host can find the page a position is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_span: Option<[i64; 2]>,
+    /// For an unbuilt page, the header and footer parts its build paints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_parts: Option<HfParts>,
+    /// The blank sheet an `oddPage` / `evenPage` section start inserts to
+    /// reach its parity. It keeps its page number and prints, but Word's
+    /// Print Layout does not show it, so hosts may collapse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parity_filler: bool,
+}
+
+/// The page rect a host's layout reservation takes, in page coordinates.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayReservation {
+    pub owner: String,
+    pub id: String,
+    pub x: Number,
+    pub y: Number,
+    pub width: Number,
+    pub height: Number,
+}
+
+/// One table cell edge segment in page coordinates.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayGridline {
+    pub x1: Number,
+    pub y1: Number,
+    pub x2: Number,
+    pub y2: Number,
+}
+
+/// Relationship ids of the header and footer parts a page paints.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HfParts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayBounds {
+    pub x: Number,
+    pub y: Number,
+    pub width: Number,
+    pub height: Number,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRegion {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub separator_primitives: Vec<Primitive>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primitives: Vec<Primitive>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_ids: Vec<i64>,
+    /// Per-note backlink metadata: the body-document anchor range and the
+    /// formatted label, so a note can be linked back to its reference mark.
+    /// Emitted only for notes that carry anchor or label data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<NoteRegionNote>,
+}
+
+/// Backlink metadata for one note region entry.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRegionNote {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    /// body-doc range of the reference mark anchoring this note
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_doc_start: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_doc_end: Option<i64>,
+    /// formatted reference label (display number / custom mark); file-derived
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Header or footer band in page coordinates.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HfRegion {
+    pub r_id: String,
+    pub kind: HfKind,
+    pub y: Number,
+    pub height: Number,
+    /// paint order
+    pub primitives: Vec<Primitive>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HfKind {
+    #[serde(rename = "header")]
+    Header,
+    #[serde(rename = "footer")]
+    Footer,
+}
+
+/// One paint operation. A renderer walks these in order and needs no knowledge
+/// of DOCX to draw them.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind")]
+pub enum Primitive {
+    #[serde(rename = "text")]
+    Text(TextRunPrimitive),
+    #[serde(rename = "glyphRun")]
+    GlyphRun(GlyphRunPrimitive),
+    #[serde(rename = "rect")]
+    Rect(RectPrimitive),
+    #[serde(rename = "line")]
+    Line(LinePrimitive),
+    #[serde(rename = "image")]
+    Image(ImagePrimitive),
+    #[serde(rename = "shape")]
+    Shape(ShapePrimitive),
+    #[serde(rename = "decoration")]
+    Decoration(DecorationPrimitive),
+}
+
+/// One browser text cluster at an offset from its run's pen origin.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CanvasTextCluster {
+    pub text: String,
+    pub offset: Number,
+    #[serde(
+        rename = "sourceRange",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_range: Option<std::ops::Range<usize>>,
+}
+
+/// Everything a primitive carries about the document content it came from:
+/// its position range, block and paragraph identity, enclosing table cell,
+/// content-control ancestry, revision and comment state, and the per-class
+/// paint metadata flattened alongside. This is the only channel through which
+/// a painted primitive can be mapped back to the document.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DocAttrs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_start: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_end: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<Number>,
+    /// raw string block id, emitted when the id is NOT numeric (the live
+    /// pipeline's compound `block-N` keys). Consumers group by
+    /// `blockKey ?? String(blockId)` — exactly one of the two is present
+    /// whenever the primitive has block identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_key: Option<String>,
+    /// Exact document range of the owning paragraph fragment. A primitive's own
+    /// range describes inline content and normally starts at the paragraph's
+    /// `pmStart + 1`, whereas a paragraph wrapper starts at the fragment's
+    /// `pmStart`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_doc_start: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_doc_end: Option<i64>,
+    /// Stable Word `w14:paraId` of the enclosing paragraph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub para_id: Option<String>,
+    /// Measured line window `[from_line, to_line)` of the paragraph fragment
+    /// this primitive belongs to. Stamped only where a fragment surfaces as a
+    /// paragraph wrapper — body, header/footer and text-box content. Table-cell
+    /// paragraphs are omitted, because they surface as ARIA cells and have no
+    /// fragment of their own to carry the window.
+    /// Omitted when no stamped range exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_line: Option<u64>,
+    /// Resolved line index within the owning paragraph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_index: Option<u64>,
+    /// table cell the primitive paints inside (0-based grid coordinates)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<Box<TableCellRef>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_ids: Option<Vec<String>>,
+    /// inert field identity when this primitive paints a field result — the
+    /// a11y mirror announces it; the instruction is NEVER parsed/executed.
+    /// Additive + serde-optional: field-free fixtures stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<Box<FieldMetadata>>,
+    /// footnote/endnote reference identity when this primitive is the body
+    /// reference mark (note backlinks). Additive + serde-optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_ref: Option<Box<NoteRefMetadata>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<Box<Revision>>,
+    /// Synthetic numbering glyph emitted before the first line of a list
+    /// paragraph. The mirror uses this to expose the stable list-marker class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_marker: Option<bool>,
+    /// Pending tracked-change paint for the synthetic numbering glyph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_marker_revision: Option<RevisionKind>,
+    /// structural tracked-change cue on a paragraph mark or table structure
+    /// (paragraph mark, whole table, row, or cell). Additive + optional so
+    /// display-list snapshots that carry only run-level revisions stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_revision: Option<Box<StructuralRevision>>,
+    /// sanitized hyperlink target for clickable text/image primitives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_history: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_doc_location: Option<String>,
+    /// innermost block-level content-control identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdt: Option<Box<SdtAttrs>>,
+    /// Full outer-to-inner content-control ancestry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sdt_path: Vec<SdtAttrs>,
+    /// inline content-control widget metadata when this text primitive is its glyph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_sdt_widget: Option<Box<InlineSdtWidgetAttrs>>,
+    /// accessibility summary for primitives that compose one chart block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<ChartA11yAttrs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_order: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi_level: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decorative: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aria_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aria_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_object: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<Box<CommentMetadata>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_group: Option<Box<ClipGroupMetadata>>,
+    /// Leader glyph metadata shared by text and glyph primitives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_glyphs: Option<Box<LeaderGlyphMetadata>>,
+    /// Optional decoration metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_slice: Option<Box<HighlightSliceMetadata>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<DisplayBorderStyle>,
+    /// Fields belonging to one primitive class are flattened through the shared
+    /// attrs, so a constructor that fills only the common fields stays valid.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "opacity")]
+    pub primitive_opacity: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "flipH")]
+    pub image_flip_h: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "flipV")]
+    pub image_flip_v: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "shapeType")]
+    pub image_shape_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_frame: Option<Box<ContentFrame>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<Box<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_paint: Option<Box<Value>>,
+    /// Lossless DrawingML stroke details beyond the plain colour/width/dash
+    /// triple: compound, alignment, caps, joins, arrows and custom dashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_paint: Option<Box<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_extent: Option<Box<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawing_scene: Option<Box<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_body_properties: Option<Box<Value>>,
+    /// GlyphRun-only member flattened through the shared attrs (same pattern
+    /// as the image/shape members above): the resolved CSS font shorthand the
+    /// canvas fillText safety net uses when glyph outlines are unavailable,
+    /// so the fallback keeps the measured face instead of generic sans-serif.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_font: Option<String>,
+    /// Positioned browser text clusters, boxed to keep primitives compact.
+    #[allow(clippy::box_collection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_clusters: Option<Box<Vec<CanvasTextCluster>>>,
+    /// Text/GlyphRun-only member: modern w14 text effects payload
+    /// (glow/shadow/reflection/textFill/textOutline), passed through losslessly
+    /// from `RunFormatting.modernEffects`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modern_effects: Option<Box<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<Box<TableMetadata>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_shape_atom: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TableMetadata {
+    pub table_id: String,
+    pub row_start: u64,
+    pub row_end: u64,
+    pub row_count: u64,
+    pub column_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_row_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_table_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<bool>,
+    /// reviewer display name (file-derived, attacker-controlled)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    /// comment date string, passed through verbatim
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// plain-text comment body excerpt, capped at [`MAX_COMMENT_TEXT_CHARS`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// total replies in the thread (may exceed `replies.len()` when capped)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_count: Option<u64>,
+    /// reply summaries in thread order, capped at [`MAX_COMMENT_REPLIES`]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<CommentReplyMetadata>,
+}
+
+/// One reply summary inside [`CommentMetadata`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentReplyMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Inert field identity carried by a primitive.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldMetadata {
+    /// resolved category: PAGE, NUMPAGES, DATE, TIME or OTHER
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// raw Word field type token (e.g. TOC, PAGEREF, REF)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// raw instruction text, capped at [`MAX_FIELD_INSTRUCTION_CHARS`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+}
+
+/// Footnote or endnote identity on a body reference mark.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRefMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipGroupMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip: Option<ClipRect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Number>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct ClipRect {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<Number>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaderGlyphMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glyph: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_y: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtl: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HighlightSliceMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascent: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub includes_trailing_whitespace: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ChartA11yAttrs {
+    pub label: String,
+    /// The placed chart box every primitive of the chart paints inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<Box<ContentFrame>>,
+}
+
+/// The grid position of the cell a primitive paints inside.
+///
+/// `row` and `col` are 0-based anchor-grid coordinates with vertical merges and
+/// column spans already resolved, so a merged cell keeps its anchor row, and
+/// spans are always at least 1. `continuation` marks the synthetic slice of a
+/// vertically merged cell re-painted on a later page: not selectable, and with
+/// document positions stripped. A repeated header row is a literal re-paint and
+/// is deliberately not flagged.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TableCellRef {
+    pub row: u64,
+    pub col: u64,
+    pub row_span: u64,
+    pub col_span: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_header: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_header: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_wrap: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owns_top_border: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owns_right_border: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owns_bottom_border: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owns_left_border: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SdtAttrs {
+    pub group_id: String,
+    pub sdt_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeating_item: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineSdtWidgetAttrs {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_kind: Option<String>,
+    pub group_id: String,
+    pub pos: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_items: Vec<InlineSdtListItemAttrs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineSdtListItemAttrs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Revision {
+    pub author: String,
+    pub date: String,
+    pub revision_id: String,
+    pub kind: RevisionKind,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum RevisionKind {
+    #[serde(rename = "ins")]
+    Ins,
+    #[serde(rename = "del")]
+    Del,
+    #[serde(rename = "format")]
+    Format,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StructuralRevision {
+    pub scope: StructuralRevisionScope,
+    pub author: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    pub revision_id: String,
+    pub kind: StructuralRevisionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub col_index: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralRevisionScope {
+    #[serde(rename = "pmark")]
+    Pmark,
+    #[serde(rename = "table")]
+    Table,
+    #[serde(rename = "row")]
+    Row,
+    #[serde(rename = "cell")]
+    Cell,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralRevisionKind {
+    #[serde(rename = "ins")]
+    Ins,
+    #[serde(rename = "del")]
+    Del,
+    #[serde(rename = "merge")]
+    Merge,
+}
+
+/// A run of text painted from a font shorthand and a measured advance, used
+/// wherever shaping is unavailable for the run.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TextRunPrimitive {
+    pub text: String,
+    /// Canvas-only glyph stand-in text, boxed to keep primitives compact.
+    #[allow(clippy::box_collection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint_text: Option<Box<String>>,
+    /// pen origin
+    pub x: Number,
+    pub baseline_y: Number,
+    /// measured advance of the whole run
+    pub width: Number,
+    /// Guessed horizontal paint slot. Missing y/h leaves ink vertically unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint_clip: Option<ClipRect>,
+    /// CSS font shorthand.
+    pub font: String,
+    /// Script faces its paragraph needs, as the layout's font collection resolves them.
+    #[allow(clippy::box_collection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scripts: Option<Box<Vec<String>>>,
+    pub color: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub letter_spacing: Option<Number>,
+    /// Extra advance added after each U+0020 cluster (px), set only on
+    /// justified lines (`jc` of `both` or `distribute`). The primitive's
+    /// `width` already includes the same stretch, so this is an interchange
+    /// hint. Absent means no stretch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub word_spacing: Option<Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtl: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation_deg: Option<Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horizontal_scale: Option<Number>,
+    /// Canvas-only width ratio for substituted font bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substitute_scale: Option<Number>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all_caps: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub small_caps: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_shadow: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub text_outline: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emphasis_mark: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_effect: Option<String>,
+    #[serde(flatten)]
+    pub attrs: DocAttrs,
+}
+
+/// A shaped run of positioned glyphs, single-font by contract.
+///
+/// A renderer paints each glyph as an outline from `font_id`'s bytes, while
+/// `text` keeps the real characters for accessibility and copying. Emitted only
+/// when the measurement font store is populated and the run's font chain
+/// resolves; otherwise the builder emits a [`TextRunPrimitive`]. A run spanning
+/// several fallback fonts becomes one glyph run per maximal same-font subrange.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GlyphRunPrimitive {
+    /// id in the measurement `FontStore` (the same registry `fontChains`
+    /// references).
+    pub font_id: u32,
+    /// font size in px.
+    pub size: f64,
+    pub color: String,
+    /// SOURCE TEXT — the a11y mirror renders this as real characters and the
+    /// glyph `cluster`s index into it. REQUIRED.
+    pub text: String,
+    /// Canvas-only glyph stand-in text for the fillText fallback, boxed to
+    /// keep primitives compact.
+    #[allow(clippy::box_collection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint_text: Option<Box<String>>,
+    pub glyphs: Vec<PlacedGlyph>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub echo: Option<EchoRunFacts>,
+    /// Guessed horizontal paint slot. Missing y/h leaves ink vertically unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint_clip: Option<ClipRect>,
+    /// extra advance added after each U+0020 cluster on a justified line (px) —
+    /// equivalent to [`TextRunPrimitive::word_spacing`]; the glyph `x` positions
+    /// already fold this stretch in, so it is an interchange hint, not
+    /// re-applied by the renderer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub word_spacing: Option<Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtl: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation_deg: Option<Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horizontal_scale: Option<Number>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all_caps: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub small_caps: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_shadow: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub text_outline: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emphasis_mark: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_effect: Option<String>,
+    #[serde(flatten)]
+    pub attrs: DocAttrs,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EchoRunFacts {
+    #[serde(serialize_with = "echo_coordinate")]
+    pub x: f64,
+    #[serde(serialize_with = "echo_coordinate")]
+    pub right: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub kern: bool,
+    #[serde(default, skip_serializing_if = "echo_zero")]
+    pub kerning: f64,
+    #[serde(default = "echo_primary", skip_serializing_if = "echo_is_primary")]
+    pub primary_font: bool,
+    #[serde(default, skip_serializing_if = "echo_zero")]
+    pub letter_spacing: f64,
+    #[serde(default, skip_serializing_if = "echo_zero")]
+    pub position: f64,
+    #[serde(default = "echo_scale", skip_serializing_if = "echo_default_scale")]
+    pub scale: f64,
+    #[serde(default)]
+    pub can_empty: bool,
+    /// Unstretched width of a line that justification stretches to `right`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stretch: Option<f64>,
+    /// Width a centered line centers in from `x`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_width: Option<f64>,
+}
+
+fn echo_coordinate<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    if value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0 {
+        serializer.serialize_i64(*value as i64)
+    } else {
+        serializer.serialize_f64(*value)
+    }
+}
+
+fn echo_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+fn echo_primary() -> bool {
+    true
+}
+
+fn echo_is_primary(value: &bool) -> bool {
+    *value
+}
+
+fn echo_scale() -> f64 {
+    100.0
+}
+
+fn echo_default_scale(value: &f64) -> bool {
+    *value == echo_scale()
+}
+
+/// One positioned glyph inside a [`GlyphRunPrimitive`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacedGlyph {
+    /// glyph id within the run's `font_id`.
+    pub id: u32,
+    /// pen origin x, page-local px (accumulated advances + x_offset + any
+    /// justification stretch).
+    pub x: f64,
+    /// baseline y, page-local px (includes the shaped y_offset).
+    pub y: f64,
+    /// BYTE index into the run's `text` of the cluster this glyph belongs to
+    /// (the glyph↔char map for hit-testing / a11y).
+    pub cluster: u32,
+    /// pen advance for this glyph in page-local px — how far the pen moves after
+    /// painting it (the shaped `x_advance` plus any justification word-spacing
+    /// folded in for a U+0020 cluster). `x + advance` is the next glyph's pen
+    /// origin; for the trailing glyph it closes the run's true right extent, so
+    /// hit-testing and the a11y mirror read the real run width off the glyphs
+    /// instead of estimating a uniform trailing advance.
+    pub advance: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_order: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidi_level: Option<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RectPrimitive {
+    pub x: Number,
+    pub y: Number,
+    pub w: Number,
+    pub h: Number,
+    pub fill: String,
+    #[serde(flatten)]
+    pub attrs: DocAttrs,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LinePrimitive {
+    pub x1: Number,
+    pub y1: Number,
+    pub x2: Number,
+    pub y2: Number,
+    pub stroke_width: Number,
+    pub color: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dash: Option<Vec<Number>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<LineRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_style: Option<DisplayBorderStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_owner: Option<BorderOwner>,
+    /// Ownership metadata for table/cell border and cut lines: `attrs.cell`
+    /// names the owning grid cell (with its border-ownership flags) and
+    /// `attrs.table` the enclosing fragment, replacing the consumer-side
+    /// geometric fallback association. Every field is optional/defaulted, so
+    /// a default `DocAttrs` serializes to zero extra bytes. `doc_attrs_mut` deliberately keeps
+    /// returning `None` for lines so the generic sdt/clip/paragraph stamping
+    /// passes stay line-inert; table emission stamps these attrs explicitly.
+    #[serde(flatten, default)]
+    pub attrs: DocAttrs,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderOwner {
+    #[serde(rename = "cell")]
+    Cell,
+    #[serde(rename = "fragment")]
+    Fragment,
+    #[serde(rename = "paragraph")]
+    Paragraph,
+    #[serde(rename = "textBox")]
+    TextBox,
+}
+
+impl LinePrimitive {
+    fn contract_defaults() -> Self {
+        Self {
+            x1: px(0.0),
+            y1: px(0.0),
+            x2: px(0.0),
+            y2: px(0.0),
+            stroke_width: px(0.0),
+            color: String::new(),
+            dash: None,
+            role: None,
+            border_style: None,
+            secondary_color: None,
+            opacity: None,
+            border_owner: None,
+            attrs: DocAttrs::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayBorderStyle {
+    #[serde(rename = "solid")]
+    Solid,
+    #[serde(rename = "double")]
+    Double,
+    #[serde(rename = "dotted")]
+    Dotted,
+    #[serde(rename = "dashed")]
+    Dashed,
+    #[serde(rename = "dashDot")]
+    DashDot,
+    #[serde(rename = "dashDotDot")]
+    DashDotDot,
+    #[serde(rename = "triple")]
+    Triple,
+    #[serde(rename = "thinThick")]
+    ThinThick,
+    #[serde(rename = "thickThin")]
+    ThickThin,
+    #[serde(rename = "wave")]
+    Wave,
+    #[serde(rename = "doubleWave")]
+    DoubleWave,
+    #[serde(rename = "groove")]
+    Groove,
+    #[serde(rename = "ridge")]
+    Ridge,
+    #[serde(rename = "inset")]
+    Inset,
+    #[serde(rename = "outset")]
+    Outset,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum LineRole {
+    #[serde(rename = "border")]
+    Border,
+    #[serde(rename = "table-border")]
+    TableBorder,
+    #[serde(rename = "table-cut")]
+    TableCut,
+    #[serde(rename = "separator")]
+    Separator,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PageBorderPrimitive {
+    pub x: Number,
+    pub y: Number,
+    pub w: Number,
+    pub h: Number,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_order: Option<PageBorderZOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<PageBorderSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<PageBorderSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<PageBorderSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<PageBorderSide>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageBorderZOrder {
+    #[serde(rename = "front")]
+    Front,
+    #[serde(rename = "back")]
+    Back,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PageBorderSide {
+    pub width: Number,
+    pub color: String,
+    pub style: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagePrimitive {
+    pub rel_id: String,
+    pub x: Number,
+    pub y: Number,
+    pub w: Number,
+    pub h: Number,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation_deg: Option<Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub decorative: bool,
+    /// fractions 0..1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop: Option<Crop>,
+    /// alternative text (`wp:docPr` `descr`), capped at
+    /// [`MAX_ALT_TEXT_CHARS`] — file-derived, attacker-controlled data
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_text: Option<String>,
+    #[serde(flatten)]
+    pub attrs: DocAttrs,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct ContentFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<Number>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapePrimitive {
+    pub x: Number,
+    pub y: Number,
+    pub w: Number,
+    pub h: Number,
+    pub geometry_path: Vec<ShapePathCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<ShapeStrokePrimitive>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<ShapeTransformPrimitive>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub decorative: bool,
+    #[serde(flatten)]
+    pub attrs: DocAttrs,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type")]
+pub enum ShapePathCommand {
+    #[serde(rename = "move")]
+    Move { x: Number, y: Number },
+    #[serde(rename = "line")]
+    Line { x: Number, y: Number },
+    #[serde(rename = "quad")]
+    Quad {
+        cpx: Number,
+        cpy: Number,
+        x: Number,
+        y: Number,
+    },
+    #[serde(rename = "cubic")]
+    Cubic {
+        cp1x: Number,
+        cp1y: Number,
+        cp2x: Number,
+        cp2y: Number,
+        x: Number,
+        y: Number,
+    },
+    #[serde(rename = "close")]
+    Close,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeStrokePrimitive {
+    pub color: String,
+    pub width: Number,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dash: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeTransformPrimitive {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Number>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flip_h: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flip_v: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Crop {
+    pub top: Number,
+    pub right: Number,
+    pub bottom: Number,
+    pub left: Number,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DecorationPrimitive {
+    pub deco: DecoKind,
+    pub x: Number,
+    pub y: Number,
+    pub w: Number,
+    pub h: Number,
+    pub color: String,
+    /// Dashed rule instead of a solid one, used for the tracked-change
+    /// insertion underline. Omitted for a plain solid decoration.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dashed: bool,
+    /// dotted rule instead of a solid one — set for hidden-run dotted underline.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dotted: bool,
+    #[serde(flatten)]
+    pub attrs: DocAttrs,
+}
+
+/// serde `skip_serializing_if` predicate: omit `false` bools from the wire form.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum DecoKind {
+    #[serde(rename = "underline")]
+    Underline,
+    #[serde(rename = "strike")]
+    Strike,
+    #[serde(rename = "highlight")]
+    Highlight,
+    #[serde(rename = "comment-range")]
+    CommentRange,
+    #[serde(rename = "spell")]
+    Spell,
+}
+
+/// The parsed build envelope: the measured blocks and options pagination also
+/// saw, the `Layout` it produced, and the display-only extras.
+pub struct BuildInput {
+    defer_stale_block_pruning: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    stale_block_pruning_passes: usize,
+    contract_version: Option<u32>,
+    measured: Vec<MeasuredBlockIn>,
+    converted_measurements: HashMap<String, ConvertedMeasurement>,
+    options: Value,
+    layout: LayoutIn,
+    /// Optional header/footer payload; see [`crate::hf_bands`] for its shape.
+    /// Absent means the pages carry no bands.
+    headers_footers: Option<crate::hf_bands::HeadersFootersIn>,
+    headers_footers_content: Option<HeadersFootersContentIn>,
+    /// Font fallback chains keyed `"<family lowercase>|<bold>|<italic>"`, the
+    /// same map measurement used. Resolving these against a populated font
+    /// store is what gates glyph-run emission.
+    font_chains: HashMap<String, Vec<u32>>,
+    resolved_comment_ids: Vec<i64>,
+    comment_authors: Vec<CommentAuthorIn>,
+    comment_threads: Vec<CommentThreadIn>,
+    unreadable: Vec<UnreadableDisplayInput>,
+}
+
+/// Display input the compiler could not read and left unpainted instead of
+/// failing the document: a measured block, whose fragments then paint
+/// nothing, or one fragment of a layout page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableDisplayInput {
+    /// Canonical key of the block.
+    pub block: String,
+    /// Layout page of an unreadable fragment; `None` for a measured block.
+    pub page: Option<usize>,
+    pub reason: String,
+}
+
+/// Records `entry` and reports it once per thread, so a block that stays
+/// unreadable across rebuilds warns once; the set restarts when it fills.
+fn record_unreadable(unreadable: &mut Vec<UnreadableDisplayInput>, entry: UnreadableDisplayInput) {
+    std::thread_local! {
+        static REPORTED: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
+    }
+    let fingerprint = {
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&(&entry.block, entry.page, &entry.reason), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    };
+    if REPORTED.with(|reported| {
+        let mut reported = reported.borrow_mut();
+        if reported.len() >= 1024 {
+            reported.clear();
+        }
+        reported.insert(fingerprint)
+    }) {
+        let place = entry.page.map_or_else(
+            || "measured block".to_owned(),
+            |page| format!("page {page} fragment of block"),
+        );
+        crate::warn_degraded(&format!(
+            "display list left {place} {:?} unpainted: {}",
+            entry.block, entry.reason
+        ));
+    }
+    unreadable.retain(|known| known.block != entry.block || known.page != entry.page);
+    unreadable.push(entry);
+}
+
+/// Parsed display input retained by the editing engine across edits. Its fields
+/// stay private so the display-input contract can evolve without becoming a
+/// second public layout model.
+pub struct ResidentDisplayInput {
+    input: BuildInput,
+}
+
+struct ConvertedMeasurement {
+    fingerprint: u128,
+    extent_key: Vec<u8>,
+    source: crate::types::LayoutBlock,
+}
+
+impl ResidentDisplayInput {
+    #[doc(hidden)]
+    pub fn remember_measurement_fingerprints(
+        &mut self,
+        pagination: &crate::types::Input,
+        fingerprints: &[u128],
+    ) {
+        self.input.converted_measurements.clear();
+        if fingerprints.len() != pagination.measured.len() {
+            return;
+        }
+        let keys: HashSet<_> = self
+            .input
+            .measured
+            .iter()
+            .filter_map(measured_block_key)
+            .collect();
+        let unreadable: HashSet<_> = self
+            .input
+            .unreadable
+            .iter()
+            .filter(|known| known.page.is_none())
+            .map(|known| known.block.as_str())
+            .collect();
+        let mut seen = HashSet::new();
+        for (measured, &fingerprint) in pagination.measured.iter().zip(fingerprints) {
+            let Some(key) = resident_block_key(&measured.block) else {
+                continue;
+            };
+            if !seen.insert(key.to_string()) {
+                self.input.converted_measurements.remove(key.as_ref());
+                continue;
+            }
+            if keys.contains(&key) && !unreadable.contains(key.as_ref()) {
+                let mut extent_key = Vec::new();
+                if crate::extent_key::encode(&mut extent_key, &measured.measure).is_err() {
+                    continue;
+                }
+                self.input.converted_measurements.insert(
+                    key.into_owned(),
+                    ConvertedMeasurement {
+                        fingerprint,
+                        extent_key,
+                        source: measured.block.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn defer_stale_block_pruning(&mut self, defer: bool) {
+        self.input.defer_stale_block_pruning = defer;
+    }
+
+    pub fn font_chains(&self) -> &HashMap<String, Vec<u32>> {
+        &self.input.font_chains
+    }
+
+    /// What the retained input left unpainted because it could not be read.
+    pub fn unreadable(&self) -> &[UnreadableDisplayInput] {
+        &self.input.unreadable
+    }
+}
+
+impl std::fmt::Debug for ResidentDisplayInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("ResidentDisplayInput");
+        debug
+            .field("measured_blocks", &self.input.measured.len())
+            .field("pages", &self.input.layout.pages.len())
+            .field("unreadable", &self.input.unreadable);
+        #[cfg(any(test, feature = "test-support"))]
+        debug.field(
+            "stale_block_pruning_passes",
+            &self.input.stale_block_pruning_passes,
+        );
+        debug.finish_non_exhaustive()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildInputWire {
+    #[serde(default)]
+    contract_version: Option<u32>,
+    #[serde(default)]
+    measured: Vec<MeasuredBlockIn>,
+    #[serde(default)]
+    options: Value,
+    layout: LayoutIn,
+    #[serde(default)]
+    headers_footers: Option<Value>,
+    #[serde(default)]
+    font_chains: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    resolved_comment_ids: Vec<i64>,
+    #[serde(default)]
+    comment_authors: Vec<CommentAuthorIn>,
+    #[serde(default)]
+    comment_threads: Vec<CommentThreadIn>,
+}
+
+/// The display-only half of [`BuildInputWire`]; the resident path supplies the
+/// measured blocks, options and layout from typed values.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResidentExtrasWire {
+    #[serde(default)]
+    contract_version: Option<u32>,
+    #[serde(default)]
+    headers_footers: Option<Value>,
+    #[serde(default)]
+    font_chains: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    resolved_comment_ids: Vec<i64>,
+    #[serde(default)]
+    comment_authors: Vec<CommentAuthorIn>,
+    #[serde(default)]
+    comment_threads: Vec<CommentThreadIn>,
+}
+
+impl<'de> Deserialize<'de> for BuildInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = BuildInputWire::deserialize(deserializer)?;
+        let headers_footers = wire
+            .headers_footers
+            .clone()
+            .map(|v| serde_json::to_string(&v).and_then(|s| serde_json::from_str(&s)))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        let headers_footers_content = wire
+            .headers_footers
+            .map(|v| serde_json::to_string(&v).and_then(|s| serde_json::from_str(&s)))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            defer_stale_block_pruning: false,
+            #[cfg(any(test, feature = "test-support"))]
+            stale_block_pruning_passes: 0,
+            contract_version: wire.contract_version,
+            measured: wire.measured,
+            converted_measurements: HashMap::new(),
+            options: wire.options,
+            layout: wire.layout,
+            headers_footers,
+            headers_footers_content,
+            font_chains: wire.font_chains,
+            resolved_comment_ids: wire.resolved_comment_ids,
+            comment_authors: wire.comment_authors,
+            comment_threads: wire.comment_threads,
+            unreadable: Vec::new(),
+        })
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct HeadersFootersContentIn {
+    #[serde(default)]
+    header_distance: Option<f64>,
+    #[serde(default)]
+    footer_distance: Option<f64>,
+    #[serde(default)]
+    variants: Vec<HfVariantContentIn>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HfVariantContentIn {
+    r_id: String,
+    kind: HfKind,
+    /// The section whose page geometry the variant was measured at.
+    #[serde(default)]
+    section_index: Option<u64>,
+    #[serde(default)]
+    measured: Vec<MeasuredBlockIn>,
+    #[serde(default)]
+    height: Option<f64>,
+    #[serde(default)]
+    flow_height: Option<f64>,
+    #[serde(default)]
+    field_widths: Vec<HfFieldWidthContentIn>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HfFieldWidthContentIn {
+    pm_start: i64,
+    fallback_width: f64,
+    #[serde(default)]
+    per_page: Vec<f64>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CommentAuthorIn {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    palette_index: Option<u64>,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+/// One comment thread from the display-list envelope.
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CommentThreadIn {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    author_id: Option<String>,
+    #[serde(default)]
+    author_name: Option<String>,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    replies: Vec<CommentReplyIn>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CommentReplyIn {
+    #[serde(default)]
+    author_name: Option<String>,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RenderOptionsIn {
+    #[serde(default)]
+    page_borders: Option<PageBordersIn>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PageBordersIn {
+    #[serde(default)]
+    top: Option<PageBorderSpecIn>,
+    #[serde(default)]
+    right: Option<PageBorderSpecIn>,
+    #[serde(default)]
+    bottom: Option<PageBorderSpecIn>,
+    #[serde(default)]
+    left: Option<PageBorderSpecIn>,
+    #[serde(default)]
+    display: Option<String>,
+    #[serde(default)]
+    offset_from: Option<String>,
+    #[serde(default)]
+    z_order: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+struct PageBorderSpecIn {
+    #[serde(default)]
+    style: Option<String>,
+    #[serde(default)]
+    color: Option<Value>,
+    /// width in eighths of a point (OOXML w:sz)
+    #[serde(default)]
+    size: Option<f64>,
+    /// spacing from page/text in points
+    #[serde(default)]
+    space: Option<f64>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(tag = "kind")]
+pub(crate) enum WatermarkIn {
+    #[serde(rename = "text")]
+    Text(TextWatermarkIn),
+    #[serde(rename = "picture")]
+    Picture(PictureWatermarkIn),
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TextWatermarkIn {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    font: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    semitransparent: Option<bool>,
+    #[serde(default)]
+    layout: Option<String>,
+    /// points; absent means Word's "Auto" sizing
+    #[serde(default)]
+    font_size: Option<f64>,
+    #[serde(default)]
+    decorative: Option<bool>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PictureWatermarkIn {
+    /// Parsed package watermarks usually carry a renderable data URL. This is
+    /// the same key shape the canvas image resolver accepts for normal images.
+    #[serde(default)]
+    data_url: Option<String>,
+    /// Fallback/testing key when no data URL is available.
+    #[serde(default)]
+    rel_id: Option<String>,
+    #[serde(default)]
+    scale: Option<f64>,
+    #[serde(default)]
+    washout: Option<bool>,
+    #[serde(default)]
+    width_emu: Option<f64>,
+    #[serde(default)]
+    height_emu: Option<f64>,
+    #[serde(default)]
+    decorative: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MeasuredBlockIn {
+    pub(crate) block: BlockIn,
+    pub(crate) measure: MeasureIn,
+}
+
+// variants boxed: a transient deserialization mirror, but the enum nests
+// inside cell block lists so the size difference would multiply
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+pub(crate) enum BlockIn {
+    #[serde(rename = "paragraph")]
+    Paragraph(Box<ParagraphBlockIn>),
+    #[serde(rename = "table")]
+    Table(Box<TableBlockIn>),
+    #[serde(rename = "image")]
+    Image(Box<ImageBlockIn>),
+    #[serde(rename = "textBox")]
+    TextBox(Box<TextBoxBlockIn>),
+    #[serde(rename = "shape")]
+    Shape(Box<ShapeBlockIn>),
+    #[serde(rename = "chart")]
+    Chart(Box<ChartBlockIn>),
+    #[serde(rename = "reserved")]
+    Reserved(Box<ReservedBlockIn>),
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Deserialize, Clone, Default)]
+struct ReservationRefIn {
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    id: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ReservedBlockIn {
+    pub(crate) id: Value,
+    #[serde(default)]
+    reservation: ReservationRefIn,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ParagraphBlockIn {
+    #[serde(default)]
+    sdt_groups: Vec<SdtGroupIn>,
+    pub(crate) id: Value,
+    /// stable Word `w14:paraId`, threaded onto the paragraph's
+    /// primitives so the a11y mirror can emit `data-para-id`
+    #[serde(default)]
+    pub(crate) para_id: Option<String>,
+    #[serde(default)]
+    runs: Vec<RunIn>,
+    #[serde(default)]
+    pub(crate) attrs: Option<ParaAttrsIn>,
+    #[serde(default)]
+    pub(crate) pm_start: Option<i64>,
+    #[serde(default)]
+    pub(crate) pm_end: Option<i64>,
+    /// [`paragraph_base_is_rtl`], computed once for all of the paragraph's fragments
+    #[serde(skip)]
+    base_rtl: std::sync::OnceLock<bool>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SdtGroupIn {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    sdt_type: String,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    lock: Option<String>,
+    #[serde(default)]
+    checked: Option<bool>,
+    #[serde(default)]
+    bound: Option<bool>,
+    #[serde(default)]
+    repeating_item: Option<bool>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(tag = "kind")]
+enum RunIn {
+    #[serde(rename = "text")]
+    Text(TextRunIn),
+    #[serde(rename = "tab")]
+    Tab(TabRunIn),
+    #[serde(rename = "image")]
+    Image(ImageRunIn),
+    #[serde(rename = "lineBreak")]
+    LineBreak(LineBreakRunIn),
+    #[serde(rename = "field")]
+    Field(FieldRunIn),
+    #[serde(rename = "reserved")]
+    Reserved(ReservedRunIn),
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ReservedRunIn {
+    #[serde(default)]
+    reservation: ReservationRefIn,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct RunFormattingIn {
+    #[serde(default)]
+    font_slots: Option<crate::types::RunFontSlots>,
+    #[serde(default)]
+    complex_script: Option<bool>,
+    #[serde(default)]
+    bold: Option<bool>,
+    #[serde(default)]
+    italic: Option<bool>,
+    /// bool or { style, color }
+    #[serde(default)]
+    underline: Option<Value>,
+    #[serde(default)]
+    strike: Option<bool>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    highlight: Option<String>,
+    #[serde(default)]
+    font_family: Option<String>,
+    /// points
+    #[serde(default)]
+    font_size: Option<f64>,
+    #[serde(default)]
+    letter_spacing: Option<f64>,
+    #[serde(default)]
+    superscript: Option<bool>,
+    #[serde(default)]
+    subscript: Option<bool>,
+    #[serde(default)]
+    all_caps: Option<bool>,
+    #[serde(default)]
+    small_caps: Option<bool>,
+    #[serde(default)]
+    position_px: Option<f64>,
+    #[serde(default)]
+    horizontal_scale: Option<f64>,
+    #[serde(default)]
+    kerning_min_pt: Option<f64>,
+    #[serde(default)]
+    imprint: Option<bool>,
+    #[serde(default)]
+    emboss: Option<bool>,
+    #[serde(default)]
+    text_shadow: Option<bool>,
+    #[serde(default)]
+    text_outline: Option<bool>,
+    #[serde(default)]
+    emphasis_mark: Option<String>,
+    #[serde(default)]
+    hidden: Option<bool>,
+    #[serde(default)]
+    rtl: Option<bool>,
+    #[serde(default)]
+    text_effect: Option<String>,
+    /// modern w14 text effects payload, passed through verbatim to the
+    /// text/glyph primitives (the canvas backend owns the paint recipe)
+    #[serde(default)]
+    modern_effects: Option<Value>,
+    #[serde(default)]
+    footnote_ref_id: Option<i64>,
+    #[serde(default)]
+    endnote_ref_id: Option<i64>,
+    #[serde(default)]
+    comment_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    is_insertion: Option<bool>,
+    #[serde(default)]
+    is_deletion: Option<bool>,
+    #[serde(default)]
+    change_author: Option<String>,
+    #[serde(default)]
+    change_date: Option<String>,
+    #[serde(default)]
+    change_revision_id: Option<i64>,
+    #[serde(default)]
+    format_change: Option<Revision>,
+    #[serde(default)]
+    hyperlink: Option<HyperlinkIn>,
+    #[serde(default)]
+    inline_sdt_widget: Option<InlineSdtWidgetAttrs>,
+    #[serde(default)]
+    language: Option<RunLanguageIn>,
+    #[serde(default)]
+    logical_order: Option<u64>,
+    #[serde(default)]
+    bidi_level: Option<u8>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct RunLanguageIn {
+    #[serde(default)]
+    latin: Option<String>,
+    #[serde(default)]
+    east_asia: Option<String>,
+    #[serde(default)]
+    bidi: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct RevisionInfoIn {
+    #[serde(default)]
+    revision_id: Option<i64>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    date: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HyperlinkIn {
+    #[serde(default)]
+    href: Option<String>,
+    #[serde(default)]
+    no_default_style: Option<bool>,
+    #[serde(default)]
+    tooltip: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    history: Option<bool>,
+    #[serde(default)]
+    doc_location: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TextRunIn {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+    #[serde(flatten)]
+    fmt: RunFormattingIn,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TabRunIn {
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+    /// resolved advance in px, filled in by measurement
+    #[serde(default)]
+    width: Option<f64>,
+    #[serde(default)]
+    leader_glyphs: Option<LeaderGlyphIn>,
+    #[serde(flatten)]
+    fmt: RunFormattingIn,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct LeaderGlyphIn {
+    #[serde(default)]
+    glyph: Option<String>,
+    #[serde(default)]
+    count: Option<u64>,
+    #[serde(default)]
+    advance: Option<f64>,
+    #[serde(default)]
+    font: Option<String>,
+    #[serde(default)]
+    font_size: Option<f64>,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ImageRunIn {
+    #[serde(default)]
+    src: String,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    /// Alternative text from `wp:docPr` `descr`.
+    #[serde(default)]
+    alt: Option<String>,
+    #[serde(default)]
+    shape_type: Option<String>,
+    #[serde(default)]
+    transform: Option<String>,
+    #[serde(default)]
+    wrap_type: Option<String>,
+    #[serde(default)]
+    display_mode: Option<String>,
+    /// CSS float direction (`left`/`right`/`none`) — resolves the horizontal
+    /// anchor for a float that carries no explicit `position` (imageWrapText /
+    /// resolveHorizontalAnchor).
+    #[serde(default)]
+    css_float: Option<String>,
+    /// anchor position for a floating image run (`wp:positionH`/`wp:positionV`),
+    /// resolved to a page rect by [`resolve_anchored_position`]
+    #[serde(default, deserialize_with = "deserialize_anchor_position")]
+    position: Option<crate::types::ImageRunPosition>,
+    #[serde(default)]
+    crop_top: Option<f64>,
+    #[serde(default)]
+    crop_right: Option<f64>,
+    #[serde(default)]
+    crop_bottom: Option<f64>,
+    #[serde(default)]
+    crop_left: Option<f64>,
+    #[serde(default)]
+    opacity: Option<f64>,
+    #[serde(default)]
+    rotation_deg: Option<f64>,
+    #[serde(default)]
+    flip_h: Option<bool>,
+    #[serde(default)]
+    flip_v: Option<bool>,
+    #[serde(default)]
+    rotation_bounds: Option<RotationBoundsIn>,
+    #[serde(default)]
+    effects: Vec<Value>,
+    #[serde(default)]
+    outline: Option<Value>,
+    #[serde(default)]
+    decorative: Option<bool>,
+    #[serde(default)]
+    hyperlink: Option<HyperlinkIn>,
+    #[serde(default)]
+    inline_shape: Option<Value>,
+    #[serde(default)]
+    inline_chart: Option<Value>,
+    #[serde(default)]
+    inline_math: Option<ooxml_text::math::MathLayout>,
+    #[serde(default)]
+    baseline_depth: Option<f64>,
+    #[serde(default)]
+    is_insertion: Option<bool>,
+    #[serde(default)]
+    is_deletion: Option<bool>,
+    #[serde(default)]
+    change_author: Option<String>,
+    #[serde(default)]
+    change_date: Option<String>,
+    #[serde(default)]
+    change_revision_id: Option<f64>,
+    #[serde(default)]
+    hlink_href: Option<String>,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RotationBoundsIn {
+    #[serde(default)]
+    width: Option<f64>,
+    #[serde(default)]
+    height: Option<f64>,
+    #[serde(default)]
+    offset_x: Option<f64>,
+    #[serde(default)]
+    offset_y: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnchorPosIn {
+    #[serde(default)]
+    horizontal: Option<crate::types::AxisPosition>,
+    #[serde(default)]
+    vertical: Option<crate::types::AxisPosition>,
+    #[serde(default)]
+    relative_height: Option<u64>,
+}
+
+fn deserialize_anchor_position<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::types::ImageRunPosition>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        Option::<AnchorPosIn>::deserialize(deserializer)?.map(|position| {
+            crate::types::ImageRunPosition {
+                horizontal: position.horizontal,
+                vertical: position.vertical,
+                relative_height: position.relative_height,
+                use_simple_pos: None,
+                simple_pos: None,
+                behind_doc: None,
+            }
+        }),
+    )
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LineBreakRunIn {
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pm_end: Option<i64>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FieldRunIn {
+    #[serde(default)]
+    field_type: Option<String>,
+    /// raw Word field type token (a11y identity; never evaluated)
+    #[serde(default)]
+    raw_type: Option<String>,
+    /// raw instruction text (a11y identity; INERT — never parsed/executed)
+    #[serde(default)]
+    instruction: Option<String>,
+    #[serde(default)]
+    fallback: Option<String>,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+    #[serde(flatten)]
+    fmt: RunFormattingIn,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ParaAttrsIn {
+    #[serde(default)]
+    leading_inline_box: Option<crate::types::LeadingInlineBox>,
+    #[serde(default)]
+    horizontal_rules: Vec<crate::types::HorizontalRule>,
+    #[serde(default)]
+    alignment: Option<String>,
+    /// Resolved paragraph spacing.
+    #[serde(default)]
+    pub(crate) spacing: Option<SpacingIn>,
+    #[serde(default)]
+    bidi: Option<bool>,
+    #[serde(default)]
+    shading: Option<String>,
+    #[serde(default)]
+    indent: Option<IndentIn>,
+    #[serde(default)]
+    borders: Option<ParaBordersIn>,
+    /// Pre-computed list marker text.
+    #[serde(default)]
+    list_marker: Option<String>,
+    #[serde(default)]
+    style_id: Option<String>,
+    #[serde(default)]
+    style_name: Option<String>,
+    /// w:vanish on the numbering level rPr — a hidden marker reserves no slot
+    #[serde(default)]
+    list_marker_hidden: Option<bool>,
+    #[serde(default)]
+    list_marker_font_family: Option<String>,
+    #[serde(default)]
+    list_marker_font_size: Option<f64>,
+    #[serde(default)]
+    list_marker_bold: Option<bool>,
+    #[serde(default)]
+    list_marker_italic: Option<bool>,
+    #[serde(default)]
+    list_marker_color: Option<String>,
+    #[serde(default)]
+    list_marker_revision: Option<RevisionKind>,
+    #[serde(default)]
+    default_font_family: Option<String>,
+    #[serde(default)]
+    default_font_size: Option<f64>,
+    #[serde(default)]
+    tabs: Option<Vec<TabStopIn>>,
+    /// `<w:pPr><w:rPr><w:ins/>`: tracked insertion on the paragraph mark.
+    #[serde(default)]
+    p_pr_ins: Option<RevisionInfoIn>,
+    /// `<w:pPr><w:rPr><w:del/>`: tracked deletion on the paragraph mark.
+    #[serde(default)]
+    p_pr_del: Option<RevisionInfoIn>,
+    /// `w:autoSpaceDE` / `w:autoSpaceDN` opt-outs; absent is the default (on).
+    #[serde(default, rename = "autoSpaceDE")]
+    auto_space_de: Option<bool>,
+    #[serde(default, rename = "autoSpaceDN")]
+    auto_space_dn: Option<bool>,
+    /// `w:characterSpacingControl` is `compressPunctuation`.
+    #[serde(default)]
+    compress_punctuation: Option<bool>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TabStopIn {
+    #[serde(default)]
+    val: Option<String>,
+    #[serde(default)]
+    pos: Option<f64>,
+    #[serde(default)]
+    leader: Option<String>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SpacingIn {
+    #[serde(default)]
+    pub(crate) before: Option<f64>,
+    #[serde(default)]
+    pub(crate) after: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct IndentIn {
+    #[serde(default)]
+    left: Option<f64>,
+    #[serde(default)]
+    right: Option<f64>,
+    #[serde(default)]
+    first_line: Option<f64>,
+    #[serde(default)]
+    hanging: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone, PartialEq)]
+pub(crate) struct ParaBordersIn {
+    #[serde(default)]
+    top: Option<BorderEdgeIn>,
+    #[serde(default)]
+    bottom: Option<BorderEdgeIn>,
+    #[serde(default)]
+    left: Option<BorderEdgeIn>,
+    #[serde(default)]
+    right: Option<BorderEdgeIn>,
+    #[serde(default)]
+    between: Option<BorderEdgeIn>,
+    #[serde(default)]
+    bar: Option<BorderEdgeIn>,
+}
+
+#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+struct BorderEdgeIn {
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    style: Option<String>,
+    #[serde(rename = "ooxmlStyle", default)]
+    ooxml_style: Option<String>,
+    #[serde(default)]
+    width: Option<f64>,
+    #[serde(default)]
+    space: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TableBlockIn {
+    #[serde(default)]
+    sdt_groups: Vec<SdtGroupIn>,
+    pub(crate) id: Value,
+    #[serde(default)]
+    pub(crate) rows: Vec<TableRowIn>,
+    #[serde(default)]
+    bidi: Option<bool>,
+    #[serde(default)]
+    justification: Option<String>,
+    #[serde(default)]
+    indent: Option<f64>,
+    #[serde(default)]
+    compatibility_mode: Option<u8>,
+    #[serde(default)]
+    cell_margin_left: Option<f64>,
+    #[serde(default)]
+    cell_spacing: Option<f64>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    /// `<w:tblpPr>` placement. A floating table does not advance the
+    /// header/footer flow cursor.
+    #[serde(default)]
+    pub(crate) floating: Option<FloatingTablePositionIn>,
+    #[serde(default)]
+    gridlines: Option<bool>,
+}
+
+pub(crate) type FloatingTablePositionIn = crate::types::FloatingTablePosition;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TableRowIn {
+    #[serde(default)]
+    cells: Vec<TableCellIn>,
+    #[serde(default)]
+    grid_before: Option<u64>,
+    #[serde(default)]
+    grid_after: Option<u64>,
+    #[serde(default)]
+    is_header: Option<bool>,
+    #[serde(default)]
+    height: Option<f64>,
+    #[serde(default)]
+    height_rule: Option<String>,
+    #[serde(default)]
+    tracked_ins: Option<RevisionInfoIn>,
+    #[serde(default)]
+    tracked_del: Option<RevisionInfoIn>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TableCellIn {
+    #[serde(default)]
+    text_direction: Option<String>,
+    #[serde(default)]
+    blocks: Vec<BlockIn>,
+    #[serde(default)]
+    col_span: Option<u32>,
+    #[serde(default)]
+    row_span: Option<u32>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    borders: Option<CellBordersIn>,
+    #[serde(default)]
+    padding: Option<CellPaddingIn>,
+    /// Cell content vertical alignment.
+    #[serde(default)]
+    vertical_align: Option<String>,
+    #[serde(default)]
+    no_wrap: Option<bool>,
+    #[serde(default)]
+    tracked_marker: Option<CellMarkerIn>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CellMarkerIn {
+    kind: StructuralRevisionKind,
+    info: RevisionInfoIn,
+}
+
+#[derive(Deserialize, Default)]
+struct CellBordersIn {
+    #[serde(default)]
+    top: Option<BorderEdgeIn>,
+    #[serde(default)]
+    right: Option<BorderEdgeIn>,
+    #[serde(default)]
+    bottom: Option<BorderEdgeIn>,
+    #[serde(default)]
+    left: Option<BorderEdgeIn>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+struct CellPaddingIn {
+    #[serde(default)]
+    top: Option<f64>,
+    #[serde(default)]
+    right: Option<f64>,
+    #[serde(default)]
+    bottom: Option<f64>,
+    #[serde(default)]
+    left: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageBlockIn {
+    #[serde(default)]
+    pub(crate) sdt_groups: Vec<SdtGroupIn>,
+    pub(crate) id: Value,
+    #[serde(default)]
+    pub(crate) src: String,
+    #[serde(default)]
+    pub(crate) width: f64,
+    #[serde(default)]
+    pub(crate) height: f64,
+    /// Alternative text from `wp:docPr` `descr`.
+    #[serde(default)]
+    pub(crate) alt: Option<String>,
+    #[serde(default)]
+    pub(crate) shape_type: Option<String>,
+    #[serde(default)]
+    pub(crate) transform: Option<String>,
+    #[serde(default)]
+    pub(crate) opacity: Option<f64>,
+    #[serde(default)]
+    pub(crate) rotation_deg: Option<f64>,
+    #[serde(default)]
+    pub(crate) flip_h: Option<bool>,
+    #[serde(default)]
+    pub(crate) flip_v: Option<bool>,
+    #[serde(default)]
+    pub(crate) rotation_bounds: Option<RotationBoundsIn>,
+    #[serde(default)]
+    pub(crate) hlink_href: Option<String>,
+    #[serde(default)]
+    pub(crate) hlink_title: Option<String>,
+    #[serde(default)]
+    pub(crate) decorative: Option<bool>,
+    #[serde(default)]
+    pub(crate) crop: Option<CropIn>,
+    #[serde(default)]
+    pub(crate) effects: Vec<Value>,
+    #[serde(default)]
+    pub(crate) outline: Option<Value>,
+    #[serde(default)]
+    pub(crate) pm_start: Option<i64>,
+    #[serde(default)]
+    pub(crate) pm_end: Option<i64>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+pub(crate) struct CropIn {
+    #[serde(default)]
+    top: Option<f64>,
+    #[serde(default)]
+    right: Option<f64>,
+    #[serde(default)]
+    bottom: Option<f64>,
+    #[serde(default)]
+    left: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ShapeBlockIn {
+    #[serde(default)]
+    sdt_groups: Vec<SdtGroupIn>,
+    pub(crate) id: Value,
+    #[serde(default)]
+    #[allow(dead_code)]
+    shape_type: Option<String>,
+    #[serde(default)]
+    geometry_path: Vec<ShapePathCommand>,
+    #[serde(default)]
+    fill: Option<ShapeFillIn>,
+    #[serde(default)]
+    stroke: Option<ShapeStrokeIn>,
+    #[serde(default)]
+    transform: Option<ShapeTransformIn>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    width: f64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    height: f64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    x: Option<f64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    y: Option<f64>,
+    #[serde(default)]
+    inner_text: Vec<ParagraphBlockIn>,
+    #[serde(default)]
+    inner_measures: Vec<ParagraphExtentIn>,
+    #[serde(default)]
+    children: Vec<ShapeBlockIn>,
+    #[serde(default)]
+    scene: Option<Value>,
+    #[serde(default)]
+    effects: Vec<Value>,
+    #[serde(default)]
+    effect_extent: Option<Value>,
+    #[serde(default)]
+    text_body_properties: Option<Value>,
+    #[serde(default)]
+    relative_height: Option<u64>,
+    #[serde(default)]
+    decorative: Option<bool>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    hidden: Option<bool>,
+    #[serde(default)]
+    doc_start: Option<i64>,
+    #[serde(default)]
+    doc_end: Option<i64>,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+    #[serde(default)]
+    pub(crate) position: Option<crate::types::ImageRunPosition>,
+    #[serde(default)]
+    pub(crate) behind_doc: Option<bool>,
+    #[serde(default)]
+    pub(crate) wrap_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChartBlockIn {
+    #[serde(default)]
+    sdt_groups: Vec<SdtGroupIn>,
+    pub(crate) id: Value,
+    #[serde(default)]
+    chart: ChartIn,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    doc_start: Option<i64>,
+    #[serde(default)]
+    doc_end: Option<i64>,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartIn {
+    #[serde(default)]
+    chart_type: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    series: Vec<ChartSeriesIn>,
+    #[serde(default)]
+    legend: Option<ChartLegendIn>,
+    #[serde(default)]
+    axes: Option<ChartAxesIn>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    decorative: Option<bool>,
+    #[serde(default)]
+    plot_groups: Vec<ChartPlotGroupIn>,
+    #[serde(default)]
+    axis_list: Vec<ChartAxisIn>,
+    #[serde(default)]
+    text: Option<ChartTextIn>,
+    #[serde(default)]
+    title_text: Option<ChartTextIn>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartTextIn {
+    #[serde(default)]
+    font: Option<String>,
+    #[serde(default)]
+    size_pt: Option<f64>,
+    #[serde(default)]
+    bold: Option<bool>,
+    #[serde(default)]
+    italic: Option<bool>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    spacing_pt: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartPlotGroupIn {
+    #[serde(default)]
+    chart_type: Option<String>,
+    #[serde(default)]
+    grouping: Option<String>,
+    #[serde(default)]
+    series: Vec<ChartSeriesIn>,
+    #[serde(default)]
+    overlap: Option<f64>,
+    #[serde(default)]
+    gap_width: Option<f64>,
+    #[serde(default)]
+    hole_size: Option<f64>,
+    #[serde(default)]
+    first_slice_angle: Option<f64>,
+    #[serde(default)]
+    vary_colors: bool,
+    #[serde(default)]
+    scatter_style: Option<String>,
+    #[serde(default)]
+    radar_style: Option<String>,
+    #[serde(default)]
+    bubble_scale: Option<f64>,
+    #[serde(default)]
+    size_represents: Option<String>,
+    #[serde(default)]
+    wireframe: Option<bool>,
+    #[serde(default)]
+    hi_low_lines: bool,
+    #[serde(default)]
+    up_down_bars: bool,
+    #[serde(default)]
+    marker: Option<bool>,
+    #[serde(default)]
+    axis_ids: Vec<String>,
+    #[serde(default)]
+    data_labels: Option<ChartDataLabelsIn>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartDataLabelsIn {
+    #[serde(default)]
+    delete: Option<bool>,
+    #[serde(default)]
+    show_value: Option<bool>,
+    #[serde(default)]
+    show_category_name: Option<bool>,
+    #[serde(default)]
+    show_series_name: Option<bool>,
+    #[serde(default)]
+    show_percent: Option<bool>,
+    #[serde(default)]
+    show_legend_key: Option<bool>,
+    #[serde(default)]
+    show_bubble_size: Option<bool>,
+    #[serde(default)]
+    separator: Option<String>,
+    #[serde(default)]
+    position: Option<String>,
+    #[serde(default)]
+    number_format: Option<String>,
+    #[serde(default)]
+    text: Option<ChartTextIn>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartSeriesIn {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default, deserialize_with = "blank_numbers::deserialize")]
+    values: Vec<f64>,
+    #[serde(default)]
+    value_format: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    points: Vec<ChartPointIn>,
+    #[serde(default)]
+    grouping: Option<String>,
+    #[serde(default)]
+    marker: Option<Value>,
+    #[serde(default, deserialize_with = "blank_numbers::deserialize")]
+    x_values: Vec<f64>,
+    #[serde(default, deserialize_with = "blank_numbers::deserialize")]
+    bubble_sizes: Vec<f64>,
+    #[serde(default)]
+    smooth: bool,
+    #[serde(default)]
+    data_labels: Option<ChartDataLabelsIn>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartPointIn {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    value: Option<f64>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    marker: Option<Value>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    explosion: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartLegendIn {
+    #[serde(default)]
+    position: Option<String>,
+    #[serde(default)]
+    visible: Option<bool>,
+    #[serde(default)]
+    overlay: bool,
+    #[serde(default)]
+    text: Option<ChartTextIn>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+struct ChartAxesIn {
+    #[serde(default)]
+    value: Option<ChartAxisIn>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartAxisIn {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    min: Option<f64>,
+    #[serde(default)]
+    max: Option<f64>,
+    #[serde(default)]
+    axis_type: Option<String>,
+    #[serde(default)]
+    logarithmic_base: Option<f64>,
+    #[serde(default)]
+    reversed: bool,
+    #[serde(default)]
+    major_unit: Option<f64>,
+    #[serde(default)]
+    minor_unit: Option<f64>,
+    #[serde(default)]
+    major_tick_mark: Option<String>,
+    #[serde(default)]
+    minor_tick_mark: Option<String>,
+    #[serde(default)]
+    tick_label_position: Option<String>,
+    #[serde(default)]
+    major_gridlines: bool,
+    #[serde(default)]
+    minor_gridlines: bool,
+    #[serde(default)]
+    cross_between: Option<String>,
+    #[serde(default)]
+    number_format: Option<String>,
+    #[serde(default)]
+    position: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    text: Option<ChartTextIn>,
+    #[serde(default)]
+    major_gridline_line: Option<ChartLineIn>,
+    #[serde(default)]
+    minor_gridline_line: Option<ChartLineIn>,
+}
+
+/// `c:spPr/a:ln` of a chart part.
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChartLineIn {
+    #[serde(default)]
+    none: bool,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    width_emu: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeFillIn {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    gradient_type: Option<String>,
+    #[serde(default)]
+    gradient_angle: Option<f64>,
+    #[serde(default)]
+    gradient_stops: Vec<Value>,
+    #[serde(default)]
+    pattern_preset: Option<String>,
+    #[serde(default)]
+    foreground_color: Option<String>,
+    #[serde(default)]
+    background_color: Option<String>,
+    #[serde(default)]
+    picture_rel_id: Option<String>,
+    /// resolved SAFE embedded picture source (`data:`/`blob:` or a `media:{n}`
+    /// part token, minted by the parser from embedded parts; never an external
+    /// target)
+    #[serde(default)]
+    picture_src: Option<String>,
+    #[serde(default)]
+    picture_src_rect: Option<Value>,
+    #[serde(default)]
+    picture_fill_mode: Option<String>,
+    #[serde(default)]
+    picture_tile: Option<Value>,
+    #[serde(default)]
+    picture_stretch_rect: Option<Value>,
+    #[serde(default)]
+    picture_opacity: Option<f64>,
+    #[serde(default)]
+    theme_ref_index: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeStrokeIn {
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    width: Option<f64>,
+    #[serde(default)]
+    dash: Option<String>,
+    #[serde(default)]
+    compound: Option<String>,
+    #[serde(default)]
+    alignment: Option<String>,
+    #[serde(default)]
+    cap: Option<String>,
+    #[serde(default)]
+    join: Option<String>,
+    #[serde(default)]
+    miter_limit: Option<f64>,
+    #[serde(default)]
+    custom_dash: Vec<f64>,
+    #[serde(default)]
+    head_end: Option<Value>,
+    #[serde(default)]
+    tail_end: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeTransformIn {
+    #[serde(default)]
+    rotation: Option<f64>,
+    #[serde(default)]
+    flip_h: Option<bool>,
+    #[serde(default)]
+    flip_v: Option<bool>,
+}
+
+/// Positioned text-box input.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TextBoxBlockIn {
+    #[serde(default)]
+    sdt_groups: Vec<SdtGroupIn>,
+    pub(crate) id: Value,
+    #[serde(default)]
+    fill_color: Option<String>,
+    #[serde(default)]
+    outline_width: Option<f64>,
+    #[serde(default)]
+    outline_color: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    outline_style: Option<String>,
+    /// internal padding; absent ⇒ [`DEFAULT_TEXTBOX_MARGINS`]
+    #[serde(default)]
+    margins: Option<TextBoxMarginsIn>,
+    /// inner paragraph blocks, index-aligned with the measure's `innerMeasures`
+    #[serde(default)]
+    content: Vec<ParagraphBlockIn>,
+    #[serde(default)]
+    display_mode: Option<String>,
+    #[serde(default)]
+    css_float: Option<String>,
+    #[serde(default)]
+    wrap_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_anchor_position")]
+    position: Option<crate::types::ImageRunPosition>,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+    // NB: the box's own pmStart/pmEnd are carried by the TextBoxFragment (read
+    // there); the block's copies are ignored (serde drops the unread fields).
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct TextBoxMarginsIn {
+    #[serde(default)]
+    top: f64,
+    /// Parsed but unused bottom padding.
+    #[serde(default)]
+    #[allow(dead_code)]
+    bottom: f64,
+    #[serde(default)]
+    left: f64,
+    #[serde(default)]
+    right: f64,
+}
+
+/// OOXML default text-box margins in pixels.
+const DEFAULT_TEXTBOX_MARGINS: TextBoxMarginsIn = TextBoxMarginsIn {
+    top: 4.0,
+    bottom: 4.0,
+    left: 7.0,
+    right: 7.0,
+};
+
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+pub(crate) enum MeasureIn {
+    #[serde(rename = "paragraph")]
+    Paragraph(ParagraphExtentIn),
+    #[serde(rename = "table")]
+    Table(TableExtentIn),
+    #[serde(rename = "image")]
+    Image(ImageExtentIn),
+    #[serde(rename = "textBox")]
+    TextBox(TextBoxExtentIn),
+    #[serde(rename = "shape")]
+    Shape(BoxExtentIn),
+    #[serde(rename = "chart")]
+    Chart(BoxExtentIn),
+    #[serde(other)]
+    Unsupported,
+}
+
+/// text-box measure (mirrors `TextBoxExtent`): the box's resolved size plus its
+/// inner paragraphs pre-measured, index-aligned with `TextBoxBlockIn.content`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TextBoxExtentIn {
+    #[serde(default)]
+    #[allow(dead_code)]
+    width: f64,
+    /// resolved box height; used by HF stacked-height fallback (`hf_bands`)
+    #[serde(default)]
+    pub(crate) height: f64,
+    #[serde(default)]
+    inner_measures: Vec<ParagraphExtentIn>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+pub(crate) struct BoxExtentIn {
+    #[serde(default)]
+    pub(crate) width: f64,
+    #[serde(default)]
+    pub(crate) height: f64,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+pub(crate) struct ImageExtentIn {
+    #[serde(default)]
+    pub(crate) width: f64,
+    #[serde(default)]
+    pub(crate) height: f64,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ParagraphExtentIn {
+    #[serde(default)]
+    pub(crate) lines: Vec<LineIn>,
+    #[serde(rename = "totalHeight", default)]
+    pub(crate) total_height: f64,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LineIn {
+    #[serde(default)]
+    head_run: usize,
+    #[serde(default)]
+    head_char: usize,
+    #[serde(default)]
+    tail_run: usize,
+    #[serde(default)]
+    tail_char: usize,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    ascent: f64,
+    #[serde(default)]
+    descent: f64,
+    #[serde(default)]
+    line_height: f64,
+    #[serde(default)]
+    synthetic_fallback: bool,
+    #[serde(default)]
+    left_offset: Option<f64>,
+    #[serde(default)]
+    right_offset: Option<f64>,
+    #[serde(default)]
+    float_skip_before: Option<f64>,
+    /// Extra first-line px after a marker overruns its hanging indent.
+    #[serde(default)]
+    marker_tab_offset: Option<f64>,
+    #[serde(default)]
+    marker_inline_width: Option<f64>,
+    #[serde(default)]
+    run_advances: Vec<TypesetRunAdvanceIn>,
+    #[serde(default)]
+    cluster_advances: Vec<TypesetClusterAdvanceIn>,
+    #[serde(default)]
+    bidi_slices: Vec<TypesetBidiSliceIn>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct TypesetRunAdvanceIn {
+    #[serde(default)]
+    run_index: Option<usize>,
+    #[serde(default)]
+    start_char: Option<usize>,
+    #[serde(default)]
+    end_char: Option<usize>,
+    #[serde(default)]
+    advance: Option<f64>,
+    #[serde(default)]
+    logical_order: Option<u64>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct TypesetClusterAdvanceIn {
+    #[serde(default)]
+    run_index: Option<usize>,
+    #[serde(default)]
+    start_char: Option<usize>,
+    #[serde(default)]
+    end_char: Option<usize>,
+    #[serde(default)]
+    advance: Option<f64>,
+    #[serde(default)]
+    x_offset: Option<f64>,
+    #[serde(default)]
+    bidi_level: Option<u8>,
+    #[serde(default)]
+    logical_order: Option<u64>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct TypesetBidiSliceIn {
+    #[serde(default)]
+    run_index: Option<usize>,
+    #[serde(default)]
+    start_char: Option<usize>,
+    #[serde(default)]
+    end_char: Option<usize>,
+    #[serde(default)]
+    advance: Option<f64>,
+    #[serde(default)]
+    bidi_level: Option<u8>,
+    #[serde(default)]
+    visual_order: Option<u64>,
+    #[serde(default)]
+    logical_order: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TableExtentIn {
+    #[serde(default)]
+    pub(crate) rows: Vec<TableRowExtentIn>,
+    #[serde(default)]
+    column_widths: Vec<f64>,
+    #[serde(default)]
+    total_width: f64,
+    #[serde(default)]
+    pub(crate) total_height: f64,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct TableRowExtentIn {
+    #[serde(default)]
+    cells: Vec<TableCellExtentIn>,
+    #[serde(default)]
+    height: f64,
+}
+
+#[derive(Deserialize)]
+struct TableCellExtentIn {
+    #[serde(default)]
+    blocks: Vec<MeasureIn>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default, rename = "topBand")]
+    top_band: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LayoutIn {
+    #[serde(default)]
+    pages: Vec<PageIn>,
+    /// See `Layout::partial`.
+    #[serde(default)]
+    partial: bool,
+    #[serde(default)]
+    cached_page_totals: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PageIn {
+    #[serde(default)]
+    pub(crate) size: SizeIn,
+    #[serde(default)]
+    pub(crate) margins: MarginsIn,
+    #[serde(default)]
+    body_margins: Option<MarginsIn>,
+    #[serde(default)]
+    body_anchor_margins: Option<MarginsIn>,
+    /// 1-based page number (canonical layouts carry it; falls back to index+1)
+    #[serde(default)]
+    pub(crate) number: Option<u64>,
+    #[serde(default)]
+    pub(crate) page_label: Option<String>,
+    #[serde(default)]
+    section_id: Option<String>,
+    #[serde(default)]
+    pub(crate) section_index: Option<u64>,
+    #[serde(default)]
+    pub(crate) section_page_index: Option<u64>,
+    #[serde(default)]
+    pub(crate) section_page_number: Option<u64>,
+    #[serde(default)]
+    pub(crate) header_footer_refs: Option<PageHeaderFooterRefsIn>,
+    #[serde(default)]
+    pub(crate) parity_filler: Option<bool>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    page_borders: Option<PageBordersIn>,
+    #[serde(default)]
+    columns: Option<ColumnLayoutIn>,
+    #[serde(default)]
+    note_areas: Vec<NoteAreaIn>,
+    #[serde(default)]
+    fragments: Vec<FragmentIn>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PageHeaderFooterRefsIn {
+    #[serde(default)]
+    pub(crate) header_default: Option<String>,
+    #[serde(default)]
+    pub(crate) header_first: Option<String>,
+    #[serde(default)]
+    pub(crate) header_even: Option<String>,
+    #[serde(default)]
+    pub(crate) footer_default: Option<String>,
+    #[serde(default)]
+    pub(crate) footer_first: Option<String>,
+    #[serde(default)]
+    pub(crate) footer_even: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ColumnLayoutIn {
+    #[serde(default)]
+    count: usize,
+    #[serde(default)]
+    gap: f64,
+    #[serde(default)]
+    equal_width: Option<bool>,
+    #[serde(default)]
+    separator: Option<bool>,
+    #[serde(default)]
+    columns: Vec<ColumnSpecIn>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+struct ColumnSpecIn {
+    #[serde(default)]
+    width: Option<f64>,
+    #[serde(default)]
+    space: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NoteAreaIn {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    height: Option<f64>,
+    #[serde(default)]
+    columns: Option<u64>,
+    #[serde(default)]
+    section_id: Option<String>,
+    #[serde(default)]
+    separator: Option<NoteItemIn>,
+    #[serde(default)]
+    notes: Vec<NoteItemIn>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NoteItemIn {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    blocks: Vec<BlockIn>,
+    #[serde(default)]
+    measures: Vec<MeasureIn>,
+    #[serde(default)]
+    height: Option<f64>,
+    #[serde(default)]
+    anchor_doc_start: Option<i64>,
+    #[serde(default)]
+    anchor_doc_end: Option<i64>,
+    /// formatted reference label (display number / custom mark); file-derived
+    #[serde(default)]
+    display_label: Option<String>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+pub(crate) struct SizeIn {
+    #[serde(default)]
+    pub(crate) w: f64,
+    #[serde(default)]
+    pub(crate) h: f64,
+}
+
+/// Page margins as serialized in the `Layout`. `header` and `footer` are the
+/// band distances header/footer composition falls back to.
+#[derive(Deserialize, Default, Clone, Copy)]
+pub(crate) struct MarginsIn {
+    #[serde(default)]
+    pub(crate) top: f64,
+    #[serde(default)]
+    pub(crate) right: f64,
+    #[serde(default)]
+    pub(crate) bottom: f64,
+    #[serde(default)]
+    pub(crate) left: f64,
+    #[serde(default)]
+    pub(crate) header: Option<f64>,
+    #[serde(default)]
+    pub(crate) footer: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+enum FragmentIn {
+    #[serde(rename = "paragraph")]
+    Paragraph(ParagraphFragmentIn),
+    #[serde(rename = "table")]
+    Table(TableFragmentIn),
+    #[serde(rename = "image")]
+    Image(ImageFragmentIn),
+    #[serde(rename = "textBox")]
+    TextBox(TextBoxFragmentIn),
+    #[serde(rename = "shape")]
+    Shape(ShapeFragmentIn),
+    #[serde(rename = "chart")]
+    Chart(ChartFragmentIn),
+    #[serde(rename = "reserved")]
+    Reserved(ReservedFragmentIn),
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReservedFragmentIn {
+    block_id: Value,
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ParagraphFragmentIn {
+    #[serde(default)]
+    pub(crate) horizontal_frame: Option<crate::types::HorizontalFrame>,
+    pub(crate) block_id: Value,
+    #[serde(default)]
+    pub(crate) x: f64,
+    #[serde(default)]
+    pub(crate) y: f64,
+    #[serde(default)]
+    pub(crate) width: f64,
+    #[serde(default)]
+    pub(crate) height: f64,
+    #[serde(default)]
+    pub(crate) from_line: usize,
+    #[serde(default)]
+    pub(crate) to_line: usize,
+    #[serde(default)]
+    pub(crate) pm_start: Option<i64>,
+    #[serde(default)]
+    pub(crate) pm_end: Option<i64>,
+    #[serde(default)]
+    pub(crate) carried_from_prev: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) carried_to_next: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TableFragmentIn {
+    pub(crate) block_id: Value,
+    #[serde(default)]
+    pub(crate) x: f64,
+    #[serde(default)]
+    pub(crate) y: f64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) width: f64,
+    #[serde(default)]
+    pub(crate) height: f64,
+    #[serde(default)]
+    pub(crate) row_start: usize,
+    #[serde(default)]
+    pub(crate) row_end: usize,
+    #[serde(default)]
+    pub(crate) clip_top: Option<f64>,
+    #[serde(default)]
+    pub(crate) clip_bottom: Option<f64>,
+    #[serde(default)]
+    pub(crate) cell_clips: Option<Vec<crate::types::CellClip>>,
+    #[serde(default)]
+    pub(crate) header_row_count: Option<usize>,
+    #[serde(default)]
+    pub(crate) carried_from_prev: Option<bool>,
+    #[serde(default)]
+    pub(crate) carried_to_next: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageFragmentIn {
+    block_id: Value,
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextBoxFragmentIn {
+    block_id: Value,
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+    /// Unused stacking hint.
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_floating: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    z_index: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeFragmentIn {
+    block_id: Value,
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    doc_start: Option<i64>,
+    #[serde(default)]
+    doc_end: Option<i64>,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_anchored: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    z_index: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChartFragmentIn {
+    block_id: Value,
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    doc_start: Option<i64>,
+    #[serde(default)]
+    doc_end: Option<i64>,
+    #[serde(default)]
+    pm_start: Option<i64>,
+    #[serde(default)]
+    pm_end: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// numeric canonicalization
+// ---------------------------------------------------------------------------
+
+/// canonical JSON number: rounded to 3 decimals (golden precision), -0
+/// collapsed, integral values emitted as integers so 96 stays `96`, not `96.0`.
+pub fn px(v: f64) -> Number {
+    let r = (v * 1000.0).round() / 1000.0;
+    let r = if r == 0.0 { 0.0 } else { r };
+    if r.fract() == 0.0 && r.abs() < 9.0e15 {
+        Number::from(r as i64)
+    } else {
+        Number::from_f64(r).unwrap_or_else(|| Number::from(0))
+    }
+}
+
+fn num_f64(n: &Number) -> f64 {
+    n.as_f64().unwrap_or(0.0)
+}
+
+/// round a coordinate to golden precision (3 decimals, -0 collapsed) as a plain
+/// `f64` — GlyphRun glyph positions are `f64` by contract (unlike the `Number`
+/// coordinates on the other primitives), so this keeps them deterministic
+/// without the integer-collapse `px` applies.
+fn round3(v: f64) -> f64 {
+    let r = (v * 1000.0).round() / 1000.0;
+    if r == 0.0 { 0.0 } else { r }
+}
+
+/// Primitive block identity for string or numeric identifiers.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub(crate) struct BlockRef {
+    id: Option<Number>,
+    key: Option<String>,
+}
+
+impl BlockRef {
+    pub(crate) fn of(raw: &Value) -> Self {
+        match raw {
+            Value::Number(n) => BlockRef {
+                id: Some(n.clone()),
+                key: None,
+            },
+            Value::String(s) => BlockRef {
+                id: None,
+                key: Some(s.clone()),
+            },
+            _ => BlockRef::default(),
+        }
+    }
+
+    /// DocAttrs carrying only the block identity; callers fill the rest
+    pub(crate) fn attrs(&self) -> DocAttrs {
+        DocAttrs {
+            block_id: self.id.clone(),
+            block_key: self.key.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Returns the canonical string key for a block identifier.
+fn block_key(id: &Value) -> Cow<'_, str> {
+    match id {
+        Value::String(s) => Cow::Borrowed(s),
+        other => Cow::Owned(other.to_string()),
+    }
+}
+
+const DEFAULT_FONT_PT: f64 = 11.0;
+/// A `fontChains` entry marking the chains as for measuring tab leaders only.
+const LEADER_FONTS_KEY: &str = "@nimbleoffice/fonts/leader";
+const DEFAULT_FONT_FAMILY: &str = "Calibri";
+const REVISION_INS_COLOR: &str = "#2e7d32";
+const REVISION_DEL_COLOR: &str = "#c62828";
+const REVISION_MERGE_COLOR: &str = "#5f6368";
+const STRUCTURAL_CHANGE_BAR_OFFSET_X: f64 = -10.0;
+const STRUCTURAL_CHANGE_BAR_WIDTH: f64 = 2.0;
+const CELL_STRUCTURAL_BAR_HEIGHT: f64 = 3.0;
+const PARAGRAPH_MARK_GLYPH_GAP: f64 = 2.0;
+const PARAGRAPH_MARK_GLYPH_WIDTH: f64 = 8.0;
+
+fn font_px_of(fmt: &RunFormattingIn) -> f64 {
+    fmt.font_size.unwrap_or(DEFAULT_FONT_PT) * 96.0 / 72.0
+}
+
+fn script_scale_of(fmt: &RunFormattingIn) -> f64 {
+    if fmt.superscript == Some(true) || fmt.subscript == Some(true) {
+        let base = fmt.font_size.unwrap_or(DEFAULT_FONT_PT);
+        ooxml_text::script_size_pt(base) / base
+    } else {
+        1.0
+    }
+}
+
+fn effective_font_px_of(fmt: &RunFormattingIn) -> f64 {
+    font_px_of(fmt) * script_scale_of(fmt)
+}
+
+/// Paint-side twin of the measurement kerning gate: Word applies pair kerning
+/// only above a nonzero `w:kern` threshold, so an absent one shapes `kern=0`.
+fn kern_features_of(fmt: &RunFormattingIn, size_px: f64) -> Vec<ooxml_text::ShapeFeature> {
+    ooxml_text::kern_features(fmt.kerning_min_pt.is_some_and(|threshold| {
+        ooxml_text::kern_enabled(
+            (size_px * 1.5).round() as u32,
+            (threshold * 2.0).round() as u32,
+        )
+    }))
+}
+
+fn fallback_scalar_count(text: &str, all_caps: Option<bool>) -> usize {
+    if all_caps == Some(true) {
+        text.chars().flat_map(char::to_uppercase).count()
+    } else {
+        text.chars().count()
+    }
+}
+
+fn fallback_text_width(text: &str, fmt: &RunFormattingIn, default_font_pt: f64) -> f64 {
+    let font_size = fmt
+        .font_size
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(default_font_pt);
+    let font_px = font_size * 96.0 / 72.0 * script_scale_of(fmt);
+    let letter_spacing = fmt
+        .letter_spacing
+        .filter(|spacing| spacing.is_finite() && *spacing > 0.0 && *spacing <= 1_000.0)
+        .unwrap_or(0.0);
+    let horizontal_scale = fmt
+        .horizontal_scale
+        .filter(|scale| scale.is_finite() && *scale > 0.0 && *scale <= 600.0)
+        .map(|scale| scale / 100.0)
+        .unwrap_or(1.0);
+    fallback_scalar_count(text, fmt.all_caps) as f64 * (font_px + letter_spacing) * horizontal_scale
+}
+
+/// Paint-only baseline offset. A positive `positionPx` raises the text, which
+/// is a smaller y coordinate.
+fn baseline_y_of(fmt: &RunFormattingIn, baseline: f64) -> f64 {
+    let mut y = baseline - fmt.position_px.unwrap_or(0.0);
+    let base = fmt.font_size.unwrap_or(DEFAULT_FONT_PT);
+    if fmt.superscript == Some(true) {
+        y -= ooxml_text::superscript_raise(base) * 96.0 / 72.0;
+    }
+    if fmt.subscript == Some(true) {
+        y += ooxml_text::subscript_drop(base) * 96.0 / 72.0;
+    }
+    y
+}
+
+fn horizontal_scale_of(fmt: &RunFormattingIn) -> Option<Number> {
+    match fmt.horizontal_scale {
+        Some(scale) if (scale - 100.0).abs() > f64::EPSILON => Some(px(scale)),
+        _ => None,
+    }
+}
+
+fn text_shadow_of(fmt: &RunFormattingIn) -> Option<String> {
+    if fmt.emboss == Some(true) {
+        Some("emboss".to_string())
+    } else if fmt.imprint == Some(true) {
+        Some("imprint".to_string())
+    } else if fmt.text_shadow == Some(true) {
+        Some("shadow".to_string())
+    } else {
+        None
+    }
+}
+
+fn text_primitive_requires_browser_path(fmt: &RunFormattingIn) -> bool {
+    fmt.all_caps == Some(true)
+        || fmt.small_caps == Some(true)
+        || fmt.hidden == Some(true)
+        || fmt.text_shadow == Some(true)
+        || fmt.emboss == Some(true)
+        || fmt.imprint == Some(true)
+        || fmt.text_outline == Some(true)
+        || fmt.emphasis_mark.is_some()
+        || fmt.text_effect.is_some()
+}
+
+fn structural_revision(
+    info: &RevisionInfoIn,
+    scope: StructuralRevisionScope,
+    kind: StructuralRevisionKind,
+    row_index: Option<u64>,
+    col_index: Option<u64>,
+) -> StructuralRevision {
+    StructuralRevision {
+        scope,
+        author: info.author.clone().unwrap_or_default(),
+        date: info.date.clone(),
+        revision_id: info
+            .revision_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        kind,
+        row_index,
+        col_index,
+    }
+}
+
+fn structural_color(kind: StructuralRevisionKind) -> &'static str {
+    match kind {
+        StructuralRevisionKind::Ins => REVISION_INS_COLOR,
+        StructuralRevisionKind::Del => REVISION_DEL_COLOR,
+        StructuralRevisionKind::Merge => REVISION_MERGE_COLOR,
+    }
+}
+
+fn sdt_attrs_at_depth(group: &SdtGroupIn, depth: usize) -> SdtAttrs {
+    SdtAttrs {
+        group_id: group.id.clone(),
+        sdt_type: group.sdt_type.clone(),
+        depth: Some(depth as u64),
+        tag: group.tag.clone(),
+        alias: group.alias.clone(),
+        lock: group.lock.clone(),
+        checked: group.checked,
+        bound: group.bound,
+        repeating_item: group.repeating_item,
+    }
+}
+
+fn sdt_path_from_groups(groups: &[SdtGroupIn]) -> Vec<SdtAttrs> {
+    groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| sdt_attrs_at_depth(group, index + 1))
+        .collect()
+}
+
+pub(crate) fn sdt_attrs_from_groups(groups: &[SdtGroupIn]) -> Option<SdtAttrs> {
+    let depth = groups.len();
+    groups.last().map(|group| sdt_attrs_at_depth(group, depth))
+}
+
+fn stamp_sdt_range(prims: &mut [Primitive], groups: &[SdtGroupIn], overwrite: bool) {
+    let Some(sdt) = sdt_attrs_from_groups(groups) else {
+        return;
+    };
+    let path = sdt_path_from_groups(groups);
+    for p in prims {
+        if let Some(attrs) = doc_attrs_mut(p)
+            && (overwrite || attrs.sdt.is_none())
+        {
+            attrs.sdt = Some(Box::new(sdt.clone()));
+            attrs.sdt_path = path.clone();
+        }
+    }
+}
+
+fn same_revision_burst(a: &RevisionInfoIn, b: &RevisionInfoIn) -> bool {
+    a.author.as_deref().unwrap_or("") == b.author.as_deref().unwrap_or("")
+        && a.date.as_deref() == b.date.as_deref()
+}
+
+fn whole_table_revision(block: &TableBlockIn) -> Option<StructuralRevision> {
+    let first = block.rows.first()?;
+    if let Some(shared) = first.tracked_ins.as_ref()
+        && block.rows.iter().all(|row| {
+            row.tracked_ins
+                .as_ref()
+                .is_some_and(|r| same_revision_burst(r, shared))
+        })
+    {
+        return Some(structural_revision(
+            shared,
+            StructuralRevisionScope::Table,
+            StructuralRevisionKind::Ins,
+            None,
+            None,
+        ));
+    }
+    if let Some(shared) = first.tracked_del.as_ref()
+        && block.rows.iter().all(|row| {
+            row.tracked_del
+                .as_ref()
+                .is_some_and(|r| same_revision_burst(r, shared))
+        })
+    {
+        return Some(structural_revision(
+            shared,
+            StructuralRevisionScope::Table,
+            StructuralRevisionKind::Del,
+            None,
+            None,
+        ));
+    }
+    None
+}
+
+fn row_structural_revision(row: &TableRowIn, row_index: usize) -> Option<StructuralRevision> {
+    row.tracked_del
+        .as_ref()
+        .map(|info| {
+            structural_revision(
+                info,
+                StructuralRevisionScope::Row,
+                StructuralRevisionKind::Del,
+                Some(row_index as u64),
+                None,
+            )
+        })
+        .or_else(|| {
+            row.tracked_ins.as_ref().map(|info| {
+                structural_revision(
+                    info,
+                    StructuralRevisionScope::Row,
+                    StructuralRevisionKind::Ins,
+                    Some(row_index as u64),
+                    None,
+                )
+            })
+        })
+}
+
+fn row_parent_revision_id(row: &TableRowIn) -> Option<i64> {
+    row.tracked_ins
+        .as_ref()
+        .and_then(|r| r.revision_id)
+        .or_else(|| row.tracked_del.as_ref().and_then(|r| r.revision_id))
+}
+
+/// Returns CSS font shorthand for a run.
+#[allow(clippy::box_collection)]
+fn boxed_scripts(scripts: &[String]) -> Option<Box<Vec<String>>> {
+    (!scripts.is_empty()).then(|| Box::new(scripts.to_vec()))
+}
+
+fn paragraph_scripts(runs: &[RunIn]) -> Vec<String> {
+    ooxml_text::paragraph_scripts_with_languages(
+        runs.iter().filter_map(|run| match run {
+            RunIn::Text(text) => Some((
+                text.text.as_str(),
+                text.fmt
+                    .language
+                    .as_ref()
+                    .and_then(|language| language.east_asia.as_deref()),
+            )),
+            _ => None,
+        }),
+        false,
+    )
+}
+
+fn css_font(fmt: &RunFormattingIn) -> String {
+    styled_css_font(
+        fmt,
+        fmt.font_family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY),
+        fmt.bold == Some(true),
+        fmt.italic == Some(true),
+    )
+}
+
+fn styled_css_font(fmt: &RunFormattingIn, family: &str, bold: bool, italic: bool) -> String {
+    let size = px(effective_font_px_of(fmt));
+    let weight = if bold { 700 } else { 400 };
+    let variant = if fmt.small_caps == Some(true) {
+        "small-caps "
+    } else {
+        ""
+    };
+    if italic {
+        format!("italic {variant}{weight} {size}px {family}, sans-serif")
+    } else {
+        format!("{variant}{weight} {size}px {family}, sans-serif")
+    }
+}
+
+fn resolved_css_font(shape: Option<&ShapeFonts<'_>>, text: &str, fmt: &RunFormattingIn) -> String {
+    let Some(shape) = shape else {
+        return css_font(fmt);
+    };
+    let bold = fmt.bold == Some(true);
+    let italic = fmt.italic == Some(true);
+    let family = fmt.font_family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY);
+    let Some(chain) = shape.chain_for(family, bold, italic) else {
+        return css_font(fmt);
+    };
+    #[cfg(not(feature = "base-latin"))]
+    if !chain
+        .ids
+        .iter()
+        .any(|&id| shape.store.backstop_style(id).is_some())
+    {
+        return css_font(fmt);
+    }
+    if chain.ids.iter().any(|&id| shape.store.metrics(id).is_err()) {
+        return css_font(fmt);
+    }
+    let Some(fonts): Option<Vec<_>> = text
+        .chars()
+        .map(|ch| chain.resolve_with_style(shape.store, ch, bold, italic, family))
+        .collect()
+    else {
+        return css_font(fmt);
+    };
+    if let Some(&font) = fonts.first()
+        && fonts.iter().all(|&id| id == font)
+        && !text.chars().any(ooxml_text::font_store::base_latin_alias)
+        && let Some((bold, italic)) = shape.store.backstop_style(font)
+    {
+        return styled_css_font(fmt, ooxml_text::BASE_LATIN_FAMILY, bold, italic);
+    }
+    let css = css_font(fmt);
+    if fonts
+        .iter()
+        .any(|&id| shape.store.backstop_style(id).is_some())
+    {
+        if !ooxml_text::font_store::symbol_family(family)
+            && text.chars().any(ooxml_text::font_store::base_latin_alias)
+        {
+            return css;
+        }
+        css.replace(
+            ", sans-serif",
+            &format!(", {}, sans-serif", ooxml_text::BASE_LATIN_FAMILY),
+        )
+    } else {
+        css
+    }
+}
+
+/// Resolves deletion, hyperlink, and explicit run colors.
+fn run_color(fmt: &RunFormattingIn) -> String {
+    if fmt.is_deletion == Some(true) {
+        return "#c62828".to_string();
+    }
+    if let Some(c) = &fmt.color {
+        return c.clone();
+    }
+    if let Some(link) = &fmt.hyperlink
+        && link.no_default_style != Some(true)
+    {
+        return "#0563c1".to_string();
+    }
+    "#000000".to_string()
+}
+
+pub(crate) fn sanitized_href(href: Option<&str>) -> Option<String> {
+    let raw = href?;
+    let probe = raw
+        .replace(['\t', '\n', '\r'], "")
+        .trim_start_matches(|c: char| c <= '\u{20}')
+        .to_string();
+    if probe.is_empty() {
+        return None;
+    }
+    let Some(colon) = probe.find(':') else {
+        return Some(raw.to_string());
+    };
+    let scheme = &probe[..colon];
+    let mut chars = scheme.chars();
+    let Some(first) = chars.next() else {
+        return Some(raw.to_string());
+    };
+    if !first.is_ascii_alphabetic()
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    {
+        return Some(raw.to_string());
+    }
+    if matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "mailto" | "tel" | "ftp"
+    ) {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
+fn hyperlink_href(fmt: &RunFormattingIn) -> Option<String> {
+    sanitized_href(fmt.hyperlink.as_ref().and_then(|h| h.href.as_deref()))
+}
+
+/// base-direction detection for paragraphs without explicit w:bidi: only
+/// paragraphs carrying at least one w:rtl run are candidates; the base then
+/// follows the first strong directional character (dir="auto" rule). (#719)
+fn paragraph_base_is_rtl(block: &ParagraphBlockIn) -> bool {
+    *block.base_rtl.get_or_init(|| {
+        runs_base_is_rtl(block.runs.iter().filter_map(|run| match run {
+            RunIn::Text(text) => Some((text.fmt.rtl == Some(true), text.text.as_str())),
+            _ => None,
+        }))
+    })
+}
+
+/// Returns whether an image is positioned outside inline flow.
+fn is_floating_image_run(run: &ImageRunIn) -> bool {
+    crate::cell_layout::is_floating_image(run.wrap_type.as_deref(), run.display_mode.as_deref())
+}
+
+/// parse "rotate(NNdeg)" out of a CSS transform string, normalized to [0, 360)
+pub(crate) fn rotation_degrees(transform: Option<&str>) -> f64 {
+    let Some(t) = transform else { return 0.0 };
+    let Some(idx) = t.find("rotate(") else {
+        return 0.0;
+    };
+    let rest = &t[idx + 7..];
+    let Some(end) = rest.find("deg") else {
+        return 0.0;
+    };
+    let deg: f64 = rest[..end].trim().parse().unwrap_or(0.0);
+    ((deg % 360.0) + 360.0) % 360.0
+}
+
+/// hard cap on image alt text — `wp:docPr descr` is attacker-controlled file
+/// data, so an unbounded value must never ride into every consumer's copy of
+/// the display list (a11y mirror DOM, canvas hosts, serialized snapshots)
+pub const MAX_ALT_TEXT_CHARS: usize = 2048;
+
+/// Alt text for an image primitive: an empty value is dropped rather than
+/// emitted, and an oversized one truncates on a character boundary.
+pub(crate) fn capped_alt_text(alt: Option<&str>) -> Option<String> {
+    let alt = alt?;
+    if alt.is_empty() {
+        return None;
+    }
+    Some(alt.chars().take(MAX_ALT_TEXT_CHARS).collect())
+}
+
+fn emit_watermark(prims: &mut Vec<Primitive>, watermark: &WatermarkIn, page: &PageIn) {
+    match watermark {
+        WatermarkIn::Text(wm) => emit_text_watermark(prims, wm, page),
+        WatermarkIn::Picture(wm) => emit_picture_watermark(prims, wm, page),
+    }
+}
+
+fn watermark_auto_font_px(text: &str, available_width_px: f64) -> f64 {
+    let chars = text.trim().chars().count().max(1) as f64;
+    let size = available_width_px / (chars * 0.62);
+    size.clamp(24.0, 180.0)
+}
+
+fn emit_text_watermark(prims: &mut Vec<Primitive>, wm: &TextWatermarkIn, page: &PageIn) {
+    if wm.text.is_empty() {
+        return;
+    }
+    let text: String = wm.text.chars().take(MAX_ALT_TEXT_CHARS).collect();
+    let content_width = page.size.w - page.margins.left - page.margins.right;
+    let target_width = if wm.layout.as_deref() == Some("diagonal") {
+        content_width * 1.3
+    } else {
+        content_width
+    };
+    let font_px = wm
+        .font_size
+        .map(|pt| pt * 96.0 / 72.0)
+        .filter(|px| px.is_finite() && *px > 0.0)
+        .unwrap_or_else(|| watermark_auto_font_px(&text, target_width));
+    let width = (text.trim().chars().count().max(1) as f64) * font_px * 0.62;
+    let x = (page.size.w - width) / 2.0;
+    // textRunRect centers at baseline - 0.2em; choose the baseline so the
+    // primitive's geometry center is exactly the page center before rotation.
+    let baseline = page.size.h / 2.0 + font_px * 0.2;
+    let family = wm.font.as_deref().unwrap_or(DEFAULT_FONT_FAMILY);
+    let font = format!("700 {}px {}, sans-serif", px(font_px), family);
+    let opacity = if wm.semitransparent == Some(true) {
+        0.5
+    } else {
+        0.85
+    };
+    let rotation = if wm.layout.as_deref() == Some("diagonal") {
+        Some(px(-45.0))
+    } else {
+        None
+    };
+
+    let attrs = DocAttrs {
+        decorative: Some(wm.decorative.unwrap_or(true)),
+        ..DocAttrs::default()
+    };
+    prims.push(Primitive::Text(TextRunPrimitive {
+        text,
+        paint_text: None,
+        x: px(x),
+        baseline_y: px(baseline),
+        width: px(width),
+        paint_clip: None,
+        font,
+        scripts: None,
+        color: wm.color.clone().unwrap_or_else(|| "#C0C0C0".to_string()),
+        letter_spacing: None,
+        word_spacing: None,
+        rtl: None,
+        opacity: Some(px(opacity)),
+        rotation_deg: rotation,
+        horizontal_scale: None,
+        substitute_scale: None,
+        all_caps: false,
+        small_caps: false,
+        hidden: false,
+        text_shadow: None,
+        text_outline: false,
+        emphasis_mark: None,
+        text_effect: None,
+        attrs,
+    }));
+}
+
+fn emit_picture_watermark(prims: &mut Vec<Primitive>, wm: &PictureWatermarkIn, page: &PageIn) {
+    let rel_id = wm
+        .data_url
+        .as_deref()
+        .or(wm.rel_id.as_deref())
+        .unwrap_or("");
+    if rel_id.is_empty() {
+        return;
+    }
+    let content_width = page.size.w - page.margins.left - page.margins.right;
+    let natural_width = wm
+        .width_emu
+        .map(emu_to_px)
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .unwrap_or(content_width * 0.75);
+    let natural_height = wm
+        .height_emu
+        .map(emu_to_px)
+        .filter(|h| h.is_finite() && *h > 0.0)
+        .unwrap_or(natural_width);
+    let scale = wm
+        .scale
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(1.0);
+    let w = natural_width * scale;
+    let h = natural_height * scale;
+    let washout = wm.washout == Some(true);
+
+    prims.push(Primitive::Image(ImagePrimitive {
+        rel_id: rel_id.to_string(),
+        x: px((page.size.w - w) / 2.0),
+        y: px((page.size.h - h) / 2.0),
+        w: px(w),
+        h: px(h),
+        rotation_deg: None,
+        opacity: if washout { Some(px(0.5)) } else { None },
+        filter: if washout {
+            Some("brightness(1.4) contrast(0.4)".to_string())
+        } else {
+            None
+        },
+        decorative: wm.decorative.unwrap_or(true),
+        crop: None,
+        alt_text: None,
+        attrs: DocAttrs::default(),
+    }));
+}
+
+fn crop_of(run: &ImageRunIn) -> Option<Crop> {
+    let t = run.crop_top.unwrap_or(0.0);
+    let r = run.crop_right.unwrap_or(0.0);
+    let b = run.crop_bottom.unwrap_or(0.0);
+    let l = run.crop_left.unwrap_or(0.0);
+    if t == 0.0 && r == 0.0 && b == 0.0 && l == 0.0 {
+        return None;
+    }
+    Some(Crop {
+        top: px(t),
+        right: px(r),
+        bottom: px(b),
+        left: px(l),
+    })
+}
+
+fn crop_of_block(block: &ImageBlockIn) -> Option<Crop> {
+    let crop = block.crop.as_ref()?;
+    Some(Crop {
+        top: px(crop.top.unwrap_or(0.0)),
+        right: px(crop.right.unwrap_or(0.0)),
+        bottom: px(crop.bottom.unwrap_or(0.0)),
+        left: px(crop.left.unwrap_or(0.0)),
+    })
+}
+
+fn transform_has_flip(transform: Option<&str>, axis: char) -> bool {
+    let needle = if axis == 'x' {
+        "scaleX(-1)"
+    } else {
+        "scaleY(-1)"
+    };
+    transform.is_some_and(|value| value.replace(' ', "").contains(needle))
+}
+
+fn content_frame(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    bounds: Option<&RotationBoundsIn>,
+) -> Option<ContentFrame> {
+    let bounds = bounds?;
+    Some(ContentFrame {
+        x: Some(px(x + bounds.offset_x.unwrap_or(0.0))),
+        y: Some(px(y + bounds.offset_y.unwrap_or(0.0))),
+        w: Some(px(width)),
+        h: Some(px(height)),
+    })
+}
+
+fn stamp_hyperlink_attrs(
+    attrs: &mut DocAttrs,
+    link: Option<&HyperlinkIn>,
+    legacy_href: Option<&str>,
+) {
+    let href = link.and_then(|value| value.href.as_deref()).or(legacy_href);
+    attrs.href = sanitized_href(href);
+    if let Some(link) = link {
+        attrs.tooltip = link.tooltip.clone();
+        attrs.link_title = link.tooltip.clone();
+        attrs.link_target = link.target.clone();
+        attrs.link_history = link.history;
+        attrs.link_doc_location = link.doc_location.clone();
+    }
+}
+
+fn stamp_image_run_metadata(
+    attrs: &mut DocAttrs,
+    run: &ImageRunIn,
+    logical_order: Option<u64>,
+    bidi_level: Option<u8>,
+) {
+    stamp_hyperlink_attrs(attrs, run.hyperlink.as_ref(), run.hlink_href.as_deref());
+    attrs.logical_order = attrs.logical_order.or(logical_order);
+    attrs.bidi_level = attrs.bidi_level.or(bidi_level);
+    if run.is_insertion == Some(true) || run.is_deletion == Some(true) {
+        attrs.revision = Some(Box::new(Revision {
+            author: run.change_author.clone().unwrap_or_default(),
+            date: run.change_date.clone().unwrap_or_default(),
+            revision_id: run
+                .change_revision_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            kind: if run.is_insertion == Some(true) {
+                RevisionKind::Ins
+            } else {
+                RevisionKind::Del
+            },
+        }));
+    }
+}
+
+fn stamp_image_run_attrs(attrs: &mut DocAttrs, run: &ImageRunIn, x: f64, y: f64) {
+    stamp_image_run_metadata(attrs, run, None, None);
+    attrs.image_flip_h = (run.flip_h == Some(true)
+        || transform_has_flip(run.transform.as_deref(), 'x'))
+    .then_some(true);
+    attrs.image_flip_v = (run.flip_v == Some(true)
+        || transform_has_flip(run.transform.as_deref(), 'y'))
+    .then_some(true);
+    attrs.content_frame =
+        content_frame(x, y, run.width, run.height, run.rotation_bounds.as_ref()).map(Box::new);
+    attrs.image_shape_type = run.shape_type.clone();
+    attrs.effects = run.effects.clone();
+    attrs.border = run.outline.clone().map(Box::new);
+}
+
+fn stamp_image_block_attrs(attrs: &mut DocAttrs, block: &ImageBlockIn, x: f64, y: f64) {
+    attrs.href = sanitized_href(block.hlink_href.as_deref());
+    attrs.link_title = block.hlink_title.clone();
+    attrs.tooltip = block.hlink_title.clone();
+    attrs.image_flip_h = (block.flip_h == Some(true)
+        || transform_has_flip(block.transform.as_deref(), 'x'))
+    .then_some(true);
+    attrs.image_flip_v = (block.flip_v == Some(true)
+        || transform_has_flip(block.transform.as_deref(), 'y'))
+    .then_some(true);
+    attrs.content_frame = content_frame(
+        x,
+        y,
+        block.width,
+        block.height,
+        block.rotation_bounds.as_ref(),
+    )
+    .map(Box::new);
+    attrs.image_shape_type = block.shape_type.clone();
+    attrs.effects = block.effects.clone();
+    attrs.border = block.outline.clone().map(Box::new);
+}
+
+fn image_layout_width(run: &ImageRunIn) -> f64 {
+    run.rotation_bounds
+        .as_ref()
+        .and_then(|bounds| bounds.width)
+        .unwrap_or(run.width)
+}
+
+fn image_layout_height(run: &ImageRunIn) -> f64 {
+    run.rotation_bounds
+        .as_ref()
+        .and_then(|bounds| bounds.height)
+        .unwrap_or(run.height)
+}
+
+/// one run's visible slice on a laid-out line: the (possibly sliced) run plus
+/// its on-line text; non-text runs pass through whole with empty text
+struct ResolvedSegment<'a> {
+    run: &'a RunIn,
+    /// for boundary text runs: the sliced text + shifted document positions
+    text: String,
+    pm_start: Option<i64>,
+    pm_end: Option<i64>,
+}
+
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// Slice using UTF-16 offsets. Start/end are snapped to
+/// scalar boundaries so malformed hand-authored envelopes cannot split a
+/// surrogate pair; authoritative cluster metadata already lands on grapheme
+/// boundaries and therefore passes through unchanged.
+fn slice_utf16(text: &str, start: usize, end: usize) -> String {
+    slice_utf16_with_total(text, utf16_len(text), start, end)
+}
+
+/// [`slice_utf16`] with the text's utf16 length precomputed, so per-line run
+/// slicing measures each run once instead of once per bound.
+fn slice_utf16_with_total(text: &str, total: usize, start: usize, end: usize) -> String {
+    let start = start.min(total);
+    let end = end.max(start).min(total);
+    let mut units = 0usize;
+    text.chars()
+        .filter_map(|ch| {
+            let next = units + ch.len_utf16();
+            let keep = units >= start && next <= end;
+            units = next;
+            keep.then_some(ch)
+        })
+        .collect()
+}
+
+fn resolve_line_segments<'a>(runs: &'a [RunIn], line: &LineIn) -> Vec<ResolvedSegment<'a>> {
+    #[cfg(any(test, feature = "test-support"))]
+    crate::work_counters::resolved_line();
+    let mut out = Vec::new();
+    for run_index in line.head_run..=line.tail_run {
+        let Some(run) = runs.get(run_index) else {
+            continue;
+        };
+        match run {
+            RunIn::Text(t) => {
+                let total = utf16_len(&t.text);
+                let start = if run_index == line.head_run {
+                    line.head_char.min(total)
+                } else {
+                    0
+                };
+                let end = if run_index == line.tail_run {
+                    line.tail_char.min(total)
+                } else {
+                    total
+                };
+                let end = end.max(start);
+                let text = slice_utf16_with_total(&t.text, total, start, end);
+                // an unsliced run keeps its own document span; a boundary slice
+                // shifts the positions to match (text runs are 1 position per char)
+                let (pm_start, pm_end) = if start == 0 && end == total {
+                    (t.pm_start, t.pm_end.or(t.pm_start.map(|p| p + end as i64)))
+                } else {
+                    match t.pm_start {
+                        Some(p) => (Some(p + start as i64), Some(p + end as i64)),
+                        None => (None, None),
+                    }
+                };
+                out.push(ResolvedSegment {
+                    run,
+                    text,
+                    pm_start,
+                    pm_end,
+                });
+            }
+            RunIn::Tab(t) => out.push(ResolvedSegment {
+                run,
+                text: String::new(),
+                pm_start: t.pm_start,
+                pm_end: t.pm_end,
+            }),
+            RunIn::Image(t) => out.push(ResolvedSegment {
+                run,
+                text: String::new(),
+                pm_start: t.pm_start,
+                pm_end: t.pm_end,
+            }),
+            RunIn::LineBreak(t) => out.push(ResolvedSegment {
+                run,
+                text: String::new(),
+                pm_start: t.pm_start,
+                pm_end: t.pm_start,
+            }),
+            RunIn::Field(t) => out.push(ResolvedSegment {
+                run,
+                text: String::new(),
+                pm_start: t.pm_start,
+                pm_end: t.pm_end,
+            }),
+            RunIn::Reserved(t) => out.push(ResolvedSegment {
+                run,
+                text: String::new(),
+                pm_start: t.pm_start,
+                pm_end: t.pm_end,
+            }),
+            RunIn::Unsupported => {}
+        }
+    }
+    out
+}
+
+struct LineTextItem<'a> {
+    text: String,
+    fmt: &'a RunFormattingIn,
+    pm_start: Option<i64>,
+    pm_end: Option<i64>,
+    width: f64,
+    level: u8,
+    source_start: usize,
+    source_end: usize,
+    logical_order: Option<u64>,
+    exact_advance: bool,
+    /// source field run when this item paints a field result — carries the
+    /// inert a11y identity (type/instruction) onto the emitted primitives
+    field: Option<&'a FieldRunIn>,
+}
+
+enum LinePaintItem<'a> {
+    Text(LineTextItem<'a>),
+    Tab {
+        run: &'a TabRunIn,
+        width: f64,
+        level: u8,
+        logical_order: Option<u64>,
+    },
+    Image {
+        run: &'a ImageRunIn,
+        pm_start: Option<i64>,
+        pm_end: Option<i64>,
+        single_image_line: bool,
+        level: u8,
+        logical_order: Option<u64>,
+    },
+    LineBreak {
+        pm_start: Option<i64>,
+        level: u8,
+    },
+    Reserved {
+        run: &'a ReservedRunIn,
+        single: bool,
+        level: u8,
+    },
+}
+
+impl LinePaintItem<'_> {
+    fn level(&self) -> u8 {
+        match self {
+            LinePaintItem::Text(item) => item.level,
+            LinePaintItem::Tab { level, .. }
+            | LinePaintItem::Image { level, .. }
+            | LinePaintItem::LineBreak { level, .. }
+            | LinePaintItem::Reserved { level, .. } => *level,
+        }
+    }
+
+    fn width(&self) -> f64 {
+        match self {
+            LinePaintItem::Text(item) => item.width,
+            LinePaintItem::Tab { width, .. } => *width,
+            LinePaintItem::Image { run, .. } => run
+                .rotation_bounds
+                .as_ref()
+                .and_then(|bounds| bounds.width)
+                .unwrap_or(run.width),
+            LinePaintItem::LineBreak { .. } => 0.0,
+            LinePaintItem::Reserved { run, .. } => run.width,
+        }
+    }
+}
+
+fn base_bidi_direction(is_rtl: bool) -> ooxml_text::BaseDirection {
+    if is_rtl {
+        ooxml_text::BaseDirection::Rtl
+    } else {
+        ooxml_text::BaseDirection::Ltr
+    }
+}
+
+fn base_bidi_level(is_rtl: bool) -> u8 {
+    if is_rtl { 1 } else { 0 }
+}
+
+fn shape_direction_for_level(level: u8) -> ooxml_text::ShapeDirection {
+    if ooxml_text::level_is_rtl(level) {
+        ooxml_text::ShapeDirection::Rtl
+    } else {
+        ooxml_text::ShapeDirection::Ltr
+    }
+}
+
+fn bidi_char_levels(text: &str, base: ooxml_text::BaseDirection) -> Vec<u8> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let paras = ooxml_text::bidi_paragraphs(text, base);
+    let mut runs = paras.iter().flat_map(|p| p.runs.iter());
+    let mut cur = runs.next();
+    let mut levels = Vec::new();
+    for (byte, _) in text.char_indices() {
+        while let Some(r) = cur {
+            if byte < r.end {
+                break;
+            }
+            cur = runs.next();
+        }
+        levels.push(cur.map_or_else(
+            || base_bidi_level(base == ooxml_text::BaseDirection::Rtl),
+            |r| r.level,
+        ));
+    }
+    levels
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_bidi_text_items<'a>(
+    out: &mut Vec<LinePaintItem<'a>>,
+    text: &str,
+    fmt: &'a RunFormattingIn,
+    pm_start: Option<i64>,
+    pm_end: Option<i64>,
+    total_width: f64,
+    levels: &[u8],
+    level_cursor: &mut usize,
+    default_level: u8,
+    word_space_extra: f64,
+    field: Option<&'a FieldRunIn>,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        out.push(LinePaintItem::Text(LineTextItem {
+            text: String::new(),
+            fmt,
+            pm_start,
+            pm_end,
+            width: total_width,
+            level: default_level,
+            source_start: 0,
+            source_end: 0,
+            logical_order: fmt.logical_order,
+            exact_advance: false,
+            field,
+        }));
+        return;
+    }
+
+    let total_chars = chars.len();
+    let total_scalars = fallback_scalar_count(text, fmt.all_caps);
+    let mut utf16_offsets = Vec::with_capacity(total_chars + 1);
+    utf16_offsets.push(0usize);
+    let mut utf16_units = 0usize;
+    for character in &chars {
+        utf16_units += character.len_utf16();
+        utf16_offsets.push(utf16_units);
+    }
+    let mut start = 0usize;
+    while start < total_chars {
+        let level = levels
+            .get(*level_cursor + start)
+            .copied()
+            .unwrap_or(default_level);
+        let mut end = start + 1;
+        while end < total_chars
+            && levels
+                .get(*level_cursor + end)
+                .copied()
+                .unwrap_or(default_level)
+                == level
+        {
+            end += 1;
+        }
+
+        let slice: String = chars[start..end].iter().collect();
+        let slice_scalars = fallback_scalar_count(&slice, fmt.all_caps);
+        let spaces = slice.chars().filter(|&ch| ch == ' ').count();
+        let base_width = total_width * slice_scalars as f64 / total_scalars as f64;
+        let width = if word_space_extra > 0.0 {
+            // `total_width` already includes the stretched spaces. Remove the
+            // segment-level equal-share stretch and reapply it per bidi slice.
+            let total_spaces = text.chars().filter(|&ch| ch == ' ').count();
+            let unstretched = total_width - word_space_extra * total_spaces as f64;
+            (unstretched * slice_scalars as f64 / total_scalars as f64)
+                + word_space_extra * spaces as f64
+        } else {
+            base_width
+        };
+
+        let slice_pm_end = if end == total_chars {
+            pm_end.or_else(|| pm_start.map(|p| p + utf16_offsets[end] as i64))
+        } else {
+            pm_start.map(|p| p + utf16_offsets[end] as i64)
+        };
+
+        out.push(LinePaintItem::Text(LineTextItem {
+            text: slice,
+            fmt,
+            pm_start: pm_start.map(|p| p + utf16_offsets[start] as i64),
+            pm_end: slice_pm_end,
+            width,
+            level,
+            source_start: utf16_offsets[start],
+            source_end: utf16_offsets[end],
+            logical_order: fmt.logical_order,
+            exact_advance: false,
+            field,
+        }));
+        start = end;
+    }
+    *level_cursor += total_chars;
+}
+
+// ---------------------------------------------------------------------------
+// builder
+// ---------------------------------------------------------------------------
+
+/// Per-page resolved widths for one PAGE/NUMPAGES field run. `fallback` is the
+/// width the measure baked into the line (from the field's fallback text);
+/// `per_page[i]` is the width of its resolved text on layout page `i`.
+pub(crate) struct FieldWidthEntry {
+    pub(crate) fallback: f64,
+    pub(crate) per_page: Vec<f64>,
+}
+
+/// field document position → per-page widths (see [`FieldWidthEntry`]).
+pub(crate) type FieldWidthMap = HashMap<i64, FieldWidthEntry>;
+
+/// Everything emission needs that varies per page or per band: the numbers
+/// PAGE and NUMPAGES resolve to, the shaping fonts, and the field widths scoped
+/// to the header/footer variant being composed.
+pub(crate) struct RenderCtx<'a> {
+    pub(crate) page_number: u64,
+    /// Formatted PAGE label; `None` falls back to `page_number`.
+    pub(crate) page_label: Option<String>,
+    /// Zero-based key into per-page field-width arrays.
+    /// Distinct from `page_label`, which restarts per section.
+    pub(crate) page_index: usize,
+    pub(crate) total_pages: u64,
+    pub(crate) cached_page_totals: bool,
+    /// Shaping fonts for glyph-run emission.
+    pub(crate) shape: Option<&'a ShapeFonts<'a>>,
+    /// Fonts for measuring tab leader glyphs when text itself is not shaped.
+    pub(crate) leader_fonts: Option<&'a ShapeFonts<'a>>,
+    /// Per-page PAGE/NUMPAGES widths for header/footer field lines.
+    pub(crate) field_widths: Option<&'a FieldWidthMap>,
+    /// Collects the page's reservation rects; `None` drops them.
+    pub(crate) reservations: Option<&'a std::cell::RefCell<Vec<DisplayReservation>>>,
+    /// Collects the page's table gridlines; `None` drops them.
+    pub(crate) gridlines: Option<&'a std::cell::RefCell<Vec<DisplayGridline>>>,
+    /// Body paragraphs of every page, which header/footer STYLEREF fields read.
+    pub(crate) style_refs: Option<&'a [Vec<&'a ParagraphBlockIn>]>,
+    /// A footer's STYLEREF takes the last match on the page, a header's the first.
+    pub(crate) style_ref_last: bool,
+}
+
+impl RenderCtx<'_> {
+    fn reserve(&self, reservation: &ReservationRefIn, x: f64, y: f64, width: f64, height: f64) {
+        if let Some(reservations) = self.reservations {
+            reservations.borrow_mut().push(DisplayReservation {
+                owner: reservation.owner.clone(),
+                id: reservation.id.clone(),
+                x: px(x),
+                y: px(y),
+                width: px(width),
+                height: px(height),
+            });
+        }
+    }
+
+    /// `(fallback_width, resolved_width_on_this_page)` for a field run, when the
+    /// input supplied a per-page width keyed on its document position.
+    fn field_width(&self, pm_start: Option<i64>) -> Option<(f64, f64)> {
+        let entry = self.field_widths?.get(&pm_start?)?;
+        let resolved = entry.per_page.get(self.page_index).copied()?;
+        Some((entry.fallback, resolved))
+    }
+}
+
+/// The measurement font store plus the input's `fontChains` (u32 ids converted
+/// to `FontId` once), the two things `emit_text_segment` needs to shape a run
+/// into a [`GlyphRunPrimitive`]. Built once per `build_display_list` and
+/// borrowed by every page/HF `RenderCtx`.
+pub(crate) struct ShapeFonts<'a> {
+    store: &'a ooxml_text::FontStore,
+    chains: HashMap<String, ShapeFontChain>,
+    coverage_only: bool,
+}
+
+type FontResolver =
+    fn(&ooxml_text::FontStore, &[ooxml_text::FontId], char) -> Option<ooxml_text::FontId>;
+
+struct ShapeFontChain {
+    ids: Vec<ooxml_text::FontId>,
+    coverage_only: bool,
+    resolve: FontResolver,
+}
+
+impl ShapeFontChain {
+    fn new(ids: Vec<ooxml_text::FontId>, coverage_only: bool) -> Self {
+        Self {
+            ids,
+            coverage_only,
+            resolve: if coverage_only {
+                Self::resolve_covered
+            } else {
+                Self::resolve_with_fallback
+            },
+        }
+    }
+
+    fn resolve_with_fallback(
+        store: &ooxml_text::FontStore,
+        chain: &[ooxml_text::FontId],
+        ch: char,
+    ) -> Option<ooxml_text::FontId> {
+        store.resolve(chain, ch).or_else(|| chain.last().copied())
+    }
+
+    fn resolve_covered(
+        store: &ooxml_text::FontStore,
+        chain: &[ooxml_text::FontId],
+        ch: char,
+    ) -> Option<ooxml_text::FontId> {
+        if !ooxml_text::measure::needs_glyph(ch) {
+            return chain.iter().copied().find(|&id| store.metrics(id).is_ok());
+        }
+        store.resolve(chain, ch)
+    }
+
+    fn resolve_with_style(
+        &self,
+        store: &ooxml_text::FontStore,
+        ch: char,
+        bold: bool,
+        italic: bool,
+        family: &str,
+    ) -> Option<ooxml_text::FontId> {
+        if ooxml_text::font_store::base_latin_alias(ch) {
+            return store
+                .resolve_with_family(&self.ids, ch, bold, italic, family)
+                .filter(|&id| {
+                    !self.coverage_only
+                        || ooxml_text::covered_character(store, id, ch)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                });
+        }
+        #[cfg(not(feature = "base-latin"))]
+        {
+            (self.resolve)(store, &self.ids, ch)
+        }
+        #[cfg(feature = "base-latin")]
+        {
+            let resolved = (self.resolve)(store, &self.ids, ch);
+            if resolved.is_some_and(|id| {
+                ooxml_text::covered_character(store, id, ch)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                    || (self.coverage_only && !ooxml_text::measure::needs_glyph(ch))
+            }) {
+                return resolved;
+            }
+            store
+                .resolve_with_style(&self.ids, ch, bold, italic)
+                .filter(|&id| {
+                    !self.coverage_only
+                        || ooxml_text::covered_character(store, id, ch)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                })
+        }
+    }
+}
+
+impl<'a> ShapeFonts<'a> {
+    /// Build the shaping context from the input's `fontChains`, or `None` when
+    /// the input carries no chains (the browser-measured path). The u32 ids are
+    /// converted to `FontId` here so lookups downstream are cheap; ids that
+    /// don't belong to `store` fail at shape time and route their run back to
+    /// the `TextRunPrimitive` fallback.
+    fn build(input: &BuildInput, store: &'a ooxml_text::FontStore) -> Option<ShapeFonts<'a>> {
+        if input.font_chains.is_empty() {
+            return None;
+        }
+        let coverage_only: HashSet<_> = input
+            .font_chains
+            .get("@nimbleoffice/fonts/coverage")
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        let chains = input
+            .font_chains
+            .iter()
+            .map(|(k, ids)| {
+                (
+                    k.clone(),
+                    ShapeFontChain::new(
+                        ids.iter()
+                            .map(|&id| ooxml_text::FontId::from_u32(id))
+                            .collect(),
+                        ids.last().is_some_and(|id| coverage_only.contains(id)),
+                    ),
+                )
+            })
+            .collect();
+        Some(ShapeFonts {
+            store,
+            chains,
+            coverage_only: !coverage_only.is_empty(),
+        })
+    }
+
+    /// Fallback chain for a `(family, bold, italic)` combination, keyed exactly
+    /// like the measure input (`"<family lowercase>|<b>|<i>"`). `None` when the
+    /// run's family has no chain — that run falls back to `TextRunPrimitive`.
+    fn chain_for(&self, family: &str, bold: bool, italic: bool) -> Option<&ShapeFontChain> {
+        let key = format!(
+            "{}|{}|{}",
+            family.to_lowercase(),
+            u8::from(bold),
+            u8::from(italic)
+        );
+        self.chains.get(&key)
+    }
+}
+
+fn text_paint_override(
+    fonts: Option<&ShapeFonts<'_>>,
+    text: &str,
+    fmt: &RunFormattingIn,
+) -> Option<String> {
+    if !text.contains('\u{2011}') {
+        return None;
+    }
+    let fonts = fonts?;
+    let family = fmt.font_family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY);
+    let chain = fonts.chain_for(family, fmt.bold == Some(true), fmt.italic == Some(true))?;
+    let font = (chain.resolve)(fonts.store, &chain.ids, '\u{2011}')?;
+    glyph_paint_text(fonts.store, font, text)
+}
+
+fn glyph_paint_text(
+    store: &ooxml_text::FontStore,
+    font: ooxml_text::FontId,
+    text: &str,
+) -> Option<String> {
+    if !text.contains('\u{2011}') {
+        return None;
+    }
+    let stand_in = ooxml_text::covered_character(store, font, '\u{2011}').ok()??;
+    (stand_in != '\u{2011}').then(|| text.replace('\u{2011}', &stand_in.to_string()))
+}
+
+fn painted_text_width(
+    fonts: &ShapeFonts<'_>,
+    font: ooxml_text::FontId,
+    text: &str,
+    fmt: &RunFormattingIn,
+    bidi_level: u8,
+    authoritative: bool,
+    coverage_only: bool,
+) -> Option<f64> {
+    let size = effective_font_px_of(fmt);
+    let features = kern_features_of(fmt, size);
+    let direction = shape_direction_for_level(bidi_level);
+    let language = fmt.language.as_ref().and_then(|language| {
+        if ooxml_text::level_is_rtl(bidi_level) {
+            language.bidi.as_deref().or(language.latin.as_deref())
+        } else {
+            language.east_asia.as_deref().or(language.latin.as_deref())
+        }
+    });
+    let width = |text: &str, small_caps: bool| {
+        let covered = |ch: char| {
+            ooxml_text::covered_character(fonts.store, font, ch)
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        let uncovered = if coverage_only {
+            text.chars().any(|ch| {
+                ooxml_text::measure::needs_glyph(ch) && !ch.is_whitespace() && !covered(ch)
+            })
+        } else {
+            text.chars().any(|ch| !ch.is_whitespace() && !covered(ch))
+        };
+        if uncovered {
+            return None;
+        }
+        let mut features = features.clone();
+        if small_caps {
+            features.push(ooxml_text::ShapeFeature {
+                tag: *b"smcp",
+                value: 1,
+            });
+        }
+        ooxml_text::shape::shape_with_properties(
+            fonts.store,
+            font,
+            text,
+            size as f32,
+            &features,
+            direction,
+            language,
+        )
+        .ok()
+        .map(|glyphs| {
+            glyphs
+                .iter()
+                .map(|glyph| f64::from(glyph.x_advance))
+                .sum::<f64>()
+        })
+    };
+    if fmt.all_caps == Some(true) {
+        return width(&text.to_uppercase(), false);
+    }
+    if fmt.small_caps != Some(true) {
+        return width(text, false);
+    }
+    let mut total = 0.0;
+    let mut segment = String::new();
+    let mut segment_scale = 1.0;
+    let mut segment_smcp = false;
+    for ch in text.chars() {
+        let real_small_cap = authoritative
+            && ch.is_lowercase()
+            && {
+                let text = ch.to_string();
+                let plain = ooxml_text::shape_with_direction(
+                    fonts.store,
+                    font,
+                    &text,
+                    size as f32,
+                    &[],
+                    direction,
+                );
+                let featured = ooxml_text::shape_with_direction(
+                    fonts.store,
+                    font,
+                    &text,
+                    size as f32,
+                    &[ooxml_text::ShapeFeature {
+                        tag: *b"smcp",
+                        value: 1,
+                    }],
+                    direction,
+                );
+                matches!((plain, featured), (Ok(a), Ok(b)) if a.iter().map(|glyph| glyph.glyph_id).collect::<Vec<_>>() != b.iter().map(|glyph| glyph.glyph_id).collect::<Vec<_>>())
+            };
+        let scale = if ch.is_lowercase() && !real_small_cap {
+            if authoritative {
+                ooxml_text::WORD_SMALL_CAPS_ADVANCE_SCALE
+            } else {
+                ooxml_text::BROWSER_SMALL_CAPS_ADVANCE_SCALE
+            }
+        } else {
+            1.0
+        };
+        if (scale != segment_scale || real_small_cap != segment_smcp) && !segment.is_empty() {
+            total += width(&segment, segment_smcp)? * f64::from(segment_scale);
+            segment.clear();
+        }
+        segment_scale = scale;
+        segment_smcp = real_small_cap;
+        if ch.is_lowercase() && !real_small_cap {
+            segment.extend(ooxml_text::uppercase_for_language(ch, language));
+        } else {
+            segment.push(ch);
+        }
+    }
+    Some(total + width(&segment, segment_smcp)? * f64::from(segment_scale))
+}
+
+fn text_substitute_scale(
+    fonts: Option<&ShapeFonts<'_>>,
+    text: &str,
+    fmt: &RunFormattingIn,
+    bidi_level: u8,
+    authoritative: bool,
+) -> Option<Number> {
+    let ratio = fonts.and_then(|fonts| {
+        let family = fmt.font_family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY);
+        if ooxml_text::word_fonts::requested_line_metrics(family)
+            .is_some_and(|metrics| metrics.east_asian)
+        {
+            return None;
+        }
+        let chain = fonts.chain_for(family, fmt.bold == Some(true), fmt.italic == Some(true))?;
+        let font = *chain.ids.first()?;
+        if fonts.store.family_widths(font).ok()?.is_none()
+            && fonts.store.advance_scale(font).ok()? == 1.0
+        {
+            return None;
+        }
+        let owner = fonts.store.byte_owner(font).ok()?;
+        let coverage_only = chain.coverage_only;
+        let wanted = painted_text_width(
+            fonts,
+            font,
+            text,
+            fmt,
+            bidi_level,
+            authoritative,
+            coverage_only,
+        )?;
+        let own = painted_text_width(
+            fonts,
+            owner,
+            text,
+            fmt,
+            bidi_level,
+            authoritative,
+            coverage_only,
+        )?;
+        let ratio = wanted / own;
+        (ratio.is_finite() && ratio > 0.0 && (ratio - 1.0).abs() > 1e-3).then_some(ratio)
+    });
+    ratio.and_then(Number::from_f64)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_canvas_clusters(
+    fonts: Option<&ShapeFonts<'_>>,
+    text: &str,
+    fmt: &RunFormattingIn,
+    bidi_level: u8,
+    authoritative: bool,
+    word_spacing: f64,
+    auto_space: ooxml_text::AutoSpace,
+) -> Option<Vec<CanvasTextCluster>> {
+    let family = fmt.font_family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY);
+    if !ooxml_text::word_fonts::requested_line_metrics(family)?.east_asian {
+        return None;
+    }
+    let fonts = fonts?;
+    let chain = fonts.chain_for(family, fmt.bold == Some(true), fmt.italic == Some(true))?;
+    let font = *chain.ids.first()?;
+    let coverage_only = chain.coverage_only;
+    fonts.store.family_widths(font).ok()??;
+    let mut painted = String::new();
+    let mut source_ranges = Vec::new();
+    for (start, ch) in text.char_indices() {
+        let end = start + ch.len_utf8();
+        let transformed = if fmt.all_caps == Some(true) {
+            ch.to_uppercase().collect::<String>()
+        } else {
+            ch.to_string()
+        };
+        for painted_ch in transformed.chars() {
+            source_ranges.push((painted.len(), start..end));
+            painted.push(painted_ch);
+        }
+    }
+    let text = painted;
+    if text.chars().any(|ch| {
+        ooxml_text::covered_character(fonts.store, font, ch)
+            .ok()
+            .flatten()
+            .is_none()
+    }) {
+        return None;
+    }
+    let size = effective_font_px_of(fmt);
+    let language = fmt.language.as_ref().and_then(|language| {
+        if ooxml_text::level_is_rtl(bidi_level) {
+            language.bidi.as_deref().or(language.latin.as_deref())
+        } else {
+            language.east_asia.as_deref().or(language.latin.as_deref())
+        }
+    });
+    let glyphs = ooxml_text::shape::shape_with_properties(
+        fonts.store,
+        font,
+        &text,
+        size as f32,
+        &kern_features_of(fmt, size),
+        shape_direction_for_level(bidi_level),
+        language,
+    )
+    .ok()?;
+    let mut advances = std::collections::BTreeMap::<usize, f64>::new();
+    let mut order = Vec::new();
+    for glyph in glyphs {
+        let offset = glyph.cluster as usize;
+        *advances.entry(offset).or_insert_with(|| {
+            order.push(offset);
+            0.0
+        }) += f64::from(glyph.x_advance);
+    }
+    let bounds: Vec<_> = advances
+        .keys()
+        .copied()
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let horizontal = fmt.horizontal_scale.unwrap_or(100.0) / 100.0;
+    let mut pen = 0.0;
+    let mut clusters = Vec::new();
+    for start in order {
+        let index = bounds.binary_search(&start).ok()?;
+        let end = *bounds.get(index + 1)?;
+        let cluster = text.get(start..end)?;
+        let source_start = source_ranges.partition_point(|(offset, _)| *offset <= start) - 1;
+        let source_end = source_ranges.partition_point(|(offset, _)| *offset < end) - 1;
+        clusters.push(CanvasTextCluster {
+            text: text_paint_override(Some(fonts), cluster, fmt)
+                .unwrap_or_else(|| cluster.to_owned()),
+            offset: px(pen),
+            source_range: Some(
+                source_ranges[source_start].1.start..source_ranges[source_end].1.end,
+            ),
+        });
+        pen += if fmt.small_caps == Some(true) {
+            painted_text_width(
+                fonts,
+                font,
+                cluster,
+                fmt,
+                bidi_level,
+                authoritative,
+                coverage_only,
+            )?
+        } else {
+            advances[&start]
+        };
+        if horizontal > 0.0 {
+            pen +=
+                word_spacing * cluster.chars().filter(|&ch| ch == ' ').count() as f64 / horizontal;
+            pen += fmt.letter_spacing.unwrap_or(0.0) * cluster.chars().count() as f64 / horizontal;
+            if !ooxml_text::level_is_rtl(bidi_level)
+                && let (Some(left), Some(right)) =
+                    (cluster.chars().next_back(), text[end..].chars().next())
+            {
+                pen += f64::from(auto_space.extra_px(left, right, size as f32, size as f32))
+                    / horizontal;
+            }
+        }
+    }
+    Some(clusters)
+}
+
+fn emit_column_separators(prims: &mut Vec<Primitive>, page: &PageIn) {
+    let Some(columns) = &page.columns else { return };
+    if columns.separator != Some(true) || columns.count <= 1 {
+        return;
+    }
+    let margins = page.body_margins.as_ref().unwrap_or(&page.margins);
+    let content_width = (page.size.w - margins.left - margins.right).max(0.0);
+    let content_bottom = page.size.h - margins.bottom;
+    if columns.equal_width == Some(false) && !columns.columns.is_empty() {
+        let rectangles = crate::page_flow::unequal_column_rectangles(
+            content_width,
+            columns.count,
+            columns.gap,
+            columns
+                .columns
+                .iter()
+                .map(|column| (column.width, column.space)),
+        );
+        for pair in rectangles.windows(2) {
+            let right = pair[0].0 + pair[0].1;
+            let x = page.margins.left + (right + pair[1].0) / 2.0;
+            prims.push(Primitive::Line(LinePrimitive {
+                x1: px(x),
+                y1: px(margins.top),
+                x2: px(x),
+                y2: px(content_bottom),
+                stroke_width: px(0.5),
+                color: "#000000".to_string(),
+                dash: None,
+                role: Some(LineRole::Separator),
+                border_style: Some(DisplayBorderStyle::Solid),
+                secondary_color: None,
+                opacity: None,
+                border_owner: None,
+                attrs: DocAttrs::default(),
+            }));
+        }
+        return;
+    }
+
+    let width = (content_width - (columns.count - 1) as f64 * columns.gap) / columns.count as f64;
+    for index in 0..columns.count - 1 {
+        let x = page.margins.left
+            + (index + 1) as f64 * width
+            + index as f64 * columns.gap
+            + columns.gap / 2.0;
+        prims.push(Primitive::Line(LinePrimitive {
+            x1: px(x),
+            y1: px(margins.top),
+            x2: px(x),
+            y2: px(content_bottom),
+            stroke_width: px(0.5),
+            color: "#000000".to_string(),
+            dash: None,
+            role: Some(LineRole::Separator),
+            border_style: Some(DisplayBorderStyle::Solid),
+            secondary_color: None,
+            opacity: None,
+            border_owner: None,
+            attrs: DocAttrs::default(),
+        }));
+    }
+}
+
+/// Exact body content/column boxes for interaction queries.
+fn page_content_geometry(page: &PageIn) -> (DisplayBounds, Vec<DisplayBounds>) {
+    let margins = page.body_margins.as_ref().unwrap_or(&page.margins);
+    let content_width = (page.size.w - margins.left - margins.right).max(0.0);
+    let content_height = (page.size.h - margins.top - margins.bottom).max(0.0);
+    let content = DisplayBounds {
+        x: px(page.margins.left),
+        y: px(margins.top),
+        width: px(content_width),
+        height: px(content_height),
+    };
+
+    let Some(columns) = &page.columns else {
+        return (content.clone(), vec![content]);
+    };
+    let count = columns.count.clamp(1, 45);
+    if columns.equal_width == Some(false) && !columns.columns.is_empty() {
+        let bounds = crate::page_flow::unequal_column_rectangles(
+            content_width,
+            count,
+            columns.gap,
+            columns
+                .columns
+                .iter()
+                .map(|column| (column.width, column.space)),
+        )
+        .into_iter()
+        .map(|(x, width)| DisplayBounds {
+            x: px(page.margins.left + x),
+            y: px(margins.top),
+            width: px(width),
+            height: px(content_height),
+        })
+        .collect();
+        return (content, bounds);
+    }
+
+    let gap = if columns.gap.is_finite() {
+        columns.gap.max(0.0)
+    } else {
+        0.0
+    };
+    let width = ((content_width - count.saturating_sub(1) as f64 * gap) / count as f64).max(0.0);
+    let bounds = (0..count)
+        .map(|index| DisplayBounds {
+            x: px(page.margins.left + index as f64 * (width + gap)),
+            y: px(margins.top),
+            width: px(width),
+            height: px(content_height),
+        })
+        .collect();
+    (content, bounds)
+}
+
+const NOTE_COLUMN_GAP_PX: f64 = 24.0;
+/// note reference-label cap (display numbers / custom marks are tiny)
+pub const MAX_NOTE_LABEL_CHARS: usize = 64;
+
+fn note_partitions<'a>(notes: &'a [NoteItemIn], columns: usize) -> Vec<Vec<&'a NoteItemIn>> {
+    let columns = columns.max(1);
+    if columns == 1 || notes.len() <= 1 {
+        return vec![notes.iter().collect()];
+    }
+    let total = notes
+        .iter()
+        .map(|note| note.height.unwrap_or(0.0))
+        .sum::<f64>();
+    let target = total / columns as f64;
+    let mut out: Vec<Vec<&NoteItemIn>> = vec![Vec::new()];
+    let mut height = 0.0;
+    for note in notes {
+        let note_height = note.height.unwrap_or(0.0);
+        if out.len() < columns && height > 0.0 && height + note_height / 2.0 > target {
+            out.push(Vec::new());
+            height = 0.0;
+        }
+        if let Some(column) = out.last_mut() {
+            column.push(note);
+        }
+        height += note_height;
+    }
+    out
+}
+
+/// Paint-group id shared by every primitive of one note. Grouping a note
+/// area's primitives back into stories means rebuilding it, which hit testing
+/// and the a11y mirror both do.
+pub(crate) fn note_group_id(kind: &str, id: i64) -> String {
+    format!("{kind}-{id}")
+}
+
+/// Marks a note's primitives with its paint group. Their document positions
+/// stay the note story's own, so a point or range inside a note addresses that
+/// story; the body-reference range is linkage metadata and rides on the
+/// region's `notes` entry instead.
+fn stamp_note_item(prims: &mut [Primitive], start: usize, note: &NoteItemIn, kind: &str) {
+    let Some(id) = note.id else { return };
+    let group_id = note_group_id(kind, id);
+    for primitive in &mut prims[start..] {
+        if let Some(attrs) = doc_attrs_mut(primitive) {
+            attrs.group_id = Some(group_id.clone());
+        }
+    }
+}
+
+fn emit_note_item(
+    prims: &mut Vec<Primitive>,
+    note: &NoteItemIn,
+    kind: &str,
+    x: f64,
+    y: f64,
+    width: f64,
+    ctx: &RenderCtx<'_>,
+) -> f64 {
+    let start = prims.len();
+    let mut cursor = 0.0;
+    for (block, measure) in note.blocks.iter().zip(&note.measures) {
+        match (block, measure) {
+            (BlockIn::Paragraph(block), MeasureIn::Paragraph(measure)) => {
+                let before = block
+                    .attrs
+                    .as_ref()
+                    .and_then(|attrs| attrs.spacing)
+                    .and_then(|spacing| spacing.before)
+                    .unwrap_or(0.0);
+                cursor += before;
+                let fragment = ParagraphFragmentIn {
+                    horizontal_frame: None,
+                    block_id: block.id.clone(),
+                    x,
+                    y: y + cursor,
+                    width,
+                    height: measure.total_height,
+                    from_line: 0,
+                    to_line: measure.lines.len(),
+                    pm_start: block.pm_start,
+                    pm_end: block.pm_end,
+                    carried_from_prev: None,
+                    carried_to_next: None,
+                };
+                emit_paragraph_fragment(
+                    prims,
+                    &fragment,
+                    block,
+                    measure,
+                    ctx,
+                    x,
+                    y + cursor,
+                    None,
+                    None,
+                    true,
+                    true,
+                );
+                cursor += measure.total_height;
+            }
+            (BlockIn::Table(block), MeasureIn::Table(measure)) => {
+                let fragment = TableFragmentIn {
+                    block_id: block.id.clone(),
+                    x,
+                    y: y + cursor,
+                    width: measure.total_width,
+                    height: measure.total_height,
+                    row_start: 0,
+                    row_end: block.rows.len(),
+                    clip_top: None,
+                    clip_bottom: None,
+                    cell_clips: None,
+                    header_row_count: None,
+                    carried_from_prev: None,
+                    carried_to_next: None,
+                };
+                emit_table_fragment(prims, &fragment, block, measure, ctx);
+                cursor += measure.total_height;
+            }
+            (BlockIn::Reserved(block), MeasureIn::Image(measure)) => {
+                ctx.reserve(
+                    &block.reservation,
+                    x,
+                    y + cursor,
+                    measure.width.min(width.max(0.0)).max(0.0),
+                    measure.height,
+                );
+                cursor += measure.height;
+            }
+            (BlockIn::Image(block), MeasureIn::Image(measure)) => {
+                let mut attrs = BlockRef::of(&block.id).attrs();
+                attrs.doc_start = block.pm_start;
+                attrs.doc_end = block.pm_end;
+                stamp_image_block_attrs(&mut attrs, block, x, y + cursor);
+                let rotation = block
+                    .rotation_deg
+                    .unwrap_or_else(|| rotation_degrees(block.transform.as_deref()));
+                prims.push(Primitive::Image(ImagePrimitive {
+                    rel_id: block.src.clone(),
+                    x: px(x),
+                    y: px(y + cursor),
+                    w: px(measure.width),
+                    h: px(measure.height),
+                    rotation_deg: (rotation != 0.0).then(|| px(rotation)),
+                    opacity: block.opacity.map(px),
+                    filter: None,
+                    decorative: block.decorative.unwrap_or(false),
+                    crop: crop_of_block(block),
+                    alt_text: capped_alt_text(block.alt.as_deref()),
+                    attrs,
+                }));
+                cursor += measure.height;
+            }
+            (BlockIn::TextBox(block), MeasureIn::TextBox(measure)) => {
+                let fragment = TextBoxFragmentIn {
+                    block_id: block.id.clone(),
+                    x,
+                    y: y + cursor,
+                    width,
+                    height: measure.height,
+                    pm_start: None,
+                    pm_end: None,
+                    is_floating: None,
+                    z_index: None,
+                };
+                emit_text_box_fragment(prims, &fragment, block, measure, ctx);
+                cursor += measure.height;
+            }
+            (BlockIn::Shape(block), MeasureIn::Shape(measure)) => {
+                let fragment = ShapeFragmentIn {
+                    block_id: block.id.clone(),
+                    x,
+                    y: y + cursor,
+                    width: measure.width,
+                    height: measure.height,
+                    doc_start: block.doc_start,
+                    doc_end: block.doc_end,
+                    pm_start: block.pm_start,
+                    pm_end: block.pm_end,
+                    is_anchored: None,
+                    z_index: None,
+                };
+                emit_shape_fragment(prims, &fragment, block, ctx);
+                cursor += measure.height;
+            }
+            (BlockIn::Chart(block), MeasureIn::Chart(measure)) => {
+                let fragment = ChartFragmentIn {
+                    block_id: block.id.clone(),
+                    x,
+                    y: y + cursor,
+                    width: measure.width,
+                    height: measure.height,
+                    doc_start: block.doc_start,
+                    doc_end: block.doc_end,
+                    pm_start: block.pm_start,
+                    pm_end: block.pm_end,
+                };
+                emit_chart_fragment(prims, &fragment, block);
+                cursor += measure.height;
+            }
+            _ => {}
+        }
+    }
+    stamp_note_item(prims, start, note, kind);
+    note.height.unwrap_or(cursor).max(cursor)
+}
+
+fn emit_note_regions(page: &PageIn, ctx: &RenderCtx<'_>) -> Vec<NoteRegion> {
+    let margins = page.body_margins.as_ref().unwrap_or(&page.margins);
+    let content_width = (page.size.w - page.margins.left - page.margins.right).max(1.0);
+    let mut regions = Vec::with_capacity(page.note_areas.len());
+    for area in &page.note_areas {
+        let kind = area.kind.as_deref().unwrap_or("footnote");
+        let y = area
+            .y
+            .unwrap_or(page.size.h - margins.bottom - area.height.unwrap_or(0.0));
+        let columns = area.columns.unwrap_or(1).max(1) as usize;
+        let column_width =
+            ((content_width - (columns - 1) as f64 * NOTE_COLUMN_GAP_PX) / columns as f64).max(1.0);
+        let mut separator_primitives = Vec::new();
+        if let Some(separator) = area
+            .separator
+            .as_ref()
+            .filter(|item| !item.blocks.is_empty())
+        {
+            emit_note_item(
+                &mut separator_primitives,
+                separator,
+                kind,
+                page.margins.left,
+                y,
+                content_width,
+                ctx,
+            );
+        } else {
+            separator_primitives.push(Primitive::Line(LinePrimitive {
+                x1: px(page.margins.left),
+                y1: px(y),
+                x2: px(page.margins.left + content_width / 3.0),
+                y2: px(y),
+                stroke_width: px(1.0),
+                color: "#000000".to_string(),
+                dash: None,
+                role: Some(LineRole::Separator),
+                border_style: Some(DisplayBorderStyle::Solid),
+                secondary_color: None,
+                opacity: None,
+                border_owner: None,
+                attrs: DocAttrs::default(),
+            }));
+        }
+
+        let mut primitives = Vec::new();
+        let partitions = note_partitions(&area.notes, columns);
+        for (column, notes) in partitions.into_iter().enumerate() {
+            let x = page.margins.left + column as f64 * (column_width + NOTE_COLUMN_GAP_PX);
+            let mut cursor = y + area
+                .separator
+                .as_ref()
+                .and_then(|separator| separator.height)
+                .unwrap_or(crate::footnotes::FOOTNOTE_SEPARATOR_HEIGHT);
+            for note in notes {
+                cursor += emit_note_item(&mut primitives, note, kind, x, cursor, column_width, ctx);
+            }
+        }
+        regions.push(NoteRegion {
+            kind: area.kind.clone(),
+            section_id: area.section_id.clone(),
+            y: area.y.map(px),
+            height: area.height.map(px),
+            columns: area.columns,
+            separator_primitives,
+            primitives,
+            note_ids: area.notes.iter().filter_map(|note| note.id).collect(),
+            // Only notes carrying anchor or label data get backlink metadata.
+            notes: area
+                .notes
+                .iter()
+                .filter(|note| {
+                    note.anchor_doc_start.is_some()
+                        || note.anchor_doc_end.is_some()
+                        || note.display_label.is_some()
+                })
+                .map(|note| NoteRegionNote {
+                    id: note.id,
+                    anchor_doc_start: note.anchor_doc_start,
+                    anchor_doc_end: note.anchor_doc_end,
+                    label: capped_string(note.display_label.as_deref(), MAX_NOTE_LABEL_CHARS),
+                })
+                .collect(),
+        });
+    }
+    regions
+}
+
+fn measured_block_height(measured: &MeasuredBlockIn) -> f64 {
+    match &measured.measure {
+        MeasureIn::Paragraph(measure) => measure.total_height,
+        MeasureIn::Table(measure) => measure.total_height,
+        MeasureIn::Image(measure) => measure.height,
+        MeasureIn::TextBox(measure) => measure.height,
+        MeasureIn::Shape(measure) | MeasureIn::Chart(measure) => measure.height,
+        MeasureIn::Unsupported => 0.0,
+    }
+}
+
+pub(crate) fn resolve_hf_box_position(
+    position: Option<&crate::types::ImageRunPosition>,
+    css_float: Option<&str>,
+    width: f64,
+    height: f64,
+    paragraph_y: f64,
+    geom: &PageFloatGeom,
+) -> (f64, f64) {
+    let x = match position.and_then(|position| position.horizontal.as_ref()) {
+        None if css_float == Some("right") => geom.content_width - width,
+        None => 0.0,
+        Some(axis) => {
+            let band = horizontal_anchor_band(axis.relative_to.as_deref(), geom);
+            match axis.align.as_deref() {
+                Some("right") => band.base + band.size - width,
+                Some("center") => band.base + (band.size - width) / 2.0,
+                Some("left") => band.base,
+                _ => band.base + axis.pos_offset.map(emu_to_px).unwrap_or(0.0),
+            }
+        }
+    };
+    let y = match position.and_then(|position| position.vertical.as_ref()) {
+        None => paragraph_y,
+        Some(axis) => {
+            let band = vertical_anchor_band(axis.relative_to.as_deref(), paragraph_y, geom);
+            match axis.align.as_deref() {
+                Some("bottom") if band.size != 0.0 => band.base + band.size - height,
+                Some("center") if band.size != 0.0 => band.base + (band.size - height) / 2.0,
+                Some("top") => band.base,
+                _ => band.base + axis.pos_offset.map(emu_to_px).unwrap_or(0.0),
+            }
+        }
+    };
+    (geom.margin_left + x, geom.margin_top + y)
+}
+
+pub(crate) fn emit_hf_shape(
+    prims: &mut Vec<Primitive>,
+    block: &ShapeBlockIn,
+    measure: &BoxExtentIn,
+    ctx: &RenderCtx<'_>,
+    page: &PageIn,
+    flow_y: f64,
+) {
+    let (x, y) = crate::anchor::resolve_position(
+        block.position.as_ref(),
+        measure.width,
+        measure.height,
+        &crate::anchor::AnchorFrame {
+            page_width: page.size.w,
+            page_height: page.size.h,
+            margin_left: page.margins.left,
+            margin_right: page.margins.right,
+            margin_top: page.margins.top,
+            margin_bottom: page.margins.bottom,
+            flow_x: page.margins.left,
+            flow_y,
+            flow_width: page.size.w - page.margins.left - page.margins.right,
+            flow_height: 0.0,
+            odd_page: ctx.page_number % 2 == 1,
+        },
+    );
+    let fragment = ShapeFragmentIn {
+        block_id: block.id.clone(),
+        x,
+        y,
+        width: measure.width,
+        height: measure.height,
+        doc_start: block.doc_start,
+        doc_end: block.doc_end,
+        pm_start: block.pm_start,
+        pm_end: block.pm_end,
+        is_anchored: Some(block.position.is_some()),
+        z_index: None,
+    };
+    emit_shape_fragment(prims, &fragment, block, ctx);
+}
+
+fn recompose_hf_region(
+    region: &mut HfRegion,
+    hf: &HeadersFootersContentIn,
+    page: &PageIn,
+    page_index: usize,
+    total_pages: u64,
+    cached_page_totals: bool,
+    shape: Option<&ShapeFonts<'_>>,
+    reservations: &std::cell::RefCell<Vec<DisplayReservation>>,
+    gridlines: &std::cell::RefCell<Vec<DisplayGridline>>,
+    style_refs: Option<&[Vec<&ParagraphBlockIn>]>,
+) {
+    // A header part shared by several sections is measured once per section,
+    // at that section's width: the page takes its own section's measure (or
+    // the nearest earlier one), not whichever section was measured last.
+    // Picking by rId alone laid a portrait page's header out at a later
+    // landscape section's width, past the page edge.
+    let matching = || {
+        hf.variants
+            .iter()
+            .filter(|variant| variant.r_id == region.r_id && variant.kind == region.kind)
+    };
+    let own = page.section_index.and_then(|section| {
+        matching()
+            .filter(|variant| variant.section_index.is_some_and(|index| index <= section))
+            .max_by_key(|variant| variant.section_index)
+    });
+    let Some(variant) = own.or_else(|| matching().next_back()) else {
+        return;
+    };
+    let field_widths: FieldWidthMap = variant
+        .field_widths
+        .iter()
+        .map(|field| {
+            (
+                field.pm_start,
+                FieldWidthEntry {
+                    fallback: field.fallback_width,
+                    per_page: field.per_page.clone(),
+                },
+            )
+        })
+        .collect();
+    let ctx = RenderCtx {
+        page_number: page.number.unwrap_or(page_index as u64 + 1),
+        page_label: page.page_label.clone(),
+        page_index,
+        total_pages,
+        cached_page_totals,
+        shape,
+        leader_fonts: None,
+        field_widths: (!field_widths.is_empty()).then_some(&field_widths),
+        reservations: Some(reservations),
+        gridlines: Some(gridlines),
+        style_refs,
+        style_ref_last: region.kind == HfKind::Footer,
+    };
+    let content_width = page.size.w - page.margins.left - page.margins.right;
+    let height = variant
+        .height
+        .unwrap_or_else(|| variant.measured.iter().map(measured_block_height).sum());
+    let flow_height = variant.flow_height.unwrap_or(height);
+    let (origin_y, flow_top) = match region.kind {
+        HfKind::Header => {
+            let distance = hf.header_distance.or(page.margins.header).unwrap_or(48.0);
+            (distance, distance)
+        }
+        HfKind::Footer => {
+            let distance = hf.footer_distance.or(page.margins.footer).unwrap_or(48.0);
+            (
+                page.size.h - distance - flow_height,
+                page.size.h - distance - flow_height,
+            )
+        }
+    };
+    let geom = PageFloatGeom {
+        horizontal_frame: None,
+        page_width: page.size.w,
+        page_height: page.size.h,
+        margin_left: page.margins.left,
+        margin_top: page.margins.top,
+        content_width,
+        content_height: page.size.h - page.margins.top - page.margins.bottom,
+    };
+    let mut behind = Vec::new();
+    let mut flow = Vec::new();
+    let mut front = Vec::new();
+    let mut hf_flow = crate::header_footer::HeaderFooterFlow::default();
+    for measured in &variant.measured {
+        let cursor = hf_flow.cursor;
+        match (&measured.block, &measured.measure) {
+            (BlockIn::Paragraph(block), MeasureIn::Paragraph(measure)) => {
+                let before = block
+                    .attrs
+                    .as_ref()
+                    .and_then(|attrs| attrs.spacing)
+                    .and_then(|spacing| spacing.before)
+                    .unwrap_or(0.0);
+                let after = block
+                    .attrs
+                    .as_ref()
+                    .and_then(|attrs| attrs.spacing)
+                    .and_then(|spacing| spacing.after)
+                    .unwrap_or(0.0);
+                let content_height = (measure.total_height - before - after).max(0.0);
+                let y = origin_y + hf_flow.place(content_height, before, after);
+                emit_paragraph_floating_images(&mut behind, block, origin_y + cursor, &geom, true);
+                let fragment = ParagraphFragmentIn {
+                    horizontal_frame: None,
+                    block_id: block.id.clone(),
+                    x: page.margins.left,
+                    y,
+                    width: content_width,
+                    height: content_height,
+                    from_line: 0,
+                    to_line: measure.lines.len(),
+                    pm_start: block.pm_start,
+                    pm_end: block.pm_end,
+                    carried_from_prev: None,
+                    carried_to_next: None,
+                };
+                emit_paragraph_fragment(
+                    &mut flow, &fragment, block, measure, &ctx, fragment.x, fragment.y, None, None,
+                    true, true,
+                );
+                emit_paragraph_floating_images(&mut front, block, origin_y + cursor, &geom, false);
+            }
+            (BlockIn::Table(block), MeasureIn::Table(measure)) => {
+                let (x, y) = if let Some(floating) = &block.floating {
+                    let mut top = floating.tblp_y.unwrap_or(0.0);
+                    if floating.vert_anchor.as_deref() == Some("page") {
+                        top -= flow_top;
+                    } else if floating.vert_anchor.as_deref() == Some("margin") {
+                        top += page.margins.top - flow_top;
+                    }
+                    let mut left = floating.tblp_x.unwrap_or(0.0);
+                    if floating.horz_anchor.as_deref() == Some("page") {
+                        left -= page.margins.left;
+                    }
+                    (page.margins.left + left, origin_y + top)
+                } else {
+                    (
+                        page.margins.left,
+                        origin_y + hf_flow.place(measure.total_height, 0.0, 0.0),
+                    )
+                };
+                let fragment = TableFragmentIn {
+                    block_id: block.id.clone(),
+                    x,
+                    y,
+                    width: measure.total_width,
+                    height: measure.total_height,
+                    row_start: 0,
+                    row_end: block.rows.len(),
+                    clip_top: None,
+                    clip_bottom: None,
+                    cell_clips: None,
+                    header_row_count: None,
+                    carried_from_prev: None,
+                    carried_to_next: None,
+                };
+                emit_table_fragment(&mut flow, &fragment, block, measure, &ctx);
+            }
+            (BlockIn::Reserved(block), MeasureIn::Image(measure)) => {
+                let y = origin_y + hf_flow.place(measure.height, 0.0, 0.0);
+                ctx.reserve(
+                    &block.reservation,
+                    page.margins.left,
+                    y,
+                    measure.width.min(content_width.max(0.0)).max(0.0),
+                    measure.height,
+                );
+            }
+            (BlockIn::Image(block), MeasureIn::Image(measure)) => {
+                let x = page.margins.left;
+                let y = origin_y + hf_flow.place(measure.height, 0.0, 0.0);
+                let mut attrs = BlockRef::of(&block.id).attrs();
+                attrs.doc_start = block.pm_start;
+                attrs.doc_end = block.pm_end;
+                attrs.sdt = sdt_attrs_from_groups(&block.sdt_groups).map(Box::new);
+                attrs.sdt_path = sdt_path_from_groups(&block.sdt_groups);
+                stamp_image_block_attrs(&mut attrs, block, x, y);
+                let rotation = block
+                    .rotation_deg
+                    .unwrap_or_else(|| rotation_degrees(block.transform.as_deref()));
+                flow.push(Primitive::Image(ImagePrimitive {
+                    rel_id: block.src.clone(),
+                    x: px(x),
+                    y: px(y),
+                    w: px(measure.width),
+                    h: px(measure.height),
+                    rotation_deg: (rotation != 0.0).then(|| px(rotation)),
+                    opacity: block.opacity.map(px),
+                    filter: None,
+                    decorative: block.decorative.unwrap_or(false),
+                    crop: crop_of_block(block),
+                    alt_text: capped_alt_text(block.alt.as_deref()),
+                    attrs,
+                }));
+            }
+            (BlockIn::TextBox(block), MeasureIn::TextBox(measure)) => {
+                let flow_y = if block.display_mode.as_deref() != Some("float")
+                    && !crate::cell_layout::is_floating_image(block.wrap_type.as_deref(), None)
+                {
+                    hf_flow.place(measure.height, 0.0, 0.0)
+                } else {
+                    cursor
+                };
+                let (x, y) = resolve_hf_box_position(
+                    block.position.as_ref(),
+                    block.css_float.as_deref(),
+                    measure.width,
+                    measure.height,
+                    origin_y + flow_y - page.margins.top,
+                    &geom,
+                );
+                let fragment = TextBoxFragmentIn {
+                    block_id: block.id.clone(),
+                    x,
+                    y,
+                    width: measure.width,
+                    height: measure.height,
+                    pm_start: block.pm_start,
+                    pm_end: block.pm_end,
+                    is_floating: Some(block.display_mode.as_deref() == Some("float")),
+                    z_index: None,
+                };
+                emit_text_box_fragment(&mut flow, &fragment, block, measure, &ctx);
+            }
+            (BlockIn::Shape(block), MeasureIn::Shape(measure)) => {
+                let flow_y = if block.position.is_none() {
+                    hf_flow.place(measure.height, 0.0, 0.0)
+                } else {
+                    cursor
+                };
+                let prims = if block.position.is_none() {
+                    &mut flow
+                } else if block.behind_doc.unwrap_or(false) {
+                    &mut behind
+                } else {
+                    &mut front
+                };
+                emit_hf_shape(prims, block, measure, &ctx, page, origin_y + flow_y);
+            }
+            _ => {}
+        }
+    }
+    behind.extend(flow);
+    behind.extend(front);
+    region.primitives = behind;
+}
+
+/// build a display list from the parsed input; the pure core the JSON boundary
+/// wraps
+pub fn build_display_list(input: &BuildInput, fonts: &ooxml_text::FontStore) -> DisplayList {
+    build_display_list_selected(input, fonts, None)
+}
+
+fn build_display_list_selected(
+    input: &BuildInput,
+    fonts: &ooxml_text::FontStore,
+    selected_pages: Option<&HashSet<usize>>,
+) -> DisplayList {
+    // Without font chains every text run stays a TextRunPrimitive.
+    let leader_only = input.font_chains.contains_key(LEADER_FONTS_KEY);
+    let shape_fonts = ShapeFonts::build(input, fonts);
+    let (text_shape, leader_shape) = if leader_only {
+        (None, shape_fonts.as_ref())
+    } else {
+        (shape_fonts.as_ref(), None)
+    };
+    let render_options = serde_json::to_string(&input.options)
+        .ok()
+        .and_then(|s| serde_json::from_str::<RenderOptionsIn>(&s).ok())
+        .unwrap_or_default();
+
+    // Index measured blocks by canonical block key.
+    let mut by_id: HashMap<Cow<'_, str>, &MeasuredBlockIn> = HashMap::new();
+    for mb in &input.measured {
+        let key = match &mb.block {
+            BlockIn::Paragraph(p) => block_key(&p.id),
+            BlockIn::Table(t) => block_key(&t.id),
+            BlockIn::Image(i) => block_key(&i.id),
+            BlockIn::TextBox(t) => block_key(&t.id),
+            BlockIn::Shape(s) => block_key(&s.id),
+            BlockIn::Chart(c) => block_key(&c.id),
+            BlockIn::Reserved(r) => block_key(&r.id),
+            BlockIn::Unsupported => continue,
+        };
+        by_id.entry(key).or_insert(mb);
+    }
+
+    let total_pages = if input.layout.partial {
+        0
+    } else {
+        input.layout.pages.len() as u64
+    };
+    let page_paragraphs: Vec<Vec<&ParagraphBlockIn>> = if input.headers_footers.is_some() {
+        input
+            .layout
+            .pages
+            .iter()
+            .map(|page| {
+                page.fragments
+                    .iter()
+                    .filter_map(|fragment| match fragment {
+                        FragmentIn::Paragraph(fragment) => {
+                            match &by_id.get(block_key(&fragment.block_id).as_ref())?.block {
+                                BlockIn::Paragraph(block) => Some(&**block),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut pages =
+        Vec::with_capacity(selected_pages.map_or(input.layout.pages.len(), HashSet::len));
+
+    for (page_index, page) in input.layout.pages.iter().enumerate() {
+        if selected_pages.is_some_and(|selected| !selected.contains(&page_index)) {
+            continue;
+        }
+        let page_reservations = std::cell::RefCell::new(Vec::new());
+        let page_gridlines = std::cell::RefCell::new(Vec::new());
+        let ctx = RenderCtx {
+            page_number: page.number.unwrap_or(page_index as u64 + 1),
+            page_label: page.page_label.clone(),
+            page_index,
+            total_pages,
+            cached_page_totals: input.layout.cached_page_totals,
+            shape: text_shape,
+            leader_fonts: leader_shape,
+            field_widths: None,
+            reservations: Some(&page_reservations),
+            gridlines: Some(&page_gridlines),
+            style_refs: None,
+            style_ref_last: false,
+        };
+        let mut prims: Vec<Primitive> = Vec::new();
+        let mut page_borders: Vec<PageBorderPrimitive> = Vec::new();
+
+        if let Some(watermark) = input
+            .headers_footers
+            .as_ref()
+            .and_then(|hf| hf.watermark.as_ref())
+        {
+            emit_watermark(&mut prims, watermark, page);
+        }
+        let watermark_primitive_count = (!prims.is_empty()).then_some(prims.len());
+        if let Some(border) = page_border_primitive(
+            &render_options,
+            page,
+            page.number.unwrap_or(page_index as u64 + 1),
+        ) {
+            page_borders.push(border);
+        }
+
+        // Page coordinate frame for anchored-float resolution.
+        let margins = page.body_anchor_margins.as_ref().unwrap_or(&page.margins);
+        let float_geom = PageFloatGeom {
+            horizontal_frame: None,
+            page_width: page.size.w,
+            page_height: page.size.h,
+            margin_left: margins.left,
+            margin_top: margins.top,
+            content_width: page.size.w - margins.left - margins.right,
+            content_height: page.size.h - margins.top - margins.bottom,
+        };
+
+        let mut float_paragraphs = HashSet::new();
+        let mut behind_objects = Vec::new();
+        for fragment in &page.fragments {
+            match fragment {
+                FragmentIn::Paragraph(fragment) => {
+                    if !float_paragraphs
+                        .insert((block_key(&fragment.block_id), fragment.x.to_bits()))
+                    {
+                        continue;
+                    }
+                    let Some(measured) = by_id.get(block_key(&fragment.block_id).as_ref()) else {
+                        continue;
+                    };
+                    let BlockIn::Paragraph(block) = &measured.block else {
+                        continue;
+                    };
+                    for run in &block.runs {
+                        if let RunIn::Image(image) = run
+                            && image.wrap_type.as_deref() == Some("behind")
+                            && is_floating_image_run(image)
+                        {
+                            behind_objects.push(BehindObject::Image {
+                                block,
+                                image,
+                                fragment_y: fragment.y,
+                                horizontal_frame: fragment.horizontal_frame,
+                            });
+                        }
+                    }
+                }
+                FragmentIn::Shape(fragment) => {
+                    let Some(measured) = by_id.get(block_key(&fragment.block_id).as_ref()) else {
+                        continue;
+                    };
+                    if let BlockIn::Shape(block) = &measured.block
+                        && block.position.is_some()
+                        && block.behind_doc.unwrap_or(false)
+                    {
+                        behind_objects.push(BehindObject::Shape { fragment, block });
+                    }
+                }
+                _ => {}
+            }
+        }
+        behind_objects.sort_by_key(|object| (object.relative_height(), object.doc_order()));
+        for object in behind_objects {
+            match object {
+                BehindObject::Image {
+                    block,
+                    image,
+                    fragment_y,
+                    horizontal_frame,
+                } => {
+                    let geom = float_geom.with_horizontal_frame(horizontal_frame);
+                    emit_floating_image(&mut prims, block, image, fragment_y, &geom);
+                }
+                BehindObject::Shape { fragment, block } => {
+                    emit_shape_fragment(&mut prims, fragment, block, &ctx);
+                }
+            }
+        }
+
+        // Paragraph border grouping uses neighboring fragment borders.
+        let para_borders_of = |frag: &FragmentIn| -> Option<ParaBordersIn> {
+            if let FragmentIn::Paragraph(p) = frag
+                && let Some(mb) = by_id.get(block_key(&p.block_id).as_ref())
+                && let BlockIn::Paragraph(b) = &mb.block
+            {
+                return b.attrs.as_ref().and_then(|a| a.borders.clone());
+            }
+            None
+        };
+
+        let mut prev_para_borders: Option<ParaBordersIn> = None;
+        for (i, frag) in page.fragments.iter().enumerate() {
+            match frag {
+                FragmentIn::Paragraph(pf) => {
+                    let Some(mb) = by_id.get(block_key(&pf.block_id).as_ref()) else {
+                        prev_para_borders = None;
+                        continue;
+                    };
+                    let (BlockIn::Paragraph(block), MeasureIn::Paragraph(measure)) =
+                        (&mb.block, &mb.measure)
+                    else {
+                        prev_para_borders = None;
+                        continue;
+                    };
+                    let next_borders = page.fragments.get(i + 1).and_then(para_borders_of);
+                    emit_paragraph_fragment(
+                        &mut prims,
+                        pf,
+                        block,
+                        measure,
+                        &ctx,
+                        pf.x,
+                        pf.y,
+                        prev_para_borders.as_ref(),
+                        next_borders.as_ref(),
+                        true,
+                        // body fragments surface as mirror paragraph wrappers
+                        true,
+                    );
+                    prev_para_borders = block.attrs.as_ref().and_then(|a| a.borders.clone());
+                }
+                FragmentIn::Table(tf) => {
+                    prev_para_borders = None;
+                    let Some(mb) = by_id.get(block_key(&tf.block_id).as_ref()) else {
+                        continue;
+                    };
+                    let (BlockIn::Table(block), MeasureIn::Table(measure)) =
+                        (&mb.block, &mb.measure)
+                    else {
+                        continue;
+                    };
+                    let stamp_from = prims.len();
+                    emit_table_fragment(&mut prims, tf, block, measure, &ctx);
+                    if page.columns.as_ref().is_some_and(|columns| {
+                        columns.count > 1 && columns.equal_width == Some(false)
+                    }) && tf.width < table_total_width(measure)
+                    {
+                        let clip = ClipRect {
+                            x: Some(px(tf.x)),
+                            y: Some(px(tf.y)),
+                            w: Some(px(tf.width.max(0.0))),
+                            h: Some(px(tf.height.max(0.0))),
+                        };
+                        for primitive in &mut prims[stamp_from..] {
+                            let attrs = match primitive {
+                                Primitive::Line(line) => Some(&mut line.attrs),
+                                other => doc_attrs_mut(other),
+                            };
+                            if let Some(attrs) = attrs {
+                                apply_clip_group(
+                                    attrs,
+                                    format!("clip-{}-column", block_key(&tf.block_id)),
+                                    clip.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+                FragmentIn::Image(imf) => {
+                    prev_para_borders = None;
+                    let block = by_id.get(block_key(&imf.block_id).as_ref()).and_then(|mb| {
+                        if let BlockIn::Image(b) = &mb.block {
+                            Some(b)
+                        } else {
+                            None
+                        }
+                    });
+                    let mut attrs = BlockRef::of(&imf.block_id).attrs();
+                    attrs.doc_start = imf.pm_start.or(block.and_then(|b| b.pm_start));
+                    attrs.doc_end = imf.pm_end.or(block.and_then(|b| b.pm_end));
+                    attrs.sdt = block
+                        .and_then(|b| sdt_attrs_from_groups(&b.sdt_groups))
+                        .map(Box::new);
+                    if let Some(block) = block {
+                        attrs.sdt_path = sdt_path_from_groups(&block.sdt_groups);
+                        stamp_image_block_attrs(&mut attrs, block, imf.x, imf.y);
+                    }
+                    let rot = block.and_then(|b| b.rotation_deg).unwrap_or_else(|| {
+                        rotation_degrees(block.and_then(|b| b.transform.as_deref()))
+                    });
+                    prims.push(Primitive::Image(ImagePrimitive {
+                        rel_id: block.map(|b| b.src.clone()).unwrap_or_default(),
+                        x: px(imf.x),
+                        y: px(imf.y),
+                        w: px(imf.width),
+                        h: px(imf.height),
+                        rotation_deg: if rot != 0.0 { Some(px(rot)) } else { None },
+                        opacity: block.and_then(|b| b.opacity).map(px),
+                        filter: None,
+                        decorative: block.and_then(|b| b.decorative).unwrap_or(false),
+                        crop: block.and_then(|block| crop_of_block(block)),
+                        alt_text: capped_alt_text(block.and_then(|b| b.alt.as_deref())),
+                        attrs,
+                    }));
+                }
+                FragmentIn::TextBox(tf) => {
+                    prev_para_borders = None;
+                    let Some(mb) = by_id.get(block_key(&tf.block_id).as_ref()) else {
+                        continue;
+                    };
+                    let (BlockIn::TextBox(block), MeasureIn::TextBox(measure)) =
+                        (&mb.block, &mb.measure)
+                    else {
+                        continue;
+                    };
+                    emit_text_box_fragment(&mut prims, tf, block, measure, &ctx);
+                }
+                FragmentIn::Shape(sf) => {
+                    prev_para_borders = None;
+                    let Some(mb) = by_id.get(block_key(&sf.block_id).as_ref()) else {
+                        continue;
+                    };
+                    let BlockIn::Shape(block) = &mb.block else {
+                        continue;
+                    };
+                    if block.position.is_none() || !block.behind_doc.unwrap_or(false) {
+                        emit_shape_fragment(&mut prims, sf, block, &ctx);
+                    }
+                }
+                FragmentIn::Chart(cf) => {
+                    prev_para_borders = None;
+                    let Some(mb) = by_id.get(block_key(&cf.block_id).as_ref()) else {
+                        continue;
+                    };
+                    let BlockIn::Chart(block) = &mb.block else {
+                        continue;
+                    };
+                    emit_chart_fragment(&mut prims, cf, block);
+                }
+                FragmentIn::Reserved(rf) => {
+                    prev_para_borders = None;
+                    if let Some(mb) = by_id.get(block_key(&rf.block_id).as_ref())
+                        && let BlockIn::Reserved(block) = &mb.block
+                    {
+                        ctx.reserve(&block.reservation, rf.x, rf.y, rf.width, rf.height);
+                    }
+                }
+                FragmentIn::Unsupported => {
+                    prev_para_borders = None;
+                }
+            }
+        }
+
+        // Front floating images paint after body content.
+        float_paragraphs.clear();
+        for frag in &page.fragments {
+            if let FragmentIn::Paragraph(pf) = frag
+                && float_paragraphs.insert((block_key(&pf.block_id), pf.x.to_bits()))
+                && let Some(mb) = by_id.get(block_key(&pf.block_id).as_ref())
+                && let BlockIn::Paragraph(block) = &mb.block
+            {
+                let geom = float_geom.with_horizontal_frame(pf.horizontal_frame);
+                emit_paragraph_floating_images(&mut prims, block, pf.y, &geom, false);
+            }
+        }
+
+        emit_column_separators(&mut prims, page);
+
+        // header/footer bands: resolve the page's variant and compose its
+        // region with the same emitters (see hf_bands.rs for the geometry)
+        let (mut header, mut footer) = match &input.headers_footers {
+            Some(hf) => crate::hf_bands::compose_page_regions(
+                hf,
+                page,
+                page_index,
+                total_pages,
+                input.layout.cached_page_totals,
+                text_shape,
+                Some(&page_paragraphs),
+            ),
+            None => (None, None),
+        };
+        if let Some(hf) = &input.headers_footers_content {
+            if let Some(region) = &mut header {
+                recompose_hf_region(
+                    region,
+                    hf,
+                    page,
+                    page_index,
+                    total_pages,
+                    input.layout.cached_page_totals,
+                    text_shape,
+                    &page_reservations,
+                    &page_gridlines,
+                    Some(&page_paragraphs),
+                );
+            }
+            if let Some(region) = &mut footer {
+                recompose_hf_region(
+                    region,
+                    hf,
+                    page,
+                    page_index,
+                    total_pages,
+                    input.layout.cached_page_totals,
+                    text_shape,
+                    &page_reservations,
+                    &page_gridlines,
+                    Some(&page_paragraphs),
+                );
+            }
+        }
+        let note_areas = emit_note_regions(page, &ctx);
+        let (content_bounds, column_bounds) = page_content_geometry(page);
+
+        pages.push(DisplayPage {
+            page_index: page_index as u64,
+            width: px(page.size.w),
+            height: px(page.size.h),
+            content_bounds: Some(content_bounds),
+            column_bounds,
+            section_id: page.section_id.clone(),
+            section_index: page.section_index,
+            section_page_index: page.section_page_index,
+            section_page_number: page.section_page_number,
+            page_label: page.page_label.clone(),
+            primitives: prims,
+            watermark_primitive_count,
+            background: page.background.clone(),
+            page_borders,
+            header,
+            footer,
+            note_areas,
+            reservations: page_reservations.take(),
+            table_gridlines: page_gridlines.take(),
+            unbuilt: false,
+            position_span: None,
+            hf_parts: None,
+            parity_filler: page.parity_filler == Some(true),
+        });
+    }
+
+    let mut display_list = DisplayList {
+        contract_version: input.contract_version,
+        pages,
+    };
+    apply_review_metadata(
+        &mut display_list,
+        &input.resolved_comment_ids,
+        &input.comment_authors,
+        &input.comment_threads,
+    );
+    // A resident list keeps every page, so no page holds spare capacity.
+    for page in &mut display_list.pages {
+        page.primitives.shrink_to_fit();
+        for region in [&mut page.header, &mut page.footer].into_iter().flatten() {
+            region.primitives.shrink_to_fit();
+        }
+    }
+    display_list
+}
+
+fn reviewer_palette_color(index: u64) -> &'static str {
+    const COLORS: [&str; 8] = [
+        "#c67c00", "#1565c0", "#6a1b9a", "#00838f", "#ad1457", "#2e7d32", "#5d4037", "#455a64",
+    ];
+    COLORS[index as usize % COLORS.len()]
+}
+
+fn comment_author_for_ids<'a>(
+    ids: &[String],
+    authors: &'a [CommentAuthorIn],
+) -> Option<&'a CommentAuthorIn> {
+    authors
+        .iter()
+        .find(|author| {
+            author
+                .id
+                .as_ref()
+                .is_some_and(|author_id| ids.iter().any(|id| id == author_id))
+        })
+        // The frozen input has no comment-id → author-id join. A single
+        // reviewer is unambiguous; with multiple unmatched reviewers, omit
+        // attribution rather than assigning the wrong person's identity.
+        .or_else(|| (authors.len() == 1).then(|| &authors[0]))
+}
+
+/// comment-id keyed thread lookup: the first thread whose id matches any of
+/// the primitive's comment ids (Word ranges rarely overlap; when they do the
+/// first/outermost id wins, matching the wash color choice)
+fn comment_thread_for_ids<'a>(
+    ids: &[String],
+    threads: &'a [CommentThreadIn],
+) -> Option<&'a CommentThreadIn> {
+    ids.iter()
+        .filter_map(|id| id.parse::<i64>().ok())
+        .find_map(|comment_id| threads.iter().find(|thread| thread.id == Some(comment_id)))
+}
+
+/// comment body/reply text cap — announcement excerpts, not full transcripts
+pub const MAX_COMMENT_TEXT_CHARS: usize = 512;
+/// reply-summary cap; `reply_count` still reports the real total
+pub const MAX_COMMENT_REPLIES: usize = 16;
+
+/// bounded copy of a file-derived string: empty drops, oversized truncates on
+/// a char boundary (same policy as [`capped_alt_text`])
+fn capped_string(value: Option<&str>, max_chars: usize) -> Option<String> {
+    let value = value?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(max_chars).collect())
+}
+
+/// merge one thread's a11y metadata into the primitive's CommentMetadata:
+/// author name/date/body plus bounded reply summaries. Everything here is
+/// file-derived and announce-only — the mirror assigns it via
+/// setAttribute/textContent, never markup.
+fn apply_comment_thread_metadata(metadata: &mut CommentMetadata, thread: &CommentThreadIn) {
+    metadata.author_name = capped_string(thread.author_name.as_deref(), MAX_COMMENT_TEXT_CHARS);
+    metadata.date = capped_string(thread.date.as_deref(), MAX_COMMENT_TEXT_CHARS);
+    metadata.text = capped_string(thread.text.as_deref(), MAX_COMMENT_TEXT_CHARS);
+    metadata.reply_count = Some(thread.replies.len() as u64);
+    metadata.replies = thread
+        .replies
+        .iter()
+        .take(MAX_COMMENT_REPLIES)
+        .map(|reply| CommentReplyMetadata {
+            author_name: capped_string(reply.author_name.as_deref(), MAX_COMMENT_TEXT_CHARS),
+            date: capped_string(reply.date.as_deref(), MAX_COMMENT_TEXT_CHARS),
+            text: capped_string(reply.text.as_deref(), MAX_COMMENT_TEXT_CHARS),
+        })
+        .collect();
+    // the thread input carries the real comment-id → author join the frozen
+    // author palette lacked; fill authorId only when the palette heuristic
+    // found none, so existing attribution stays byte-stable
+    if metadata.author_id.is_none() {
+        metadata.author_id = capped_string(thread.author_id.as_deref(), MAX_COMMENT_TEXT_CHARS);
+    }
+}
+
+fn review_color(author: &CommentAuthorIn) -> String {
+    author
+        .color
+        .clone()
+        .unwrap_or_else(|| reviewer_palette_color(author.palette_index.unwrap_or(0)).to_string())
+}
+
+fn comment_wash(color: &str) -> String {
+    let hex = color.strip_prefix('#').unwrap_or(color);
+    if hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let red = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
+        let green = u8::from_str_radix(&hex[2..4], 16).unwrap_or(212);
+        let blue = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+        format!("rgba({red}, {green}, {blue}, 0.15)")
+    } else {
+        color.to_string()
+    }
+}
+
+fn apply_review_primitive_metadata(
+    primitives: &mut Vec<Primitive>,
+    resolved_ids: &HashSet<i64>,
+    authors: &[CommentAuthorIn],
+    threads: &[CommentThreadIn],
+) {
+    primitives.retain_mut(|primitive| {
+        let is_comment_wash = matches!(
+            primitive,
+            Primitive::Decoration(DecorationPrimitive {
+                deco: DecoKind::CommentRange,
+                ..
+            })
+        );
+        let comment_ids = doc_attrs_mut(primitive).and_then(|attrs| attrs.comment_ids.clone());
+        if let Some(comment_ids) = comment_ids {
+            let all_resolved = !comment_ids.is_empty()
+                && comment_ids.iter().all(|id| {
+                    id.parse::<i64>()
+                        .is_ok_and(|comment_id| resolved_ids.contains(&comment_id))
+                });
+            let author = comment_author_for_ids(&comment_ids, authors);
+            let color = author.map(review_color);
+            let thread = comment_thread_for_ids(&comment_ids, threads);
+            if let Some(attrs) = doc_attrs_mut(primitive) {
+                let mut metadata = CommentMetadata {
+                    status: Some(if all_resolved { "resolved" } else { "active" }.to_string()),
+                    author_id: author.and_then(|entry| entry.id.clone()),
+                    palette_index: author.and_then(|entry| entry.palette_index),
+                    color: color.clone(),
+                    selected: None,
+                    ..CommentMetadata::default()
+                };
+                if let Some(thread) = thread {
+                    apply_comment_thread_metadata(&mut metadata, thread);
+                }
+                attrs.comment = Some(Box::new(metadata));
+            }
+            if is_comment_wash {
+                if all_resolved {
+                    return false;
+                }
+                if let Some(color) = color
+                    && let Primitive::Decoration(decoration) = &mut *primitive
+                {
+                    decoration.color = comment_wash(&color);
+                }
+            }
+        }
+
+        // Revisions do carry an author name, so author-colored underline and
+        // strike recipes can be applied without the missing comment join.
+        if let Primitive::Decoration(decoration) = primitive
+            && matches!(decoration.deco, DecoKind::Underline | DecoKind::Strike)
+            && let Some(revision) = &decoration.attrs.revision
+            && let Some(author) = authors.iter().find(|entry| {
+                entry.name.as_deref() == Some(revision.author.as_str())
+                    || entry.id.as_deref() == Some(revision.author.as_str())
+            })
+        {
+            decoration.color = review_color(author);
+        }
+        true
+    });
+}
+
+fn apply_review_metadata(
+    display_list: &mut DisplayList,
+    resolved_comment_ids: &[i64],
+    authors: &[CommentAuthorIn],
+    threads: &[CommentThreadIn],
+) {
+    let resolved_ids: HashSet<i64> = resolved_comment_ids.iter().copied().collect();
+    for page in &mut display_list.pages {
+        apply_review_primitive_metadata(&mut page.primitives, &resolved_ids, authors, threads);
+        if let Some(header) = &mut page.header {
+            apply_review_primitive_metadata(
+                &mut header.primitives,
+                &resolved_ids,
+                authors,
+                threads,
+            );
+        }
+        if let Some(footer) = &mut page.footer {
+            apply_review_primitive_metadata(
+                &mut footer.primitives,
+                &resolved_ids,
+                authors,
+                threads,
+            );
+        }
+        for area in &mut page.note_areas {
+            apply_review_primitive_metadata(
+                &mut area.separator_primitives,
+                &resolved_ids,
+                authors,
+                threads,
+            );
+            apply_review_primitive_metadata(&mut area.primitives, &resolved_ids, authors, threads);
+        }
+    }
+}
+
+/// Paints one paragraph fragment: shading rect, grouped borders, then each
+/// measured line's runs with indent padding, per-line float offsets and the
+/// alignment shift.
+///
+/// `origin_*` are the fragment's page coordinates; cell content passes its own
+/// origin and suppresses border grouping. `stamp_line_range` records the
+/// fragment's `[from_line, to_line)` on every primitive it emits — table-cell
+/// callers pass `false`, since a cell paragraph has no fragment of its own for
+/// the range to describe.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_paragraph_fragment(
+    prims: &mut Vec<Primitive>,
+    frag: &ParagraphFragmentIn,
+    block: &ParagraphBlockIn,
+    measure: &ParagraphExtentIn,
+    ctx: &RenderCtx<'_>,
+    origin_x: f64,
+    origin_y: f64,
+    prev_borders: Option<&ParaBordersIn>,
+    next_borders: Option<&ParaBordersIn>,
+    emit_block_chrome: bool,
+    stamp_line_range: bool,
+) {
+    let fallback_ctx;
+    let ctx = if ctx.shape.is_some_and(|fonts| fonts.coverage_only)
+        && measure.lines.iter().any(|line| line.synthetic_fallback)
+    {
+        fallback_ctx = RenderCtx {
+            shape: None,
+            leader_fonts: ctx.leader_fonts,
+            page_label: ctx.page_label.clone(),
+            ..*ctx
+        };
+        &fallback_ctx
+    } else {
+        ctx
+    };
+    // primitives emitted for this fragment get the paragraph's paraId stamped
+    // afterward (mirror `data-para-id`); remember where they start
+    let stamp_from = prims.len();
+    let attrs = block.attrs.as_ref();
+    let is_rtl = attrs.and_then(|a| a.bidi).unwrap_or(false) || paragraph_base_is_rtl(block);
+    let indent = attrs.and_then(|a| a.indent).unwrap_or_default();
+
+    // rtl paragraphs mirror the two indent sides
+    let ind_l = indent.left.unwrap_or(0.0);
+    let ind_r = indent.right.unwrap_or(0.0);
+    let (indent_left, indent_right) = if is_rtl {
+        (ind_r, ind_l)
+    } else {
+        (ind_l, ind_r)
+    };
+    let hanging = indent.hanging.unwrap_or(0.0);
+    let first_line = indent.first_line.unwrap_or(0.0);
+
+    let block_ref = BlockRef::of(&frag.block_id);
+    let pmark_revision = attrs.and_then(|a| {
+        a.p_pr_ins
+            .as_ref()
+            .map(|info| {
+                structural_revision(
+                    info,
+                    StructuralRevisionScope::Pmark,
+                    StructuralRevisionKind::Ins,
+                    None,
+                    None,
+                )
+            })
+            .or_else(|| {
+                a.p_pr_del.as_ref().map(|info| {
+                    structural_revision(
+                        info,
+                        StructuralRevisionScope::Pmark,
+                        StructuralRevisionKind::Del,
+                        None,
+                        None,
+                    )
+                })
+            })
+    });
+
+    if emit_block_chrome {
+        if let Some(rev) = pmark_revision.clone() {
+            let mut bar_attrs = block_ref.attrs();
+            bar_attrs.structural_revision = Some(Box::new(rev.clone()));
+            prims.push(Primitive::Rect(RectPrimitive {
+                x: px(origin_x + STRUCTURAL_CHANGE_BAR_OFFSET_X),
+                y: px(origin_y),
+                w: px(STRUCTURAL_CHANGE_BAR_WIDTH),
+                h: px(frag.height),
+                fill: structural_color(rev.kind).to_string(),
+                attrs: bar_attrs,
+            }));
+        }
+        // paragraph shading paints as a fragment-sized rect behind everything
+        if let Some(shading) = attrs.and_then(|a| a.shading.as_ref()) {
+            let mut shading_attrs = block_ref.attrs();
+            shading_attrs.doc_start = frag.pm_start;
+            shading_attrs.doc_end = frag.pm_end;
+            prims.push(Primitive::Rect(RectPrimitive {
+                x: px(origin_x),
+                y: px(origin_y),
+                w: px(frag.width),
+                h: px(frag.height),
+                fill: shading.clone(),
+                attrs: shading_attrs,
+            }));
+        }
+        if let Some(borders) = attrs.and_then(|a| a.borders.as_ref()) {
+            // A paragraph whose every line wraps in the same strip beside a
+            // float draws its borders around that strip, as Word does (the
+            // title rule beside a page float stays in the narrow column).
+            let (float_left, float_right) = shared_float_offsets(measure, frag);
+            emit_paragraph_borders(
+                prims,
+                borders,
+                prev_borders,
+                next_borders,
+                origin_x + float_left,
+                origin_y,
+                frag.width - float_left - float_right,
+                frag.height,
+                if !is_rtl && indent_left != 0.0 {
+                    indent_left - hanging
+                } else {
+                    indent_left
+                },
+                indent_right,
+            );
+        }
+    }
+
+    let total_lines = measure.lines.len();
+    let carried_from_prev = frag.carried_from_prev == Some(true);
+    let alignment = attrs.and_then(|a| a.alignment.as_deref());
+    // A visible list marker occupies the first-line hanging indent.
+    let has_list_marker = attrs
+        .and_then(|a| a.list_marker.as_deref())
+        .is_some_and(|m| !m.is_empty())
+        && attrs.and_then(|a| a.list_marker_hidden) != Some(true);
+    // a trailing <w:br> makes Word justify the paragraph's final line too
+    let para_ends_with_line_break = matches!(block.runs.last(), Some(RunIn::LineBreak(_)));
+
+    let mut line_top = origin_y;
+    let mut last_line: Option<LinePaintMetrics> = None;
+    let scripts = paragraph_scripts(&block.runs);
+    for idx in frag.from_line..frag.to_line.min(total_lines) {
+        let line = &measure.lines[idx];
+        // lead skip reserves vertical space above the line (float push-down)
+        line_top += line.float_skip_before.unwrap_or(0.0);
+
+        let is_first_line = idx == 0 && !carried_from_prev;
+        let is_last_line = idx + 1 == total_lines;
+        let line_stamp_from = prims.len();
+
+        last_line = emit_line(
+            prims,
+            block,
+            line,
+            LineGeom {
+                frag_x: origin_x,
+                frag_width: frag.width,
+                line_top,
+                indent_left,
+                indent_right,
+                hanging,
+                first_line,
+                is_first_line,
+                is_last_line,
+                is_rtl,
+                alignment,
+                frag_pm_start: frag.pm_start,
+                has_list_marker,
+                para_ends_with_line_break,
+            },
+            &block_ref,
+            ctx,
+            &scripts,
+        );
+        for primitive in &mut prims[line_stamp_from..] {
+            if let Some(attrs) = doc_attrs_mut(primitive) {
+                attrs.line_index = Some(idx as u64);
+            }
+        }
+
+        line_top += line.line_height;
+    }
+
+    // The tracked-change pilcrow marks the paragraph's end, so only the final
+    // fragment gets it; earlier fragments get the margin bar alone.
+    if let (Some(rev), Some(line)) = (pmark_revision, last_line)
+        && frag.carried_to_next != Some(true)
+    {
+        let mut glyph_attrs = block_ref.attrs();
+        glyph_attrs.structural_revision = Some(Box::new(rev.clone()));
+        let glyph_x = line.end_x + PARAGRAPH_MARK_GLYPH_GAP;
+        prims.push(Primitive::Text(TextRunPrimitive {
+            text: "¶".to_string(),
+            paint_text: None,
+            x: px(glyph_x),
+            baseline_y: px(line.baseline),
+            width: px(PARAGRAPH_MARK_GLYPH_WIDTH),
+            paint_clip: None,
+            font: resolved_css_font(ctx.shape, "¶", &RunFormattingIn::default()),
+            scripts: None,
+            color: structural_color(rev.kind).to_string(),
+            letter_spacing: None,
+            word_spacing: None,
+            rtl: None,
+            opacity: None,
+            rotation_deg: None,
+            horizontal_scale: None,
+            substitute_scale: text_substitute_scale(
+                ctx.shape,
+                "¶",
+                &RunFormattingIn::default(),
+                0,
+                false,
+            ),
+            all_caps: false,
+            small_caps: false,
+            hidden: false,
+            text_shadow: None,
+            text_outline: false,
+            emphasis_mark: None,
+            text_effect: None,
+            attrs: glyph_attrs.clone(),
+        }));
+        if rev.kind == StructuralRevisionKind::Del {
+            prims.push(Primitive::Decoration(DecorationPrimitive {
+                deco: DecoKind::Strike,
+                x: px(glyph_x),
+                y: px(line.baseline - (font_px_of(&RunFormattingIn::default()) * 0.3).round()),
+                w: px(PARAGRAPH_MARK_GLYPH_WIDTH),
+                h: px(1.0),
+                color: structural_color(rev.kind).to_string(),
+                dashed: false,
+                dotted: false,
+                attrs: glyph_attrs,
+            }));
+        }
+    }
+
+    // stamp the paragraph's stable paraId AND (for mirror-surfaced fragments) its
+    // measured line window on every primitive it emitted, so the a11y mirror can
+    // group the wrapper and expose `data-para-id` / `data-from-line` /
+    // `data-to-line` (lines carry no DocAttrs and are left untouched)
+    let para_id = block.para_id.as_ref();
+    let line_range = if stamp_line_range {
+        Some((frag.from_line as u64, frag.to_line as u64))
+    } else {
+        None
+    };
+    let sdt = sdt_attrs_from_groups(&block.sdt_groups);
+    let sdt_path = sdt_path_from_groups(&block.sdt_groups);
+    if para_id.is_some()
+        || line_range.is_some()
+        || sdt.is_some()
+        || frag.pm_start.is_some()
+        || frag.pm_end.is_some()
+    {
+        for p in &mut prims[stamp_from..] {
+            if let Some(a) = doc_attrs_mut(p) {
+                a.fragment_doc_start = frag.pm_start;
+                a.fragment_doc_end = frag.pm_end;
+                if let Some(pid) = para_id {
+                    a.para_id = Some(pid.clone());
+                }
+                if let Some((from, to)) = line_range {
+                    a.from_line = Some(from);
+                    a.to_line = Some(to);
+                }
+                if let Some(sdt) = &sdt {
+                    a.sdt = Some(Box::new(sdt.clone()));
+                    a.sdt_path = sdt_path.clone();
+                }
+            }
+        }
+    }
+}
+
+/// Everything one line needs beyond its own measure: the fragment box it sits
+/// in, the paragraph's indents, its position within the paragraph, and the
+/// direction and alignment that place its content.
+struct LineGeom<'a> {
+    frag_x: f64,
+    frag_width: f64,
+    line_top: f64,
+    indent_left: f64,
+    indent_right: f64,
+    hanging: f64,
+    first_line: f64,
+    is_first_line: bool,
+    is_last_line: bool,
+    is_rtl: bool,
+    alignment: Option<&'a str>,
+    frag_pm_start: Option<i64>,
+    /// Whether the first line reserves the hanging indent for a list marker.
+    has_list_marker: bool,
+    /// A trailing explicit line break allows the closing line to justify.
+    para_ends_with_line_break: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LinePaintMetrics {
+    end_x: f64,
+    baseline: f64,
+}
+
+/// Materialize the authoritative Rust-measure seam into paint items. Every
+/// tuple uses the measure engine's UTF-16 cluster boundary and exact advance;
+/// no width is inferred from the number of Unicode scalars. `bidiSlices` wins
+/// because it carries explicit visual order, followed by cluster metadata and
+/// finally exact run slices for older authoritative payloads.
+fn authoritative_line_items<'a>(
+    block: &'a ParagraphBlockIn,
+    line: &LineIn,
+    ctx: &RenderCtx<'_>,
+    default_level: u8,
+    leading_inline_box: bool,
+) -> Option<Vec<LinePaintItem<'a>>> {
+    let mut slices: Vec<(usize, usize, usize, f64, u8, u64, Option<u64>)> = Vec::new();
+    if !line.bidi_slices.is_empty() {
+        for (index, slice) in line.bidi_slices.iter().enumerate() {
+            slices.push((
+                slice.run_index?,
+                slice.start_char?,
+                slice.end_char?,
+                slice.advance?,
+                slice.bidi_level.unwrap_or(default_level),
+                slice.visual_order.unwrap_or(index as u64),
+                slice.logical_order,
+            ));
+        }
+        slices.sort_by_key(|slice| slice.5);
+    } else if !line.cluster_advances.is_empty() {
+        for (index, cluster) in line.cluster_advances.iter().enumerate() {
+            slices.push((
+                cluster.run_index?,
+                cluster.start_char?,
+                cluster.end_char?,
+                cluster.advance?,
+                cluster.bidi_level.unwrap_or(default_level),
+                // xOffset is the authoritative visual coordinate. Convert it
+                // to a stable integer sort key without changing the value.
+                cluster
+                    .x_offset
+                    .map(|x| (x.max(0.0) * 1_000.0).round() as u64)
+                    .unwrap_or(index as u64),
+                cluster.logical_order,
+            ));
+        }
+        slices.sort_by_key(|slice| slice.5);
+    } else if !line.run_advances.is_empty() {
+        for (index, run) in line.run_advances.iter().enumerate() {
+            let run_index = run.run_index?;
+            let level = match block.runs.get(run_index) {
+                Some(RunIn::Text(text)) => text.fmt.bidi_level.unwrap_or(default_level),
+                Some(RunIn::Field(field)) => field.fmt.bidi_level.unwrap_or(default_level),
+                Some(RunIn::Tab(tab)) => tab.fmt.bidi_level.unwrap_or(default_level),
+                _ => default_level,
+            };
+            slices.push((
+                run_index,
+                run.start_char?,
+                run.end_char?,
+                run.advance?,
+                level,
+                index as u64,
+                run.logical_order,
+            ));
+        }
+    } else {
+        return None;
+    }
+
+    let item_count = slices.len();
+    let mut out = Vec::with_capacity(item_count);
+    for (run_index, start, end, measured_width, level, _, logical_order) in slices {
+        let run = block.runs.get(run_index)?;
+        match run {
+            RunIn::Text(text) => {
+                let visible = slice_utf16(&text.text, start, end);
+                out.push(LinePaintItem::Text(LineTextItem {
+                    text: visible,
+                    fmt: &text.fmt,
+                    pm_start: text.pm_start.map(|pos| pos + start as i64),
+                    pm_end: text.pm_start.map(|pos| pos + end as i64).or(text.pm_end),
+                    width: measured_width,
+                    level,
+                    source_start: start,
+                    source_end: end,
+                    logical_order: logical_order.or(text.fmt.logical_order),
+                    exact_advance: true,
+                    field: None,
+                }));
+            }
+            RunIn::Field(field) => {
+                let text = field_text(field, ctx);
+                let width = ctx
+                    .field_width(field.pm_start)
+                    .map(|(_, resolved)| resolved)
+                    .unwrap_or(measured_width);
+                out.push(LinePaintItem::Text(LineTextItem {
+                    text,
+                    fmt: &field.fmt,
+                    pm_start: field.pm_start,
+                    pm_end: field.pm_end,
+                    width,
+                    level,
+                    source_start: start,
+                    source_end: end,
+                    logical_order: logical_order.or(field.fmt.logical_order),
+                    exact_advance: true,
+                    field: Some(field),
+                }));
+            }
+            RunIn::Tab(tab) => out.push(LinePaintItem::Tab {
+                run: tab,
+                width: measured_width,
+                level,
+                logical_order,
+            }),
+            RunIn::Image(image) if !is_floating_image_run(image) => {
+                out.push(LinePaintItem::Image {
+                    run: image,
+                    pm_start: image.pm_start,
+                    pm_end: image.pm_end,
+                    single_image_line: item_count == 1 && !leading_inline_box,
+                    level,
+                    logical_order,
+                });
+            }
+            RunIn::LineBreak(line_break) => out.push(LinePaintItem::LineBreak {
+                pm_start: line_break.pm_start,
+                level,
+            }),
+            RunIn::Reserved(reserved) => out.push(LinePaintItem::Reserved {
+                run: reserved,
+                single: item_count == 1,
+                level,
+            }),
+            RunIn::Image(_) | RunIn::Unsupported => {}
+        }
+    }
+    Some(out)
+}
+
+/// paint one typeset line: pen starts at the indent-derived x, runs advance by
+/// their resolved widths (tabs/images exact, text distributed over the measured
+/// line width), decorations ride with their run in paint order (highlight and
+/// comment tint behind the glyphs, underline/strike after).
+fn emit_line(
+    prims: &mut Vec<Primitive>,
+    block: &ParagraphBlockIn,
+    line: &LineIn,
+    geom: LineGeom,
+    block_ref: &BlockRef,
+    ctx: &RenderCtx<'_>,
+    scripts: &[String],
+) -> Option<LinePaintMetrics> {
+    let echo_start = prims.len();
+    let segments = resolve_line_segments(&block.runs, line);
+    let attrs = block.attrs.as_ref();
+    let auto_space = ooxml_text::AutoSpace::from_options(
+        attrs.and_then(|attrs| attrs.auto_space_de),
+        attrs.and_then(|attrs| attrs.auto_space_dn),
+    )
+    .compressing(attrs.and_then(|attrs| attrs.compress_punctuation));
+    let default_bidi_level = base_bidi_level(geom.is_rtl);
+    let leading_inline_box = geom.is_first_line
+        && attrs
+            .and_then(|attrs| attrs.leading_inline_box.as_ref())
+            .is_some();
+    let authoritative_items =
+        authoritative_line_items(block, line, ctx, default_bidi_level, leading_inline_box);
+    let authoritative_active = authoritative_items.is_some();
+    let authoritative_width = authoritative_items
+        .as_ref()
+        .map(|items| items.iter().map(LinePaintItem::width).sum::<f64>());
+
+    // distribute the measured line width over runs whose advance we don't know
+    // individually: fixed-width runs (tabs, inline images) subtract first, the
+    // rest splits across text-ish segments by their fallback slots.
+    //
+    // Per-page field widths are fixed and removed from the text pool.
+    let mut fixed_width = 0.0;
+    let default_font_pt = attrs
+        .and_then(|attrs| attrs.default_font_size)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(DEFAULT_FONT_PT);
+    let mut pool_estimate = 0.0;
+    let mut field_fixed = 0.0; // Σ per-page resolved widths of supplied fields
+    let mut field_fallback = 0.0; // Σ their fallback widths baked into line.width
+    if authoritative_items.is_none() {
+        for seg in &segments {
+            match seg.run {
+                RunIn::Tab(t) => fixed_width += t.width.unwrap_or(48.0),
+                RunIn::Image(imr) => {
+                    if !is_floating_image_run(imr) {
+                        fixed_width += image_layout_width(imr);
+                    }
+                }
+                RunIn::Reserved(reserved) => fixed_width += reserved.width,
+                RunIn::Text(text) => {
+                    if let Some(rule) = attrs.and_then(|attrs| {
+                        attrs
+                            .horizontal_rules
+                            .iter()
+                            .find(|rule| seg.pm_start == Some(rule.pm_start as i64))
+                    }) {
+                        if text.fmt.hidden != Some(true) {
+                            fixed_width += rule.advance_width(
+                                (geom.frag_width - geom.indent_left - geom.indent_right).max(0.0),
+                            );
+                        }
+                    } else {
+                        pool_estimate += fallback_text_width(&seg.text, &text.fmt, default_font_pt);
+                    }
+                }
+                RunIn::Field(f) => match ctx.field_width(seg.pm_start) {
+                    Some((fallback, resolved)) => {
+                        field_fallback += fallback;
+                        field_fixed += resolved;
+                    }
+                    None => {
+                        pool_estimate +=
+                            fallback_text_width(&field_text(f, ctx), &f.fmt, default_font_pt)
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+    let pool_width = (line.width - fixed_width - field_fallback).max(0.0);
+    let width_per_estimate = if pool_estimate > 0.0 {
+        pool_width / pool_estimate
+    } else {
+        0.0
+    };
+    // the line's true rendered extent on this page; equals line.width when no
+    // per-page field widths were supplied
+    let effective_line_width =
+        authoritative_width.unwrap_or(pool_width + fixed_width + field_fixed);
+
+    let horizontal = horizontal_line_box(
+        HorizontalLineGeometry {
+            frag_x: geom.frag_x,
+            frag_width: geom.frag_width,
+            indent_left: geom.indent_left,
+            indent_right: geom.indent_right,
+            hanging: geom.hanging,
+            first_line: geom.first_line,
+            is_first_line: geom.is_first_line,
+            is_last_line: geom.is_last_line,
+            is_rtl: geom.is_rtl,
+            alignment: geom.alignment,
+            has_list_marker: geom.has_list_marker,
+            left_offset: line.left_offset.unwrap_or(0.0),
+            right_offset: line.right_offset.unwrap_or(0.0),
+            marker_tab_offset: line.marker_tab_offset.unwrap_or(0.0),
+            marker_inline_width: line.marker_inline_width.unwrap_or(0.0),
+            marker_font_size_pt: attrs
+                .and_then(|attrs| attrs.list_marker_font_size.or(attrs.default_font_size)),
+        },
+        effective_line_width,
+    );
+    let echo_x = horizontal.echo_x;
+    let mut pen_x = horizontal.pen_x;
+    let usable_width = horizontal.usable_width;
+    let line_bottom = geom.line_top + line.line_height;
+    // Word hangs the baseline off the box top: whatever the spacing rule adds
+    // beyond ascent + descent is leading below the descent, never centered.
+    let baseline = geom.line_top + line.ascent;
+
+    // Numbering is not part of the story text, so materialize the precomputed
+    // marker as its own first-line primitive. The hanging-indent slot is its
+    // authoritative horizontal extent; body text already begins after it.
+    if geom.is_first_line
+        && let Some(marker) = attrs
+            .and_then(|attrs| attrs.list_marker.as_deref())
+            .filter(|marker| !marker.is_empty())
+        && attrs.and_then(|attrs| attrs.list_marker_hidden) != Some(true)
+    {
+        let mut marker_format = RunFormattingIn::default();
+        marker_format.bold = attrs.and_then(|attrs| attrs.list_marker_bold);
+        marker_format.italic = attrs.and_then(|attrs| attrs.list_marker_italic);
+        marker_format.font_family = attrs.and_then(|attrs| {
+            attrs
+                .list_marker_font_family
+                .clone()
+                .or_else(|| attrs.default_font_family.clone())
+        });
+        marker_format.font_size =
+            attrs.and_then(|attrs| attrs.list_marker_font_size.or(attrs.default_font_size));
+        let marker_geometry = horizontal.marker.expect("a visible marker has geometry");
+        let slot_width = marker_geometry.width;
+        let marker_x = marker_geometry.x;
+        let marker_revision = attrs.and_then(|attrs| attrs.list_marker_revision);
+        let color = match marker_revision {
+            Some(RevisionKind::Ins) => REVISION_INS_COLOR,
+            Some(RevisionKind::Del) => REVISION_DEL_COLOR,
+            None | Some(RevisionKind::Format) => attrs
+                .and_then(|attrs| attrs.list_marker_color.as_deref())
+                .unwrap_or("#000000"),
+        };
+        let mut marker_attrs = block_ref.attrs();
+        marker_attrs.list_marker = Some(true);
+        marker_attrs.list_marker_revision = marker_revision;
+        prims.push(Primitive::Text(TextRunPrimitive {
+            text: marker.to_owned(),
+            paint_text: text_paint_override(ctx.shape, marker, &marker_format).map(Box::new),
+            x: px(marker_x),
+            baseline_y: px(baseline),
+            width: px(slot_width),
+            paint_clip: None,
+            font: resolved_css_font(ctx.shape, marker, &marker_format),
+            scripts: boxed_scripts(scripts),
+            color: color.to_owned(),
+            letter_spacing: None,
+            word_spacing: None,
+            rtl: geom.is_rtl.then_some(true),
+            opacity: None,
+            rotation_deg: None,
+            horizontal_scale: horizontal_scale_of(&marker_format),
+            substitute_scale: text_substitute_scale(
+                ctx.shape,
+                marker,
+                &marker_format,
+                base_bidi_level(geom.is_rtl),
+                false,
+            ),
+            all_caps: false,
+            small_caps: false,
+            hidden: false,
+            text_shadow: None,
+            text_outline: false,
+            emphasis_mark: None,
+            text_effect: None,
+            attrs: marker_attrs,
+        }));
+    }
+
+    // Distribute justification slack across U+0020 clusters.
+    let justified = geom.alignment == Some("justify")
+        && ooxml_text::line_is_justified(
+            geom.is_last_line,
+            geom.para_ends_with_line_break,
+            &ooxml_text::CompatFlags::default(),
+        );
+    let mut word_space_px: Option<Number> = None;
+    let mut word_space_extra = 0.0_f64;
+    if justified && (pool_estimate > 0.0 || authoritative_items.is_some()) {
+        let slack = (usable_width - effective_line_width).max(0.0);
+        if slack > 0.0 {
+            let mut space_count = 0usize;
+            if let Some(items) = &authoritative_items {
+                space_count = items
+                    .iter()
+                    .map(|item| match item {
+                        LinePaintItem::Text(text) => {
+                            text.text.chars().filter(|&ch| ch == ' ').count()
+                        }
+                        _ => 0,
+                    })
+                    .sum();
+            } else {
+                for seg in &segments {
+                    let text = match seg.run {
+                        RunIn::Text(_) => seg.text.clone(),
+                        // a field with a supplied per-page width is fixed-width, so
+                        // it's out of the text pool and never absorbs justify slack
+                        RunIn::Field(f) if ctx.field_width(seg.pm_start).is_none() => {
+                            field_text(f, ctx)
+                        }
+                        _ => continue,
+                    };
+                    space_count += text.chars().filter(|&ch| ch == ' ').count();
+                }
+            }
+            if space_count > 0 {
+                word_space_extra = slack / space_count as f64;
+                word_space_px = Some(px(word_space_extra));
+            }
+        }
+    }
+
+    let mut emitted_positioned_text = false;
+    let mut line_break_pos: Option<i64> = None;
+
+    let bidi_base = base_bidi_direction(geom.is_rtl);
+    let mut line_text = String::new();
+    for seg in &segments {
+        match seg.run {
+            RunIn::Text(_) => line_text.push_str(&seg.text),
+            RunIn::Field(f) => line_text.push_str(&field_text(f, ctx)),
+            _ => {}
+        }
+    }
+    let line_levels = bidi_char_levels(&line_text, bidi_base);
+    let mut level_cursor = 0usize;
+    let mut logical_items: Vec<LinePaintItem<'_>> = authoritative_items.unwrap_or_default();
+
+    if logical_items.is_empty() {
+        for seg in &segments {
+            match seg.run {
+                // hidden runs (w:vanish) stay in the doc-position flow — the DOM
+                // editing view paints them dimmed rather than suppressing them, so
+                // the display list keeps their primitives for hit-testing too
+                RunIn::Text(t) => {
+                    let w = attrs
+                        .and_then(|attrs| {
+                            attrs
+                                .horizontal_rules
+                                .iter()
+                                .find(|rule| seg.pm_start == Some(rule.pm_start as i64))
+                        })
+                        .map(|rule| {
+                            if t.fmt.hidden == Some(true) {
+                                0.0
+                            } else {
+                                rule.advance_width(
+                                    (geom.frag_width - geom.indent_left - geom.indent_right)
+                                        .max(0.0),
+                                )
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            width_per_estimate
+                                * fallback_text_width(&seg.text, &t.fmt, default_font_pt)
+                                + word_space_extra
+                                    * seg.text.chars().filter(|&ch| ch == ' ').count() as f64
+                        });
+                    push_bidi_text_items(
+                        &mut logical_items,
+                        &seg.text,
+                        &t.fmt,
+                        seg.pm_start,
+                        seg.pm_end,
+                        w,
+                        &line_levels,
+                        &mut level_cursor,
+                        default_bidi_level,
+                        word_space_extra,
+                        None,
+                    );
+                }
+                RunIn::Field(f) => {
+                    let text = field_text(f, ctx);
+                    // Supplied field widths override character distribution.
+                    let (w, item_word_space_extra) = match ctx.field_width(seg.pm_start) {
+                        Some((_, resolved)) => (resolved, 0.0),
+                        None => (
+                            width_per_estimate
+                                * fallback_text_width(&text, &f.fmt, default_font_pt)
+                                + word_space_extra
+                                    * text.chars().filter(|&ch| ch == ' ').count() as f64,
+                            word_space_extra,
+                        ),
+                    };
+                    push_bidi_text_items(
+                        &mut logical_items,
+                        &text,
+                        &f.fmt,
+                        seg.pm_start,
+                        seg.pm_end,
+                        w,
+                        &line_levels,
+                        &mut level_cursor,
+                        default_bidi_level,
+                        item_word_space_extra,
+                        Some(f),
+                    );
+                }
+                RunIn::Tab(t) => {
+                    logical_items.push(LinePaintItem::Tab {
+                        run: t,
+                        width: t.width.unwrap_or(48.0),
+                        level: default_bidi_level,
+                        logical_order: t.fmt.logical_order,
+                    });
+                }
+                RunIn::Image(imr) => {
+                    // The page and cell float layers own these, not the line.
+                    if is_floating_image_run(imr) {
+                        continue;
+                    }
+                    logical_items.push(LinePaintItem::Image {
+                        run: imr,
+                        pm_start: seg.pm_start,
+                        pm_end: seg.pm_end,
+                        single_image_line: segments.len() == 1 && !leading_inline_box,
+                        level: default_bidi_level,
+                        logical_order: None,
+                    });
+                }
+                RunIn::LineBreak(lb) => {
+                    logical_items.push(LinePaintItem::LineBreak {
+                        pm_start: lb.pm_start,
+                        level: default_bidi_level,
+                    });
+                }
+                RunIn::Reserved(reserved) => {
+                    logical_items.push(LinePaintItem::Reserved {
+                        run: reserved,
+                        single: segments.len() == 1,
+                        level: default_bidi_level,
+                    });
+                }
+                RunIn::Unsupported => {}
+            }
+        }
+    }
+
+    let visual_order = if !authoritative_active {
+        let item_levels: Vec<u8> = logical_items.iter().map(LinePaintItem::level).collect();
+        ooxml_text::visual_order_for_levels(&item_levels)
+    } else {
+        (0..logical_items.len()).collect()
+    };
+
+    for item_idx in visual_order {
+        let Some(item) = logical_items.get(item_idx) else {
+            continue;
+        };
+        match item {
+            LinePaintItem::Text(item) => {
+                let rule = attrs.and_then(|attrs| {
+                    attrs.horizontal_rules.iter().find(|rule| {
+                        item.pm_start == Some(rule.pm_start as i64)
+                            && item.pm_end == Some(rule.pm_end as i64)
+                    })
+                });
+                let mut text_x = pen_x;
+                if let Some(rule) = rule.filter(|_| item.fmt.hidden != Some(true)) {
+                    let standalone = segments.iter().all(|segment| {
+                        segment.pm_start == Some(rule.pm_start as i64)
+                            || matches!(segment.run, RunIn::Text(text) if text.fmt.hidden == Some(true)
+                                || segment.text.is_empty())
+                    });
+                    let available_width =
+                        (geom.frag_width - geom.indent_left - geom.indent_right).max(0.0);
+                    if standalone {
+                        let remaining = available_width - rule.rendered_width(available_width);
+                        text_x = geom.frag_x
+                            + geom.indent_left
+                            + match rule.alignment.as_str() {
+                                "left" => 0.0,
+                                "right" => remaining,
+                                _ => remaining / 2.0,
+                            };
+                    }
+                    emit_horizontal_rule(prims, rule, block_ref, text_x, baseline, available_width);
+                }
+                let paint_width = if rule.is_some() && item.fmt.hidden == Some(true) {
+                    0.0
+                } else {
+                    item.width
+                        + if item.exact_advance {
+                            word_space_extra
+                                * item.text.chars().filter(|&ch| ch == ' ').count() as f64
+                        } else {
+                            0.0
+                        }
+                };
+                emit_text_segment(
+                    prims,
+                    &item.text,
+                    item.fmt,
+                    item.pm_start,
+                    item.pm_end,
+                    text_x,
+                    baseline,
+                    paint_width,
+                    word_space_px.clone(),
+                    item.level,
+                    item.logical_order,
+                    item.source_start,
+                    item.source_end,
+                    item.exact_advance,
+                    line.synthetic_fallback,
+                    geom.line_top,
+                    line_bottom,
+                    block_ref,
+                    ctx.shape,
+                    auto_space,
+                    item.field,
+                    scripts,
+                );
+                if item.pm_start.is_some() {
+                    emitted_positioned_text = true;
+                }
+                pen_x = text_x + paint_width;
+            }
+            LinePaintItem::Tab {
+                run,
+                width,
+                logical_order,
+                ..
+            } => {
+                let leader = run
+                    .leader_glyphs
+                    .as_ref()
+                    .and_then(|leader| leader.glyph.as_deref())
+                    .map(|_| "shaped".to_string())
+                    .or_else(|| tab_leader_for(attrs, pen_x - geom.frag_x));
+                if let Some(leader) = leader {
+                    emit_tab_leader(
+                        prims,
+                        run,
+                        &leader,
+                        pen_x,
+                        baseline,
+                        *width,
+                        *logical_order,
+                        block_ref,
+                        ctx.shape.or(ctx.leader_fonts),
+                    );
+                    if run.pm_start.is_some() {
+                        emitted_positioned_text = true;
+                    }
+                }
+                if *width > 0.0
+                    && !matches!(
+                        run.fmt
+                            .underline
+                            .as_ref()
+                            .and_then(|value| value.get("style"))
+                            .and_then(Value::as_str),
+                        Some("none" | "words")
+                    )
+                {
+                    let mut attrs = block_ref.attrs();
+                    attrs.doc_start = run.pm_start;
+                    attrs.doc_end = run.pm_end;
+                    attrs.logical_order = logical_order.or(run.fmt.logical_order);
+                    attrs.bidi_level = run.fmt.bidi_level;
+                    if let Some(decoration) = underline_decoration(
+                        &run.fmt,
+                        &attrs,
+                        pen_x,
+                        baseline_y_of(&run.fmt, baseline),
+                        *width,
+                    ) {
+                        prims.push(Primitive::Decoration(decoration));
+                    }
+                }
+                pen_x += width;
+            }
+            LinePaintItem::Image {
+                run: imr,
+                pm_start,
+                pm_end,
+                single_image_line,
+                level,
+                logical_order,
+            } => {
+                // Image-only lines center; inline images sit on the baseline.
+                let layout_width = imr
+                    .rotation_bounds
+                    .as_ref()
+                    .and_then(|bounds| bounds.width)
+                    .unwrap_or(imr.width);
+                let layout_height = imr
+                    .rotation_bounds
+                    .as_ref()
+                    .and_then(|bounds| bounds.height)
+                    .unwrap_or(imr.height);
+                let y = if *single_image_line && line.descent <= 0.0 {
+                    // Alone on its line: the image is the box's top, any
+                    // added line spacing falls below it.
+                    geom.line_top + (line.ascent - layout_height).max(0.0)
+                } else if *single_image_line {
+                    geom.line_top + ((line.line_height - layout_height) / 2.0).max(0.0)
+                } else {
+                    baseline - layout_height
+                };
+                if let Some(math) = imr.inline_math.as_ref() {
+                    let mut math_attrs = block_ref.attrs();
+                    math_attrs.doc_start = *pm_start;
+                    math_attrs.doc_end = *pm_end;
+                    math_attrs.logical_order = *logical_order;
+                    math_attrs.bidi_level = logical_order.map(|_| *level);
+                    emit_math(prims, math, pen_x, baseline, &math_attrs);
+                    pen_x += math.width as f64;
+                    continue;
+                }
+                if let Some(inline_value) = imr.inline_shape.as_ref()
+                    && let Some(shape_block) = serde_json::to_string(&inline_value)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<ShapeBlockIn>(&s).ok())
+                {
+                    let stamp_from = prims.len();
+                    let fragment = ShapeFragmentIn {
+                        block_id: shape_block.id.clone(),
+                        x: pen_x,
+                        y,
+                        width: layout_width,
+                        height: layout_height,
+                        doc_start: *pm_start,
+                        doc_end: *pm_end,
+                        pm_start: *pm_start,
+                        pm_end: *pm_end,
+                        is_anchored: None,
+                        z_index: None,
+                    };
+                    emit_shape_fragment(prims, &fragment, &shape_block, ctx);
+                    for primitive in &mut prims[stamp_from..] {
+                        if let Some(attrs) = doc_attrs_mut(primitive) {
+                            attrs.inline_shape_atom = Some(true);
+                            stamp_image_run_metadata(
+                                attrs,
+                                imr,
+                                *logical_order,
+                                logical_order.map(|_| *level),
+                            );
+                        }
+                    }
+                    if imr.display_mode.as_deref() != Some("block")
+                        && imr.wrap_type.as_deref() != Some("topAndBottom")
+                    {
+                        pen_x += layout_width;
+                    }
+                    continue;
+                }
+                if let Some(inline_value) = imr.inline_chart.as_ref()
+                    && let Some(chart_block) = serde_json::to_string(inline_value)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<ChartBlockIn>(&s).ok())
+                {
+                    let stamp_from = prims.len();
+                    let fragment = ChartFragmentIn {
+                        block_id: chart_block.id.clone(),
+                        x: pen_x,
+                        y,
+                        width: layout_width,
+                        height: layout_height,
+                        doc_start: *pm_start,
+                        doc_end: *pm_end,
+                        pm_start: *pm_start,
+                        pm_end: *pm_end,
+                    };
+                    emit_chart_fragment(prims, &fragment, &chart_block);
+                    for primitive in &mut prims[stamp_from..] {
+                        if let Some(attrs) = doc_attrs_mut(primitive) {
+                            stamp_image_run_metadata(
+                                attrs,
+                                imr,
+                                *logical_order,
+                                logical_order.map(|_| *level),
+                            );
+                        }
+                    }
+                    if imr.display_mode.as_deref() != Some("block")
+                        && imr.wrap_type.as_deref() != Some("topAndBottom")
+                    {
+                        pen_x += layout_width;
+                    }
+                    continue;
+                }
+                let rot = imr
+                    .rotation_deg
+                    .unwrap_or_else(|| rotation_degrees(imr.transform.as_deref()));
+                let mut img_attrs = block_ref.attrs();
+                img_attrs.doc_start = *pm_start;
+                img_attrs.doc_end = *pm_end;
+                img_attrs.logical_order = *logical_order;
+                img_attrs.bidi_level = logical_order.map(|_| *level);
+                stamp_image_run_attrs(&mut img_attrs, imr, pen_x, y);
+                prims.push(Primitive::Image(ImagePrimitive {
+                    rel_id: imr.src.clone(),
+                    x: px(pen_x),
+                    y: px(y),
+                    w: px(layout_width),
+                    h: px(layout_height),
+                    rotation_deg: if rot != 0.0 { Some(px(rot)) } else { None },
+                    opacity: imr.opacity.map(px),
+                    filter: None,
+                    decorative: imr.decorative.unwrap_or(false),
+                    crop: crop_of(imr),
+                    alt_text: capped_alt_text(imr.alt.as_deref()),
+                    attrs: img_attrs,
+                }));
+                if imr.display_mode.as_deref() != Some("block")
+                    && imr.wrap_type.as_deref() != Some("topAndBottom")
+                {
+                    pen_x += layout_width;
+                }
+            }
+            LinePaintItem::LineBreak { pm_start, .. } => {
+                if line_break_pos.is_none() {
+                    line_break_pos = *pm_start;
+                }
+            }
+            LinePaintItem::Reserved { run, single, .. } => {
+                let y = if *single && line.descent <= 0.0 {
+                    geom.line_top + (line.ascent - run.height).max(0.0)
+                } else if *single {
+                    geom.line_top + ((line.line_height - run.height) / 2.0).max(0.0)
+                } else {
+                    baseline - run.height
+                };
+                ctx.reserve(&run.reservation, pen_x, y, run.width, run.height);
+                if line_break_pos.is_none() {
+                    line_break_pos = run.pm_start;
+                }
+                pen_x += run.width;
+            }
+        }
+    }
+
+    // A line with no positioned text still needs a doc position for hit
+    // testing. A blank row from a line break carries the break's own inline
+    // position; an empty paragraph line carries the paragraph's CONTENT
+    // position, which is `pmStart + 1`. The fragment's own pmStart is the
+    // paragraph boundary, and a caret cannot sit there — emitting it would land
+    // every click and vertical move BEFORE the paragraph.
+    if !emitted_positioned_text
+        && !(leading_inline_box && segments.is_empty() && !block.runs.is_empty())
+    {
+        let pos = line_break_pos.or(geom.frag_pm_start.map(|p| p + 1));
+        if let Some(p) = pos {
+            let mut marker_attrs = block_ref.attrs();
+            marker_attrs.doc_start = Some(p);
+            marker_attrs.doc_end = Some(p);
+            prims.push(Primitive::Text(TextRunPrimitive {
+                text: String::new(),
+                paint_text: None,
+                x: px(echo_x),
+                baseline_y: px(baseline),
+                width: px(0.0),
+                paint_clip: None,
+                font: css_font(&RunFormattingIn::default()),
+                scripts: None,
+                color: "#000000".to_string(),
+                letter_spacing: None,
+                word_spacing: None,
+                rtl: None,
+                opacity: None,
+                rotation_deg: None,
+                horizontal_scale: None,
+                substitute_scale: text_substitute_scale(
+                    ctx.shape,
+                    "",
+                    &RunFormattingIn::default(),
+                    default_bidi_level,
+                    false,
+                ),
+                all_caps: false,
+                small_caps: false,
+                hidden: false,
+                text_shadow: None,
+                text_outline: false,
+                emphasis_mark: None,
+                text_effect: None,
+                attrs: marker_attrs,
+            }));
+        }
+    }
+
+    let echo_placement = match geom.alignment {
+        _ if geom.is_rtl => None,
+        None | Some("left") => Some((None, None)),
+        Some("justify") if justified => Some((Some(effective_line_width), None)),
+        Some("justify") => Some((None, None)),
+        Some("center") => Some((None, Some(usable_width))),
+        _ => None,
+    };
+    for primitive in &mut prims[echo_start..] {
+        if let Primitive::GlyphRun(run) = primitive {
+            match (echo_placement, &mut run.echo) {
+                (Some((stretch, center_width)), Some(echo)) => {
+                    echo.x = echo_x;
+                    echo.right = echo_x + usable_width;
+                    echo.stretch = stretch;
+                    echo.center_width = center_width;
+                }
+                _ => run.echo = None,
+            }
+        }
+    }
+    Some(LinePaintMetrics {
+        end_x: pen_x,
+        baseline,
+    })
+}
+
+fn tab_leader_for(attrs: Option<&ParaAttrsIn>, current_x_px: f64) -> Option<String> {
+    let stops = attrs?.tabs.as_ref()?;
+    stops
+        .iter()
+        .filter(|stop| stop.val.as_deref() != Some("clear"))
+        .filter_map(|stop| {
+            let pos_px = stop.pos? / 15.0;
+            if pos_px <= current_x_px + 0.5 {
+                return None;
+            }
+            let leader = stop.leader.as_deref()?;
+            if leader == "none" {
+                return None;
+            }
+            Some((pos_px, leader.to_string()))
+        })
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, leader)| leader)
+}
+
+fn emit_tab_leader(
+    prims: &mut Vec<Primitive>,
+    tab: &TabRunIn,
+    leader: &str,
+    x: f64,
+    baseline: f64,
+    width: f64,
+    logical_order: Option<u64>,
+    block_ref: &BlockRef,
+    shape: Option<&ShapeFonts<'_>>,
+) {
+    if width <= 0.0 {
+        return;
+    }
+    if let Some(measured) = &tab.leader_glyphs
+        && let (Some(glyph), Some(advance)) = (measured.glyph.as_deref(), measured.advance)
+        && !glyph.is_empty()
+        && advance.is_finite()
+        && advance > 0.0
+    {
+        let count = measured
+            .count
+            .unwrap_or_else(|| (width / advance).floor().max(1.0) as u64)
+            .min(10_000);
+        let mut fmt = tab.fmt.clone();
+        if let Some(font) = &measured.font {
+            fmt.font_family = Some(font.clone());
+        }
+        if let Some(size) = measured.font_size {
+            fmt.font_size = Some(size);
+        }
+        if let Some(color) = &measured.color {
+            fmt.color = Some(color.clone());
+        }
+        fmt.all_caps = Some(false);
+        let text = glyph.repeat(count as usize);
+        let substitute_scale = text_substitute_scale(
+            shape,
+            &text,
+            &fmt,
+            base_bidi_level(fmt.rtl == Some(true)),
+            false,
+        );
+        let font = resolved_css_font(shape, &text, &fmt);
+        let leader_font = if font == css_font(&fmt) {
+            measured.font.clone()
+        } else {
+            Some(font.clone())
+        };
+        let mut attrs = block_ref.attrs();
+        attrs.doc_start = tab.pm_start;
+        attrs.doc_end = tab.pm_end;
+        attrs.logical_order = logical_order.or(tab.fmt.logical_order);
+        attrs.bidi_level = tab.fmt.bidi_level;
+        attrs.leader_glyphs = Some(Box::new(LeaderGlyphMetadata {
+            glyph: Some(
+                text_paint_override(shape, glyph, &fmt).unwrap_or_else(|| glyph.to_string()),
+            ),
+            count: Some(count),
+            x: Some(px(x)),
+            baseline_y: Some(px(baseline)),
+            advance: Some(px(advance)),
+            width: Some(px(width)),
+            font: leader_font,
+            font_id: None,
+            size: measured.font_size.map(|size| px(size * 96.0 / 72.0)),
+            color: Some(run_color(&fmt)),
+            rtl: tab.fmt.rtl.filter(|rtl| *rtl),
+        }));
+        prims.push(Primitive::Text(TextRunPrimitive {
+            paint_text: text_paint_override(shape, &text, &fmt).map(Box::new),
+            text,
+            x: px(x),
+            baseline_y: px(baseline),
+            width: px(width),
+            paint_clip: None,
+            font,
+            scripts: None,
+            color: run_color(&fmt),
+            letter_spacing: None,
+            word_spacing: None,
+            rtl: tab.fmt.rtl.filter(|rtl| *rtl),
+            opacity: None,
+            rotation_deg: None,
+            horizontal_scale: horizontal_scale_of(&fmt),
+            substitute_scale,
+            all_caps: false,
+            small_caps: false,
+            hidden: false,
+            text_shadow: None,
+            text_outline: false,
+            emphasis_mark: None,
+            text_effect: None,
+            attrs,
+        }));
+        return;
+    }
+    if leader == "dot"
+        && let Some(prim) =
+            dot_leader_text(tab, x, baseline, width, logical_order, block_ref, shape)
+    {
+        prims.push(prim);
+        return;
+    }
+    let font_px = effective_font_px_of(&tab.fmt);
+    let thickness = (font_px / 16.0).round().max(1.0);
+    let (dashed, dotted, y, h) = match leader {
+        "dot" | "middleDot" => (false, true, baseline - (font_px * 0.25).round(), thickness),
+        "hyphen" => (true, false, baseline - (font_px * 0.25).round(), thickness),
+        "underscore" => (
+            false,
+            false,
+            baseline + (font_px * 0.1875).round(),
+            thickness,
+        ),
+        "heavy" => (
+            false,
+            false,
+            baseline + (font_px * 0.1875).round(),
+            thickness.max(2.0),
+        ),
+        _ => return,
+    };
+    let mut attrs = block_ref.attrs();
+    attrs.doc_start = tab.pm_start;
+    attrs.doc_end = tab.pm_end;
+    attrs.logical_order = logical_order.or(tab.fmt.logical_order);
+    attrs.bidi_level = tab.fmt.bidi_level;
+    prims.push(Primitive::Decoration(DecorationPrimitive {
+        deco: DecoKind::Underline,
+        x: px(x),
+        y: px(y),
+        w: px(width),
+        h: px(h),
+        color: run_color(&tab.fmt),
+        dashed,
+        dotted,
+        attrs,
+    }));
+}
+
+/// Dot leader as real '.' glyphs on a grid of the dot advance anchored at the page origin, as Word draws it.
+fn dot_leader_text(
+    tab: &TabRunIn,
+    x: f64,
+    baseline: f64,
+    width: f64,
+    logical_order: Option<u64>,
+    block_ref: &BlockRef,
+    shape: Option<&ShapeFonts<'_>>,
+) -> Option<Primitive> {
+    let fonts = shape?;
+    let fmt = &tab.fmt;
+    let family = fmt.font_family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY);
+    let chain = fonts.chain_for(family, fmt.bold == Some(true), fmt.italic == Some(true))?;
+    let font = *chain.ids.first()?;
+    let advance = painted_text_width(
+        fonts,
+        font,
+        ".",
+        fmt,
+        base_bidi_level(fmt.rtl == Some(true)),
+        false,
+        chain.coverage_only,
+    )?;
+    if !advance.is_finite() || advance <= 0.0 {
+        return None;
+    }
+    const EPS: f64 = 1e-3;
+    let first = (x / advance - EPS).ceil();
+    let last = ((x + width) / advance + EPS).floor();
+    let count = (last - first).max(0.0) as usize;
+    if count == 0 {
+        return None;
+    }
+    let text = ".".repeat(count);
+    let mut attrs = block_ref.attrs();
+    attrs.doc_start = tab.pm_start;
+    attrs.doc_end = tab.pm_end;
+    attrs.logical_order = logical_order.or(fmt.logical_order);
+    attrs.bidi_level = fmt.bidi_level;
+    Some(Primitive::Text(TextRunPrimitive {
+        paint_text: None,
+        text,
+        x: px(first * advance),
+        baseline_y: px(baseline),
+        width: px(count as f64 * advance),
+        paint_clip: None,
+        font: resolved_css_font(shape, ".", fmt),
+        scripts: None,
+        color: run_color(fmt),
+        letter_spacing: None,
+        word_spacing: None,
+        rtl: fmt.rtl.filter(|rtl| *rtl),
+        opacity: None,
+        rotation_deg: None,
+        horizontal_scale: horizontal_scale_of(fmt),
+        substitute_scale: None,
+        all_caps: false,
+        small_caps: false,
+        hidden: false,
+        text_shadow: None,
+        text_outline: false,
+        emphasis_mark: None,
+        text_effect: None,
+        attrs,
+    }))
+}
+
+fn underline_decoration(
+    fmt: &RunFormattingIn,
+    attrs: &DocAttrs,
+    x: f64,
+    baseline: f64,
+    width: f64,
+) -> Option<DecorationPrimitive> {
+    let (color, style) = match &fmt.underline {
+        Some(Value::Bool(true)) => (run_color(fmt), DisplayBorderStyle::Solid),
+        Some(Value::Object(value)) => (
+            value
+                .get("color")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| run_color(fmt)),
+            display_border_style(value.get("style").and_then(Value::as_str)),
+        ),
+        _ => return None,
+    };
+    let font_px = effective_font_px_of(fmt);
+    let mut attrs = attrs.clone();
+    attrs.style = Some(style);
+    Some(DecorationPrimitive {
+        deco: DecoKind::Underline,
+        x: px(x),
+        y: px(baseline + (font_px * 0.1875).round()),
+        w: px(width),
+        h: px((font_px / 16.0).round().max(1.0)),
+        color,
+        dashed: matches!(
+            style,
+            DisplayBorderStyle::Dashed
+                | DisplayBorderStyle::DashDot
+                | DisplayBorderStyle::DashDotDot
+        ),
+        dotted: style == DisplayBorderStyle::Dotted,
+        attrs,
+    })
+}
+
+/// one styled text slice: comment tint and highlight paint behind the glyphs,
+/// the text primitive itself, then underline/strike over it
+#[allow(clippy::too_many_arguments)]
+fn emit_text_segment(
+    prims: &mut Vec<Primitive>,
+    text: &str,
+    fmt: &RunFormattingIn,
+    pm_start: Option<i64>,
+    pm_end: Option<i64>,
+    x: f64,
+    baseline: f64,
+    width: f64,
+    word_spacing: Option<Number>,
+    bidi_level: u8,
+    logical_order: Option<u64>,
+    source_start: usize,
+    source_end: usize,
+    exact_advance: bool,
+    synthetic_fallback: bool,
+    line_top: f64,
+    line_bottom: f64,
+    block_ref: &BlockRef,
+    shape: Option<&ShapeFonts<'_>>,
+    auto_space: ooxml_text::AutoSpace,
+    field: Option<&FieldRunIn>,
+    scripts: &[String],
+) {
+    let font_px = effective_font_px_of(fmt);
+    let paint_baseline = baseline_y_of(fmt, baseline);
+    let comment_ids: Option<Vec<String>> = fmt
+        .comment_ids
+        .as_ref()
+        .filter(|ids| !ids.is_empty())
+        .map(|ids| ids.iter().map(|id| id.to_string()).collect());
+    let revision = if fmt.is_insertion == Some(true) || fmt.is_deletion == Some(true) {
+        Some(Revision {
+            author: fmt.change_author.clone().unwrap_or_default(),
+            date: fmt.change_date.clone().unwrap_or_default(),
+            revision_id: fmt
+                .change_revision_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            kind: if fmt.is_insertion == Some(true) {
+                RevisionKind::Ins
+            } else {
+                RevisionKind::Del
+            },
+        })
+    } else {
+        None
+    };
+    let mut attrs = block_ref.attrs();
+    attrs.doc_start = pm_start;
+    attrs.doc_end = pm_end;
+    attrs.comment_ids = comment_ids.clone();
+    attrs.revision = revision.or_else(|| fmt.format_change.clone()).map(Box::new);
+    attrs.href = hyperlink_href(fmt);
+    attrs.inline_sdt_widget = fmt.inline_sdt_widget.clone().map(Box::new);
+    attrs.logical_order = logical_order.or(fmt.logical_order);
+    attrs.bidi_level = exact_advance.then_some(bidi_level).or(fmt.bidi_level);
+    attrs.lang = fmt.language.as_ref().and_then(|language| {
+        if ooxml_text::level_is_rtl(bidi_level) {
+            language.bidi.clone().or_else(|| language.latin.clone())
+        } else {
+            language
+                .east_asia
+                .clone()
+                .or_else(|| language.latin.clone())
+        }
+    });
+    if let Some(link) = &fmt.hyperlink {
+        attrs.tooltip = link.tooltip.clone();
+        attrs.link_title = link.tooltip.clone();
+        attrs.link_target = link.target.clone();
+        attrs.link_history = link.history;
+        attrs.link_doc_location = link.doc_location.clone();
+    }
+    // inert field identity: type/instruction ride on the result primitives so
+    // the a11y mirror can announce what the field is. Announce-only — nothing
+    // downstream parses or executes the instruction.
+    if let Some(field_run) = field {
+        attrs.field = Some(Box::new(field_metadata(field_run)));
+    }
+    // footnote/endnote body reference mark → note_ref, the backlink hook
+    // (the mirror renders it as a doc-noteref link to `oox-<kind>-<id>`)
+    if let Some(id) = fmt.footnote_ref_id {
+        attrs.note_ref = Some(Box::new(NoteRefMetadata {
+            kind: Some("footnote".to_string()),
+            id: Some(id),
+        }));
+    } else if let Some(id) = fmt.endnote_ref_id {
+        attrs.note_ref = Some(Box::new(NoteRefMetadata {
+            kind: Some("endnote".to_string()),
+            id: Some(id),
+        }));
+    }
+
+    // Highlight is the run font box, never the containing line band. Exact
+    // slices carry their authoritative source boundaries for mirror/hit logic.
+    if let Some(hl) = &fmt.highlight {
+        let ascent = font_px * 0.8;
+        let descent = font_px * 0.2;
+        let mut highlight_attrs = attrs.clone();
+        highlight_attrs.highlight_slice = Some(Box::new(HighlightSliceMetadata {
+            source_start: exact_advance.then_some(source_start as u64),
+            source_end: exact_advance.then_some(source_end as u64),
+            ascent: Some(px(ascent)),
+            descent: Some(px(descent)),
+            includes_trailing_whitespace: Some(
+                text.chars().next_back().is_some_and(char::is_whitespace),
+            ),
+        }));
+        prims.push(Primitive::Decoration(DecorationPrimitive {
+            deco: DecoKind::Highlight,
+            x: px(x),
+            y: px(paint_baseline - ascent),
+            w: px(width),
+            h: px(ascent + descent),
+            color: hl.clone(),
+            dashed: false,
+            dotted: false,
+            attrs: highlight_attrs,
+        }));
+    }
+    // Comment ranges tint behind the glyphs.
+    if comment_ids.is_some() {
+        prims.push(Primitive::Decoration(DecorationPrimitive {
+            deco: DecoKind::CommentRange,
+            x: px(x),
+            y: px(line_top),
+            w: px(width),
+            h: px(line_bottom - line_top),
+            color: "rgba(255, 212, 0, 0.15)".to_string(),
+            dashed: false,
+            dotted: false,
+            attrs: attrs.clone(),
+        }));
+    }
+    // Paint the insertion wash across the full line band.
+    if fmt.is_insertion == Some(true) {
+        prims.push(Primitive::Decoration(DecorationPrimitive {
+            deco: DecoKind::Highlight,
+            x: px(x),
+            y: px(line_top),
+            w: px(width),
+            h: px(line_bottom - line_top),
+            color: "rgba(52, 168, 83, 0.08)".to_string(),
+            dashed: false,
+            dotted: false,
+            attrs: attrs.clone(),
+        }));
+    }
+    // Suggested deletion: a red wash behind the glyphs. The red text itself
+    // comes from run_color and the strike from the Strike decoration below.
+    if fmt.is_deletion == Some(true) {
+        prims.push(Primitive::Decoration(DecorationPrimitive {
+            deco: DecoKind::Highlight,
+            x: px(x),
+            y: px(line_top),
+            w: px(width),
+            h: px(line_bottom - line_top),
+            color: "rgba(211, 47, 47, 0.08)".to_string(),
+            dashed: false,
+            dotted: false,
+            attrs: attrs.clone(),
+        }));
+    }
+
+    let color = run_color(fmt);
+    let paint_clip = synthetic_fallback.then(|| ClipRect {
+        x: Some(px(x)),
+        y: None,
+        w: Some(px(width)),
+        h: None,
+    });
+    // Unresolved or failed shaping falls back to a text primitive.
+    let emitted_glyphs = match shape {
+        Some(sf) => try_emit_glyph_runs(
+            prims,
+            sf,
+            text,
+            fmt,
+            pm_start,
+            pm_end,
+            x,
+            paint_baseline,
+            &word_spacing,
+            bidi_level,
+            exact_advance.then_some(width),
+            logical_order,
+            &attrs,
+            &color,
+            &paint_clip,
+            auto_space,
+        ),
+        None => false,
+    };
+    if !emitted_glyphs {
+        let mut text_attrs = attrs.clone();
+        text_attrs.modern_effects = fmt.modern_effects.clone().map(Box::new);
+        text_attrs.canvas_clusters = text_canvas_clusters(
+            shape,
+            text,
+            fmt,
+            bidi_level,
+            exact_advance,
+            word_spacing.as_ref().map(num_f64).unwrap_or(0.0),
+            auto_space,
+        )
+        .filter(|clusters| !clusters.is_empty())
+        .map(Box::new);
+        prims.push(Primitive::Text(TextRunPrimitive {
+            text: text.to_string(),
+            paint_text: text_paint_override(shape, text, fmt).map(Box::new),
+            x: px(x),
+            baseline_y: px(paint_baseline),
+            width: px(width),
+            paint_clip,
+            font: resolved_css_font(shape, text, fmt),
+            scripts: boxed_scripts(scripts),
+            color: color.clone(),
+            letter_spacing: fmt.letter_spacing.map(px),
+            word_spacing,
+            rtl: if ooxml_text::level_is_rtl(bidi_level) {
+                Some(true)
+            } else {
+                None
+            },
+            opacity: None,
+            rotation_deg: None,
+            horizontal_scale: horizontal_scale_of(fmt),
+            substitute_scale: text_substitute_scale(shape, text, fmt, bidi_level, exact_advance),
+            all_caps: fmt.all_caps == Some(true),
+            small_caps: fmt.small_caps == Some(true),
+            hidden: fmt.hidden == Some(true),
+            text_shadow: text_shadow_of(fmt),
+            text_outline: fmt.text_outline == Some(true),
+            emphasis_mark: fmt.emphasis_mark.clone(),
+            text_effect: fmt.text_effect.clone(),
+            attrs: text_attrs,
+        }));
+    }
+
+    // decoration thickness/offsets derived from the font size (deterministic
+    // stand-ins for the browser's UA decoration metrics)
+    let thickness = (font_px / 16.0).round().max(1.0);
+    if let Some(decoration) = underline_decoration(fmt, &attrs, x, paint_baseline, width) {
+        prims.push(Primitive::Decoration(decoration));
+    } else if fmt.is_insertion == Some(true) {
+        // Suggested insertion: a green dashed rule under the run, reusing the
+        // offset and thickness of an explicit underline; the dashed flag drives
+        // the canvas
+        // rule. `else if` so an already-underlined inserted run keeps a single
+        // rule rather than stacking two lines at the same baseline offset.
+        prims.push(Primitive::Decoration(DecorationPrimitive {
+            deco: DecoKind::Underline,
+            x: px(x),
+            y: px(paint_baseline + (font_px * 0.1875).round()),
+            w: px(width),
+            h: px(thickness),
+            color: "#2e7d32".to_string(),
+            dashed: true,
+            dotted: false,
+            attrs: attrs.clone(),
+        }));
+    } else if fmt.hidden == Some(true) {
+        prims.push(Primitive::Decoration(DecorationPrimitive {
+            deco: DecoKind::Underline,
+            x: px(x),
+            y: px(paint_baseline + (font_px * 0.1875).round()),
+            w: px(width),
+            h: px(thickness),
+            color: color.clone(),
+            dashed: false,
+            dotted: true,
+            attrs: attrs.clone(),
+        }));
+    }
+    if let Some(change) = &fmt.format_change {
+        let mut cue_attrs = attrs.clone();
+        cue_attrs.revision = Some(Box::new(change.clone()));
+        prims.push(Primitive::Decoration(DecorationPrimitive {
+            deco: DecoKind::Underline,
+            x: px(x),
+            y: px(paint_baseline + (font_px * 0.3).round()),
+            w: px(width),
+            h: px(1.0),
+            color: "#6a1b9a".to_owned(),
+            dashed: false,
+            dotted: true,
+            attrs: cue_attrs,
+        }));
+    }
+    // Deletions strike through in the revision colour.
+    if fmt.strike == Some(true) || fmt.is_deletion == Some(true) {
+        prims.push(Primitive::Decoration(DecorationPrimitive {
+            deco: DecoKind::Strike,
+            x: px(x),
+            y: px(paint_baseline - (font_px * 0.3).round()),
+            w: px(width),
+            h: px(thickness),
+            color,
+            dashed: false,
+            dotted: false,
+            attrs,
+        }));
+    }
+}
+
+/// Shape one styled text slice into [`GlyphRunPrimitive`]s and push them, or
+/// return `false` to signal the caller to emit a [`TextRunPrimitive`]
+/// instead. Returns `false` (touching nothing) when the run has no text, its
+/// font family has no chain, or any subrange fails to shape — so the fallback
+/// is always a clean whole-segment TextRunPrimitive, never a partial mix.
+///
+/// A run can span several fallback fonts, but a GlyphRun is single-font by
+/// contract, so the segment is split into maximal same-font subranges (the same
+/// policy as ooxml-text `measure_plain_text`) and one GlyphRun is emitted per
+/// subrange. RTL subranges are placed in visual order. The pen advance
+/// accumulates ACROSS subranges so contiguous glyphs keep flowing; each glyph's
+/// `x` is `x + accumulated_advance + x_offset`, its `y` is `baseline - y_offset`
+/// (shaped `y_offset` is up, screen y is down).
+/// Justification stretch (`word_spacing`) is folded into the advance after each
+/// U+0020 cluster, matching how `emit_line` computed the line width.
+#[allow(clippy::too_many_arguments)]
+fn try_emit_glyph_runs(
+    prims: &mut Vec<Primitive>,
+    shape_fonts: &ShapeFonts<'_>,
+    text: &str,
+    fmt: &RunFormattingIn,
+    pm_start: Option<i64>,
+    pm_end: Option<i64>,
+    x: f64,
+    baseline: f64,
+    word_spacing: &Option<Number>,
+    bidi_level: u8,
+    exact_width: Option<f64>,
+    logical_order: Option<u64>,
+    attrs: &DocAttrs,
+    color: &str,
+    paint_clip: &Option<ClipRect>,
+    auto_space: ooxml_text::AutoSpace,
+) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    // Browser-shaped text primitives are still the faithful path for CSS-only
+    // effects such as small-caps, text-emphasis, and hidden dotted underlines.
+    if text_primitive_requires_browser_path(fmt) {
+        return false;
+    }
+    let family = fmt.font_family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY);
+    let bold = fmt.bold == Some(true);
+    let italic = fmt.italic == Some(true);
+    let Some(chain) = shape_fonts.chain_for(family, bold, italic) else {
+        return false;
+    };
+    if chain.ids.is_empty()
+        || chain
+            .ids
+            .iter()
+            .any(|&id| shape_fonts.store.metrics(id).is_err())
+    {
+        return false;
+    }
+    // Each character takes its face from its own font slot, as measurement
+    // does (ooxml-text `family_for_slot`): Chinese text in a run with
+    // `w:ascii="Times New Roman" w:eastAsia="黑体"` is drawn in 黑体, not in
+    // Times New Roman's coverage fallback.
+    let slots = fmt.font_slots.as_ref();
+    let east_asia_hint = slots.and_then(|slots| slots.hint.as_deref()) == Some("eastAsia");
+    let slot_of: Vec<usize> =
+        ooxml_text::font_slot_characters(text, fmt.complex_script == Some(true), east_asia_hint)
+            .map(|(_, slot)| slot)
+            .collect();
+    let slot_chains: [(&ShapeFontChain, &str); 4] = std::array::from_fn(|slot| {
+        let selected = slots.and_then(|slots| match slot {
+            0 => slots.ascii.as_deref(),
+            1 => slots.h_ansi.as_deref(),
+            2 => slots.east_asia.as_deref(),
+            _ => slots.cs.as_deref(),
+        });
+        selected
+            .filter(|name| !name.is_empty())
+            .and_then(|name| {
+                shape_fonts
+                    .chain_for(name, bold, italic)
+                    .filter(|chain| {
+                        !chain.ids.is_empty()
+                            && chain
+                                .ids
+                                .iter()
+                                .all(|&id| shape_fonts.store.metrics(id).is_ok())
+                    })
+                    .map(|chain| (chain, name))
+            })
+            .unwrap_or((chain, family))
+    });
+    let resolve = |index: usize, ch| {
+        let (chain, family) = slot_chains[slot_of.get(index).copied().unwrap_or(1)];
+        chain.resolve_with_style(shape_fonts.store, ch, bold, italic, family)
+    };
+    let echo_font_route = fmt.complex_script != Some(true)
+        && fmt.font_slots.as_ref().is_none_or(|slots| {
+            slots.ascii == slots.h_ansi
+                && slots.ascii_theme == slots.h_ansi_theme
+                && slots
+                    .ascii
+                    .as_deref()
+                    .is_none_or(|name| name.eq_ignore_ascii_case(family))
+                && slots.hint.as_deref().is_none_or(|hint| hint == "default")
+        });
+
+    let size_px = effective_font_px_of(fmt);
+    let features = kern_features_of(fmt, size_px);
+    let ws_px = word_spacing.as_ref().map(num_f64).unwrap_or(0.0);
+    let letter_spacing = fmt.letter_spacing.unwrap_or(0.0);
+    let direction = shape_direction_for_level(bidi_level);
+    let rtl = if direction == ooxml_text::ShapeDirection::Rtl {
+        Some(true)
+    } else {
+        None
+    };
+
+    // resolve each char to a font (chain head fallback per ooxml-text). A run
+    // covered by a single font — the overwhelmingly common case — is detected
+    // in this validation pass without any per-char scratch allocation.
+    let mut first_font: Option<ooxml_text::FontId> = None;
+    let mut uniform = true;
+    for (index, ch) in text.chars().enumerate() {
+        match resolve(index, ch) {
+            Some(font) => match first_font {
+                None => first_font = Some(font),
+                Some(first) if font != first => uniform = false,
+                Some(_) => {}
+            },
+            None => return false,
+        }
+    }
+    let Some(first_font) = first_font else {
+        return false;
+    };
+
+    /// one maximal same-font subrange: its owned text slice plus the utf16
+    /// offsets of its char boundaries within the whole segment
+    struct ShapeSegment {
+        text: String,
+        font: ooxml_text::FontId,
+        utf16_start: usize,
+        utf16_end: usize,
+    }
+
+    let mut segments: Vec<ShapeSegment> = if uniform {
+        vec![ShapeSegment {
+            text: text.to_owned(),
+            font: first_font,
+            utf16_start: 0,
+            // the single segment is also the last one, which closes on pm_end
+            // without consulting utf16_end
+            utf16_end: 0,
+        }]
+    } else {
+        let chars: Vec<char> = text.chars().collect();
+        let mut fonts: Vec<ooxml_text::FontId> = Vec::with_capacity(chars.len());
+        for (index, &ch) in chars.iter().enumerate() {
+            match resolve(index, ch) {
+                Some(font) => fonts.push(font),
+                None => return false,
+            }
+        }
+        // utf16 prefix table: prefix[i] = utf16 length of chars[..i], so a
+        // subrange's doc span is two lookups instead of two O(n) rescans
+        let mut prefix = Vec::with_capacity(chars.len() + 1);
+        let mut units = 0usize;
+        prefix.push(0);
+        for &ch in &chars {
+            units += ch.len_utf16();
+            prefix.push(units);
+        }
+        let mut segments = Vec::new();
+        let mut ci = 0usize;
+        while ci < chars.len() {
+            let font = fonts[ci];
+            let mut cj = ci + 1;
+            while cj < chars.len() && fonts[cj] == font {
+                cj += 1;
+            }
+            segments.push(ShapeSegment {
+                text: chars[ci..cj].iter().collect(),
+                font,
+                utf16_start: prefix[ci],
+                utf16_end: prefix[cj],
+            });
+            ci = cj;
+        }
+        segments
+    };
+
+    // build the glyph runs into a local buffer; commit only when every subrange
+    // shapes, so a mid-segment failure never leaves a partial run behind
+    let mut local: Vec<Primitive> = Vec::new();
+    let mut acc = 0.0_f64; // pen advance from the segment origin `x`
+    let segment_count = segments.len();
+    // East Asian auto-space (`w:autoSpaceDE` / `w:autoSpaceDN`): the measure
+    // pass already widened the cluster before each boundary, so the pen has to
+    // widen with it or the segment's `exact_width` reconciliation would dump
+    // every boundary's gap onto its last glyph. A boundary that falls between
+    // two same-font subranges is spaced from the next subrange's first
+    // character. RTL never mixes with East Asian text here, so it is left out.
+    let auto_space_active =
+        auto_space.any() && direction != ooxml_text::ShapeDirection::Rtl && segment_count > 0;
+    let subrange_first: Vec<Option<char>> = if auto_space_active {
+        segments
+            .iter()
+            .map(|segment| segment.text.chars().next())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let range_order: Box<dyn Iterator<Item = usize>> =
+        if direction == ooxml_text::ShapeDirection::Rtl {
+            Box::new((0..segment_count).rev())
+        } else {
+            Box::new(0..segment_count)
+        };
+    for range_index in range_order {
+        let font = segments[range_index].font;
+        // each index is visited exactly once, so the segment text moves into
+        // its primitive instead of cloning
+        let sub_text = std::mem::take(&mut segments[range_index].text);
+        let (sub_start_utf16, sub_end_utf16) = (
+            segments[range_index].utf16_start,
+            segments[range_index].utf16_end,
+        );
+        let is_last = range_index + 1 == segment_count;
+        let glyphs = match ooxml_text::shape_with_direction(
+            shape_fonts.store,
+            font,
+            &sub_text,
+            size_px as f32,
+            &features,
+            direction,
+        ) {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+
+        let auto_gaps: Vec<(usize, f64)> = if auto_space_active {
+            let mut gaps = Vec::new();
+            let mut chars = sub_text.char_indices().peekable();
+            while let Some((offset, ch)) = chars.next() {
+                let next = chars
+                    .peek()
+                    .map(|&(_, next)| next)
+                    .or_else(|| subrange_first.get(range_index + 1).copied().flatten());
+                let Some(next) = next else { break };
+                let extra = auto_space.extra_px(ch, next, size_px as f32, size_px as f32) as f64;
+                if extra > 0.0 {
+                    gaps.push((offset, extra));
+                }
+            }
+            gaps
+        } else {
+            Vec::new()
+        };
+        // Compressed punctuation (`w:characterSpacingControl`): measurement
+        // narrowed each fullwidth pause mark and bracket, so the pen narrows
+        // with it and an opening bracket's glyph moves left into the half it
+        // gave up.
+        let trims: Vec<(usize, ooxml_text::PunctuationTrim)> =
+            if auto_space.compress_punctuation && direction != ooxml_text::ShapeDirection::Rtl {
+                let mut trims = Vec::new();
+                for (index, g) in glyphs.iter().enumerate() {
+                    // one glyph for one character: a ligature or a decomposed
+                    // mark is never a lone fullwidth punctuation mark
+                    let shares_cluster = |other: Option<&ooxml_text::ShapedGlyph>| {
+                        other.is_some_and(|other| other.cluster == g.cluster)
+                    };
+                    if shares_cluster(glyphs.get(index + 1))
+                        || shares_cluster(index.checked_sub(1).and_then(|i| glyphs.get(i)))
+                    {
+                        continue;
+                    }
+                    let mut chars = sub_text[g.cluster as usize..].chars();
+                    let Some(ch) = chars.next() else { continue };
+                    let Some(trim) = auto_space.punctuation_trim(ch, g.x_advance, size_px as f32)
+                    else {
+                        continue;
+                    };
+                    let end = g.cluster as usize + ch.len_utf8();
+                    let next_cluster = glyphs
+                        .iter()
+                        .map(|other| other.cluster as usize)
+                        .filter(|&cluster| cluster > g.cluster as usize)
+                        .min()
+                        .unwrap_or(sub_text.len());
+                    if next_cluster == end {
+                        trims.push((index, trim));
+                    }
+                }
+                trims
+            } else {
+                Vec::new()
+            };
+        let has_extra_advance = letter_spacing != 0.0 || ws_px != 0.0 || !auto_gaps.is_empty();
+        let cluster_bounds = if has_extra_advance {
+            let mut bounds: Vec<usize> =
+                glyphs.iter().map(|glyph| glyph.cluster as usize).collect();
+            bounds.sort_unstable();
+            bounds.dedup();
+            bounds.push(sub_text.len());
+            bounds
+        } else {
+            Vec::new()
+        };
+        let mut natural: Vec<f64> = Vec::with_capacity(glyphs.len());
+        for (index, g) in glyphs.iter().enumerate() {
+            let mut advance = g.x_advance as f64;
+            if has_extra_advance
+                && glyphs
+                    .get(index + 1)
+                    .is_none_or(|next| next.cluster != g.cluster)
+            {
+                let start = g.cluster as usize;
+                let boundary = cluster_bounds.binary_search(&start).unwrap();
+                let end = cluster_bounds[boundary + 1];
+                let cluster = &sub_text[start..end];
+                advance += letter_spacing * cluster.chars().count() as f64;
+                advance += ws_px * cluster.chars().filter(|&ch| ch == ' ').count() as f64;
+                advance += auto_gaps
+                    .iter()
+                    .filter(|(offset, _)| *offset >= start && *offset < end)
+                    .map(|(_, extra)| extra)
+                    .sum::<f64>();
+            }
+            natural.push(advance);
+        }
+        // measurement spends a line's compression budget only when the line is
+        // tight, so the marks give up their share of what the segment lost
+        let compressible: f64 = trims.iter().map(|(_, trim)| f64::from(trim.trim)).sum();
+        let compression = match exact_width {
+            Some(target) if compressible > 0.0 => {
+                ((natural.iter().sum::<f64>() - target) / compressible).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        };
+        let mut placed: Vec<PlacedGlyph> = Vec::with_capacity(glyphs.len());
+        for (index, g) in glyphs.iter().enumerate() {
+            let mut advance = natural[index];
+            let mut shift = 0.0_f64;
+            if let Ok(found) = trims.binary_search_by_key(&index, |(at, _)| *at) {
+                let trim = trims[found].1;
+                shift = f64::from(trim.shift) * compression;
+                advance -= f64::from(trim.trim) * compression;
+            }
+            placed.push(PlacedGlyph {
+                id: g.glyph_id,
+                x: round3(x + acc + shift + g.x_offset as f64),
+                y: round3(baseline - g.y_offset as f64),
+                cluster: g.cluster,
+                advance: round3(advance),
+                logical_order,
+                bidi_level: exact_width.map(|_| bidi_level),
+            });
+            acc += advance;
+        }
+
+        // text runs are 1 document position per char, so a subrange's doc span shifts
+        // pm_start by its char offset; the last subrange closes on pm_end so a
+        // single-subrange run carries exactly the segment's [pm_start, pm_end]
+        let mut sub_attrs = attrs.clone();
+        sub_attrs.doc_start = pm_start.map(|p| p + sub_start_utf16 as i64);
+        sub_attrs.doc_end = if is_last {
+            pm_end
+        } else {
+            pm_start.map(|p| p + sub_end_utf16 as i64)
+        };
+        // the resolved CSS face for the canvas fillText safety net (glyph
+        // outlines unavailable) — same shorthand the TextRunPrimitive would
+        // carry, so the fallback keeps family/weight/style
+        sub_attrs.fallback_font = Some(match shape_fonts.store.backstop_style(font) {
+            Some((bold, italic)) => {
+                styled_css_font(fmt, ooxml_text::BASE_LATIN_FAMILY, bold, italic)
+            }
+            None => css_font(fmt),
+        });
+        sub_attrs.modern_effects = fmt.modern_effects.clone().map(Box::new);
+
+        local.push(Primitive::GlyphRun(GlyphRunPrimitive {
+            font_id: font.to_u32(),
+            size: round3(size_px),
+            color: color.to_string(),
+            paint_text: glyph_paint_text(shape_fonts.store, font, &sub_text).map(Box::new),
+            text: sub_text,
+            glyphs: placed,
+            echo: Some(EchoRunFacts {
+                x: 0.0,
+                right: 0.0,
+                kern: features.is_empty(),
+                kerning: fmt.kerning_min_pt.unwrap_or(0.0),
+                primary_font: echo_font_route && chain.ids.first() == Some(&font),
+                letter_spacing: fmt.letter_spacing.unwrap_or(0.0),
+                position: fmt.position_px.unwrap_or(0.0),
+                scale: fmt.horizontal_scale.unwrap_or(100.0),
+                can_empty: false,
+                stretch: None,
+                center_width: None,
+            }),
+            paint_clip: paint_clip.clone(),
+            word_spacing: word_spacing.clone(),
+            rtl,
+            opacity: None,
+            rotation_deg: None,
+            horizontal_scale: horizontal_scale_of(fmt),
+            all_caps: fmt.all_caps == Some(true),
+            small_caps: fmt.small_caps == Some(true),
+            hidden: fmt.hidden == Some(true),
+            text_shadow: text_shadow_of(fmt),
+            text_outline: fmt.text_outline == Some(true),
+            emphasis_mark: fmt.emphasis_mark.clone(),
+            text_effect: fmt.text_effect.clone(),
+            attrs: sub_attrs,
+        }));
+    }
+
+    if let Some(target) = exact_width
+        && let Some(Primitive::GlyphRun(run)) = local.last_mut()
+        && let Some(last) = run.glyphs.last_mut()
+    {
+        last.advance = round3(last.advance + target - acc);
+    }
+
+    prims.extend(local);
+    true
+}
+
+/// field instruction -> display text (PAGE/NUMPAGES from the page context;
+/// DATE/TIME deliberately resolve to the stored fallback for determinism)
+fn field_text(f: &FieldRunIn, ctx: &RenderCtx<'_>) -> String {
+    match f.field_type.as_deref() {
+        Some("PAGE") => {
+            crate::regions::page_field_text(ctx.page_label.as_deref(), ctx.page_number).into_owned()
+        }
+        Some("NUMPAGES") if ctx.total_pages == 0 => {
+            if ctx.cached_page_totals {
+                f.fallback
+                    .clone()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        }
+        Some("NUMPAGES") => ctx.total_pages.to_string(),
+        _ => style_ref_text(f, ctx).unwrap_or_else(|| f.fallback.clone().unwrap_or_default()),
+    }
+}
+
+/// Canonical form of a style name; Word matches the localized built-in
+/// heading names against the English ones.
+fn canonical_style_name(name: &str) -> String {
+    let compact: String = name
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    match compact.strip_prefix("标题") {
+        Some(level) => format!("heading{level}"),
+        None => compact,
+    }
+}
+
+fn paragraph_text(block: &ParagraphBlockIn) -> String {
+    let mut text = String::new();
+    for run in &block.runs {
+        match run {
+            RunIn::Text(run) => text.push_str(&run.text),
+            RunIn::Field(field) => text.push_str(field.fallback.as_deref().unwrap_or_default()),
+            _ => {}
+        }
+    }
+    text.trim().to_owned()
+}
+
+/// A header/footer STYLEREF resolved against the page's paragraphs: the first
+/// match on the page (the last in a footer or with `\l`), else the nearest
+/// earlier one. `None` leaves the cached result.
+fn style_ref_text(f: &FieldRunIn, ctx: &RenderCtx<'_>) -> Option<String> {
+    let pages = ctx.style_refs?;
+    let instruction = f.instruction.as_deref()?;
+    let rest = instruction.trim_start();
+    let keyword_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    if !rest[..keyword_end].eq_ignore_ascii_case("STYLEREF") {
+        return None;
+    }
+    let rest = rest[keyword_end..].trim_start();
+    let (name, tail) = match rest.strip_prefix('"') {
+        Some(quoted) => {
+            let end = quoted.find('"')?;
+            (&quoted[..end], &quoted[end + 1..])
+        }
+        None => {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (&rest[..end], &rest[end..])
+        }
+    };
+    if name.is_empty() || name.starts_with('\\') {
+        return None;
+    }
+    let mut number = false;
+    let mut last = ctx.style_ref_last;
+    for switch in tail.split('\\').skip(1) {
+        match switch.chars().next()? {
+            'n' | 'r' | 'w' => number = true,
+            'l' => last = true,
+            's' | 'p' | 't' | 'f' => return None,
+            _ => {}
+        }
+    }
+    let wanted = canonical_style_name(name);
+    let matches = |block: &&&ParagraphBlockIn| {
+        block.attrs.as_ref().is_some_and(|attrs| {
+            [attrs.style_name.as_deref(), attrs.style_id.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|style| canonical_style_name(style) == wanted)
+        })
+    };
+    let page = pages.get(ctx.page_index)?;
+    let on_page = if last {
+        page.iter().rev().find(matches)
+    } else {
+        page.iter().find(matches)
+    };
+    let block = on_page.or_else(|| {
+        pages[..ctx.page_index]
+            .iter()
+            .rev()
+            .find_map(|page| page.iter().rev().find(matches))
+    })?;
+    if number {
+        let marker = block.attrs.as_ref()?.list_marker.as_deref()?;
+        Some(marker.trim().trim_end_matches('.').trim_end().to_owned())
+    } else {
+        Some(paragraph_text(block))
+    }
+}
+
+/// field instruction cap — announcement identity, not a full field-code view
+pub const MAX_FIELD_INSTRUCTION_CHARS: usize = 1024;
+
+/// Inert accessibility identity of a field run: its resolved category, raw type
+/// token, and bounded instruction. The instruction is file-derived and
+/// attacker-controlled; it is carried for announcement ONLY — nothing here or
+/// downstream evaluates it (field codes render inert; see the repo security guidelines).
+fn field_metadata(f: &FieldRunIn) -> FieldMetadata {
+    FieldMetadata {
+        category: f.field_type.clone(),
+        r#type: capped_string(f.raw_type.as_deref(), MAX_FIELD_INSTRUCTION_CHARS),
+        instruction: capped_string(f.instruction.as_deref(), MAX_FIELD_INSTRUCTION_CHARS),
+    }
+}
+
+fn border_visible(b: &BorderEdgeIn) -> bool {
+    !matches!(b.style.as_deref(), Some("none") | Some("nil"))
+        && !matches!(b.ooxml_style.as_deref(), Some("none") | Some("nil"))
+        && b.width.unwrap_or(1.0) > 0.0
+}
+
+fn border_number(b: &BorderEdgeIn) -> u8 {
+    match b
+        .ooxml_style
+        .as_deref()
+        .or(b.style.as_deref())
+        .unwrap_or("single")
+    {
+        "single" | "solid" => 1,
+        "thick" => 2,
+        "double" => 3,
+        "dotted" => 4,
+        "dashed" => 5,
+        "dotDash" => 6,
+        "dotDotDash" => 7,
+        "triple" => 8,
+        "thinThickSmallGap" => 9,
+        "thickThinSmallGap" => 10,
+        "thinThickThinSmallGap" => 11,
+        "thinThickMediumGap" => 12,
+        "thickThinMediumGap" => 13,
+        "thinThickThinMediumGap" => 14,
+        "thinThickLargeGap" => 15,
+        "thickThinLargeGap" => 16,
+        "thinThickThinLargeGap" => 17,
+        "wave" => 18,
+        "doubleWave" => 19,
+        "dashSmallGap" => 20,
+        "dashDotStroked" => 21,
+        "threeDEmboss" | "ridge" => 22,
+        "threeDEngrave" | "groove" => 23,
+        "outset" => 24,
+        "inset" => 25,
+        _ => 1,
+    }
+}
+
+fn is_dot_dash_border(border_num: u8) -> bool {
+    matches!(border_num, 4..=7 | 20 | 21)
+}
+
+fn border_brightness_key(edge: &BorderEdgeIn) -> (u32, u32, u32) {
+    let (r, g, b) = edge
+        .color
+        .as_deref()
+        .map(|raw| raw.strip_prefix('#').unwrap_or(raw))
+        .filter(|hex| hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .and_then(|hex| {
+            Some((
+                u32::from(u8::from_str_radix(&hex[0..2], 16).ok()?),
+                u32::from(u8::from_str_radix(&hex[2..4], 16).ok()?),
+                u32::from(u8::from_str_radix(&hex[4..6], 16).ok()?),
+            ))
+        })
+        .unwrap_or((0, 0, 0));
+    (r + b + 2 * g, b + 2 * g, g)
+}
+
+/// Resolves a shared cell edge from both neighbours per ECMA-376 Part 1 §17.4.66.
+fn resolve_shared_border<'a>(
+    first: Option<&'a BorderEdgeIn>,
+    second: Option<&'a BorderEdgeIn>,
+) -> Option<&'a BorderEdgeIn> {
+    let first = first.filter(|edge| border_visible(edge));
+    let second = second.filter(|edge| border_visible(edge));
+    let (Some(a), Some(b)) = (first, second) else {
+        return first.or(second);
+    };
+    let num_a = border_number(a);
+    let num_b = border_number(b);
+    let weight_a = a.width.unwrap_or(1.0) * f64::from(num_a);
+    let weight_b = b.width.unwrap_or(1.0) * f64::from(num_b);
+    if (weight_a - weight_b).abs() > 1e-9 {
+        return if weight_a > weight_b {
+            Some(a)
+        } else {
+            Some(b)
+        };
+    }
+    let rank_a = (!is_dot_dash_border(num_a), num_a);
+    let rank_b = (!is_dot_dash_border(num_b), num_b);
+    if rank_a != rank_b {
+        return if rank_a > rank_b { Some(a) } else { Some(b) };
+    }
+    if border_brightness_key(b) < border_brightness_key(a) {
+        Some(b)
+    } else {
+        Some(a)
+    }
+}
+
+fn display_border_style(style: Option<&str>) -> DisplayBorderStyle {
+    match style.unwrap_or("single") {
+        "double" => DisplayBorderStyle::Double,
+        "dotted" => DisplayBorderStyle::Dotted,
+        "dash" | "dashed" | "dashSmallGap" | "dashLong" | "dashLargeGap" => {
+            DisplayBorderStyle::Dashed
+        }
+        "dotDash" | "dashDot" => DisplayBorderStyle::DashDot,
+        "dotDotDash" | "dashDotDot" => DisplayBorderStyle::DashDotDot,
+        "triple" => DisplayBorderStyle::Triple,
+        "thinThickSmallGap" | "thinThickMediumGap" | "thinThickLargeGap" | "thinThick" => {
+            DisplayBorderStyle::ThinThick
+        }
+        "thickThinSmallGap" | "thickThinMediumGap" | "thickThinLargeGap" | "thickThin" => {
+            DisplayBorderStyle::ThickThin
+        }
+        "wave" => DisplayBorderStyle::Wave,
+        "doubleWave" => DisplayBorderStyle::DoubleWave,
+        "threeDEngrave" | "groove" => DisplayBorderStyle::Groove,
+        "threeDEmboss" | "ridge" => DisplayBorderStyle::Ridge,
+        "inset" => DisplayBorderStyle::Inset,
+        "outset" => DisplayBorderStyle::Outset,
+        _ => DisplayBorderStyle::Solid,
+    }
+}
+
+fn border_dash(style: DisplayBorderStyle, width: f64) -> Option<Vec<Number>> {
+    let unit = width.max(1.0);
+    match style {
+        DisplayBorderStyle::Dotted => Some(vec![px(unit), px(unit * 1.5)]),
+        DisplayBorderStyle::Dashed => Some(vec![px(unit * 4.0), px(unit * 2.0)]),
+        DisplayBorderStyle::DashDot => Some(vec![
+            px(unit * 4.0),
+            px(unit * 1.5),
+            px(unit),
+            px(unit * 1.5),
+        ]),
+        DisplayBorderStyle::DashDotDot => Some(vec![
+            px(unit * 4.0),
+            px(unit * 1.5),
+            px(unit),
+            px(unit * 1.5),
+            px(unit),
+            px(unit * 1.5),
+        ]),
+        _ => None,
+    }
+}
+
+fn borders_edge_equal(a: Option<&BorderEdgeIn>, b: Option<&BorderEdgeIn>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.style == b.style && a.width == b.width && a.color == b.color,
+        _ => false,
+    }
+}
+
+/// ECMA-376 §17.3.1.24 border grouping: adjacent paragraphs with identical
+/// border definitions form a group
+fn borders_form_group(a: Option<&ParaBordersIn>, b: Option<&ParaBordersIn>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return false;
+    };
+    borders_edge_equal(a.top.as_ref(), b.top.as_ref())
+        && borders_edge_equal(a.bottom.as_ref(), b.bottom.as_ref())
+        && borders_edge_equal(a.left.as_ref(), b.left.as_ref())
+        && borders_edge_equal(a.right.as_ref(), b.right.as_ref())
+        && borders_edge_equal(a.between.as_ref(), b.between.as_ref())
+}
+
+fn points_to_px(points: f64) -> f64 {
+    points * 96.0 / 72.0
+}
+
+fn eighths_to_px(eighths: f64) -> f64 {
+    points_to_px(eighths / 8.0)
+}
+
+fn page_border_should_render(page_number: u64, display: Option<&str>) -> bool {
+    match display.unwrap_or("allPages") {
+        "firstPage" => page_number == 1,
+        "notFirstPage" => page_number != 1,
+        _ => true,
+    }
+}
+
+fn page_border_visible(border: Option<&PageBorderSpecIn>) -> bool {
+    let Some(border) = border else {
+        return false;
+    };
+    !matches!(border.style.as_deref(), Some("none") | Some("nil"))
+}
+
+fn page_border_space_px(border: Option<&PageBorderSpecIn>) -> f64 {
+    border
+        .and_then(|b| b.space)
+        .map(points_to_px)
+        .unwrap_or(0.0)
+}
+
+fn page_border_style(style: Option<&str>) -> &'static str {
+    match style.unwrap_or("single") {
+        "double" | "triple" => "double",
+        "dotted" => "dotted",
+        "dashed" | "dashSmallGap" => "dashed",
+        "threeDEmboss" => "ridge",
+        "threeDEngrave" => "groove",
+        "outset" => "outset",
+        "inset" => "inset",
+        _ => "solid",
+    }
+}
+
+fn normalize_hex_color(raw: &str) -> String {
+    if raw.starts_with('#') || raw.starts_with("rgb") || raw == "transparent" {
+        return raw.to_string();
+    }
+    if raw.eq_ignore_ascii_case("auto") {
+        return "#000000".to_string();
+    }
+    if raw.len() == 6 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return format!("#{raw}");
+    }
+    raw.to_string()
+}
+
+fn page_border_color(color: Option<&Value>) -> String {
+    let Some(color) = color else {
+        return "#000000".to_string();
+    };
+    if let Some(s) = color.as_str() {
+        return normalize_hex_color(s);
+    }
+    if color.get("auto").and_then(Value::as_bool).unwrap_or(false) {
+        return "#000000".to_string();
+    }
+    if let Some(rgb) = color.get("rgb").and_then(Value::as_str) {
+        return normalize_hex_color(rgb);
+    }
+    "#000000".to_string()
+}
+
+fn page_border_side(border: Option<&PageBorderSpecIn>) -> Option<PageBorderSide> {
+    if !page_border_visible(border) {
+        return None;
+    }
+    let border = border?;
+    let mut width = eighths_to_px(border.size.unwrap_or(6.0)).max(1.0);
+    let style = page_border_style(border.style.as_deref()).to_string();
+    if style == "double" && width < 3.0 {
+        width = 3.0;
+    }
+    Some(PageBorderSide {
+        width: px(width),
+        color: page_border_color(border.color.as_ref()),
+        style,
+    })
+}
+
+fn page_border_primitive(
+    options: &RenderOptionsIn,
+    page: &PageIn,
+    page_number: u64,
+) -> Option<PageBorderPrimitive> {
+    let (pb, page_number) = match (&options.page_borders, &page.page_borders) {
+        (Some(pb), _) => (pb, page_number),
+        (None, Some(pb)) => (
+            pb,
+            page.section_page_index
+                .map_or(page_number, |index| index + 1),
+        ),
+        (None, None) => return None,
+    };
+    if !page_border_should_render(page_number, pb.display.as_deref()) {
+        return None;
+    }
+    if ![
+        pb.top.as_ref(),
+        pb.right.as_ref(),
+        pb.bottom.as_ref(),
+        pb.left.as_ref(),
+    ]
+    .into_iter()
+    .any(page_border_visible)
+    {
+        return None;
+    }
+
+    let top_offset = page_border_space_px(pb.top.as_ref());
+    let right_offset = page_border_space_px(pb.right.as_ref());
+    let bottom_offset = page_border_space_px(pb.bottom.as_ref());
+    let left_offset = page_border_space_px(pb.left.as_ref());
+    let (top, right, bottom, left) = if pb.offset_from.as_deref() == Some("page") {
+        (top_offset, right_offset, bottom_offset, left_offset)
+    } else {
+        (
+            (page.margins.top - top_offset).max(0.0),
+            (page.margins.right - right_offset).max(0.0),
+            (page.margins.bottom - bottom_offset).max(0.0),
+            (page.margins.left - left_offset).max(0.0),
+        )
+    };
+    let w = (page.size.w - left - right).max(0.0);
+    let h = (page.size.h - top - bottom).max(0.0);
+    Some(PageBorderPrimitive {
+        x: px(left),
+        y: px(top),
+        w: px(w),
+        h: px(h),
+        z_order: if pb.z_order.as_deref() == Some("back") {
+            Some(PageBorderZOrder::Back)
+        } else {
+            Some(PageBorderZOrder::Front)
+        },
+        top: page_border_side(pb.top.as_ref()),
+        right: page_border_side(pb.right.as_ref()),
+        bottom: page_border_side(pb.bottom.as_ref()),
+        left: page_border_side(pb.left.as_ref()),
+    })
+}
+
+/// Paints a laid-out equation as text runs and rule bars around `baseline`.
+fn emit_math(
+    prims: &mut Vec<Primitive>,
+    math: &ooxml_text::math::MathLayout,
+    x: f64,
+    baseline: f64,
+    attrs: &DocAttrs,
+) {
+    use ooxml_text::math::MathItem;
+    for item in &math.items {
+        match item {
+            MathItem::Glyph {
+                text,
+                x: gx,
+                y: gy,
+                size,
+                width,
+                italic,
+                bold,
+            } => {
+                let fmt = RunFormattingIn {
+                    font_family: Some("Cambria Math".to_string()),
+                    font_size: Some(f64::from(*size) * 0.75),
+                    italic: Some(*italic),
+                    bold: Some(*bold),
+                    ..RunFormattingIn::default()
+                };
+                prims.push(Primitive::Text(TextRunPrimitive {
+                    text: text.clone(),
+                    paint_text: None,
+                    x: px(x + f64::from(*gx)),
+                    baseline_y: px(baseline + f64::from(*gy)),
+                    width: px(f64::from(*width)),
+                    paint_clip: None,
+                    font: css_font(&fmt),
+                    scripts: None,
+                    color: "#000000".to_string(),
+                    letter_spacing: None,
+                    word_spacing: None,
+                    rtl: None,
+                    opacity: None,
+                    rotation_deg: None,
+                    horizontal_scale: None,
+                    substitute_scale: None,
+                    all_caps: false,
+                    small_caps: false,
+                    hidden: false,
+                    text_shadow: None,
+                    text_outline: false,
+                    emphasis_mark: None,
+                    text_effect: None,
+                    attrs: attrs.clone(),
+                }));
+            }
+            MathItem::Rule { x: rx, y: ry, w, h } => {
+                let y = baseline + f64::from(*ry) + f64::from(*h) / 2.0;
+                prims.push(Primitive::Line(LinePrimitive {
+                    x1: px(x + f64::from(*rx)),
+                    y1: px(y),
+                    x2: px(x + f64::from(*rx) + f64::from(*w)),
+                    y2: px(y),
+                    stroke_width: px(f64::from(*h)),
+                    color: "#000000".to_string(),
+                    dash: None,
+                    role: None,
+                    border_style: None,
+                    secondary_color: None,
+                    opacity: None,
+                    border_owner: None,
+                    attrs: DocAttrs::default(),
+                }));
+            }
+        }
+    }
+}
+
+fn emit_horizontal_rule(
+    prims: &mut Vec<Primitive>,
+    rule: &crate::types::HorizontalRule,
+    block_ref: &BlockRef,
+    x: f64,
+    baseline: f64,
+    available_width: f64,
+) {
+    let width = rule.rendered_width(available_width);
+    let height = (rule.height - 8.0 / 15.0).max(0.0);
+    let x = x + if rule.no_shade { 0.0 } else { 1.0 };
+    let y = baseline - if rule.no_shade { height } else { rule.height };
+    let mut attrs = block_ref.attrs();
+    attrs.doc_start = Some(rule.pm_start as i64);
+    attrs.doc_end = Some(rule.pm_end as i64);
+    if rule.no_shade {
+        prims.push(Primitive::Rect(RectPrimitive {
+            x: px(x),
+            y: px(y),
+            w: px(width),
+            h: px(height),
+            fill: rule.color.clone(),
+            attrs,
+        }));
+    } else {
+        for (x1, y1, x2, y2) in [
+            (x, y, x + width, y),
+            (x, y + height, x + width, y + height),
+            (x, y, x, y + height),
+            (x + width, y, x + width, y + height),
+        ] {
+            prims.push(Primitive::Line(LinePrimitive {
+                x1: px(x1),
+                y1: px(y1),
+                x2: px(x2),
+                y2: px(y2),
+                stroke_width: px(1.0),
+                color: "#000000".to_owned(),
+                attrs: attrs.clone(),
+                ..LinePrimitive::contract_defaults()
+            }));
+        }
+    }
+}
+
+/// paragraph borders as line primitives (role 'border'): top only when the
+/// fragment opens its group (between-rule otherwise), bottom only when it
+/// closes it, left/right on every member, plus the §17.3.1.4 bar edge
+#[allow(clippy::too_many_arguments)]
+/// The float offsets every line of a paragraph fragment shares, or zeros when
+/// its lines sit in different strips (or none is narrowed).
+fn shared_float_offsets(measure: &ParagraphExtentIn, frag: &ParagraphFragmentIn) -> (f64, f64) {
+    let to = frag.to_line.min(measure.lines.len());
+    let lines = measure.lines.get(frag.from_line.min(to)..to).unwrap_or(&[]);
+    let offsets = |line: &LineIn| {
+        (
+            line.left_offset.filter(|v| v.is_finite()).unwrap_or(0.0),
+            line.right_offset.filter(|v| v.is_finite()).unwrap_or(0.0),
+        )
+    };
+    let Some(first) = lines.first().map(offsets) else {
+        return (0.0, 0.0);
+    };
+    if first == (0.0, 0.0) || lines.iter().any(|line| offsets(line) != first) {
+        return (0.0, 0.0);
+    }
+    (first.0.max(0.0), first.1.max(0.0))
+}
+
+fn emit_paragraph_borders(
+    prims: &mut Vec<Primitive>,
+    borders: &ParaBordersIn,
+    prev: Option<&ParaBordersIn>,
+    next: Option<&ParaBordersIn>,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    indent_left: f64,
+    indent_right: f64,
+) {
+    let grouped_with_prev = borders_form_group(prev, Some(borders));
+    let grouped_with_next = borders_form_group(Some(borders), next);
+    let top = if grouped_with_prev {
+        borders.between.as_ref()
+    } else {
+        borders.top.as_ref()
+    };
+    let bottom = if grouped_with_next {
+        None
+    } else {
+        borders.bottom.as_ref()
+    };
+
+    let left_space = borders.left.as_ref().and_then(|b| b.space).unwrap_or(0.0);
+    let right_space = borders.right.as_ref().and_then(|b| b.space).unwrap_or(0.0);
+    let lx = x + indent_left - left_space;
+    let rx = x + width - indent_right + right_space;
+    let ty = y - top.and_then(|b| b.space).unwrap_or(0.0);
+    let by = y + height + bottom.and_then(|b| b.space).unwrap_or(0.0);
+
+    let mut push = |x1: f64, y1: f64, x2: f64, y2: f64, b: &BorderEdgeIn| {
+        if !border_visible(b) {
+            return;
+        }
+        let style = display_border_style(b.style.as_deref());
+        let width = b.width.unwrap_or(1.0);
+        prims.push(Primitive::Line(LinePrimitive {
+            x1: px(x1),
+            y1: px(y1),
+            x2: px(x2),
+            y2: px(y2),
+            stroke_width: px(width),
+            color: b.color.clone().unwrap_or_else(|| "#000000".to_string()),
+            dash: border_dash(style, width),
+            role: Some(LineRole::Border),
+            border_style: Some(style),
+            border_owner: Some(BorderOwner::Paragraph),
+            ..LinePrimitive::contract_defaults()
+        }));
+    };
+
+    if let Some(b) = top {
+        push(lx, ty, rx, ty, b);
+    }
+    if let Some(b) = bottom {
+        push(lx, by, rx, by, b);
+    }
+    if let Some(b) = borders.left.as_ref() {
+        push(lx, ty, lx, by, b);
+    }
+    if let Some(b) = borders.right.as_ref() {
+        push(rx, ty, rx, by, b);
+    }
+    // bar border: vertical decorative rule left of the text (§17.3.1.4)
+    if let Some(b) = borders.bar.as_ref() {
+        push(x - 8.0, y, x - 8.0, y + height, b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// floating images + text boxes
+// ---------------------------------------------------------------------------
+
+/// Page coordinate frame for anchored floats, in pixels.
+#[derive(Clone, Copy)]
+pub(crate) struct PageFloatGeom {
+    pub(crate) horizontal_frame: Option<crate::types::HorizontalFrame>,
+    pub(crate) page_width: f64,
+    pub(crate) page_height: f64,
+    pub(crate) margin_left: f64,
+    pub(crate) margin_top: f64,
+    pub(crate) content_width: f64,
+    pub(crate) content_height: f64,
+}
+
+impl PageFloatGeom {
+    fn with_horizontal_frame(mut self, frame: Option<crate::types::HorizontalFrame>) -> Self {
+        if let Some(frame) = frame {
+            self.margin_left = frame.margin_left;
+            self.content_width = frame.content_width;
+            self.horizontal_frame = Some(frame);
+        }
+        self
+    }
+}
+
+/// an anchor band: `base` is the band's origin (content-relative px) and `size`
+/// its extent; `size == 0` marks a zero-width band (align falls back to base/0).
+struct AnchorBand {
+    base: f64,
+    size: f64,
+}
+
+/// Converts EMU to rounded pixels at 96 DPI.
+fn emu_to_px(emu: f64) -> f64 {
+    (emu * 96.0 / 914400.0).round()
+}
+
+/// Resolves the horizontal band for a `relativeFrom` value.
+fn horizontal_anchor_band(relative_to: Option<&str>, geom: &PageFloatGeom) -> AnchorBand {
+    match relative_to {
+        Some("page") => AnchorBand {
+            base: -geom.margin_left,
+            size: geom.page_width,
+        },
+        Some("leftMargin") => AnchorBand {
+            base: -geom.margin_left,
+            size: geom.margin_left,
+        },
+        Some("rightMargin") => AnchorBand {
+            base: geom.content_width,
+            size: if geom.horizontal_frame.is_some() {
+                geom.page_width - geom.margin_left - geom.content_width
+            } else {
+                geom.margin_left
+            },
+        },
+        Some("column") => geom.horizontal_frame.map_or(
+            AnchorBand {
+                base: 0.0,
+                size: geom.content_width,
+            },
+            |frame| AnchorBand {
+                base: frame.column_x - geom.margin_left,
+                size: frame.column_width,
+            },
+        ),
+        Some("character") => AnchorBand {
+            base: geom
+                .horizontal_frame
+                .map_or(0.0, |frame| frame.column_x - geom.margin_left),
+            size: 0.0,
+        },
+        // margin / insideMargin / outsideMargin / default
+        _ => AnchorBand {
+            base: 0.0,
+            size: geom.content_width,
+        },
+    }
+}
+
+/// Resolves the vertical band for a `relativeFrom` value.
+fn vertical_anchor_band(
+    relative_to: Option<&str>,
+    fragment_y: f64,
+    geom: &PageFloatGeom,
+) -> AnchorBand {
+    match relative_to {
+        Some("paragraph") | Some("line") => AnchorBand {
+            base: fragment_y,
+            size: 0.0,
+        },
+        Some("page") => AnchorBand {
+            base: -geom.margin_top,
+            size: geom.page_height,
+        },
+        Some("topMargin") => AnchorBand {
+            base: -geom.margin_top,
+            size: geom.margin_top,
+        },
+        Some("bottomMargin") => AnchorBand {
+            base: geom.content_height,
+            size: geom.margin_top,
+        },
+        // margin / insideMargin / outsideMargin / default
+        _ => AnchorBand {
+            base: 0.0,
+            size: geom.content_height,
+        },
+    }
+}
+
+/// Resolves a floating image run's OOXML anchor to a content-relative origin.
+///
+/// Each axis reads its `relativeFrom` band, then applies either an explicit
+/// offset or an alignment inside that band. `fragment_y` is the anchoring
+/// paragraph fragment's content-relative top, which is the base for the
+/// `paragraph` and `line` bands. Anchors are resolved here rather than read off
+/// the fragment, because the layout does not store them.
+pub(crate) fn resolve_anchored_position(
+    position: Option<&crate::types::ImageRunPosition>,
+    css_float: Option<&str>,
+    width: f64,
+    height: f64,
+    fragment_y: f64,
+    geom: &PageFloatGeom,
+) -> (f64, f64) {
+    let x = match position.and_then(|p| p.horizontal.as_ref()) {
+        None => {
+            let band = horizontal_anchor_band(Some("column"), geom);
+            if css_float == Some("right") {
+                band.base + band.size - width
+            } else {
+                band.base
+            }
+        }
+        Some(h) => {
+            let band = horizontal_anchor_band(h.relative_to.as_deref(), geom);
+            match h.align.as_deref() {
+                Some("right") => {
+                    if band.size != 0.0 {
+                        band.base + band.size - width
+                    } else {
+                        0.0
+                    }
+                }
+                Some("left") => band.base,
+                Some("center") => {
+                    if band.size != 0.0 {
+                        band.base + (band.size - width) / 2.0
+                    } else {
+                        0.0
+                    }
+                }
+                _ => match h.pos_offset {
+                    Some(off) => band.base + emu_to_px(off),
+                    None => band.base,
+                },
+            }
+        }
+    };
+
+    let y = match position.and_then(|p| p.vertical.as_ref()) {
+        None => fragment_y,
+        Some(v) => {
+            let band = vertical_anchor_band(v.relative_to.as_deref(), fragment_y, geom);
+            match v.align.as_deref() {
+                Some("top") => band.base,
+                Some("center") => {
+                    if band.size != 0.0 {
+                        band.base + (band.size - height) / 2.0
+                    } else {
+                        fragment_y
+                    }
+                }
+                Some("bottom") => {
+                    if band.size != 0.0 {
+                        band.base + band.size - height
+                    } else {
+                        fragment_y
+                    }
+                }
+                _ => match v.pos_offset {
+                    Some(off) => band.base + emu_to_px(off),
+                    None => {
+                        if matches!(v.relative_to.as_deref(), Some("paragraph") | Some("line")) {
+                            fragment_y
+                        } else {
+                            band.base
+                        }
+                    }
+                },
+            }
+        }
+    };
+
+    (x, y)
+}
+
+enum BehindObject<'a> {
+    Image {
+        block: &'a ParagraphBlockIn,
+        image: &'a ImageRunIn,
+        fragment_y: f64,
+        horizontal_frame: Option<crate::types::HorizontalFrame>,
+    },
+    Shape {
+        fragment: &'a ShapeFragmentIn,
+        block: &'a ShapeBlockIn,
+    },
+}
+
+impl BehindObject<'_> {
+    fn relative_height(&self) -> u64 {
+        match self {
+            Self::Image { image, .. } => image.position.as_ref().and_then(|p| p.relative_height),
+            Self::Shape { block, .. } => block.relative_height,
+        }
+        .unwrap_or(0)
+    }
+
+    /// Tie-break for equal ranks: document order.
+    fn doc_order(&self) -> i64 {
+        match self {
+            Self::Image { image, .. } => image.pm_start,
+            Self::Shape { fragment, block } => fragment.pm_start.or(block.pm_start),
+        }
+        .unwrap_or(i64::MAX)
+    }
+}
+
+/// Emits a paragraph's floating image runs at their resolved page rectangles.
+/// `want_behind` selects the pass: behind-document floats paint before body
+/// content, the rest after.
+fn emit_paragraph_floating_images(
+    prims: &mut Vec<Primitive>,
+    block: &ParagraphBlockIn,
+    frag_y: f64,
+    geom: &PageFloatGeom,
+    want_behind: bool,
+) {
+    for run in &block.runs {
+        let RunIn::Image(imr) = run else { continue };
+        if !is_floating_image_run(imr) {
+            continue;
+        }
+        let is_behind = imr.wrap_type.as_deref() == Some("behind");
+        if is_behind != want_behind {
+            continue;
+        }
+        emit_floating_image(prims, block, imr, frag_y, geom);
+    }
+}
+
+/// Word clamps a text-wrapping float into its page and leaves `wrapNone` free.
+pub(crate) fn clamp_wrapped_float_y(
+    y: f64,
+    height: f64,
+    wrap: Option<&str>,
+    page_height: f64,
+) -> f64 {
+    if !matches!(wrap, Some("square" | "tight" | "through" | "topAndBottom")) {
+        return y;
+    }
+    y.min(page_height - height).max(0.0)
+}
+
+fn emit_floating_image(
+    prims: &mut Vec<Primitive>,
+    block: &ParagraphBlockIn,
+    imr: &ImageRunIn,
+    frag_y: f64,
+    geom: &PageFloatGeom,
+) {
+    let block_ref = BlockRef::of(&block.id);
+    let (x, y) = resolve_anchored_position(
+        imr.position.as_ref(),
+        imr.css_float.as_deref(),
+        image_layout_width(imr),
+        image_layout_height(imr),
+        frag_y - geom.margin_top,
+        geom,
+    );
+    let page_x = geom.margin_left + x;
+    let rot = imr
+        .rotation_deg
+        .unwrap_or_else(|| rotation_degrees(imr.transform.as_deref()));
+    let layout_width = image_layout_width(imr);
+    let layout_height = image_layout_height(imr);
+    let page_y = clamp_wrapped_float_y(
+        geom.margin_top + y,
+        layout_height,
+        imr.wrap_type.as_deref(),
+        geom.page_height,
+    );
+    let mut attrs = block_ref.attrs();
+    attrs.doc_start = imr.pm_start;
+    attrs.doc_end = imr.pm_end;
+    stamp_image_run_attrs(&mut attrs, imr, page_x, page_y);
+    attrs.sdt = sdt_attrs_from_groups(&block.sdt_groups).map(Box::new);
+    attrs.sdt_path = sdt_path_from_groups(&block.sdt_groups);
+    prims.push(Primitive::Image(ImagePrimitive {
+        rel_id: imr.src.clone(),
+        x: px(page_x),
+        y: px(page_y),
+        w: px(layout_width),
+        h: px(layout_height),
+        rotation_deg: if rot != 0.0 { Some(px(rot)) } else { None },
+        opacity: imr.opacity.map(px),
+        filter: None,
+        decorative: imr.decorative.unwrap_or(false),
+        crop: crop_of(imr),
+        alt_text: capped_alt_text(imr.alt.as_deref()),
+        attrs,
+    }));
+}
+
+/// paint one DrawingML shape fragment: a page-placed path primitive carrying
+/// the shape's scaled geometry, paint, transform, document range, and optional
+/// inner paragraphs when their measurements are present.
+fn emit_shape_fragment(
+    prims: &mut Vec<Primitive>,
+    frag: &ShapeFragmentIn,
+    block: &ShapeBlockIn,
+    ctx: &RenderCtx<'_>,
+) {
+    let clip = block.scene.as_ref().and_then(|scene| {
+        matches!(
+            scene.pointer("/root/kind").and_then(Value::as_str),
+            Some("group" | "canvas")
+        )
+        .then(|| shape_text_bounds(frag, block))
+    });
+    emit_shape_fragment_with_clip(prims, frag, block, ctx, clip);
+}
+
+fn shape_text_bounds(frag: &ShapeFragmentIn, block: &ShapeBlockIn) -> ClipRect {
+    let rotation = block
+        .transform
+        .as_ref()
+        .and_then(|transform| transform.rotation)
+        .unwrap_or(0.0);
+    let (sin, cos) = fmath::sin_cos(rotation.to_radians());
+    let width = frag.width * cos.abs() + frag.height * sin.abs();
+    let height = frag.width * sin.abs() + frag.height * cos.abs();
+    ClipRect {
+        x: Some(px(frag.x + (frag.width - width) / 2.0)),
+        y: Some(px(frag.y + (frag.height - height) / 2.0)),
+        w: Some(px(width)),
+        h: Some(px(height)),
+    }
+}
+
+fn emit_shape_fragment_with_clip(
+    prims: &mut Vec<Primitive>,
+    frag: &ShapeFragmentIn,
+    block: &ShapeBlockIn,
+    ctx: &RenderCtx<'_>,
+    group_clip: Option<ClipRect>,
+) {
+    let group_clip = if !block.children.is_empty() {
+        group_clip.map(|clip| {
+            let mut attrs = DocAttrs::default();
+            apply_clip_group(&mut attrs, String::new(), clip);
+            apply_clip_group(&mut attrs, String::new(), shape_text_bounds(frag, block));
+            attrs.clip_group.unwrap().clip.unwrap()
+        })
+    } else {
+        group_clip
+    };
+    let stamp_from = prims.len();
+    let block_ref = BlockRef::of(&frag.block_id);
+    let mut attrs = block_ref.attrs();
+    attrs.doc_start = frag
+        .doc_start
+        .or(frag.pm_start)
+        .or(block.doc_start)
+        .or(block.pm_start);
+    attrs.doc_end = frag
+        .doc_end
+        .or(frag.pm_end)
+        .or(block.doc_end)
+        .or(block.pm_end);
+    attrs.sdt = sdt_attrs_from_groups(&block.sdt_groups).map(Box::new);
+    attrs.sdt_path = sdt_path_from_groups(&block.sdt_groups);
+    attrs.aria_label = block.title.clone();
+    attrs.aria_description = block.description.clone();
+    // decorative is carried by ShapePrimitive's own field; duplicating it on
+    // the flattened attrs produced two identical JSON keys that serde_json's
+    // Map used to collapse silently. One authoritative slot keeps the encoded
+    // object duplicate-free.
+    attrs.hidden_object = block.hidden.filter(|hidden| *hidden);
+    attrs.logical_order = block.relative_height;
+    attrs.group_id = block
+        .scene
+        .as_ref()
+        .and_then(|scene| scene.pointer("/root/id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    attrs.fill_paint = shape_fill_paint(block.fill.as_ref()).map(Box::new);
+    attrs.stroke_paint = shape_stroke_paint(block.stroke.as_ref()).map(Box::new);
+    attrs.effects = block.effects.clone();
+    attrs.effect_extent = block.effect_extent.clone().map(Box::new);
+    attrs.drawing_scene = block.scene.clone().map(Box::new);
+    attrs.text_body_properties = block.text_body_properties.clone().map(Box::new);
+
+    let decorative = block.decorative.unwrap_or_else(|| {
+        block.inner_text.is_empty() && block.title.is_none() && block.description.is_none()
+    });
+
+    prims.push(Primitive::Shape(ShapePrimitive {
+        x: px(frag.x),
+        y: px(frag.y),
+        w: px(frag.width),
+        h: px(frag.height),
+        geometry_path: scale_shape_path(&block.geometry_path, frag),
+        fill: shape_fill_color(block.fill.as_ref()),
+        stroke: shape_stroke(block.stroke.as_ref()),
+        transform: shape_transform(block.transform.as_ref()),
+        decorative,
+        attrs,
+    }));
+
+    if !block.inner_text.is_empty() {
+        let body_margins = block
+            .text_body_properties
+            .as_ref()
+            .and_then(|properties| properties.get("margins"));
+        let half_line = block
+            .stroke
+            .as_ref()
+            .and_then(|stroke| stroke.width)
+            .unwrap_or(0.0)
+            .max(0.0)
+            / 2.0;
+        let margin = |side: &str| {
+            body_margins
+                .and_then(|margins| margins.get(side))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                + half_line
+        };
+        let margin_left = margin("left");
+        let margin_right = margin("right");
+        let margin_top = margin("top");
+        let margin_bottom = margin("bottom");
+        let mut flow = crate::header_footer::HeaderFooterFlow::default();
+        let tops: Vec<f64> = block
+            .inner_text
+            .iter()
+            .zip(&block.inner_measures)
+            .map(|(para, pm)| {
+                let spacing = para.attrs.as_ref().and_then(|attrs| attrs.spacing);
+                let before = spacing.and_then(|spacing| spacing.before).unwrap_or(0.0);
+                let after = spacing.and_then(|spacing| spacing.after).unwrap_or(0.0);
+                let content_height = (pm.total_height - before - after).max(0.0);
+                flow.place(content_height, before, after)
+            })
+            .collect();
+        let content_height = flow.height();
+        let properties = block.text_body_properties.as_ref();
+        let vertical = properties
+            .and_then(|properties| properties.get("vertical"))
+            .and_then(Value::as_str);
+        let vertical_rotation = match vertical {
+            Some("vertical") => 90.0,
+            Some("vertical270") => -90.0,
+            _ => 0.0,
+        };
+        let body_width = (frag.width - margin_left - margin_right).max(0.0);
+        let body_height = (frag.height - margin_top - margin_bottom).max(0.0);
+        let (content_width, available_height) = if vertical_rotation != 0.0 {
+            (body_height, body_width)
+        } else {
+            (body_width, body_height)
+        };
+        let anchor = block
+            .text_body_properties
+            .as_ref()
+            .and_then(|properties| properties.get("anchor"))
+            .and_then(Value::as_str);
+        let anchor_offset = match anchor {
+            Some("middle") => ((available_height - content_height) / 2.0).max(0.0),
+            Some("bottom") => (available_height - content_height).max(0.0),
+            _ => 0.0,
+        };
+        let content_x = frag.x + margin_left + (body_width - content_width) / 2.0;
+        let content_y = frag.y + margin_top + (body_height - available_height) / 2.0;
+        let text_start = prims.len();
+        let auto_fit = properties
+            .and_then(|properties| properties.get("autoFit"))
+            .and_then(Value::as_str);
+        let bounded = (group_clip.is_some() || auto_fit == Some("none"))
+            && auto_fit != Some("shape")
+            && properties
+                .and_then(|properties| properties.get("verticalOverflow"))
+                .and_then(Value::as_str)
+                != Some("overflow");
+        for (i, para) in block.inner_text.iter().enumerate() {
+            let (Some(pm), Some(&top)) = (block.inner_measures.get(i), tops.get(i)) else {
+                continue;
+            };
+            let y_offset = anchor_offset + top;
+            let para_y = content_y + y_offset;
+            let mut line_y = y_offset;
+            let to_line = if bounded && group_clip.is_some() {
+                pm.lines
+                    .iter()
+                    .take_while(|line| {
+                        let fits = line_y + line.ascent <= available_height + 1e-6;
+                        line_y += line.line_height;
+                        fits
+                    })
+                    .count()
+            } else {
+                pm.lines.len()
+            };
+            if to_line == 0 {
+                break;
+            }
+            let synthetic = ParagraphFragmentIn {
+                horizontal_frame: None,
+                block_id: para.id.clone(),
+                x: content_x,
+                y: para_y,
+                width: content_width,
+                height: pm.total_height,
+                from_line: 0,
+                to_line,
+                pm_start: para.pm_start,
+                pm_end: para.pm_end,
+                carried_from_prev: None,
+                carried_to_next: None,
+            };
+            emit_paragraph_fragment(
+                prims, &synthetic, para, pm, ctx, content_x, para_y, None, None, true, true,
+            );
+        }
+        let shape_rotation = if properties
+            .and_then(|properties| properties.get("upright"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            0.0
+        } else {
+            block
+                .transform
+                .as_ref()
+                .and_then(|transform| transform.rotation)
+                .unwrap_or(0.0)
+        };
+        let rotation = shape_rotation
+            + vertical_rotation
+            + properties
+                .and_then(|properties| properties.get("rotation"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+        rotate_shape_text(
+            &mut prims[text_start..],
+            (frag.x + frag.width / 2.0, frag.y + frag.height / 2.0),
+            rotation,
+        );
+        if group_clip.is_none() && bounded && rotation == 0.0 {
+            let clip = ClipRect {
+                x: Some(px(frag.x + margin_left)),
+                y: Some(px(frag.y + margin_top)),
+                w: Some(px(body_width)),
+                h: Some(px(body_height)),
+            };
+            for primitive in &mut prims[text_start..] {
+                if let Some(attrs) = doc_attrs_mut(primitive) {
+                    apply_clip_group(
+                        attrs,
+                        format!("shape-text:{}", block_key(&block.id)),
+                        clip.clone(),
+                    );
+                }
+            }
+        }
+        if let Some(group_clip) = &group_clip {
+            let clip = if bounded {
+                shape_text_bounds(frag, block)
+            } else {
+                group_clip.clone()
+            };
+            for primitive in &mut prims[text_start..] {
+                if let Some(attrs) = doc_attrs_mut(primitive) {
+                    apply_clip_group(
+                        attrs,
+                        format!("shape-text:{}", block_key(&block.id)),
+                        group_clip.clone(),
+                    );
+                    apply_clip_group(
+                        attrs,
+                        format!("shape-text:{}", block_key(&block.id)),
+                        clip.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    for child in &block.children {
+        let child_frag = ShapeFragmentIn {
+            block_id: child.id.clone(),
+            x: frag.x + child.x.unwrap_or(0.0),
+            y: frag.y + child.y.unwrap_or(0.0),
+            width: child.width,
+            height: child.height,
+            doc_start: child.doc_start.or(child.pm_start),
+            doc_end: child.doc_end.or(child.pm_end),
+            pm_start: child.pm_start,
+            pm_end: child.pm_end,
+            is_anchored: None,
+            z_index: None,
+        };
+        emit_shape_fragment_with_clip(prims, &child_frag, child, ctx, group_clip.clone());
+    }
+
+    stamp_sdt_range(&mut prims[stamp_from..], &block.sdt_groups, false);
+}
+
+fn rotate_shape_text(primitives: &mut [Primitive], center: (f64, f64), rotation: f64) {
+    if rotation == 0.0 {
+        return;
+    }
+    let (sin, cos) = fmath::sin_cos(rotation.to_radians());
+    let delta = |x: f64, y: f64| {
+        let dx = x - center.0;
+        let dy = y - center.1;
+        (
+            center.0 + cos * dx - sin * dy - x,
+            center.1 + sin * dx + cos * dy - y,
+        )
+    };
+    for primitive in primitives {
+        match primitive {
+            Primitive::Text(text) => {
+                let size = text
+                    .font
+                    .split_whitespace()
+                    .find_map(|part| {
+                        part.strip_suffix("px")
+                            .and_then(|size| size.parse::<f64>().ok())
+                    })
+                    .unwrap_or(11.0 * 96.0 / 72.0);
+                let (dx, dy) = delta(
+                    num_f64(&text.x) + num_f64(&text.width) / 2.0,
+                    num_f64(&text.baseline_y) - size * 0.2,
+                );
+                text.x = px(num_f64(&text.x) + dx);
+                text.baseline_y = px(num_f64(&text.baseline_y) + dy);
+                text.rotation_deg = Some(px(rotation));
+                text.paint_clip = None;
+            }
+            Primitive::GlyphRun(run) => {
+                let Some(first) = run.glyphs.first() else {
+                    continue;
+                };
+                let left = run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.x)
+                    .fold(f64::INFINITY, f64::min);
+                let right = run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.x + glyph.advance)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let (dx, dy) = delta((left + right) / 2.0, first.y - run.size * 0.2);
+                for glyph in &mut run.glyphs {
+                    glyph.x += dx;
+                    glyph.y += dy;
+                }
+                run.rotation_deg = Some(px(rotation));
+                run.paint_clip = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn shape_fill_color(fill: Option<&ShapeFillIn>) -> Option<String> {
+    let fill = fill?;
+    ooxml_drawingml::resolve_shape_fill_color(fill.kind.as_deref(), fill.color.as_deref())
+}
+
+fn shape_fill_paint(fill: Option<&ShapeFillIn>) -> Option<Value> {
+    let fill = fill?;
+    let mut paint = serde_json::Map::new();
+    if let Some(kind) = &fill.kind {
+        paint.insert("kind".to_string(), Value::String(kind.clone()));
+    }
+    if let Some(color) = &fill.color {
+        paint.insert("color".to_string(), Value::String(color.clone()));
+    }
+    if let Some(angle) = fill.gradient_angle.and_then(Number::from_f64) {
+        paint.insert("angle".to_string(), Value::Number(angle));
+    }
+    if !fill.gradient_stops.is_empty() {
+        paint.insert(
+            "stops".to_string(),
+            Value::Array(fill.gradient_stops.clone()),
+        );
+    }
+    for (key, value) in [
+        ("gradientType", fill.gradient_type.as_ref()),
+        ("patternPreset", fill.pattern_preset.as_ref()),
+        ("foregroundColor", fill.foreground_color.as_ref()),
+        ("backgroundColor", fill.background_color.as_ref()),
+        ("pictureRelId", fill.picture_rel_id.as_ref()),
+        ("pictureFillMode", fill.picture_fill_mode.as_ref()),
+    ] {
+        if let Some(value) = value {
+            paint.insert(key.to_string(), Value::String(value.clone()));
+        }
+    }
+    // resolved picture-fill source: pass through only parser-minted embedded
+    // schemes (data:/blob:, or a media:{n} part token) so a hand-crafted input
+    // cannot smuggle an external URL to the canvas image resolver
+    if let Some(src) = fill
+        .picture_src
+        .as_ref()
+        .filter(|src| src.starts_with("data:") || src.starts_with("blob:") || is_media_token(src))
+    {
+        paint.insert("pictureSrc".to_string(), Value::String(src.clone()));
+    }
+    for (key, value) in [
+        ("pictureSrcRect", fill.picture_src_rect.as_ref()),
+        ("pictureTile", fill.picture_tile.as_ref()),
+        ("pictureStretchRect", fill.picture_stretch_rect.as_ref()),
+    ] {
+        if let Some(value) = value {
+            paint.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(opacity) = fill.picture_opacity.and_then(Number::from_f64) {
+        paint.insert("pictureOpacity".to_string(), Value::Number(opacity));
+    }
+    if let Some(index) = fill.theme_ref_index {
+        paint.insert("themeRefIndex".to_string(), Value::Number(index.into()));
+    }
+    (!paint.is_empty()).then_some(Value::Object(paint))
+}
+
+/// A `media:{n}` token naming a package part the host resolves.
+fn is_media_token(src: &str) -> bool {
+    src.strip_prefix("media:").is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn shape_stroke_paint(stroke: Option<&ShapeStrokeIn>) -> Option<Value> {
+    let stroke = stroke?;
+    let mut paint = serde_json::Map::new();
+    for (key, value) in [
+        ("color", stroke.color.as_ref()),
+        ("dash", stroke.dash.as_ref()),
+        ("compound", stroke.compound.as_ref()),
+        ("alignment", stroke.alignment.as_ref()),
+        ("cap", stroke.cap.as_ref()),
+        ("join", stroke.join.as_ref()),
+    ] {
+        if let Some(value) = value {
+            paint.insert(key.to_string(), Value::String(value.clone()));
+        }
+    }
+    for (key, value) in [("width", stroke.width), ("miterLimit", stroke.miter_limit)] {
+        if let Some(value) = value.and_then(Number::from_f64) {
+            paint.insert(key.to_string(), Value::Number(value));
+        }
+    }
+    if !stroke.custom_dash.is_empty() {
+        paint.insert(
+            "customDash".to_string(),
+            Value::Array(
+                stroke
+                    .custom_dash
+                    .iter()
+                    .filter_map(|value| Number::from_f64(*value).map(Value::Number))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(value) = &stroke.head_end {
+        paint.insert("headEnd".to_string(), value.clone());
+    }
+    if let Some(value) = &stroke.tail_end {
+        paint.insert("tailEnd".to_string(), value.clone());
+    }
+    (!paint.is_empty()).then_some(Value::Object(paint))
+}
+
+fn shape_stroke(stroke: Option<&ShapeStrokeIn>) -> Option<ShapeStrokePrimitive> {
+    let stroke = stroke?;
+    let width = stroke.width.unwrap_or(1.0);
+    if width <= 0.0 {
+        return None;
+    }
+    Some(ShapeStrokePrimitive {
+        color: stroke
+            .color
+            .clone()
+            .unwrap_or_else(|| "#000000".to_string()),
+        width: px(width),
+        dash: stroke
+            .dash
+            .clone()
+            .filter(|d| !d.is_empty() && d != "solid"),
+    })
+}
+
+fn shape_transform(transform: Option<&ShapeTransformIn>) -> Option<ShapeTransformPrimitive> {
+    let transform = transform?;
+    let rotation = transform.rotation.filter(|r| *r != 0.0).map(px);
+    let flip_h = transform.flip_h == Some(true);
+    let flip_v = transform.flip_v == Some(true);
+    if rotation.is_none() && !flip_h && !flip_v {
+        return None;
+    }
+    Some(ShapeTransformPrimitive {
+        rotation,
+        flip_h,
+        flip_v,
+    })
+}
+
+fn scale_shape_path(path: &[ShapePathCommand], frag: &ShapeFragmentIn) -> Vec<ShapePathCommand> {
+    path.iter()
+        .map(|cmd| match cmd {
+            ShapePathCommand::Move { x, y } => ShapePathCommand::Move {
+                x: scale_shape_x(x, frag),
+                y: scale_shape_y(y, frag),
+            },
+            ShapePathCommand::Line { x, y } => ShapePathCommand::Line {
+                x: scale_shape_x(x, frag),
+                y: scale_shape_y(y, frag),
+            },
+            ShapePathCommand::Quad { cpx, cpy, x, y } => ShapePathCommand::Quad {
+                cpx: scale_shape_x(cpx, frag),
+                cpy: scale_shape_y(cpy, frag),
+                x: scale_shape_x(x, frag),
+                y: scale_shape_y(y, frag),
+            },
+            ShapePathCommand::Cubic {
+                cp1x,
+                cp1y,
+                cp2x,
+                cp2y,
+                x,
+                y,
+            } => ShapePathCommand::Cubic {
+                cp1x: scale_shape_x(cp1x, frag),
+                cp1y: scale_shape_y(cp1y, frag),
+                cp2x: scale_shape_x(cp2x, frag),
+                cp2y: scale_shape_y(cp2y, frag),
+                x: scale_shape_x(x, frag),
+                y: scale_shape_y(y, frag),
+            },
+            ShapePathCommand::Close => ShapePathCommand::Close,
+        })
+        .collect()
+}
+
+fn scale_shape_x(n: &Number, frag: &ShapeFragmentIn) -> Number {
+    px(frag.x + num_f64(n) * frag.width)
+}
+
+fn scale_shape_y(n: &Number, frag: &ShapeFragmentIn) -> Number {
+    px(frag.y + num_f64(n) * frag.height)
+}
+
+fn plot_chart_from(chart: &ChartIn) -> PlotChart<'_> {
+    PlotChart {
+        chart_type: &chart.chart_type,
+        title: chart.title.as_deref(),
+        legend: chart.legend.as_ref().map(|legend| PlotLegend {
+            position: legend.position.as_deref(),
+            visible: legend.visible,
+            overlay: legend.overlay,
+        }),
+        value_axis: chart
+            .axes
+            .as_ref()
+            .and_then(|axes| axes.value.as_ref())
+            .map(|axis| PlotAxisRange {
+                min: axis.min,
+                max: axis.max,
+            }),
+        axis_titles: PlotAxisTitles::default(),
+        series: chart
+            .series
+            .iter()
+            .map(|series| plot_series_from(series, None))
+            .collect(),
+        plot_groups: chart
+            .plot_groups
+            .iter()
+            .map(|group| PlotGroup {
+                chart_type: group.chart_type.as_deref(),
+                grouping: group.grouping.as_deref(),
+                series: group
+                    .series
+                    .iter()
+                    .map(|series| plot_series_from(series, group.data_labels.as_ref()))
+                    .collect(),
+                overlap: group.overlap,
+                gap_width: group.gap_width,
+                hole_size: group.hole_size,
+                first_slice_angle: group.first_slice_angle,
+                vary_colors: group.vary_colors,
+                scatter_style: group.scatter_style.as_deref(),
+                radar_style: group.radar_style.as_deref(),
+                bubble_scale: group.bubble_scale,
+                size_represents: group.size_represents.as_deref(),
+                wireframe: group.wireframe,
+                hi_low_lines: group.hi_low_lines,
+                up_down_bars: group.up_down_bars,
+                markers: group.marker,
+                axis_ids: group.axis_ids.iter().map(String::as_str).collect(),
+            })
+            .collect(),
+        axes: chart.axis_list.iter().map(plot_axis_from).collect(),
+        text: PlotChartText {
+            chart: plot_text_from(chart.text.as_ref()),
+            title: plot_text_from(chart.title_text.as_ref()),
+            legend: plot_text_from(
+                chart
+                    .legend
+                    .as_ref()
+                    .and_then(|legend| legend.text.as_ref()),
+            ),
+        },
+        fill: None,
+        plot_layout: None,
+    }
+}
+
+fn plot_text_from(text: Option<&ChartTextIn>) -> PlotTextStyle<'_> {
+    text.map(|text| PlotTextStyle {
+        font: text.font.as_deref(),
+        size_pt: text.size_pt,
+        bold: text.bold,
+        italic: text.italic,
+        color: text.color.as_deref(),
+        spacing_pt: text.spacing_pt,
+    })
+    .unwrap_or_default()
+}
+
+/// Merges a series `dataLabels` over its plot group's, matching the shared
+/// geometry's inheritance.
+fn plot_labels_from<'a>(
+    group: Option<&'a ChartDataLabelsIn>,
+    series: Option<&'a ChartDataLabelsIn>,
+) -> Option<PlotDataLabels<'a>> {
+    let levels = [series, group];
+    levels.iter().copied().flatten().next()?;
+    if levels
+        .iter()
+        .copied()
+        .flatten()
+        .find_map(|labels| labels.delete)
+        == Some(true)
+    {
+        return None;
+    }
+    let switch = |read: fn(&ChartDataLabelsIn) -> Option<bool>| {
+        series
+            .and_then(read)
+            .or_else(|| group.and_then(read))
+            .unwrap_or(false)
+    };
+    let text = |read: fn(&ChartDataLabelsIn) -> Option<&str>| {
+        series.and_then(read).or_else(|| group.and_then(read))
+    };
+    Some(PlotDataLabels {
+        show_value: switch(|labels| labels.show_value),
+        show_category_name: switch(|labels| labels.show_category_name),
+        show_series_name: switch(|labels| labels.show_series_name),
+        show_percent: switch(|labels| labels.show_percent),
+        show_legend_key: switch(|labels| labels.show_legend_key),
+        show_bubble_size: switch(|labels| labels.show_bubble_size),
+        separator: text(|labels| labels.separator.as_deref()),
+        position: text(|labels| labels.position.as_deref()),
+        number_format: text(|labels| labels.number_format.as_deref()),
+        text: plot_text_from(
+            series
+                .and_then(|labels| labels.text.as_ref())
+                .or_else(|| group.and_then(|labels| labels.text.as_ref())),
+        ),
+    })
+}
+
+fn plot_axis_from(axis: &ChartAxisIn) -> PlotAxis<'_> {
+    PlotAxis {
+        id: axis.id.as_deref(),
+        kind: axis
+            .axis_type
+            .as_deref()
+            .map(PlotAxisKind::from_name)
+            .unwrap_or(PlotAxisKind::Value),
+        range: PlotAxisRange {
+            min: axis.min,
+            max: axis.max,
+        },
+        log_base: axis.logarithmic_base,
+        reversed: axis.reversed,
+        major_unit: axis.major_unit,
+        minor_unit: axis.minor_unit,
+        major_tick_mark: axis.major_tick_mark.as_deref(),
+        minor_tick_mark: axis.minor_tick_mark.as_deref(),
+        tick_label_position: axis.tick_label_position.as_deref(),
+        major_gridlines: axis.major_gridlines,
+        minor_gridlines: axis.minor_gridlines,
+        cross_between: axis.cross_between.as_deref(),
+        number_format: axis.number_format.as_deref(),
+        position: axis.position.as_deref(),
+        title: axis.title.as_deref(),
+        hidden: axis.hidden,
+        text: plot_text_from(axis.text.as_ref()),
+        line: None,
+        major_gridline: axis.major_gridline_line.as_ref().map(plot_line_from),
+        minor_gridline: axis.minor_gridline_line.as_ref().map(plot_line_from),
+    }
+}
+
+fn plot_line_from(line: &ChartLineIn) -> PlotLine<'_> {
+    PlotLine {
+        none: line.none,
+        color: line.color.as_deref(),
+        width_emu: line.width_emu,
+    }
+}
+
+fn plot_series_from<'a>(
+    series: &'a ChartSeriesIn,
+    group_labels: Option<&'a ChartDataLabelsIn>,
+) -> PlotSeries<'a> {
+    let mut labels = plot_labels_from(group_labels, series.data_labels.as_ref());
+    if let Some(spec) = labels.as_mut()
+        && spec.number_format.is_none()
+    {
+        spec.number_format = series.value_format.as_deref();
+    }
+    PlotSeries {
+        name: series.name.as_deref(),
+        categories: &series.categories,
+        values: &series.values,
+        color: series.color.as_deref(),
+        points: series
+            .points
+            .iter()
+            .map(|point| PlotPoint {
+                index: point.index,
+                value: point.value,
+                color: point.color.as_deref(),
+                marker: plot_marker_from(point.marker.as_ref()),
+                label: point.label.as_deref(),
+                label_runs: None,
+                explosion: point.explosion,
+                labels,
+            })
+            .collect(),
+        grouping: series.grouping.as_deref(),
+        marker: plot_marker_from(series.marker.as_ref()),
+        x_values: &series.x_values,
+        bubble_sizes: &series.bubble_sizes,
+        smooth: series.smooth,
+        labels,
+        line: None,
+    }
+}
+
+fn plot_marker_from(marker: Option<&Value>) -> Option<PlotMarker> {
+    marker.map(|marker| PlotMarker {
+        size: marker.get("size").and_then(Value::as_f64),
+        symbol: marker
+            .get("symbol")
+            .and_then(Value::as_str)
+            .and_then(PlotMarkerSymbol::from_name),
+    })
+}
+
+fn emit_chart_fragment(prims: &mut Vec<Primitive>, frag: &ChartFragmentIn, block: &ChartBlockIn) {
+    let stamp_from = prims.len();
+    let block_ref = BlockRef::of(&frag.block_id);
+    let chart = plot_chart_from(&block.chart);
+    let mut attrs = block_ref.attrs();
+    attrs.doc_start = frag
+        .doc_start
+        .or(frag.pm_start)
+        .or(block.doc_start)
+        .or(block.pm_start);
+    attrs.doc_end = frag
+        .doc_end
+        .or(frag.pm_end)
+        .or(block.doc_end)
+        .or(block.pm_end);
+    attrs.sdt = sdt_attrs_from_groups(&block.sdt_groups).map(Box::new);
+    attrs.sdt_path = sdt_path_from_groups(&block.sdt_groups);
+    let width = if frag.width > 0.0 {
+        frag.width
+    } else {
+        block.width
+    };
+    let height = if frag.height > 0.0 {
+        frag.height
+    } else {
+        block.height
+    };
+    attrs.chart = Some(ChartA11yAttrs {
+        label: chart_aria_label(&chart),
+        frame: Some(Box::new(ContentFrame {
+            x: Some(px(frag.x)),
+            y: Some(px(frag.y)),
+            w: Some(px(width)),
+            h: Some(px(height)),
+        })),
+    });
+    attrs.aria_label = block.chart.title.clone();
+    attrs.aria_description = block.chart.description.clone();
+    attrs.decorative = block.chart.decorative.filter(|decorative| *decorative);
+
+    plot_chart_into(
+        &chart,
+        PlotRect {
+            x: frag.x,
+            y: frag.y,
+            w: width,
+            h: height,
+        },
+        &mut PrimitiveSink {
+            prims,
+            attrs: &attrs,
+        },
+    );
+    stamp_sdt_range(&mut prims[stamp_from..], &block.sdt_groups, false);
+}
+
+/// Translates plot ops into display-list primitives as they are emitted.
+struct PrimitiveSink<'a> {
+    prims: &'a mut Vec<Primitive>,
+    attrs: &'a DocAttrs,
+}
+
+impl PlotSink for PrimitiveSink<'_> {
+    fn push_op(&mut self, op: PlotOp) -> bool {
+        let (prims, attrs) = (&mut *self.prims, self.attrs);
+        match op {
+            PlotOp::Rect { x, y, w, h, fill } => prims.push(Primitive::Rect(RectPrimitive {
+                x: px(x),
+                y: px(y),
+                w: px(w),
+                h: px(h),
+                fill,
+                attrs: attrs.clone(),
+            })),
+            PlotOp::Text {
+                text,
+                x,
+                baseline_y,
+                width,
+                font,
+                color,
+                align,
+                rotation_deg: _,
+            } => {
+                let (x, width) = match align {
+                    PlotTextAlign::Start => (x, width),
+                    PlotTextAlign::Center => {
+                        let run = fallback_label_width(&text, &font);
+                        (x + (width - run) / 2.0, run)
+                    }
+                };
+                prims.push(Primitive::Text(TextRunPrimitive {
+                    x: px(x),
+                    text,
+                    paint_text: None,
+                    baseline_y: px(baseline_y),
+                    width: px(width),
+                    paint_clip: None,
+                    letter_spacing: (font.letter_spacing_px != 0.0)
+                        .then(|| px(font.letter_spacing_px)),
+                    font: font.css(),
+                    scripts: None,
+                    color,
+                    word_spacing: None,
+                    rtl: None,
+                    opacity: None,
+                    rotation_deg: None,
+                    horizontal_scale: None,
+                    substitute_scale: None,
+                    all_caps: false,
+                    small_caps: false,
+                    hidden: false,
+                    text_shadow: None,
+                    text_outline: false,
+                    emphasis_mark: None,
+                    text_effect: None,
+                    attrs: attrs.clone(),
+                }))
+            }
+            PlotOp::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                color,
+                width,
+            } => prims.push(Primitive::Line(LinePrimitive {
+                x1: px(x1),
+                y1: px(y1),
+                x2: px(x2),
+                y2: px(y2),
+                stroke_width: px(width),
+                color,
+                dash: None,
+                role: None,
+                ..LinePrimitive::contract_defaults()
+            })),
+            PlotOp::Path {
+                x,
+                y,
+                w,
+                h,
+                commands,
+                fill,
+                stroke,
+            } => prims.push(Primitive::Shape(ShapePrimitive {
+                x: px(x),
+                y: px(y),
+                w: px(w),
+                h: px(h),
+                geometry_path: commands.into_iter().map(shape_path_command).collect(),
+                fill: Some(fill),
+                stroke: stroke.map(|stroke| ShapeStrokePrimitive {
+                    color: stroke.color,
+                    width: px(stroke.width),
+                    dash: None,
+                }),
+                transform: None,
+                decorative: false,
+                attrs: attrs.clone(),
+            })),
+        }
+        true
+    }
+}
+
+fn shape_path_command(command: GeometryPathCommand) -> ShapePathCommand {
+    match command {
+        GeometryPathCommand::Move { x, y } => ShapePathCommand::Move { x: px(x), y: px(y) },
+        GeometryPathCommand::Line { x, y } => ShapePathCommand::Line { x: px(x), y: px(y) },
+        GeometryPathCommand::Quad { cpx, cpy, x, y } => ShapePathCommand::Quad {
+            cpx: px(cpx),
+            cpy: px(cpy),
+            x: px(x),
+            y: px(y),
+        },
+        GeometryPathCommand::Cubic {
+            cp1x,
+            cp1y,
+            cp2x,
+            cp2y,
+            x,
+            y,
+        } => ShapePathCommand::Cubic {
+            cp1x: px(cp1x),
+            cp1y: px(cp1y),
+            cp2x: px(cp2x),
+            cp2y: px(cp2y),
+            x: px(x),
+            y: px(y),
+        },
+        GeometryPathCommand::Close => ShapePathCommand::Close,
+    }
+}
+
+/// Paints one text-box fragment: the container's fill and border edges at the
+/// box's page rect, then the inner paragraphs at the content origin. The box
+/// behaves like a border-box, so border and padding sit inside the fragment
+/// rect and content starts at `x + borderWidth + margin`.
+fn emit_text_box_fragment(
+    prims: &mut Vec<Primitive>,
+    frag: &TextBoxFragmentIn,
+    block: &TextBoxBlockIn,
+    measure: &TextBoxExtentIn,
+    ctx: &RenderCtx<'_>,
+) {
+    let stamp_from = prims.len();
+    let block_ref = BlockRef::of(&frag.block_id);
+
+    // Container fill: a fragment-sized rect behind the content, carrying the
+    // text box's own doc range.
+    if let Some(fill) = &block.fill_color {
+        let mut fill_attrs = block_ref.attrs();
+        fill_attrs.doc_start = frag.pm_start;
+        fill_attrs.doc_end = frag.pm_end;
+        prims.push(Primitive::Rect(RectPrimitive {
+            x: px(frag.x),
+            y: px(frag.y),
+            w: px(frag.width),
+            h: px(frag.height),
+            fill: fill.clone(),
+            attrs: fill_attrs,
+        }));
+    }
+
+    // border: four edges of the box, inset by half the stroke so a
+    // box-sizing:border-box border sits inside the rect (CSS draws it inward)
+    let border_w = block.outline_width.unwrap_or(0.0);
+    if border_w > 0.0 {
+        let color = block
+            .outline_color
+            .clone()
+            .unwrap_or_else(|| "#000000".to_string());
+        let h = border_w / 2.0;
+        let l = frag.x + h;
+        let t = frag.y + h;
+        let r = frag.x + frag.width - h;
+        let b = frag.y + frag.height - h;
+        let mut edge = |x1: f64, y1: f64, x2: f64, y2: f64| {
+            let style = display_border_style(block.outline_style.as_deref());
+            prims.push(Primitive::Line(LinePrimitive {
+                x1: px(x1),
+                y1: px(y1),
+                x2: px(x2),
+                y2: px(y2),
+                stroke_width: px(border_w),
+                color: color.clone(),
+                dash: border_dash(style, border_w),
+                role: Some(LineRole::Border),
+                border_style: Some(style),
+                border_owner: Some(BorderOwner::TextBox),
+                ..LinePrimitive::contract_defaults()
+            }));
+        };
+        edge(l, t, r, t); // top
+        edge(r, t, r, b); // right
+        edge(l, b, r, b); // bottom
+        edge(l, t, l, b); // left
+    }
+
+    // The inner width excludes margins but not the border.
+    let margins = block.margins.unwrap_or(DEFAULT_TEXTBOX_MARGINS);
+    let content_x = frag.x + border_w + margins.left;
+    let content_top = frag.y + border_w + margins.top;
+    let inner_width = (frag.width - margins.left - margins.right).max(0.0);
+
+    let mut y_offset = 0.0;
+    for (i, para) in block.content.iter().enumerate() {
+        let Some(pm) = measure.inner_measures.get(i) else {
+            continue;
+        };
+        let para_y = content_top + y_offset;
+        let synthetic = ParagraphFragmentIn {
+            horizontal_frame: None,
+            block_id: para.id.clone(),
+            x: content_x,
+            y: para_y,
+            width: inner_width,
+            height: pm.total_height,
+            from_line: 0,
+            to_line: pm.lines.len(),
+            pm_start: para.pm_start,
+            pm_end: para.pm_end,
+            carried_from_prev: None,
+            carried_to_next: None,
+        };
+        emit_paragraph_fragment(
+            prims, &synthetic, para, pm, ctx, content_x, para_y, None, None, true, true,
+        );
+        y_offset += pm.total_height;
+    }
+    stamp_sdt_range(&mut prims[stamp_from..], &block.sdt_groups, false);
+}
+
+// ---------------------------------------------------------------------------
+// tables
+// ---------------------------------------------------------------------------
+
+/// A cell resolved onto the column grid.
+struct GridCell {
+    row_index: usize,
+    cell_index: usize,
+    column_index: usize,
+    col_span: usize,
+    row_span: usize,
+    x: f64,
+    width: f64,
+}
+
+/// Resolves every cell onto the column grid and gives it a pixel `x` and width
+/// from `column_widths`.
+fn compute_cell_grid(block: &TableBlockIn, column_widths: &[f64]) -> Vec<GridCell> {
+    // rtl tables (`w:bidiVisual`) mirror x so logical column 0 lands rightmost
+    let bidi = block.bidi == Some(true);
+    let table_width: f64 = column_widths.iter().sum();
+
+    let mut occupied: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut out = Vec::new();
+    for (row_index, row) in block.rows.iter().enumerate() {
+        let occ = occupied.remove(&row_index).unwrap_or_default();
+        let is_occ = |c: usize| occ.contains(&c);
+        let mut column_index = row.grid_before.unwrap_or(0).min(16_384) as usize;
+        while is_occ(column_index) {
+            column_index += 1;
+        }
+        for (cell_index, cell) in row.cells.iter().enumerate() {
+            let col_span = cell.col_span.unwrap_or(1).clamp(1, 16_384) as usize;
+            let row_span = cell.row_span.unwrap_or(1).max(1) as usize;
+            let mut x = 0.0;
+            for c in 0..column_index {
+                x += column_widths.get(c).copied().unwrap_or(0.0);
+            }
+            let mut width = 0.0;
+            for c in 0..col_span {
+                width += column_widths.get(column_index + c).copied().unwrap_or(0.0);
+            }
+            if bidi {
+                x = table_width - x - width;
+            }
+            out.push(GridCell {
+                row_index,
+                cell_index,
+                column_index,
+                col_span,
+                row_span,
+                x,
+                width,
+            });
+            if row_span > 1 {
+                for r in row_index + 1..row_index + row_span {
+                    occupied
+                        .entry(r)
+                        .or_default()
+                        .extend(column_index..column_index + col_span);
+                }
+            }
+            column_index += col_span;
+            while is_occ(column_index) {
+                column_index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Cumulative row offsets, each rounded to a whole pixel so shared borders land
+/// on the same device line. Length is `rows + 1`.
+fn row_y_positions(rows: &[TableRowExtentIn]) -> Vec<f64> {
+    // Exact fractional tops: rounding each row top to whole pixels walked
+    // every boundary up to half a pixel (Word keeps row positions continuous;
+    // measured on floattable-avoid-last-manip-ofst.docx, whose four whole
+    // rows per page accumulated a 1px shift by the second row).
+    let mut out = Vec::with_capacity(rows.len() + 1);
+    let mut y: f64 = 0.0;
+    for r in rows {
+        out.push(y);
+        y += r.height;
+    }
+    out.push(y);
+    out
+}
+
+pub(crate) fn table_total_width(measure: &TableExtentIn) -> f64 {
+    if measure.total_width > 0.0 {
+        measure.total_width
+    } else {
+        measure.column_widths.iter().sum()
+    }
+}
+
+fn nested_table_x_offset(block: &TableBlockIn, measure: &TableExtentIn, content_width: f64) -> f64 {
+    crate::cell_layout::nested_table_horizontal_offset(
+        block.floating.as_ref(),
+        block.justification.as_deref(),
+        block.indent,
+        block.compatibility_mode,
+        block.cell_margin_left,
+        table_total_width(measure),
+        content_width,
+    )
+}
+
+fn clip_number(value: &Option<Number>) -> f64 {
+    value.as_ref().map(num_f64).unwrap_or(0.0)
+}
+
+fn apply_clip_group(attrs: &mut DocAttrs, id: String, rect: ClipRect) {
+    let clip = if let Some(existing) = attrs
+        .clip_group
+        .as_ref()
+        .and_then(|group| group.clip.as_ref())
+    {
+        let left = clip_number(&existing.x).max(clip_number(&rect.x));
+        let top = clip_number(&existing.y).max(clip_number(&rect.y));
+        let right = (clip_number(&existing.x) + clip_number(&existing.w))
+            .min(clip_number(&rect.x) + clip_number(&rect.w));
+        let bottom = (clip_number(&existing.y) + clip_number(&existing.h))
+            .min(clip_number(&rect.y) + clip_number(&rect.h));
+        ClipRect {
+            x: Some(px(left)),
+            y: Some(px(top)),
+            w: Some(px((right - left).max(0.0))),
+            h: Some(px((bottom - top).max(0.0))),
+        }
+    } else {
+        rect
+    };
+    attrs.clip_group = Some(Box::new(ClipGroupMetadata {
+        id: Some(id),
+        clip: Some(clip),
+        opacity: None,
+    }));
+}
+
+fn table_metadata(
+    table_id: &str,
+    frag: &TableFragmentIn,
+    block: &TableBlockIn,
+    measure: &TableExtentIn,
+    header_row_count: usize,
+) -> TableMetadata {
+    TableMetadata {
+        table_id: table_id.to_string(),
+        row_start: frag.row_start as u64,
+        row_end: frag.row_end as u64,
+        row_count: block.rows.len() as u64,
+        column_count: measure.column_widths.len() as u64,
+        header_row_count: (header_row_count > 0).then_some(header_row_count as u64),
+        caption: block.caption.clone(),
+        description: block.description.clone(),
+        parent_table_id: None,
+    }
+}
+
+/// A row a table fragment shows, in fragment coordinates.
+struct VisibleRow {
+    row_index: usize,
+    frag_y: f64,
+    /// How far an exact row's pixel-rounded top sits above the unrounded one; content follows the latter.
+    content_shift: f64,
+    is_first_in_fragment: bool,
+    band_height: Option<f64>,
+}
+
+/// A cell a table fragment paints: a grid cell, its box in fragment coordinates, and whether it
+/// carries document positions (a vertical-merge continuation re-paint does not).
+struct CellPaint {
+    grid_index: usize,
+    cell_y: f64,
+    content_shift: f64,
+    cell_h: f64,
+    content_h: f64,
+    is_first_row: bool,
+    selectable: bool,
+}
+
+/// What one table fragment paints: the repeated header band and row window, every cell painted
+/// in them and the band everything clips to. Painting and page export both read it, so a
+/// fragment's exported content is exactly what it paints.
+struct TablePaintPlan {
+    row_tops: Vec<f64>,
+    grid: Vec<GridCell>,
+    row_count: usize,
+    col_count: usize,
+    cell_at: Vec<Option<usize>>,
+    carried: bool,
+    header_row_count: usize,
+    semantic_header_count: usize,
+    header_height: f64,
+    visible_height: f64,
+    full_bottom_border: bool,
+    /// A fragment resuming a row mid-content redraws that row's boundary band
+    /// at its cut edge, so its content starts below the band (Word-measured).
+    resume_band: f64,
+    /// Clip band in page coordinates; every emitted rect and text clips to it,
+    /// so a row sliced by the page break cannot paint past the fragment.
+    clip_top_y: f64,
+    clip_bottom_y: f64,
+    /// Where cell content stops: above the cut band of a fragment cut mid-row.
+    content_clip_bottom_y: f64,
+    visible: Vec<VisibleRow>,
+    paints: Vec<CellPaint>,
+}
+
+impl TablePaintPlan {
+    fn new(frag: &TableFragmentIn, block: &TableBlockIn, measure: &TableExtentIn) -> Self {
+        let row_tops = row_y_positions(&measure.rows);
+        let exact_tops: Vec<f64> = std::iter::once(0.0)
+            .chain(measure.rows.iter().scan(0.0, |y, row| {
+                *y += row.height;
+                Some(*y)
+            }))
+            .collect();
+        let rounding = |r: usize| {
+            let exact = block.rows.get(r).is_some_and(|row| {
+                row.height_rule.as_deref() == Some("exact") && row.height.is_some()
+            });
+            if frag.cell_clips.is_some() || !exact {
+                return 0.0;
+            }
+            let at = |tops: &[f64], i: usize| tops.get(i).copied().unwrap_or(0.0);
+            (at(&exact_tops, r) - at(&exact_tops, frag.row_start))
+                - (at(&row_tops, r) - at(&row_tops, frag.row_start))
+        };
+        let grid = compute_cell_grid(block, &measure.column_widths);
+        let row_count = block.rows.len();
+        let col_count = grid
+            .iter()
+            .map(|g| g.column_index + g.col_span)
+            .max()
+            .unwrap_or(0)
+            .max(measure.column_widths.len());
+        let mut cell_at = vec![None; row_count * col_count];
+        for (grid_index, g) in grid.iter().enumerate() {
+            for r in g.row_index..(g.row_index + g.row_span).min(row_count) {
+                for c in g.column_index..(g.column_index + g.col_span).min(col_count) {
+                    cell_at[r * col_count + c] = Some(grid_index);
+                }
+            }
+        }
+        let full_bottom_border = frag.row_end == block.rows.len()
+            && frag.clip_bottom.is_none()
+            && frag.carried_to_next != Some(true)
+            && grid.iter().any(|cell| {
+                cell.row_index + cell.row_span >= block.rows.len()
+                    && block.rows[cell.row_index].cells[cell.cell_index]
+                        .borders
+                        .as_ref()
+                        .and_then(|borders| borders.bottom.as_ref())
+                        .is_some_and(border_visible)
+            });
+
+        let carried = frag.carried_from_prev == Some(true);
+        let header_row_count = if carried {
+            frag.header_row_count.unwrap_or(0)
+        } else {
+            0
+        };
+        let authored_header_count = block
+            .rows
+            .iter()
+            .take_while(|row| row.is_header == Some(true))
+            .count();
+        let semantic_header_count = authored_header_count.max(header_row_count);
+        let mut header_height = 0.0;
+        for r in 0..header_row_count.min(measure.rows.len()) {
+            header_height += measure.rows[r].height;
+        }
+
+        // A row cut by a page break redraws its boundary band at each cut edge
+        // (Word-measured): the resumed fragment's whole window starts below the
+        // band, and the cut fragment's content stops above it. The paginator
+        // reserved both bands in the fragment's height.
+        let resume_band = if carried && frag.clip_top.unwrap_or(0.0) > 0.0 {
+            row_cut_band(measure, frag.row_start)
+        } else {
+            0.0
+        };
+        let cut_band = if frag.clip_bottom.is_some() && frag.row_end > frag.row_start {
+            row_cut_band(measure, frag.row_end - 1)
+        } else {
+            0.0
+        };
+        let win_top =
+            row_tops.get(frag.row_start).copied().unwrap_or(0.0) + frag.clip_top.unwrap_or(0.0);
+        let to_frag_y = |full_y: f64| header_height + resume_band + (full_y - win_top);
+        let visible_height = if frag.cell_clips.is_some() {
+            frag.height
+        } else if full_bottom_border {
+            frag.height
+        } else if frag.clip_bottom.is_some() {
+            frag.height.round()
+        } else if frag.carried_to_next == Some(true) && row_cut_band(measure, frag.row_end) > 0.0 {
+            // A fragment ending on a row boundary carries that boundary's band.
+            frag.height
+        } else {
+            to_frag_y(row_tops.get(frag.row_end).copied().unwrap_or(0.0))
+        };
+
+        // rows visible in this fragment: repeated header rows first (their own
+        // coordinate space above the windowed body), then the body window
+        let mut visible: Vec<VisibleRow> = Vec::new();
+        if header_row_count > 0 {
+            let mut hy = 0.0;
+            for r in 0..header_row_count.min(measure.rows.len()) {
+                visible.push(VisibleRow {
+                    row_index: r,
+                    frag_y: hy,
+                    content_shift: 0.0,
+                    is_first_in_fragment: r == 0,
+                    band_height: None,
+                });
+                hy += measure.rows[r].height;
+            }
+        }
+        let mut row_shift = 0.0;
+        for row_index in frag.row_start..frag.row_end.min(block.rows.len()) {
+            let is_first_in_fragment = if header_row_count > 0 {
+                false
+            } else {
+                carried && row_index == frag.row_start && frag.clip_top.unwrap_or(0.0) == 0.0
+            };
+            let band_height = frag.cell_clips.as_ref().and_then(|clips| {
+                clips
+                    .iter()
+                    .filter(|clip| clip.row == row_index)
+                    .map(|clip| clip.bottom - clip.top)
+                    .reduce(f64::max)
+            });
+            let mut frag_y = to_frag_y(row_tops.get(row_index).copied().unwrap_or(0.0));
+            if frag.cell_clips.is_some() {
+                frag_y += row_shift;
+            }
+            if let Some(height) = band_height {
+                let skipped = if row_index == frag.row_start {
+                    frag.clip_top.unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                frag_y += skipped;
+                let row_h = row_tops.get(row_index + 1).copied().unwrap_or(0.0)
+                    - row_tops.get(row_index).copied().unwrap_or(0.0);
+                row_shift += height - (row_h - skipped);
+            }
+            visible.push(VisibleRow {
+                row_index,
+                frag_y,
+                content_shift: rounding(row_index),
+                is_first_in_fragment,
+                band_height,
+            });
+        }
+
+        // vertically-merged cells whose restart row is on an earlier fragment but
+        // whose span reaches into this one re-paint clipped (not selectable — they
+        // carry no doc positions, matching data-vmerge-continuation)
+        let span_height = |g: &GridCell| {
+            let mut height = 0.0;
+            for r in g.row_index..(g.row_index + g.row_span).min(row_tops.len() - 1) {
+                height += row_tops[r + 1] - row_tops[r];
+            }
+            height
+        };
+        let mut paints: Vec<CellPaint> = Vec::new();
+        for (grid_index, g) in grid.iter().enumerate() {
+            if g.row_span <= 1 || g.row_index >= frag.row_start {
+                continue;
+            }
+            if g.row_index + g.row_span <= frag.row_start {
+                continue;
+            }
+            if header_row_count > 0 && g.row_index < header_row_count {
+                continue; // already drawn by the header pass
+            }
+            paints.push(CellPaint {
+                grid_index,
+                cell_y: to_frag_y(row_tops.get(g.row_index).copied().unwrap_or(0.0)),
+                content_shift: rounding(g.row_index),
+                cell_h: span_height(g),
+                content_h: span_height(g),
+                is_first_row: false,
+                selectable: false,
+            });
+        }
+        for vr in &visible {
+            let row_h = vr.band_height.unwrap_or_else(|| {
+                row_tops.get(vr.row_index + 1).copied().unwrap_or(0.0)
+                    - row_tops.get(vr.row_index).copied().unwrap_or(0.0)
+            });
+            for (grid_index, g) in grid.iter().enumerate() {
+                if g.row_index != vr.row_index {
+                    continue;
+                }
+                let cell_h = if g.row_span > 1 {
+                    span_height(g)
+                } else {
+                    row_h
+                };
+                paints.push(CellPaint {
+                    grid_index,
+                    cell_y: vr.frag_y,
+                    content_shift: vr.content_shift,
+                    cell_h,
+                    content_h: if vr.band_height.is_some() {
+                        measure
+                            .rows
+                            .iter()
+                            .skip(g.row_index)
+                            .take(g.row_span)
+                            .map(|row| row.height)
+                            .sum()
+                    } else {
+                        cell_h
+                    },
+                    is_first_row: g.row_index == 0 || vr.is_first_in_fragment,
+                    selectable: true,
+                });
+            }
+        }
+
+        Self {
+            row_tops,
+            grid,
+            row_count,
+            col_count,
+            cell_at,
+            carried,
+            header_row_count,
+            semantic_header_count,
+            header_height,
+            visible_height,
+            full_bottom_border,
+            resume_band,
+            clip_top_y: frag.y,
+            clip_bottom_y: frag.y + visible_height,
+            content_clip_bottom_y: frag.y + visible_height - cut_band,
+            visible,
+            paints,
+        }
+    }
+
+    fn cell_at(&self, row: usize, col: usize) -> Option<&GridCell> {
+        if row >= self.row_count || col >= self.col_count {
+            return None;
+        }
+        let idx = self.cell_at[row * self.col_count + col]?;
+        Some(&self.grid[idx])
+    }
+
+    fn cell_starting_at(&self, row: usize, col: usize) -> Option<&GridCell> {
+        self.cell_at(row, col).filter(|g| g.row_index == row)
+    }
+
+    fn right_neighbour(&self, g: &GridCell, row: usize, bidi: bool) -> Option<&GridCell> {
+        let right_col = if bidi {
+            g.column_index.checked_sub(1)?
+        } else {
+            g.column_index + g.col_span
+        };
+        let ng = self.cell_at(row, right_col)?;
+        ((ng.x - (g.x + g.width)).abs() < 1e-4).then_some(ng)
+    }
+
+    /// The grid row this fragment paints directly below `g`: the next row in the same band, or
+    /// the first body row under a repeated header band.
+    fn row_painted_below(&self, g: &GridCell, frag: &TableFragmentIn) -> Option<usize> {
+        let below_row = g.row_index + g.row_span;
+        let body_end = frag.row_end.min(self.row_count);
+        if g.row_index < self.header_row_count {
+            if below_row < self.header_row_count {
+                return Some(below_row);
+            }
+            return (below_row == self.header_row_count
+                && frag.row_start >= self.header_row_count
+                && frag.row_start < body_end
+                && frag.clip_top.unwrap_or(0.0) == 0.0)
+                .then_some(frag.row_start);
+        }
+        (below_row >= frag.row_start && below_row < body_end).then_some(below_row)
+    }
+
+    /// The top of the band a cell clips to: header rows paint above the window.
+    fn cell_clip_top(&self, g: &GridCell) -> f64 {
+        if g.row_index < self.header_row_count {
+            self.clip_top_y
+        } else {
+            self.clip_top_y + self.header_height + self.resume_band
+        }
+    }
+
+    fn cell_content_window(
+        &self,
+        frag: &TableFragmentIn,
+        g: &GridCell,
+        paint: &CellPaint,
+    ) -> (f64, f64, f64) {
+        let cy = frag.y + paint.cell_y;
+        if let Some(clip) = frag.cell_clips.as_ref().and_then(|clips| {
+            clips
+                .iter()
+                .find(|clip| clip.row == g.row_index && clip.cell == g.cell_index)
+        }) {
+            (
+                cy - clip.top,
+                cy.max(self.cell_clip_top(g)),
+                (cy + (clip.bottom - clip.top)).min(self.content_clip_bottom_y),
+            )
+        } else {
+            (
+                cy + paint.content_shift,
+                self.cell_clip_top(g),
+                self.content_clip_bottom_y,
+            )
+        }
+    }
+}
+
+/// The boundary band a page break redraws at a cut through `row` (the row's
+/// contiguous top band; zero in the half-share model, which has none).
+pub(crate) fn row_cut_band(measure: &TableExtentIn, row: usize) -> f64 {
+    measure
+        .rows
+        .get(row)
+        .into_iter()
+        .flat_map(|row| row.cells.iter())
+        .filter_map(|cell| cell.top_band)
+        .fold(0.0, f64::max)
+}
+
+/// Whether a grid cell is on the table's outer leading edge, whose border insets content.
+fn is_first_grid_column(g: &GridCell, block: &TableBlockIn, measure: &TableExtentIn) -> bool {
+    let row = &block.rows[g.row_index];
+    if block.bidi == Some(true) {
+        g.column_index + g.col_span + row.grid_after.unwrap_or(0).min(16_384) as usize
+            >= measure.column_widths.len()
+    } else {
+        g.column_index == row.grid_before.unwrap_or(0).min(16_384) as usize
+    }
+}
+
+/// Paints the row window this page shows of a table: the repeated header band,
+/// the visible rows, re-emitted vertical merges, collapsed shared borders, and
+/// the cut edges that close the fragment where a page break sliced it.
+pub(crate) fn emit_table_fragment(
+    prims: &mut Vec<Primitive>,
+    frag: &TableFragmentIn,
+    block: &TableBlockIn,
+    measure: &TableExtentIn,
+    ctx: &RenderCtx<'_>,
+) {
+    let stamp_from = prims.len();
+    let table_id = block_key(&frag.block_id);
+    let plan = TablePaintPlan::new(frag, block, measure);
+    let TablePaintPlan {
+        row_tops,
+        grid,
+        carried,
+        header_row_count,
+        semantic_header_count,
+        header_height,
+        visible_height,
+        clip_top_y,
+        clip_bottom_y,
+        ..
+    } = &plan;
+    let (carried, header_row_count, semantic_header_count, header_height, visible_height) = (
+        *carried,
+        *header_row_count,
+        *semantic_header_count,
+        *header_height,
+        *visible_height,
+    );
+    let (clip_top_y, clip_bottom_y) = (*clip_top_y, *clip_bottom_y);
+    struct PaintedCell<'a> {
+        g: &'a GridCell,
+        cell_h: f64,
+        is_first_row: bool,
+        selectable: bool,
+    }
+
+    let block_ref = BlockRef::of(&frag.block_id);
+    let table_revision = whole_table_revision(block);
+    if let Some(rev) = table_revision.clone() {
+        let mut attrs = block_ref.attrs();
+        attrs.structural_revision = Some(Box::new(rev.clone()));
+        prims.push(Primitive::Rect(RectPrimitive {
+            x: px(frag.x + STRUCTURAL_CHANGE_BAR_OFFSET_X),
+            y: px(frag.y),
+            w: px(STRUCTURAL_CHANGE_BAR_WIDTH),
+            h: px(visible_height),
+            fill: structural_color(rev.kind).to_string(),
+            attrs,
+        }));
+    }
+
+    if table_revision.is_none() {
+        for vr in &plan.visible {
+            let Some(row) = block.rows.get(vr.row_index) else {
+                continue;
+            };
+            let Some(rev) = row_structural_revision(row, vr.row_index) else {
+                continue;
+            };
+            let full_top = frag.y + vr.frag_y;
+            let row_h = vr.band_height.unwrap_or_else(|| {
+                row_tops.get(vr.row_index + 1).copied().unwrap_or(0.0)
+                    - row_tops.get(vr.row_index).copied().unwrap_or(0.0)
+            });
+            let t = full_top.max(clip_top_y);
+            let b = (full_top + row_h).min(clip_bottom_y);
+            if b - t <= 0.0 {
+                continue;
+            }
+            let mut attrs = block_ref.attrs();
+            attrs.structural_revision = Some(Box::new(rev.clone()));
+            prims.push(Primitive::Rect(RectPrimitive {
+                x: px(frag.x + STRUCTURAL_CHANGE_BAR_OFFSET_X),
+                y: px(t),
+                w: px(STRUCTURAL_CHANGE_BAR_WIDTH),
+                h: px(b - t),
+                fill: structural_color(rev.kind).to_string(),
+                attrs,
+            }));
+        }
+    }
+
+    // per cell: background, collapsed borders, then content — clipped to the
+    // fragment window
+    for paint in &plan.paints {
+        let cell_stamp_from = prims.len();
+        let g = &grid[paint.grid_index];
+        let cell = &block.rows[g.row_index].cells[g.cell_index];
+        let cx = frag.x + g.x;
+        let cy = frag.y + paint.cell_y;
+        let clip_top_y = plan.cell_clip_top(g);
+        // The outer left border insets cell content by its width.
+        let is_first_col = is_first_grid_column(g, block, measure);
+        let p = PaintedCell {
+            g,
+            cell_h: paint.cell_h,
+            is_first_row: paint.is_first_row,
+            selectable: paint.selectable,
+        };
+        // Grid position stamped on every primitive inside this cell. A vertical
+        // merge continuation keeps the anchor cell's row and column and flags
+        // itself so consumers know it is a re-paint.
+        let is_header = p.g.row_index < semantic_header_count
+            || block.rows[p.g.row_index].is_header == Some(true);
+        let cell_id = format!("{table_id}-r{}-c{}", p.g.row_index, p.g.column_index);
+        let header_ids = if is_header {
+            Vec::new()
+        } else {
+            (0..semantic_header_count)
+                .filter_map(|header_row| {
+                    grid.iter()
+                        .find(|cell| {
+                            cell.row_index == header_row
+                                && p.g.column_index >= cell.column_index
+                                && p.g.column_index < cell.column_index + cell.col_span
+                        })
+                        .map(|cell| {
+                            format!("{table_id}-r{}-c{}", cell.row_index, cell.column_index)
+                        })
+                })
+                .collect()
+        };
+        let cell_ref = TableCellRef {
+            row: p.g.row_index as u64,
+            col: p.g.column_index as u64,
+            row_span: p.g.row_span as u64,
+            col_span: p.g.col_span as u64,
+            continuation: if p.selectable { None } else { Some(true) },
+            cell_id: Some(cell_id),
+            is_header: is_header.then_some(true),
+            repeated_header: (carried && p.g.row_index < header_row_count).then_some(true),
+            no_wrap: cell.no_wrap.filter(|value| *value),
+            header_ids,
+            owns_top_border: (p.is_first_row
+                && cell
+                    .borders
+                    .as_ref()
+                    .and_then(|borders| borders.top.as_ref())
+                    .is_some())
+            .then_some(true),
+            owns_right_border: cell
+                .borders
+                .as_ref()
+                .and_then(|borders| borders.right.as_ref())
+                .is_some()
+                .then_some(true),
+            owns_bottom_border: cell
+                .borders
+                .as_ref()
+                .and_then(|borders| borders.bottom.as_ref())
+                .is_some()
+                .then_some(true),
+            owns_left_border: (is_first_col
+                && cell
+                    .borders
+                    .as_ref()
+                    .and_then(|borders| borders.left.as_ref())
+                    .is_some())
+            .then_some(true),
+        };
+        let clip = |top: f64, bottom: f64| -> Option<(f64, f64)> {
+            let t = top.max(clip_top_y);
+            let b = bottom.min(clip_bottom_y);
+            if b - t <= 0.0 { None } else { Some((t, b)) }
+        };
+
+        if let Some(bg) = &cell.background
+            && let Some((t, b)) = clip(cy, cy + p.cell_h)
+        {
+            let mut bg_attrs = block_ref.attrs();
+            bg_attrs.cell = Some(Box::new(cell_ref.clone()));
+            prims.push(Primitive::Rect(RectPrimitive {
+                x: px(cx),
+                y: px(t),
+                w: px(p.g.width),
+                h: px(b - t),
+                fill: bg.clone(),
+                attrs: bg_attrs,
+            }));
+        }
+
+        if let Some(marker) = &cell.tracked_marker {
+            let parent_row_revision_id = row_parent_revision_id(&block.rows[p.g.row_index]);
+            if marker.info.revision_id != parent_row_revision_id
+                && let Some((t, b)) = clip(cy, cy + CELL_STRUCTURAL_BAR_HEIGHT)
+            {
+                let rev = structural_revision(
+                    &marker.info,
+                    StructuralRevisionScope::Cell,
+                    marker.kind,
+                    Some(p.g.row_index as u64),
+                    Some(p.g.column_index as u64),
+                );
+                let mut attrs = block_ref.attrs();
+                attrs.cell = Some(Box::new(cell_ref.clone()));
+                attrs.structural_revision = Some(Box::new(rev.clone()));
+                prims.push(Primitive::Rect(RectPrimitive {
+                    x: px(cx),
+                    y: px(t),
+                    w: px(p.g.width),
+                    h: px(b - t),
+                    fill: structural_color(rev.kind).to_string(),
+                    attrs,
+                }));
+            }
+        }
+
+        // shared-edge collapse: every cell owns bottom and right, resolved against
+        // the neighbour's facing edge; top and left draw only on the outer boundary
+        let borders = cell.borders.as_ref();
+        let bidi = block.bidi == Some(true);
+        let gridlines = ctx.gridlines.filter(|_| block.gridlines == Some(true));
+        let mut push_edge = |x1: f64, y1: f64, x2: f64, y2: f64, e: Option<&BorderEdgeIn>| {
+            let visible = e.filter(|e| border_visible(e));
+            if visible.is_none() && gridlines.is_none() {
+                return;
+            }
+            // clip vertically to the window band
+            let (y1c, y2c) = (y1.max(clip_top_y), y2.min(clip_bottom_y));
+            if y1 != y2 && y2c - y1c <= 0.0 {
+                return;
+            }
+            if y1 == y2 && (y1 < clip_top_y || y1 > clip_bottom_y) {
+                return;
+            }
+            let (y1, y2) = if y1 == y2 { (y1, y2) } else { (y1c, y2c) };
+            let Some(e) = visible else {
+                if let Some(gridlines) = gridlines {
+                    gridlines.borrow_mut().push(DisplayGridline {
+                        x1: px(x1),
+                        y1: px(y1),
+                        x2: px(x2),
+                        y2: px(y2),
+                    });
+                }
+                return;
+            };
+            let style = display_border_style(e.style.as_deref());
+            let width = e.width.unwrap_or(1.0);
+            // explicit ownership: the owning grid cell rides on the line so
+            // consumers associate borders exactly (no geometric fallback)
+            let line_attrs = DocAttrs {
+                cell: Some(Box::new(cell_ref.clone())),
+                ..DocAttrs::default()
+            };
+            prims.push(Primitive::Line(LinePrimitive {
+                x1: px(x1),
+                y1: px(y1),
+                x2: px(x2),
+                y2: px(y2),
+                stroke_width: px(width),
+                color: e.color.clone().unwrap_or_else(|| "#000000".to_string()),
+                dash: border_dash(style, width),
+                role: Some(LineRole::TableBorder),
+                border_style: Some(style),
+                border_owner: Some(BorderOwner::Cell),
+                attrs: line_attrs,
+                ..LinePrimitive::contract_defaults()
+            }));
+        };
+        // Rows carrying contiguous boundary bands (Word's model for floating
+        // tables): the edge between two rows lives in the lower row's band.
+        let contiguous = row_cut_band(measure, p.g.row_index) > 0.0;
+        // The band closing a fragment's last row belongs to the fragment, so
+        // that row's vertical edges run through it to the fragment's bottom.
+        let vertical_bottom = if contiguous
+            && frag.clip_bottom.is_none()
+            && p.g.row_index + p.g.row_span >= frag.row_end.min(block.rows.len())
+        {
+            (frag.y + plan.visible_height).max(cy + p.cell_h)
+        } else {
+            cy + p.cell_h
+        };
+        if p.is_first_row {
+            let e = borders.and_then(|b| b.top.as_ref());
+            let starts_table = if carried {
+                plan.header_row_count > 0
+            } else {
+                frag.clip_top.unwrap_or(0.0) == 0.0
+            };
+            // Contiguous model: a row owns the boundary band above it, so the
+            // edge a fragment's first row draws sits inside that band.
+            let inset = match e {
+                Some(e) if p.g.row_index == 0 && starts_table => e.width.unwrap_or(1.0) / 2.0,
+                Some(e) if contiguous && frag.clip_top.unwrap_or(0.0) == 0.0 => {
+                    e.width.unwrap_or(1.0) / 2.0
+                }
+                _ => 0.0,
+            };
+            push_edge(cx, cy + inset, cx + p.g.width, cy + inset, e);
+        }
+        let own_right = borders.and_then(|b| b.right.as_ref());
+        let span_end_row = (p.g.row_index + p.g.row_span).min(block.rows.len());
+        if p.g.row_span <= 1 || span_end_row <= p.g.row_index + 1 {
+            let neighbour_left = plan
+                .right_neighbour(p.g, p.g.row_index, bidi)
+                .and_then(|ng| {
+                    block.rows[ng.row_index].cells[ng.cell_index]
+                        .borders
+                        .as_ref()
+                })
+                .and_then(|b| b.left.as_ref());
+            let e = resolve_shared_border(own_right, neighbour_left);
+            push_edge(cx + p.g.width, cy, cx + p.g.width, vertical_bottom, e);
+        } else {
+            let base_top = row_tops.get(p.g.row_index).copied().unwrap_or(0.0);
+            let mut run_start_row = p.g.row_index;
+            let first_left = plan
+                .right_neighbour(p.g, p.g.row_index, bidi)
+                .and_then(|ng| {
+                    block.rows[ng.row_index].cells[ng.cell_index]
+                        .borders
+                        .as_ref()
+                })
+                .and_then(|b| b.left.as_ref());
+            let mut run_resolved = resolve_shared_border(own_right, first_left);
+            let mut uniform = true;
+            for r in (p.g.row_index + 1)..span_end_row {
+                let next_left = plan
+                    .right_neighbour(p.g, r, bidi)
+                    .and_then(|ng| {
+                        block.rows[ng.row_index].cells[ng.cell_index]
+                            .borders
+                            .as_ref()
+                    })
+                    .and_then(|b| b.left.as_ref());
+                let next_resolved = resolve_shared_border(own_right, next_left);
+                if !borders_edge_equal(run_resolved, next_resolved) {
+                    uniform = false;
+                    let y1 =
+                        cy + (row_tops.get(run_start_row).copied().unwrap_or(base_top) - base_top);
+                    let y2 = cy + (row_tops.get(r).copied().unwrap_or(base_top) - base_top);
+                    push_edge(cx + p.g.width, y1, cx + p.g.width, y2, run_resolved);
+                    run_start_row = r;
+                    run_resolved = next_resolved;
+                }
+            }
+            let y1 = if uniform {
+                cy
+            } else {
+                cy + (row_tops.get(run_start_row).copied().unwrap_or(base_top) - base_top)
+            };
+            push_edge(
+                cx + p.g.width,
+                y1,
+                cx + p.g.width,
+                vertical_bottom,
+                run_resolved,
+            );
+        }
+        let own_bottom = borders.and_then(|b| b.bottom.as_ref());
+        let bottom_y = |e: Option<&BorderEdgeIn>| {
+            if plan.full_bottom_border && p.g.row_index + p.g.row_span >= block.rows.len() {
+                frag.y + frag.height - e.map_or(0.0, |e| e.width.unwrap_or(1.0)) / 2.0
+            } else if contiguous {
+                cy + p.cell_h + e.map_or(0.0, |e| e.width.unwrap_or(1.0)) / 2.0
+            } else {
+                cy + p.cell_h
+            }
+        };
+        let below_row = plan.row_painted_below(p.g, frag);
+        if below_row.is_none() {
+            let y = bottom_y(own_bottom);
+            push_edge(cx, y, cx + p.g.width, y, own_bottom);
+        } else if p.g.col_span <= 1 {
+            let neighbour_top = below_row
+                .and_then(|row| plan.cell_starting_at(row, p.g.column_index))
+                .and_then(|ng| {
+                    block.rows[ng.row_index].cells[ng.cell_index]
+                        .borders
+                        .as_ref()
+                })
+                .and_then(|b| b.top.as_ref());
+            let e = resolve_shared_border(own_bottom, neighbour_top);
+            let y = bottom_y(e);
+            push_edge(cx, y, cx + p.g.width, y, e);
+        } else {
+            let col_at = |offset: usize| {
+                if bidi {
+                    p.g.column_index + p.g.col_span - 1 - offset
+                } else {
+                    p.g.column_index + offset
+                }
+            };
+            let col_width = |col: usize| measure.column_widths.get(col).copied().unwrap_or(0.0);
+            let first_col = col_at(0);
+            let first_top = below_row
+                .and_then(|row| plan.cell_starting_at(row, first_col))
+                .and_then(|ng| {
+                    block.rows[ng.row_index].cells[ng.cell_index]
+                        .borders
+                        .as_ref()
+                })
+                .and_then(|b| b.top.as_ref());
+            let mut run_resolved = resolve_shared_border(own_bottom, first_top);
+            let mut run_x1 = cx;
+            let mut cursor_x = cx + col_width(first_col);
+            let mut uniform = true;
+            for offset in 1..p.g.col_span {
+                let c = col_at(offset);
+                let next_top = below_row
+                    .and_then(|row| plan.cell_starting_at(row, c))
+                    .and_then(|ng| {
+                        block.rows[ng.row_index].cells[ng.cell_index]
+                            .borders
+                            .as_ref()
+                    })
+                    .and_then(|b| b.top.as_ref());
+                let next_resolved = resolve_shared_border(own_bottom, next_top);
+                if !borders_edge_equal(run_resolved, next_resolved) {
+                    uniform = false;
+                    let y = bottom_y(run_resolved);
+                    push_edge(run_x1, y, cursor_x, y, run_resolved);
+                    run_x1 = cursor_x;
+                    run_resolved = next_resolved;
+                }
+                cursor_x += col_width(c);
+            }
+            let y = bottom_y(run_resolved);
+            let x2 = if uniform { cx + p.g.width } else { cursor_x };
+            push_edge(run_x1, y, x2, y, run_resolved);
+        }
+        if is_first_col {
+            push_edge(
+                cx,
+                cy,
+                cx,
+                vertical_bottom,
+                borders.and_then(|b| b.left.as_ref()),
+            );
+        }
+
+        let content_stamp_from = prims.len();
+        let cell_window = frag.cell_clips.as_ref().and_then(|clips| {
+            clips
+                .iter()
+                .find(|clip| clip.row == g.row_index && clip.cell == g.cell_index)
+        });
+        let windowed_lines = cell_window.is_some();
+        let (content_y, content_clip_top, content_clip_bottom) =
+            plan.cell_content_window(frag, g, paint);
+        let content_frame = if frag.cell_clips.is_none() || content_clip_bottom > content_clip_top {
+            cell_content_frame(
+                cell,
+                measure,
+                &CellPaintRef::new(p.g, block),
+                cx,
+                content_y,
+                paint.content_h,
+                is_first_col,
+                content_clip_top,
+                content_clip_bottom,
+            )
+        } else {
+            None
+        };
+        let continues_on_next = windowed_lines
+            && content_frame
+                .as_ref()
+                .is_some_and(|(frame, _)| frame.content_end > frame.clip_bottom_y + 1e-6);
+
+        let cell_clip_top = cy.max(clip_top_y);
+        let cell_clip_bottom = (cy + p.cell_h).min(clip_bottom_y);
+        let cell_clip = ClipRect {
+            x: Some(px(cx)),
+            y: Some(px(cell_clip_top)),
+            w: Some(px(p.g.width)),
+            h: Some(px((cell_clip_bottom - cell_clip_top).max(0.0))),
+        };
+        let line_clip_top = if cell_window.is_some_and(|clip| clip.top > 0.0) {
+            content_clip_top.max(cell_clip_top)
+        } else {
+            cell_clip_top
+        };
+        let line_clip_bottom = if continues_on_next {
+            content_clip_bottom.min(cell_clip_bottom)
+        } else {
+            cell_clip_bottom
+        };
+        if let Some((frame, cell_measure)) = &content_frame {
+            let content_cuts = frame.content_cuts(frag, g);
+            emit_cell_content(
+                prims,
+                cell,
+                cell_measure,
+                frame,
+                windowed_lines.then_some((line_clip_top, line_clip_bottom)),
+                content_cuts.0 || content_cuts.1,
+                ctx,
+                p.selectable,
+                &cell_ref,
+                &block_ref,
+            );
+        }
+        let clip_id = format!("clip-{table_id}-r{}-c{}", p.g.row_index, p.g.column_index);
+        for (index, primitive) in prims.iter_mut().enumerate().skip(cell_stamp_from) {
+            if windowed_lines
+                && index >= content_stamp_from
+                && let Primitive::Line(line) = primitive
+            {
+                let mut line_clip = cell_clip.clone();
+                line_clip.y = Some(px(line_clip_top));
+                line_clip.h = Some(px((line_clip_bottom - line_clip_top).max(0.0)));
+                apply_clip_group(&mut line.attrs, clip_id.clone(), line_clip);
+            } else if let Some(attrs) = doc_attrs_mut(primitive) {
+                apply_clip_group(attrs, clip_id.clone(), cell_clip.clone());
+            }
+        }
+        if let Some((frame, cell_measure)) = &content_frame {
+            let content_cuts = frame.content_cuts(frag, g);
+            emit_cell_overlay_shapes(
+                prims,
+                cell,
+                cell_measure,
+                frame,
+                content_cuts.0 || content_cuts.1,
+                ctx,
+                p.selectable,
+                &cell_ref,
+            );
+        }
+    }
+
+    // cut edges close a fragment at a page break, one rule per column so
+    // per-column styles / colSpans / borderless columns are respected;
+    // `only_spanning` limits a clean row boundary to cells crossing the edge
+    let mut draw_cut_edge = |cut_row: usize, bottom: bool, top_y: f64, only_spanning: bool| {
+        for g in grid {
+            if g.row_index > cut_row || g.row_index + g.row_span - 1 < cut_row {
+                continue;
+            }
+            if only_spanning {
+                let crosses = if bottom {
+                    g.row_index + g.row_span - 1 > cut_row
+                } else {
+                    g.row_index < cut_row
+                };
+                if !crosses {
+                    continue;
+                }
+            }
+            let cell = &block.rows[g.row_index].cells[g.cell_index];
+            let spec = cell.borders.as_ref().and_then(|b| {
+                if bottom {
+                    b.bottom.as_ref()
+                } else {
+                    b.top.as_ref()
+                }
+            });
+            let Some(spec) = spec else { continue };
+            if !border_visible(spec) {
+                continue;
+            }
+            let bw = spec.width.unwrap_or(1.0);
+            let style = display_border_style(spec.style.as_deref());
+            // A cut line sits inside the fragment, centred in the band the
+            // paginator reserved (or the stroke's own width without one).
+            let y = frag.y
+                + if bottom {
+                    top_y - bw / 2.0
+                } else {
+                    top_y + bw / 2.0
+                };
+            // ownership metadata: the cut rule closes this grid cell's column
+            // band at the fragment edge (borderOwner stays Fragment)
+            let line_attrs = DocAttrs {
+                cell: Some(Box::new(TableCellRef {
+                    row: g.row_index as u64,
+                    col: g.column_index as u64,
+                    row_span: g.row_span as u64,
+                    col_span: g.col_span as u64,
+                    continuation: None,
+                    cell_id: Some(format!("{table_id}-r{}-c{}", g.row_index, g.column_index)),
+                    is_header: None,
+                    repeated_header: None,
+                    no_wrap: None,
+                    header_ids: Vec::new(),
+                    owns_top_border: None,
+                    owns_right_border: None,
+                    owns_bottom_border: None,
+                    owns_left_border: None,
+                })),
+                ..DocAttrs::default()
+            };
+            prims.push(Primitive::Line(LinePrimitive {
+                x1: px(frag.x + g.x),
+                y1: px(y),
+                x2: px(frag.x + g.x + g.width),
+                y2: px(y),
+                stroke_width: px(bw),
+                color: spec.color.clone().unwrap_or_else(|| "#000000".to_string()),
+                dash: border_dash(style, bw),
+                role: Some(LineRole::TableCut),
+                border_style: Some(style),
+                border_owner: Some(BorderOwner::Fragment),
+                attrs: line_attrs,
+                ..LinePrimitive::contract_defaults()
+            }));
+        }
+    };
+    if frag.clip_top.unwrap_or(0.0) > 0.0 {
+        draw_cut_edge(frag.row_start, false, header_height, false);
+    } else if carried {
+        draw_cut_edge(frag.row_start, false, header_height, true);
+    }
+    if frag.clip_bottom.is_some() {
+        draw_cut_edge(frag.row_end.saturating_sub(1), true, visible_height, false);
+    } else if frag.carried_to_next == Some(true) {
+        draw_cut_edge(frag.row_end.saturating_sub(1), true, visible_height, true);
+    }
+    let metadata = table_metadata(&table_id, frag, block, measure, semantic_header_count);
+    for primitive in &mut prims[stamp_from..] {
+        // table border/cut lines carry ownership metadata too — doc_attrs_mut
+        // deliberately excludes lines from the generic stamping passes, so the
+        // fragment-identity stamp reaches them through this explicit arm
+        let attrs = match primitive {
+            Primitive::Line(line) => match line.role {
+                Some(LineRole::TableBorder | LineRole::TableCut) => Some(&mut line.attrs),
+                _ => None,
+            },
+            other => doc_attrs_mut(other),
+        };
+        if let Some(attrs) = attrs {
+            if let Some(inner) = &mut attrs.table {
+                if inner.table_id.as_str() != table_id.as_ref() && inner.parent_table_id.is_none() {
+                    inner.parent_table_id = Some(table_id.clone().into_owned());
+                }
+            } else {
+                attrs.table = Some(Box::new(metadata.clone()));
+            }
+        }
+    }
+    stamp_sdt_range(&mut prims[stamp_from..], &block.sdt_groups, false);
+}
+
+/// Where a painted cell's content goes: its content box origin and width, the
+/// stacked top of every block, and the band it clips to. A rotated cell lays
+/// its content out unrotated in a logical box at the origin, clipped only by
+/// the cell, and turns it afterwards.
+struct CellContentFrame {
+    rotation: f64,
+    /// The cell's physical box `(x, y, width, height)`.
+    physical: (f64, f64, f64, f64),
+    content_x: f64,
+    content_top: f64,
+    content_width: f64,
+    content_end: f64,
+    clip_top_y: f64,
+    clip_bottom_y: f64,
+    /// Index-aligned with the cell's blocks.
+    block_tops: Vec<f64>,
+}
+
+impl CellContentFrame {
+    fn content_cuts(&self, frag: &TableFragmentIn, g: &GridCell) -> (bool, bool) {
+        let starts_before = g.row_index < frag.row_start
+            || (g.row_index == frag.row_start && frag.clip_top.unwrap_or(0.0) > 0.0);
+        let ends_after = g.row_index + g.row_span > frag.row_end
+            || (g.row_index + g.row_span == frag.row_end && frag.clip_bottom.is_some());
+        (
+            starts_before && self.content_top < self.clip_top_y - 1e-6,
+            ends_after && self.content_end > self.clip_bottom_y + 1e-6,
+        )
+    }
+
+    fn anchor_paragraph(cell: &TableCellIn, index: usize) -> usize {
+        (index..cell.blocks.len())
+            .find(|&i| matches!(cell.blocks[i], BlockIn::Paragraph(_)))
+            .or_else(|| {
+                (0..index)
+                    .rev()
+                    .find(|&i| matches!(cell.blocks[i], BlockIn::Paragraph(_)))
+            })
+            .unwrap_or(index)
+    }
+
+    fn shows_anchor(
+        &self,
+        cell: &TableCellIn,
+        measure: &TableCellExtentIn,
+        index: usize,
+        split_row: bool,
+    ) -> bool {
+        if !split_row {
+            return true;
+        }
+        let anchor = Self::anchor_paragraph(cell, index);
+        let y = self.content_top + self.block_tops[anchor];
+        match measure.blocks.get(anchor) {
+            Some(MeasureIn::Paragraph(paragraph)) => {
+                shown_line_window(paragraph, y, self.clip_top_y, self.clip_bottom_y)
+                    .is_some_and(|(lines, _)| lines.start == 0)
+            }
+            _ => y >= self.clip_top_y && y < self.clip_bottom_y,
+        }
+    }
+}
+
+/// Stacks a cell's paragraphs and nested tables with Word's spacing collapse.
+///
+/// Adjacent paragraphs collapse `spacing.after` against the next
+/// `spacing.before`, a nested table flows after the previous paragraph's
+/// after-spacing, and a trailing after-spacing acts as the content box's bottom
+/// padding. Authored border insets remain stable across fragment cuts.
+#[allow(clippy::too_many_arguments)]
+fn cell_content_frame<'m>(
+    cell: &TableCellIn,
+    measure: &'m TableExtentIn,
+    p: &CellPaintRef,
+    cx: f64,
+    cy: f64,
+    cell_h: f64,
+    is_first_col: bool,
+    clip_top_y: f64,
+    clip_bottom_y: f64,
+) -> Option<(CellContentFrame, &'m TableCellExtentIn)> {
+    let rotation = match cell.text_direction.as_deref() {
+        Some("btLr") => -90.0,
+        Some("tbRl") => 90.0,
+        _ => 0.0,
+    };
+    let rotated = rotation != 0.0;
+    let physical = (cx, cy, p.width, cell_h);
+    let logical_width = if rotated { cell_h } else { p.width };
+    let (cx, cy, cell_h, clip_top_y, clip_bottom_y) = if rotated {
+        (0.0, 0.0, p.width, -1e9, 1e9)
+    } else {
+        (cx, cy, cell_h, clip_top_y, clip_bottom_y)
+    };
+    let cell_measure = measure.rows.get(p.row_index)?.cells.get(p.cell_index)?;
+    let left = cell.padding.and_then(|pd| pd.left).unwrap_or(7.0);
+    let top = cell.padding.and_then(|pd| pd.top).unwrap_or(0.0);
+    let right = cell.padding.and_then(|pd| pd.right).unwrap_or(7.0);
+    let bottom = cell.padding.and_then(|pd| pd.bottom).unwrap_or(0.0);
+    let (pad_left, pad_top, pad_right, pad_bottom) = match rotation {
+        -90.0 => (bottom, left, top, right),
+        90.0 => (top, right, bottom, left),
+        _ => (left, top, right, bottom),
+    };
+    let content_width = (logical_width - pad_left - pad_right).max(0.0);
+
+    // Drawn border widths inset the cell content box.
+    let edge_w = |e: &Option<BorderEdgeIn>| -> f64 {
+        e.as_ref()
+            .filter(|b| border_visible(b))
+            .map(|b| b.width.unwrap_or(1.0))
+            .unwrap_or(0.0)
+    };
+    let borders = cell.borders.as_ref();
+    let border_left = borders
+        .filter(|_| is_first_col)
+        .map_or(0.0, |b| edge_w(&b.left));
+    let border_top = if p.cell_spacing <= 0.0 && !p.exact_row {
+        // Contiguous boundary band: the band overlaps the cell's top padding
+        // (Word takes the maximum of the two, not the sum), the cell's content
+        // starts below that top space, and the bottom band belongs to the row
+        // below.
+        match cell_measure.top_band {
+            Some(band) => (band - pad_top).max(0.0),
+            None => crate::cell_layout::cell_top_inset(
+                borders.map_or(0.0, |b| edge_w(&b.top)),
+                p.row_index == 0,
+                p.exact_row,
+                p.cell_spacing,
+            ),
+        }
+    } else {
+        crate::cell_layout::cell_top_inset(
+            borders.map_or(0.0, |b| edge_w(&b.top)),
+            p.row_index == 0,
+            p.exact_row,
+            p.cell_spacing,
+        )
+    };
+    let border_bottom = if p.cell_spacing <= 0.0 && !p.exact_row && cell_measure.top_band.is_some()
+    {
+        0.0
+    } else {
+        borders.map_or(0.0, |b| edge_w(&b.bottom))
+    };
+
+    // Paragraph spacing collapses within the cell flow.
+    let mut block_tops: Vec<f64> = Vec::with_capacity(cell.blocks.len());
+    let mut stack_cursor = 0.0_f64;
+    let mut prev_after = 0.0_f64;
+    let mut float_bottom = 0.0_f64;
+    for (i, blk) in cell.blocks.iter().enumerate() {
+        match (blk, cell_measure.blocks.get(i)) {
+            (BlockIn::Paragraph(pb), Some(MeasureIn::Paragraph(pm))) => {
+                let spacing = pb.attrs.as_ref().and_then(|a| a.spacing);
+                let before = spacing.and_then(|s| s.before).unwrap_or(0.0);
+                let after = spacing.and_then(|s| s.after).unwrap_or(0.0);
+                stack_cursor += prev_after.max(before);
+                block_tops.push(stack_cursor);
+                stack_cursor += pm
+                    .lines
+                    .iter()
+                    .map(|l| l.line_height + l.float_skip_before.unwrap_or(0.0))
+                    .sum::<f64>();
+                prev_after = after;
+            }
+            (BlockIn::Table(table), Some(MeasureIn::Table(tm))) => {
+                stack_cursor += prev_after;
+                if let Some(offset) =
+                    crate::cell_layout::nested_table_float_offset(table.floating.as_ref())
+                {
+                    block_tops.push(stack_cursor + offset);
+                    float_bottom = float_bottom.max(stack_cursor + offset + tm.total_height);
+                } else {
+                    block_tops.push(stack_cursor);
+                    stack_cursor += tm.total_height;
+                }
+                prev_after = 0.0;
+            }
+            (BlockIn::Image(_) | BlockIn::Reserved(_), Some(MeasureIn::Image(image))) => {
+                stack_cursor += prev_after;
+                block_tops.push(stack_cursor);
+                stack_cursor += image.height;
+                prev_after = 0.0;
+            }
+            (BlockIn::TextBox(_), Some(MeasureIn::TextBox(text_box))) => {
+                stack_cursor += prev_after;
+                block_tops.push(stack_cursor);
+                stack_cursor += text_box.height;
+                prev_after = 0.0;
+            }
+            (BlockIn::Shape(sb), Some(MeasureIn::Shape(_)))
+                if crate::cell_layout::cell_overlay_drawing(
+                    sb.position.is_some(),
+                    sb.wrap_type.as_deref(),
+                ) =>
+            {
+                block_tops.push(stack_cursor);
+            }
+            (BlockIn::Shape(_), Some(MeasureIn::Shape(sm)))
+            | (BlockIn::Chart(_), Some(MeasureIn::Chart(sm))) => {
+                stack_cursor += prev_after;
+                block_tops.push(stack_cursor);
+                stack_cursor += sm.height;
+                prev_after = 0.0;
+            }
+            _ => block_tops.push(stack_cursor),
+        }
+    }
+    // a trailing spacing.after becomes the content box's padding-bottom
+    let content_height = (stack_cursor + prev_after).max(float_bottom);
+
+    // Content that fills or overflows the cell remains top-aligned.
+    let v_offset = crate::cell_layout::cell_vertical_offset(
+        cell.vertical_align.as_deref(),
+        cell_h,
+        if rotated {
+            content_height + pad_top + pad_bottom
+        } else {
+            cell_measure.height
+        },
+        content_height,
+        border_top + pad_top,
+        border_bottom + pad_bottom,
+    );
+
+    Some((
+        CellContentFrame {
+            rotation,
+            physical,
+            content_x: cx + border_left + pad_left,
+            content_top: cy + border_top + pad_top + v_offset,
+            content_width,
+            content_end: cy
+                + border_top
+                + pad_top
+                + v_offset
+                + content_height
+                + pad_bottom
+                + border_bottom,
+            clip_top_y,
+            clip_bottom_y,
+            block_tops,
+        },
+        cell_measure,
+    ))
+}
+
+/// Paints a cell's content into its [`CellContentFrame`].
+#[allow(clippy::too_many_arguments)]
+fn emit_cell_content(
+    prims: &mut Vec<Primitive>,
+    cell: &TableCellIn,
+    cell_measure: &TableCellExtentIn,
+    frame: &CellContentFrame,
+    line_clip: Option<(f64, f64)>,
+    split_row: bool,
+    ctx: &RenderCtx<'_>,
+    selectable: bool,
+    cell_ref: &TableCellRef,
+    block_ref: &BlockRef,
+) {
+    let stamp_from = prims.len();
+    let CellContentFrame {
+        rotation,
+        physical,
+        content_x,
+        content_top,
+        content_width,
+        clip_top_y,
+        clip_bottom_y,
+        ref block_tops,
+        ..
+    } = *frame;
+    let rotated = rotation != 0.0;
+    let windowed_lines = line_clip.is_some();
+    let (cull_top_y, cull_bottom_y) = line_clip.unwrap_or((clip_top_y, clip_bottom_y));
+    let reserved_from = ctx
+        .reservations
+        .map_or(0, |reserved| reserved.borrow().len());
+
+    // Behind-document floats paint below cell content.
+    emit_cell_floating_images(
+        prims,
+        cell,
+        cell_measure,
+        block_ref,
+        frame,
+        split_row,
+        cell_ref,
+        selectable,
+        true,
+    );
+
+    for (i, cell_block) in cell.blocks.iter().enumerate() {
+        let Some(m) = cell_measure.blocks.get(i) else {
+            continue;
+        };
+        if let BlockIn::Shape(shape) = cell_block
+            && crate::cell_layout::cell_overlay_drawing(
+                shape.position.is_some(),
+                shape.wrap_type.as_deref(),
+            )
+            && (!rotated || !frame.shows_anchor(cell, cell_measure, i, split_row))
+        {
+            continue;
+        }
+        if windowed_lines && !matches!(cell_block, BlockIn::Paragraph(_)) {
+            let height = match m {
+                MeasureIn::Table(table) => table.total_height,
+                MeasureIn::Image(image) => image.height,
+                MeasureIn::TextBox(text_box) => text_box.height,
+                MeasureIn::Shape(shape) | MeasureIn::Chart(shape) => shape.height,
+                _ => 0.0,
+            };
+            let block_y = content_top + block_tops[i];
+            if block_y + height <= cull_top_y + 1e-6 || block_y >= cull_bottom_y - 1e-6 {
+                continue;
+            }
+        }
+        if let (BlockIn::Paragraph(pb), MeasureIn::Paragraph(pm)) = (cell_block, m) {
+            // cell paragraphs never split; fabricate a whole-paragraph fragment
+            let total_height: f64 = pm
+                .lines
+                .iter()
+                .map(|l| l.line_height + l.float_skip_before.unwrap_or(0.0))
+                .sum();
+            // y of this paragraph's first line = the collapsed-spacing stack
+            // offset computed above (block_tops is index-aligned with cell.blocks)
+            let para_y = content_top + block_tops[i];
+            let (lines, para_y, total_height) = if windowed_lines {
+                let Some((lines, _)) = shown_line_window(pm, para_y, clip_top_y, clip_bottom_y)
+                else {
+                    continue;
+                };
+                let skipped: f64 = pm.lines[..lines.start]
+                    .iter()
+                    .map(|line| line.line_height + line.float_skip_before.unwrap_or(0.0))
+                    .sum();
+                let height = pm.lines[lines.clone()]
+                    .iter()
+                    .map(|line| line.line_height + line.float_skip_before.unwrap_or(0.0))
+                    .sum();
+                (lines, para_y + skipped, height)
+            } else {
+                (0..pm.lines.len(), para_y, total_height)
+            };
+            let synthetic = ParagraphFragmentIn {
+                horizontal_frame: None,
+                block_id: pb.id.clone(),
+                x: content_x,
+                y: para_y,
+                width: content_width,
+                height: total_height,
+                from_line: lines.start,
+                to_line: lines.end,
+                pm_start: if selectable { pb.pm_start } else { None },
+                pm_end: if selectable { pb.pm_end } else { None },
+                carried_from_prev: windowed_lines.then_some(lines.start > 0),
+                carried_to_next: windowed_lines.then_some(lines.end < pm.lines.len()),
+            };
+            let before = prims.len();
+            emit_paragraph_fragment(
+                // cell paragraphs render as ARIA cells in the mirror, not
+                // paragraph fragments — no line-range node to stamp
+                prims, &synthetic, pb, pm, ctx, content_x, para_y, None, None, true, false,
+            );
+            postprocess_cell_primitives(
+                prims,
+                before,
+                cull_top_y,
+                cull_bottom_y,
+                windowed_lines,
+                selectable,
+                Some(cell_ref),
+            );
+        } else if let (BlockIn::Table(tb), MeasureIn::Table(tm)) = (cell_block, m) {
+            let table_y = content_top + block_tops[i];
+            let synthetic = TableFragmentIn {
+                block_id: tb.id.clone(),
+                x: content_x + nested_table_x_offset(tb, tm, content_width),
+                y: table_y,
+                width: table_total_width(tm),
+                height: tm.total_height,
+                row_start: 0,
+                row_end: tb.rows.len(),
+                clip_top: None,
+                clip_bottom: None,
+                cell_clips: None,
+                header_row_count: None,
+                carried_from_prev: None,
+                carried_to_next: None,
+            };
+            let before = prims.len();
+            emit_table_fragment(prims, &synthetic, tb, tm, ctx);
+            // Preserve the nested table's own inner `cell` refs so the mirror can
+            // surface its table semantics; only clip to the outer cell fragment
+            // and strip doc positions on a vmerge continuation repaint.
+            postprocess_cell_primitives(
+                prims,
+                before,
+                cull_top_y,
+                cull_bottom_y,
+                windowed_lines,
+                selectable,
+                None,
+            );
+        } else if let (BlockIn::Reserved(block), MeasureIn::Image(measure)) = (cell_block, m) {
+            ctx.reserve(
+                &block.reservation,
+                content_x,
+                content_top + block_tops[i],
+                measure.width.min(content_width.max(0.0)).max(0.0),
+                measure.height,
+            );
+        } else if let (BlockIn::Image(image), MeasureIn::Image(image_measure)) = (cell_block, m) {
+            let image_x = content_x;
+            let image_y = content_top + block_tops[i];
+            let mut attrs = BlockRef::of(&image.id).attrs();
+            if selectable {
+                attrs.doc_start = image.pm_start;
+                attrs.doc_end = image.pm_end;
+            }
+            stamp_image_block_attrs(&mut attrs, image, image_x, image_y);
+            let rotation = image
+                .rotation_deg
+                .unwrap_or_else(|| rotation_degrees(image.transform.as_deref()));
+            let before = prims.len();
+            prims.push(Primitive::Image(ImagePrimitive {
+                rel_id: image.src.clone(),
+                x: px(image_x),
+                y: px(image_y),
+                w: px(image_measure.width),
+                h: px(image_measure.height),
+                rotation_deg: (rotation != 0.0).then(|| px(rotation)),
+                opacity: image.opacity.map(px),
+                filter: None,
+                decorative: image.decorative.unwrap_or(false),
+                crop: crop_of_block(image),
+                alt_text: capped_alt_text(image.alt.as_deref()),
+                attrs,
+            }));
+            postprocess_cell_primitives(
+                prims,
+                before,
+                cull_top_y,
+                cull_bottom_y,
+                windowed_lines,
+                selectable,
+                Some(cell_ref),
+            );
+        } else if let (BlockIn::TextBox(text_box), MeasureIn::TextBox(text_box_measure)) =
+            (cell_block, m)
+        {
+            let text_box_y = content_top + block_tops[i];
+            let synthetic = TextBoxFragmentIn {
+                block_id: text_box.id.clone(),
+                x: content_x,
+                y: text_box_y,
+                width: text_box_measure.width.max(0.0),
+                height: text_box_measure.height,
+                pm_start: selectable.then_some(text_box.pm_start).flatten(),
+                pm_end: selectable.then_some(text_box.pm_end).flatten(),
+                is_floating: Some(text_box.display_mode.as_deref() == Some("float")),
+                z_index: None,
+            };
+            let before = prims.len();
+            emit_text_box_fragment(prims, &synthetic, text_box, text_box_measure, ctx);
+            postprocess_cell_primitives(
+                prims,
+                before,
+                cull_top_y,
+                cull_bottom_y,
+                windowed_lines,
+                selectable,
+                Some(cell_ref),
+            );
+        } else if let (BlockIn::Shape(sb), MeasureIn::Shape(sm)) = (cell_block, m) {
+            let shape_y = content_top + block_tops[i];
+            let synthetic = ShapeFragmentIn {
+                block_id: sb.id.clone(),
+                x: content_x,
+                y: shape_y,
+                width: if sm.width > 0.0 { sm.width } else { sb.width },
+                height: if sm.height > 0.0 {
+                    sm.height
+                } else {
+                    sb.height
+                },
+                doc_start: if selectable { sb.doc_start } else { None },
+                doc_end: if selectable { sb.doc_end } else { None },
+                pm_start: if selectable { sb.pm_start } else { None },
+                pm_end: if selectable { sb.pm_end } else { None },
+                is_anchored: None,
+                z_index: None,
+            };
+            let before = prims.len();
+            emit_shape_fragment(prims, &synthetic, sb, ctx);
+            postprocess_cell_primitives(
+                prims,
+                before,
+                cull_top_y,
+                cull_bottom_y,
+                windowed_lines,
+                selectable,
+                Some(cell_ref),
+            );
+        } else if let (BlockIn::Chart(cb), MeasureIn::Chart(cm)) = (cell_block, m) {
+            let chart_y = content_top + block_tops[i];
+            let synthetic = ChartFragmentIn {
+                block_id: cb.id.clone(),
+                x: content_x,
+                y: chart_y,
+                width: if cm.width > 0.0 { cm.width } else { cb.width },
+                height: if cm.height > 0.0 {
+                    cm.height
+                } else {
+                    cb.height
+                },
+                doc_start: if selectable { cb.doc_start } else { None },
+                doc_end: if selectable { cb.doc_end } else { None },
+                pm_start: if selectable { cb.pm_start } else { None },
+                pm_end: if selectable { cb.pm_end } else { None },
+            };
+            let before = prims.len();
+            emit_chart_fragment(prims, &synthetic, cb);
+            postprocess_cell_primitives(
+                prims,
+                before,
+                cull_top_y,
+                cull_bottom_y,
+                windowed_lines,
+                selectable,
+                Some(cell_ref),
+            );
+        }
+    }
+
+    // Front cell floats paint above cell content.
+    emit_cell_floating_images(
+        prims,
+        cell,
+        cell_measure,
+        block_ref,
+        frame,
+        split_row,
+        cell_ref,
+        selectable,
+        false,
+    );
+    if windowed_lines {
+        let mut index = stamp_from;
+        while index < prims.len() {
+            let (top, bottom) = primitive_painted_v_extent(&prims[index]);
+            if bottom <= cull_top_y || top >= cull_bottom_y {
+                prims.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+    if rotated {
+        rotate_cell_content(&mut prims[stamp_from..], physical, rotation);
+    }
+    finish_cell_reservations(
+        ctx,
+        reserved_from,
+        selectable,
+        (cull_top_y, cull_bottom_y),
+        rotated.then_some((physical, rotation)),
+    );
+}
+
+/// Paints a cell's `wrapNone` drawings at their anchored positions, over the
+/// cell and unclipped by it. A rotated cell paints them with its content.
+#[allow(clippy::too_many_arguments)]
+fn emit_cell_overlay_shapes(
+    prims: &mut Vec<Primitive>,
+    cell: &TableCellIn,
+    cell_measure: &TableCellExtentIn,
+    frame: &CellContentFrame,
+    split_row: bool,
+    ctx: &RenderCtx<'_>,
+    selectable: bool,
+    cell_ref: &TableCellRef,
+) {
+    if frame.rotation != 0.0 {
+        return;
+    }
+    for (i, cell_block) in cell.blocks.iter().enumerate() {
+        let (BlockIn::Shape(shape), Some(MeasureIn::Shape(measure))) =
+            (cell_block, cell_measure.blocks.get(i))
+        else {
+            continue;
+        };
+        if !crate::cell_layout::cell_overlay_drawing(
+            shape.position.is_some(),
+            shape.wrap_type.as_deref(),
+        ) || !frame.shows_anchor(cell, cell_measure, i, split_row)
+        {
+            continue;
+        }
+        let anchor = CellContentFrame::anchor_paragraph(cell, i);
+        let width = if measure.width > 0.0 {
+            measure.width
+        } else {
+            shape.width
+        };
+        let height = if measure.height > 0.0 {
+            measure.height
+        } else {
+            shape.height
+        };
+        let content_height = frame.content_end - frame.content_top;
+        let (x, y) = crate::anchor::resolve_position(
+            shape.position.as_ref(),
+            width,
+            height,
+            &crate::anchor::AnchorFrame {
+                page_width: frame.content_width,
+                page_height: content_height,
+                margin_left: 0.0,
+                margin_right: 0.0,
+                margin_top: 0.0,
+                margin_bottom: 0.0,
+                flow_x: 0.0,
+                flow_y: frame.block_tops.get(anchor).copied().unwrap_or(0.0),
+                flow_width: frame.content_width,
+                flow_height: 0.0,
+                odd_page: ctx.page_number % 2 == 1,
+            },
+        );
+        let fragment = ShapeFragmentIn {
+            block_id: shape.id.clone(),
+            x: frame.content_x + x,
+            y: frame.content_top + y,
+            width,
+            height,
+            doc_start: if selectable { shape.doc_start } else { None },
+            doc_end: if selectable { shape.doc_end } else { None },
+            pm_start: if selectable { shape.pm_start } else { None },
+            pm_end: if selectable { shape.pm_end } else { None },
+            is_anchored: None,
+            z_index: None,
+        };
+        let before = prims.len();
+        emit_shape_fragment(prims, &fragment, shape, ctx);
+        for primitive in &mut prims[before..] {
+            if !selectable {
+                strip_doc_positions(primitive);
+            }
+            set_cell_ref(primitive, cell_ref);
+        }
+    }
+}
+
+/// Keeps a selectable paint's new reservation rects inside the cull band,
+/// turned with rotated cell content; a repaint adds none.
+fn finish_cell_reservations(
+    ctx: &RenderCtx<'_>,
+    from: usize,
+    selectable: bool,
+    (cull_top, cull_bottom): (f64, f64),
+    rotation: Option<((f64, f64, f64, f64), f64)>,
+) {
+    let Some(reservations) = ctx.reservations else {
+        return;
+    };
+    let mut reservations = reservations.borrow_mut();
+    if !selectable {
+        reservations.truncate(from);
+        return;
+    }
+    let mut index = from;
+    while index < reservations.len() {
+        let top = num_f64(&reservations[index].y);
+        let bottom = top + num_f64(&reservations[index].height);
+        if bottom <= cull_top || top >= cull_bottom {
+            reservations.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    let Some((cell, rotation)) = rotation else {
+        return;
+    };
+    for reservation in &mut reservations[from..] {
+        let width = num_f64(&reservation.width);
+        let height = num_f64(&reservation.height);
+        let x = num_f64(&reservation.x) + width / 2.0;
+        let y = num_f64(&reservation.y) + height / 2.0;
+        let (center_x, center_y) = if rotation < 0.0 {
+            (cell.0 + y, cell.1 + cell.3 - x)
+        } else {
+            (cell.0 + cell.2 - y, cell.1 + x)
+        };
+        reservation.x = px(center_x - height / 2.0);
+        reservation.y = px(center_y - width / 2.0);
+        reservation.width = px(height);
+        reservation.height = px(width);
+    }
+}
+
+fn rotate_cell_content(primitives: &mut [Primitive], cell: (f64, f64, f64, f64), rotation: f64) {
+    let point = |x: f64, y: f64| {
+        if rotation < 0.0 {
+            (cell.0 + y, cell.1 + cell.3 - x)
+        } else {
+            (cell.0 + cell.2 - y, cell.1 + x)
+        }
+    };
+    let rect = |x: &mut Number, y: &mut Number, w: &mut Number, h: &mut Number| {
+        let width = num_f64(w);
+        let height = num_f64(h);
+        let (center_x, center_y) = point(num_f64(x) + width / 2.0, num_f64(y) + height / 2.0);
+        *x = px(center_x - height / 2.0);
+        *y = px(center_y - width / 2.0);
+        *w = px(height);
+        *h = px(width);
+    };
+    for primitive in primitives {
+        match primitive {
+            Primitive::Text(text) => {
+                let size = text
+                    .font
+                    .split_whitespace()
+                    .find_map(|part| {
+                        part.strip_suffix("px")
+                            .and_then(|size| size.parse::<f64>().ok())
+                    })
+                    .unwrap_or(11.0 * 96.0 / 72.0);
+                let center = (
+                    num_f64(&text.x) + num_f64(&text.width) / 2.0,
+                    num_f64(&text.baseline_y) - size * 0.2,
+                );
+                let mapped = point(center.0, center.1);
+                text.x = px(num_f64(&text.x) + mapped.0 - center.0);
+                text.baseline_y = px(num_f64(&text.baseline_y) + mapped.1 - center.1);
+                text.rotation_deg = Some(px(rotation));
+                text.paint_clip = None;
+            }
+            Primitive::GlyphRun(run) => {
+                let Some(first) = run.glyphs.first() else {
+                    continue;
+                };
+                let left = run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.x)
+                    .fold(f64::INFINITY, f64::min);
+                let right = run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.x + glyph.advance)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let center = ((left + right) / 2.0, first.y - run.size * 0.2);
+                let mapped = point(center.0, center.1);
+                for glyph in &mut run.glyphs {
+                    glyph.x += mapped.0 - center.0;
+                    glyph.y += mapped.1 - center.1;
+                }
+                run.rotation_deg = Some(px(rotation));
+                run.paint_clip = None;
+            }
+            Primitive::Rect(value) => rect(&mut value.x, &mut value.y, &mut value.w, &mut value.h),
+            Primitive::Decoration(value) => {
+                rect(&mut value.x, &mut value.y, &mut value.w, &mut value.h)
+            }
+            Primitive::Line(value) => {
+                let first = point(num_f64(&value.x1), num_f64(&value.y1));
+                let last = point(num_f64(&value.x2), num_f64(&value.y2));
+                value.x1 = px(first.0);
+                value.y1 = px(first.1);
+                value.x2 = px(last.0);
+                value.y2 = px(last.1);
+            }
+            Primitive::Image(value) => {
+                let center = point(
+                    num_f64(&value.x) + num_f64(&value.w) / 2.0,
+                    num_f64(&value.y) + num_f64(&value.h) / 2.0,
+                );
+                value.x = px(center.0 - num_f64(&value.w) / 2.0);
+                value.y = px(center.1 - num_f64(&value.h) / 2.0);
+                value.rotation_deg = Some(px(
+                    value.rotation_deg.as_ref().map_or(0.0, num_f64) + rotation
+                ));
+            }
+            Primitive::Shape(value) => {
+                let transform = |x: &mut Number, y: &mut Number| {
+                    let mapped = point(num_f64(x), num_f64(y));
+                    *x = px(mapped.0);
+                    *y = px(mapped.1);
+                };
+                for command in &mut value.geometry_path {
+                    match command {
+                        ShapePathCommand::Move { x, y } | ShapePathCommand::Line { x, y } => {
+                            transform(x, y)
+                        }
+                        ShapePathCommand::Quad { cpx, cpy, x, y } => {
+                            transform(cpx, cpy);
+                            transform(x, y);
+                        }
+                        ShapePathCommand::Cubic {
+                            cp1x,
+                            cp1y,
+                            cp2x,
+                            cp2y,
+                            x,
+                            y,
+                        } => {
+                            transform(cp1x, cp1y);
+                            transform(cp2x, cp2y);
+                            transform(x, y);
+                        }
+                        ShapePathCommand::Close => {}
+                    }
+                }
+                rect(&mut value.x, &mut value.y, &mut value.w, &mut value.h);
+            }
+        }
+        if let Some(ContentFrame {
+            x: Some(x),
+            y: Some(y),
+            w: Some(w),
+            h: Some(h),
+        }) = doc_attrs_mut(primitive)
+            .and_then(|attrs| attrs.chart.as_mut())
+            .and_then(|chart| chart.frame.as_deref_mut())
+        {
+            rect(x, y, w, h);
+        }
+    }
+}
+
+fn postprocess_cell_primitives(
+    prims: &mut Vec<Primitive>,
+    start: usize,
+    clip_top_y: f64,
+    clip_bottom_y: f64,
+    windowed_lines: bool,
+    selectable: bool,
+    cell_ref: Option<&TableCellRef>,
+) {
+    let mut k = start;
+    while k < prims.len() {
+        let (top, bottom) = if windowed_lines {
+            primitive_painted_v_extent(&prims[k])
+        } else {
+            primitive_v_extent(&prims[k])
+        };
+        if bottom < clip_top_y || top > clip_bottom_y {
+            prims.remove(k);
+        } else {
+            if !selectable {
+                strip_doc_positions(&mut prims[k]);
+            }
+            if let Some(cell_ref) = cell_ref {
+                set_cell_ref(&mut prims[k], cell_ref);
+            }
+            k += 1;
+        }
+    }
+}
+
+/// Resolves a cell-anchored floating image to a cell-content-relative origin.
+///
+/// `paragraph_y` is the anchoring paragraph's top within the cell content box;
+/// the caller offsets the result into page space. Unlike the page float path
+/// there are no `relativeFrom` bands here — the cell content box is the only
+/// frame — and the image is clamped inside it.
+fn resolve_cell_float_position(
+    imr: &ImageRunIn,
+    paragraph_y: f64,
+    content_width: f64,
+) -> (f64, f64) {
+    let width = image_layout_width(imr);
+
+    // horizontal: align keyword, else posOffset, else cssFloat=right, else 0
+    let mut x = 0.0;
+    if let Some(h) = imr.position.as_ref().and_then(|p| p.horizontal.as_ref()) {
+        match h.align.as_deref() {
+            Some("right") => x = content_width - width,
+            Some("left") => x = 0.0,
+            Some("center") => x = (content_width - width) / 2.0,
+            _ => {
+                if let Some(off) = h.pos_offset {
+                    x = emu_to_px(off);
+                }
+            }
+        }
+    } else if imr.css_float.as_deref() == Some("right") {
+        x = content_width - width;
+    }
+
+    // vertical: posOffset from the paragraph top, align=top pins to the cell top,
+    // otherwise the anchoring paragraph's top
+    let mut y = paragraph_y;
+    if let Some(v) = imr.position.as_ref().and_then(|p| p.vertical.as_ref()) {
+        if let Some(off) = v.pos_offset {
+            y = paragraph_y + emu_to_px(off);
+        } else if v.align.as_deref() == Some("top") {
+            y = 0.0;
+        }
+    }
+
+    // clamp inside the content box: Math.max(0, Math.min(x, contentWidth - width))
+    let x = x.min(content_width - width).max(0.0);
+    (x, y)
+}
+
+/// Emits a cell's floating image runs, `want_behind` choosing the layer painted
+/// under the cell content or the one over it.
+///
+/// Each image clips to the fragment window, carries the cell's grid reference,
+/// and keeps its document positions only on a
+/// selectable slice — a vertical-merge continuation is a re-paint and carries
+/// none.
+#[allow(clippy::too_many_arguments)]
+fn emit_cell_floating_images(
+    prims: &mut Vec<Primitive>,
+    cell: &TableCellIn,
+    cell_measure: &TableCellExtentIn,
+    block_ref: &BlockRef,
+    frame: &CellContentFrame,
+    split_row: bool,
+    cell_ref: &TableCellRef,
+    selectable: bool,
+    want_behind: bool,
+) {
+    let mut paragraph_y = 0.0_f64;
+    for (i, blk) in cell.blocks.iter().enumerate() {
+        let BlockIn::Paragraph(pb) = blk else {
+            // Nested tables advance the anchor cursor by their measured height.
+            match cell_measure.blocks.get(i) {
+                Some(MeasureIn::Table(tm)) => paragraph_y += tm.total_height,
+                Some(MeasureIn::Shape(sm)) | Some(MeasureIn::Chart(sm)) => paragraph_y += sm.height,
+                _ => {}
+            }
+            continue;
+        };
+        for run in &pb.runs {
+            let RunIn::Image(imr) = run else { continue };
+            let split_anchor = split_row
+                && crate::cell_layout::cell_overlay_drawing(
+                    imr.position.is_some(),
+                    imr.wrap_type.as_deref(),
+                );
+            if !is_floating_image_run(imr)
+                || !frame.shows_anchor(cell, cell_measure, i, split_anchor)
+            {
+                continue;
+            }
+            let is_behind = imr.wrap_type.as_deref() == Some("behind");
+            if is_behind != want_behind {
+                continue;
+            }
+            let anchor_y = if split_anchor {
+                frame.block_tops[i]
+            } else {
+                paragraph_y
+            };
+            let (x, y) = resolve_cell_float_position(imr, anchor_y, frame.content_width);
+            let page_x = frame.content_x + x;
+            let page_y = frame.content_top + y;
+            let rot = imr
+                .rotation_deg
+                .unwrap_or_else(|| rotation_degrees(imr.transform.as_deref()));
+            let layout_width = image_layout_width(imr);
+            let layout_height = image_layout_height(imr);
+            let mut attrs = block_ref.attrs();
+            attrs.cell = Some(Box::new(cell_ref.clone()));
+            // A continuation repaint carries no document positions.
+            if selectable {
+                attrs.doc_start = imr.pm_start;
+                attrs.doc_end = imr.pm_end;
+            }
+            stamp_image_run_attrs(&mut attrs, imr, page_x, page_y);
+            let prim = Primitive::Image(ImagePrimitive {
+                rel_id: imr.src.clone(),
+                x: px(page_x),
+                y: px(page_y),
+                w: px(layout_width),
+                h: px(layout_height),
+                rotation_deg: if rot != 0.0 { Some(px(rot)) } else { None },
+                opacity: imr.opacity.map(px),
+                filter: None,
+                decorative: imr.decorative.unwrap_or(false),
+                crop: crop_of(imr),
+                alt_text: capped_alt_text(imr.alt.as_deref()),
+                attrs,
+            });
+            // Clip to the fragment window.
+            let (top, bottom) = primitive_v_extent(&prim);
+            if bottom < frame.clip_top_y || top > frame.clip_bottom_y {
+                continue;
+            }
+            prims.push(prim);
+        }
+        if let Some(MeasureIn::Paragraph(pm)) = cell_measure.blocks.get(i) {
+            paragraph_y += pm.total_height;
+        }
+    }
+}
+
+/// Less of a line or block than this, in CSS pixels, is too thin a sliver to count as shown:
+/// clean row breaks on rounded row offsets leave slivers that thin.
+const MIN_SHOWN_PX: f64 = 1.0;
+
+fn shown_line_window(
+    extent: &ParagraphExtentIn,
+    y: f64,
+    top: f64,
+    bottom: f64,
+) -> Option<(std::ops::Range<usize>, bool)> {
+    let mut line_top = y;
+    let mut first = None;
+    let mut last = 0;
+    let mut clipped = false;
+    for (line_index, line) in extent.lines.iter().enumerate() {
+        line_top += line.float_skip_before.unwrap_or(0.0);
+        let inside = (line_top + line.line_height).min(bottom) - line_top.max(top);
+        if inside > MIN_SHOWN_PX.min(line.line_height / 2.0) {
+            first.get_or_insert(line_index);
+            last = line_index + 1;
+            clipped |= inside < line.line_height - MIN_SHOWN_PX;
+        }
+        line_top += line.line_height;
+    }
+    match first {
+        Some(first) => Some((first..last, clipped)),
+        None if extent.lines.is_empty() && y >= top && y < bottom => Some((0..0, false)),
+        None => None,
+    }
+}
+
+/// What of one table cell block a table fragment shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ShownPart {
+    /// The window of a paragraph's lines, and whether its cell's clip box cuts through one.
+    Lines(std::ops::Range<usize>, bool),
+    /// The rows of a nested table with some content shown.
+    Rows(Vec<usize>),
+    /// A drawing or text box, shown whole.
+    Whole,
+}
+
+/// A block inside a table that a table fragment shows, by the painting rules: the fragment's
+/// cell paints and clip band, each cell's clip box and content stacking, rotated cells and nested
+/// tables. A line or block is shown wherever more than a sliver of it lies inside its cell's clip
+/// box, as painting shows it, and is cut where part of it lies outside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VisibleCellBlock {
+    /// Row, cell and block steps from the fragment's table down to the block.
+    pub path: Vec<(usize, usize, usize)>,
+    pub shown: ShownPart,
+    /// Painted as part of a repeated header row.
+    pub repeated_header: bool,
+    /// Painted in a row or vertically merged cell whose earlier part is on another page.
+    pub continuation: bool,
+}
+
+/// The blocks a table fragment shows inside its cells, tables before their content.
+pub(crate) fn visible_table_content(
+    frag: &TableFragmentIn,
+    block: &TableBlockIn,
+    measure: &TableExtentIn,
+) -> Vec<VisibleCellBlock> {
+    let mut out = Vec::new();
+    visit_table_fragment(
+        frag,
+        block,
+        measure,
+        (f64::NEG_INFINITY, f64::INFINITY),
+        (false, false),
+        &mut Vec::new(),
+        &mut out,
+    );
+    out
+}
+
+fn visit_table_fragment(
+    frag: &TableFragmentIn,
+    block: &TableBlockIn,
+    measure: &TableExtentIn,
+    band: (f64, f64),
+    inherited: (bool, bool),
+    path: &mut Vec<(usize, usize, usize)>,
+    out: &mut Vec<VisibleCellBlock>,
+) {
+    let plan = TablePaintPlan::new(frag, block, measure);
+    let row_split = frag.clip_top.unwrap_or(0.0) > 0.0;
+    for paint in &plan.paints {
+        let g = &plan.grid[paint.grid_index];
+        let Some(cell) = block
+            .rows
+            .get(g.row_index)
+            .and_then(|row| row.cells.get(g.cell_index))
+        else {
+            continue;
+        };
+        let cy = frag.y + paint.cell_y;
+        let (content_y, clip_top, clip_bottom) = plan.cell_content_window(frag, g, paint);
+        let clip_top = clip_top.max(band.0);
+        let clip_bottom = clip_bottom.min(band.1);
+        let (top, bottom) = (cy.max(clip_top), (cy + paint.cell_h).min(clip_bottom));
+        if bottom <= top {
+            continue;
+        }
+        let Some((frame, cell_measure)) = cell_content_frame(
+            cell,
+            measure,
+            &CellPaintRef::new(g, block),
+            frag.x + g.x,
+            content_y,
+            paint.content_h,
+            is_first_grid_column(g, block, measure),
+            clip_top,
+            clip_bottom,
+        ) else {
+            continue;
+        };
+        let (top, bottom) = if frame.rotation != 0.0 {
+            (f64::NEG_INFINITY, f64::INFINITY)
+        } else {
+            (top, bottom)
+        };
+        let shown = |y: f64, height: f64| {
+            let inside = (y + height).min(bottom) - y.max(top);
+            (inside > MIN_SHOWN_PX.min(height / 2.0)).then_some(inside < height - MIN_SHOWN_PX)
+        };
+        let repeated_header = inherited.0 || (plan.carried && g.row_index < plan.header_row_count);
+        let continuation =
+            inherited.1 || !paint.selectable || (row_split && g.row_index == frag.row_start);
+        for (index, (cell_block, cell_block_measure)) in
+            cell.blocks.iter().zip(&cell_measure.blocks).enumerate()
+        {
+            let y = frame.content_top + frame.block_tops.get(index).copied().unwrap_or(0.0);
+            path.push((g.row_index, g.cell_index, index));
+            let shown = match (cell_block, cell_block_measure) {
+                (BlockIn::Paragraph(_), MeasureIn::Paragraph(extent)) => {
+                    shown_line_window(extent, y, top, bottom)
+                        .map(|(lines, clipped)| ShownPart::Lines(lines, clipped))
+                }
+                (BlockIn::Table(nested), MeasureIn::Table(nested_measure)) => {
+                    let fragment = TableFragmentIn {
+                        block_id: nested.id.clone(),
+                        x: frame.content_x
+                            + nested_table_x_offset(nested, nested_measure, frame.content_width),
+                        y,
+                        width: table_total_width(nested_measure),
+                        height: nested_measure.total_height,
+                        row_start: 0,
+                        row_end: nested.rows.len(),
+                        clip_top: None,
+                        clip_bottom: None,
+                        cell_clips: None,
+                        header_row_count: None,
+                        carried_from_prev: None,
+                        carried_to_next: None,
+                    };
+                    let at = out.len();
+                    out.push(VisibleCellBlock {
+                        path: path.clone(),
+                        shown: ShownPart::Rows(Vec::new()),
+                        repeated_header,
+                        continuation,
+                    });
+                    visit_table_fragment(
+                        &fragment,
+                        nested,
+                        nested_measure,
+                        (top, bottom),
+                        (repeated_header, continuation),
+                        path,
+                        out,
+                    );
+                    let depth = path.len();
+                    let mut rows: Vec<usize> = out[at + 1..]
+                        .iter()
+                        .filter(|visible| visible.path.len() == depth + 1)
+                        .map(|visible| visible.path[depth].0)
+                        .collect();
+                    rows.sort_unstable();
+                    rows.dedup();
+                    if rows.is_empty() {
+                        out.truncate(at);
+                    } else {
+                        out[at].shown = ShownPart::Rows(rows);
+                    }
+                    path.pop();
+                    continue;
+                }
+                (_, extent) => {
+                    let height = match extent {
+                        MeasureIn::Paragraph(extent) => extent.total_height,
+                        MeasureIn::Table(extent) => extent.total_height,
+                        MeasureIn::Image(extent) => extent.height,
+                        MeasureIn::TextBox(extent) => extent.height,
+                        MeasureIn::Shape(extent) | MeasureIn::Chart(extent) => extent.height,
+                        MeasureIn::Unsupported => 0.0,
+                    };
+                    shown(y, height).map(|_| ShownPart::Whole)
+                }
+            };
+            if let Some(shown) = shown {
+                out.push(VisibleCellBlock {
+                    path: path.clone(),
+                    shown,
+                    repeated_header,
+                    continuation,
+                });
+            }
+            path.pop();
+        }
+    }
+}
+
+/// The display mirror of a resident layout value.
+pub(crate) fn display_mirror<T: DeserializeOwned>(value: &impl Serialize) -> Option<T> {
+    let mut wire = serde_json::to_value(value).ok()?;
+    normalize_integral_json_numbers(&mut wire);
+    serde_json::from_value(wire).ok()
+}
+
+/// narrow view of CellPaint the content pass needs (avoids borrowing GridCell)
+struct CellPaintRef {
+    row_index: usize,
+    cell_index: usize,
+    width: f64,
+    exact_row: bool,
+    cell_spacing: f64,
+}
+
+impl CellPaintRef {
+    fn new(g: &GridCell, block: &TableBlockIn) -> Self {
+        CellPaintRef {
+            row_index: g.row_index,
+            cell_index: g.cell_index,
+            width: g.width,
+            exact_row: block.rows.get(g.row_index).is_some_and(|row| {
+                row.height_rule.as_deref() == Some("exact") && row.height.is_some()
+            }),
+            cell_spacing: block.cell_spacing.unwrap_or(0.0),
+        }
+    }
+}
+
+fn primitive_painted_v_extent(p: &Primitive) -> (f64, f64) {
+    let (top, bottom) = primitive_v_extent(p);
+    let Primitive::Line(line) = p else {
+        return (top, bottom);
+    };
+    let width = num_f64(&line.stroke_width);
+    let border_width = width.max(0.5);
+    let outset = match line.border_style {
+        Some(DisplayBorderStyle::Double) => {
+            border_width / 2.0 + (border_width / 3.0).max(0.5) / 2.0
+        }
+        Some(DisplayBorderStyle::Triple) => border_width + (border_width / 3.0).max(0.5) / 2.0,
+        Some(DisplayBorderStyle::ThinThick | DisplayBorderStyle::ThickThin) => {
+            (border_width * 0.45 + (border_width * 0.25).max(0.5) / 2.0)
+                .max(border_width * 0.3 + (border_width * 0.55).max(0.75) / 2.0)
+        }
+        Some(DisplayBorderStyle::Wave) => border_width.max(1.0) / 2.0 + border_width / 2.0,
+        Some(DisplayBorderStyle::DoubleWave) => {
+            border_width.max(1.0) * 1.5 + (border_width / 2.0).max(0.5) / 2.0
+        }
+        _ => width / 2.0,
+    };
+    (top - outset, bottom + outset)
+}
+
+fn primitive_v_extent(p: &Primitive) -> (f64, f64) {
+    match p {
+        Primitive::Text(t) => {
+            let b = num_f64(&t.baseline_y);
+            (b - 16.0, b + 4.0)
+        }
+        // a GlyphRun replaces a TextRunPrimitive at the same baseline; reuse the
+        // Text band (relative to a representative glyph's baseline y) so a table
+        // cell's row-break clipping decides identically whether fonts are on or
+        // off. Marks sit above the baseline (smaller y), so the max glyph y is
+        // the base baseline.
+        Primitive::GlyphRun(g) => {
+            let b = g
+                .glyphs
+                .iter()
+                .map(|gl| gl.y)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let b = if b.is_finite() { b } else { 0.0 };
+            (b - 16.0, b + 4.0)
+        }
+        Primitive::Rect(r) => (num_f64(&r.y), num_f64(&r.y) + num_f64(&r.h)),
+        Primitive::Line(l) => (
+            num_f64(&l.y1).min(num_f64(&l.y2)),
+            num_f64(&l.y1).max(num_f64(&l.y2)),
+        ),
+        Primitive::Image(i) => (num_f64(&i.y), num_f64(&i.y) + num_f64(&i.h)),
+        Primitive::Shape(s) => (num_f64(&s.y), num_f64(&s.y) + num_f64(&s.h)),
+        Primitive::Decoration(d) => (num_f64(&d.y), num_f64(&d.y) + num_f64(&d.h)),
+    }
+}
+
+/// The document attributes a primitive carries, if its class has any.
+pub(crate) fn doc_attrs(p: &Primitive) -> Option<&DocAttrs> {
+    match p {
+        Primitive::Text(t) => Some(&t.attrs),
+        Primitive::GlyphRun(g) => Some(&g.attrs),
+        Primitive::Rect(r) => Some(&r.attrs),
+        Primitive::Image(i) => Some(&i.attrs),
+        Primitive::Shape(s) => Some(&s.attrs),
+        Primitive::Decoration(d) => Some(&d.attrs),
+        Primitive::Line(_) => None,
+    }
+}
+
+fn doc_attrs_mut(p: &mut Primitive) -> Option<&mut DocAttrs> {
+    match p {
+        Primitive::Text(t) => Some(&mut t.attrs),
+        Primitive::GlyphRun(g) => Some(&mut g.attrs),
+        Primitive::Rect(r) => Some(&mut r.attrs),
+        Primitive::Image(i) => Some(&mut i.attrs),
+        Primitive::Shape(s) => Some(&mut s.attrs),
+        Primitive::Decoration(d) => Some(&mut d.attrs),
+        Primitive::Line(_) => None,
+    }
+}
+
+/// vmerge continuation slices are re-paints of content owned by another
+/// fragment — visible but not selectable, so their doc positions are stripped
+fn strip_doc_positions(p: &mut Primitive) {
+    if let Some(attrs) = doc_attrs_mut(p) {
+        attrs.doc_start = None;
+        attrs.doc_end = None;
+        // A re-painted slice is not a paragraph-id target either; keeping it
+        // would expose a duplicate id for the anchor cell.
+        attrs.para_id = None;
+    }
+}
+
+/// stamp the owning cell's grid position on a cell-content primitive (lines
+/// carry no DocAttrs and stay untouched)
+fn set_cell_ref(p: &mut Primitive, cell: &TableCellRef) {
+    if let Some(attrs) = doc_attrs_mut(p) {
+        attrs.cell = Some(Box::new(cell.clone()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON boundary
+// ---------------------------------------------------------------------------
+
+/// Pure JSON boundary: `{ measured, options, layout }` in, `DisplayList` JSON
+/// out, with no shaping fonts — so every text run emits a
+/// [`TextRunPrimitive`]. Native-testable (no `JsValue`); the fonts-aware entry
+/// is [`build_display_list_json_with_fonts`].
+pub fn build_display_list_json(input: &str) -> Result<String, String> {
+    build_display_list_json_with_fonts(input, &ooxml_text::FontStore::new())
+}
+
+/// pure JSON boundary that threads a measurement `FontStore`: when the input
+/// carries `fontChains` that resolve against `fonts`, text runs are shaped into
+/// [`GlyphRunPrimitive`]s; otherwise (empty store, absent chains, or an
+/// unresolved run) the run falls back to `TextRunPrimitive`. This is the entry
+/// the wasm wrapper in `lib.rs` drives with the module-global measurement fonts.
+pub fn build_display_list_json_with_fonts(
+    input: &str,
+    fonts: &ooxml_text::FontStore,
+) -> Result<String, String> {
+    let dl = build_display_list_value_with_fonts(input, fonts)?;
+    serde_json::to_string(&dl).map_err(|e| format!("serialize: {e}"))
+}
+
+/// Typed counterpart to [`build_display_list_json_with_fonts`].
+pub fn build_display_list_value_with_fonts(
+    input: &str,
+    fonts: &ooxml_text::FontStore,
+) -> Result<DisplayList, String> {
+    let mut wire: Value = serde_json::from_str(input).map_err(|e| format!("parse: {e}"))?;
+    normalize_integral_json_numbers(&mut wire);
+    let parsed: BuildInput = serde_json::to_string(&wire)
+        .map_err(|e| format!("parse: {e}"))
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| format!("parse: {e}")))?;
+    Ok(build_display_list(&parsed, fonts))
+}
+
+/// Build from the pagination arena already retained by the editing engine.
+/// Only display-specific extras (headers/footers, font chains, comments, and
+/// the contract version) cross the wasm boundary; measured blocks, options,
+/// and layout are injected from typed resident values.
+pub fn build_display_list_value_from_resident_with_fonts(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+    fonts: &ooxml_text::FontStore,
+) -> Result<DisplayList, String> {
+    build_display_list_value_from_resident_with_fonts_observed(
+        pagination,
+        layout,
+        extras,
+        fonts,
+        &mut || {},
+    )
+}
+
+pub fn build_display_list_value_from_resident_with_fonts_observed(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+    fonts: &ooxml_text::FontStore,
+    observe_phase: &mut impl FnMut(),
+) -> Result<DisplayList, String> {
+    let parsed = resident_build_input(pagination, layout, extras)?;
+    observe_phase();
+    let list = build_display_list(&parsed, fonts);
+    observe_phase();
+    Ok(list)
+}
+
+/// Build and retain the parsed display-input mirror alongside its first list.
+/// Incremental engine frames can then refresh only the pages they rebuild.
+pub fn build_resident_display_list_with_fonts_observed(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+    fonts: &ooxml_text::FontStore,
+    observe_phase: &mut impl FnMut(),
+) -> Result<(ResidentDisplayInput, DisplayList), String> {
+    let input = resident_build_input(pagination, layout, extras)?;
+    observe_phase();
+    let list = build_display_list(&input, fonts);
+    observe_phase();
+    Ok((ResidentDisplayInput { input }, list))
+}
+
+/// [`build_resident_display_list_with_fonts_observed`] that builds only the
+/// pages `build` selects; every other page is an unbuilt placeholder carrying
+/// its geometry, for [`build_resident_display_pages_with_fonts`] to fill in.
+pub fn build_resident_display_list_partial_with_fonts_observed(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+    fonts: &ooxml_text::FontStore,
+    build: &dyn Fn(usize) -> bool,
+    observe_phase: &mut impl FnMut(),
+) -> Result<(ResidentDisplayInput, DisplayList), String> {
+    let selected: HashSet<usize> = (0..layout.pages.len())
+        .filter(|&index| build(index))
+        .collect();
+    let input = resident_build_input_for(pagination, layout, extras, Some(&selected))?;
+    observe_phase();
+    let built = build_display_list_selected(&input, fonts, Some(&selected));
+    let mut built_pages: HashMap<usize, DisplayPage> = built
+        .pages
+        .into_iter()
+        .map(|page| (page.page_index as usize, page))
+        .collect();
+    let blocks = source_blocks_by_key(
+        pagination,
+        layout
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !selected.contains(index))
+            .map(|(_, page)| page),
+    );
+    let pages = input
+        .layout
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(index, page)| match built_pages.remove(&index) {
+            Some(built) => Ok(built),
+            None => Ok(unbuilt_page_with_span(
+                page,
+                index,
+                layout_page_position_span(&layout.pages[index], &blocks)?,
+                input.headers_footers.as_ref(),
+            )),
+        })
+        .collect::<Result<_, String>>()?;
+    observe_phase();
+    Ok((
+        ResidentDisplayInput { input },
+        DisplayList {
+            contract_version: built.contract_version,
+            pages,
+        },
+    ))
+}
+
+/// Build the requested pages that are still unbuilt in `list`, refreshing
+/// their layout pages and measured blocks from the current pagination first.
+/// Returns the pages it built.
+pub fn build_resident_display_pages_with_fonts(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    fonts: &ooxml_text::FontStore,
+    resident: &mut ResidentDisplayInput,
+    list: &mut DisplayList,
+    pages: &[usize],
+) -> Result<Vec<usize>, String> {
+    build_resident_display_pages_with_fonts_and_fingerprints(
+        pagination, layout, fonts, resident, list, pages, None,
+    )
+}
+
+#[doc(hidden)]
+pub fn build_resident_display_pages_with_fonts_and_fingerprints(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    fonts: &ooxml_text::FontStore,
+    resident: &mut ResidentDisplayInput,
+    list: &mut DisplayList,
+    pages: &[usize],
+    fingerprints: Option<&[u128]>,
+) -> Result<Vec<usize>, String> {
+    if list.pages.len() != layout.pages.len()
+        || resident.input.layout.pages.len() != layout.pages.len()
+    {
+        return Err("resident display list does not match the layout".to_owned());
+    }
+    let mut wanted: Vec<usize> = pages
+        .iter()
+        .copied()
+        .filter(|&index| list.pages.get(index).is_some_and(|page| page.unbuilt))
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return Ok(wanted);
+    }
+    let reading: HashSet<usize> = wanted.iter().copied().collect();
+    refresh_resident_display_pages_reading(
+        &mut resident.input,
+        pagination,
+        layout,
+        wanted.iter().copied(),
+        &reading,
+        fingerprints,
+    )?;
+    let selected: HashSet<usize> = wanted.iter().copied().collect();
+    for page in build_display_list_selected(&resident.input, fonts, Some(&selected)).pages {
+        let index = page.page_index as usize;
+        list.pages[index] = page;
+    }
+    Ok(wanted)
+}
+
+pub fn release_resident_display_pages(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    resident: &mut ResidentDisplayInput,
+    list: &mut DisplayList,
+    pages: &[usize],
+) -> Result<Vec<usize>, String> {
+    if list.pages.len() != layout.pages.len()
+        || resident.input.layout.pages.len() != layout.pages.len()
+    {
+        return Err("resident display list does not match the layout".to_owned());
+    }
+    if pages.iter().any(|&index| index >= layout.pages.len()) {
+        return Err("resident display release page index is invalid".to_owned());
+    }
+    let mut wanted: Vec<usize> = pages
+        .iter()
+        .copied()
+        .filter(|&index| !list.pages[index].unbuilt)
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let blocks = source_blocks_by_key(pagination, wanted.iter().map(|&index| &layout.pages[index]));
+    let mut transcoder = crate::transcode::Transcoder::default();
+    let replacements = wanted
+        .iter()
+        .map(|&index| {
+            let page = convert_resident_page(
+                &mut transcoder,
+                &layout.pages[index],
+                index,
+                false,
+                &mut Vec::new(),
+            )
+            .map_err(|error| format!("parse resident display layout page: {error}"))?;
+            let placeholder = unbuilt_page_with_span(
+                &page,
+                index,
+                layout_page_position_span(&layout.pages[index], &blocks)?,
+                resident.input.headers_footers.as_ref(),
+            );
+            Ok((index, page, placeholder))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for (index, page, placeholder) in replacements {
+        resident.input.layout.pages[index] = page;
+        list.pages[index] = placeholder;
+    }
+    resident
+        .input
+        .unreadable
+        .retain(|known| known.page.is_none_or(|page| !wanted.contains(&page)));
+    prune_resident_display_measured(resident, list);
+    Ok(wanted)
+}
+
+fn prune_resident_display_measured(resident: &mut ResidentDisplayInput, list: &DisplayList) {
+    let keys: HashSet<Cow<'_, str>> = list
+        .pages
+        .iter()
+        .zip(&resident.input.layout.pages)
+        .filter(|(page, _)| !page.unbuilt)
+        .flat_map(|(_, page)| page.fragments.iter().filter_map(fragment_block_key_ref))
+        .collect();
+    resident.input.measured.retain(|measured| {
+        measured_block_key(measured).is_some_and(|key| keys.contains(key.as_ref()))
+    });
+    resident
+        .input
+        .converted_measurements
+        .retain(|key, _| keys.contains(key.as_str()));
+    prune_unreadable_blocks(&mut resident.input);
+}
+
+/// The affected pages' source blocks by canonical key, first occurrence winning.
+fn source_blocks_by_key<'a, 'b>(
+    pagination: &'a crate::types::Input,
+    pages: impl IntoIterator<Item = &'b crate::types::Page>,
+) -> HashMap<Cow<'a, str>, &'a crate::types::MeasuredBlock> {
+    let mut pending: HashSet<_> = pages
+        .into_iter()
+        .flat_map(|page| &page.fragments)
+        .map(resident_fragment_block_key)
+        .collect();
+    let mut blocks = HashMap::new();
+    for measured in &pagination.measured {
+        if pending.is_empty() {
+            break;
+        }
+        if let Some(key) = resident_block_key(&measured.block)
+            && pending.remove(key.as_ref())
+        {
+            blocks.insert(key, measured);
+        }
+    }
+    blocks
+}
+
+fn unbuilt_page_with_span(
+    page: &PageIn,
+    page_index: usize,
+    position_span: Option<[i64; 2]>,
+    headers_footers: Option<&crate::hf_bands::HeadersFootersIn>,
+) -> DisplayPage {
+    let (content_bounds, column_bounds) = page_content_geometry(page);
+    DisplayPage {
+        page_index: page_index as u64,
+        width: px(page.size.w),
+        height: px(page.size.h),
+        content_bounds: Some(content_bounds),
+        column_bounds,
+        section_id: page.section_id.clone(),
+        section_index: page.section_index,
+        section_page_index: page.section_page_index,
+        section_page_number: page.section_page_number,
+        page_label: page.page_label.clone(),
+        primitives: Vec::new(),
+        watermark_primitive_count: None,
+        background: page.background.clone(),
+        page_borders: Vec::new(),
+        header: None,
+        footer: None,
+        note_areas: Vec::new(),
+        reservations: Vec::new(),
+        table_gridlines: Vec::new(),
+        unbuilt: true,
+        position_span,
+        hf_parts: headers_footers
+            .map(|hf| crate::hf_bands::page_parts(hf, page, page_index))
+            .filter(|parts| parts.header.is_some() || parts.footer.is_some()),
+        parity_filler: page.parity_filler == Some(true),
+    }
+}
+
+/// The lowest and highest body position a pagination page's fragments place,
+/// with table fragments read from its measured blocks, converting positions as
+/// the resident transcoder does: a non-finite one is absent and a fractional or
+/// out-of-range one is an error.
+fn layout_page_position_span(
+    page: &crate::types::Page,
+    blocks: &HashMap<Cow<'_, str>, &crate::types::MeasuredBlock>,
+) -> Result<Option<[i64; 2]>, String> {
+    use crate::types::{Fragment, LayoutBlock, TableRow};
+    fn block(block: &LayoutBlock, positions: &mut Vec<Option<f64>>) {
+        match block {
+            LayoutBlock::Paragraph(paragraph) => {
+                positions.extend([paragraph.pm_start, paragraph.pm_end]);
+            }
+            LayoutBlock::Image(image) => positions.extend([image.pm_start, image.pm_end]),
+            LayoutBlock::Table(table) => rows(&table.rows, positions),
+            _ => {}
+        }
+    }
+    fn rows(rows: &[TableRow], positions: &mut Vec<Option<f64>>) {
+        for row in rows {
+            for cell in &row.cells {
+                for nested in &cell.blocks {
+                    block(nested, positions);
+                }
+            }
+        }
+    }
+    let mut positions = Vec::new();
+    for fragment in &page.fragments {
+        match fragment {
+            Fragment::Paragraph(fragment) => positions.extend([fragment.pm_start, fragment.pm_end]),
+            Fragment::Image(fragment) => positions.extend([fragment.pm_start, fragment.pm_end]),
+            Fragment::TextBox(fragment) => positions.extend([fragment.pm_start, fragment.pm_end]),
+            Fragment::Shape(fragment) => positions.extend([fragment.pm_start, fragment.pm_end]),
+            Fragment::Chart(fragment) => positions.extend([fragment.pm_start, fragment.pm_end]),
+            Fragment::Reserved(_) => {}
+            Fragment::Table(fragment) => {
+                if let Some(measured) =
+                    blocks.get(resident_block_id_key(&fragment.block_id).as_ref())
+                    && let LayoutBlock::Table(table) = &measured.block
+                {
+                    let end = fragment.row_end.min(table.rows.len());
+                    let start = fragment.row_start.min(end);
+                    rows(&table.rows[start..end], &mut positions);
+                }
+            }
+        }
+    }
+    let mut span: Option<[i64; 2]> = None;
+    for value in positions.into_iter().flatten() {
+        if !value.is_finite() {
+            continue;
+        }
+        if value.fract() != 0.0 || value < i64::MIN as f64 || value > i64::MAX as f64 {
+            return Err(format!(
+                "resident display body position {value} is not an integer"
+            ));
+        }
+        let value = value as i64;
+        span = Some(span.map_or([value, value], |[low, high]| {
+            [low.min(value), high.max(value)]
+        }));
+    }
+    Ok(span)
+}
+
+fn resident_build_input(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+) -> Result<BuildInput, String> {
+    resident_build_input_for(pagination, layout, extras, None)
+}
+
+/// [`resident_build_input`] holding only the measured blocks that `pages`
+/// place; [`refresh_resident_display_pages_reading`] adds the others as their pages
+/// build.
+fn resident_build_input_for(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+    pages: Option<&HashSet<usize>>,
+) -> Result<BuildInput, String> {
+    let mut fields: serde_json::Map<String, Value> =
+        serde_json::from_str(extras).map_err(|e| format!("parse display extras: {e}"))?;
+    for key in ["measured", "options", "layout"] {
+        fields.remove(key);
+    }
+    let mut wire = Value::Object(fields);
+    normalize_integral_json_numbers(&mut wire);
+    let extras: ResidentExtrasWire = serde_json::to_string(&wire)
+        .and_then(|s| serde_json::from_str(&s))
+        .map_err(|e| format!("parse resident display input: {e}"))?;
+    let mut transcoder = crate::transcode::Transcoder::default();
+    let mut unreadable = Vec::new();
+    let layout = convert_resident_layout(&mut transcoder, layout, pages, &mut unreadable)
+        .map_err(|e| format!("parse resident display input: {e}"))?;
+    let placed: Option<HashSet<Cow<'_, str>>> = pages.map(|pages| {
+        pages
+            .iter()
+            .filter_map(|&index| layout.pages.get(index))
+            .flat_map(|page| page.fragments.iter().filter_map(fragment_block_key_ref))
+            .collect()
+    });
+    let measured = pagination
+        .measured
+        .iter()
+        .filter(|measured| {
+            placed.as_ref().is_none_or(|keys| {
+                resident_block_key(&measured.block).is_some_and(|key| keys.contains(key.as_ref()))
+            })
+        })
+        .filter_map(|measured| convert_measured_block(&mut transcoder, measured, &mut unreadable))
+        .collect();
+    drop(placed);
+    let options = transcoder
+        .convert(&pagination.options)
+        .map_err(|e| format!("parse resident display input: {e}"))?;
+    let headers_footers = extras
+        .headers_footers
+        .clone()
+        .map(|v| serde_json::to_string(&v).and_then(|s| serde_json::from_str(&s)))
+        .transpose()
+        .map_err(|e| format!("parse resident display input: {e}"))?;
+    let headers_footers_content = extras
+        .headers_footers
+        .map(|v| serde_json::to_string(&v).and_then(|s| serde_json::from_str(&s)))
+        .transpose()
+        .map_err(|e| format!("parse resident display input: {e}"))?;
+    Ok(BuildInput {
+        defer_stale_block_pruning: false,
+        #[cfg(any(test, feature = "test-support"))]
+        stale_block_pruning_passes: 0,
+        contract_version: extras.contract_version,
+        measured,
+        converted_measurements: HashMap::new(),
+        options,
+        layout,
+        headers_footers,
+        headers_footers_content,
+        font_chains: extras.font_chains,
+        resolved_comment_ids: extras.resolved_comment_ids,
+        comment_authors: extras.comment_authors,
+        comment_threads: extras.comment_threads,
+        unreadable,
+    })
+}
+
+/// Drops the measured-block entries of blocks no retained page places.
+fn prune_unreadable_blocks(input: &mut BuildInput) {
+    let placed: HashSet<Cow<'_, str>> = input
+        .layout
+        .pages
+        .iter()
+        .flat_map(|page| page.fragments.iter().filter_map(fragment_block_key_ref))
+        .collect();
+    input
+        .unreadable
+        .retain(|known| known.page.is_some() || placed.contains(known.block.as_str()));
+}
+
+/// Converts one measured block, or records it as unreadable and leaves it out
+/// so that only its own fragments go unpainted.
+fn convert_measured_block(
+    transcoder: &mut crate::transcode::Transcoder,
+    measured: &crate::types::MeasuredBlock,
+    unreadable: &mut Vec<UnreadableDisplayInput>,
+) -> Option<MeasuredBlockIn> {
+    #[cfg(any(test, feature = "test-support"))]
+    resident_conversion_test_support::count_measured_block();
+    let key = resident_block_key(&measured.block).map(Cow::into_owned);
+    match transcoder.convert(measured) {
+        Ok(block) => {
+            if let Some(key) = key {
+                unreadable.retain(|known| known.page.is_some() || known.block != key);
+            }
+            Some(block)
+        }
+        Err(reason) => {
+            record_unreadable(
+                unreadable,
+                UnreadableDisplayInput {
+                    block: key.unwrap_or_default(),
+                    page: None,
+                    reason,
+                },
+            );
+            None
+        }
+    }
+}
+
+fn refresh_paragraph_positions(
+    block: &mut ParagraphBlockIn,
+    source: &crate::types::ParagraphBlock,
+    transcoder: &mut crate::transcode::Transcoder,
+) -> Result<(), String> {
+    (block.pm_start, block.pm_end) = transcoder.convert(&(source.pm_start, source.pm_end))?;
+    for (run, source) in block.runs.iter_mut().zip(&source.runs) {
+        let (start, end) = transcoder.convert(&(source.pm_start(), source.pm_end()))?;
+        match run {
+            RunIn::Text(run) => (run.pm_start, run.pm_end) = (start, end),
+            RunIn::Tab(run) => (run.pm_start, run.pm_end) = (start, end),
+            RunIn::Image(run) => {
+                (run.pm_start, run.pm_end) = (start, end);
+                if let crate::types::Run::Image(source) = source {
+                    run.inline_shape = transcoder.convert(&source.inline_shape)?;
+                    run.inline_chart = transcoder.convert(&source.inline_chart)?;
+                    run.inline_math = source.inline_math.as_deref().cloned();
+                    run.baseline_depth = source.baseline_depth;
+                }
+            }
+            RunIn::LineBreak(run) => (run.pm_start, run.pm_end) = (start, end),
+            RunIn::Field(run) => (run.pm_start, run.pm_end) = (start, end),
+            RunIn::Reserved(run) => (run.pm_start, run.pm_end) = (start, end),
+            RunIn::Unsupported => {}
+        }
+    }
+    Ok(())
+}
+
+fn refresh_shape_positions(
+    block: &mut ShapeBlockIn,
+    source: &crate::types::ShapeBlock,
+    transcoder: &mut crate::transcode::Transcoder,
+) -> Result<(), String> {
+    (block.pm_start, block.pm_end, block.doc_start, block.doc_end) = transcoder.convert(&(
+        source.pm_start,
+        source.pm_end,
+        source.doc_start,
+        source.doc_end,
+    ))?;
+    for (paragraph, source) in block
+        .inner_text
+        .iter_mut()
+        .zip(source.inner_text.iter().flatten())
+    {
+        refresh_paragraph_positions(paragraph, source, transcoder)?;
+    }
+    for (child, source) in block.children.iter_mut().zip(&source.children) {
+        refresh_shape_positions(child, source, transcoder)?;
+    }
+    Ok(())
+}
+
+fn refresh_block_positions(
+    block: &mut BlockIn,
+    source: &crate::types::LayoutBlock,
+    transcoder: &mut crate::transcode::Transcoder,
+) -> Result<(), String> {
+    use crate::types::LayoutBlock;
+
+    match (block, source) {
+        (BlockIn::Paragraph(block), LayoutBlock::Paragraph(source)) => {
+            refresh_paragraph_positions(block, source, transcoder)?;
+        }
+        (BlockIn::Table(block), LayoutBlock::Table(source)) => {
+            for (row, source) in block.rows.iter_mut().zip(&source.rows) {
+                for (cell, source) in row.cells.iter_mut().zip(&source.cells) {
+                    for (block, source) in cell.blocks.iter_mut().zip(&source.blocks) {
+                        refresh_block_positions(block, source, transcoder)?;
+                    }
+                }
+            }
+        }
+        (BlockIn::TextBox(block), LayoutBlock::TextBox(source)) => {
+            (block.pm_start, block.pm_end) =
+                transcoder.convert(&(source.pm_start, source.pm_end))?;
+            for (paragraph, source) in block.content.iter_mut().zip(&source.content) {
+                refresh_paragraph_positions(paragraph, source, transcoder)?;
+            }
+        }
+        (BlockIn::Shape(block), LayoutBlock::Shape(source)) => {
+            refresh_shape_positions(block, source, transcoder)?;
+        }
+        (BlockIn::Image(block), LayoutBlock::Image(source)) => {
+            (block.pm_start, block.pm_end) =
+                transcoder.convert(&(source.pm_start, source.pm_end))?;
+        }
+        (BlockIn::Chart(block), LayoutBlock::Chart(source)) => {
+            (block.pm_start, block.pm_end, block.doc_start, block.doc_end) =
+                transcoder.convert(&(
+                    source.pm_start,
+                    source.pm_end,
+                    source.doc_start,
+                    source.doc_end,
+                ))?;
+        }
+        (BlockIn::Reserved(_), LayoutBlock::Reserved(_))
+        | (BlockIn::Unsupported, LayoutBlock::SectionBreak(_))
+        | (BlockIn::Unsupported, LayoutBlock::PageBreak(_))
+        | (BlockIn::Unsupported, LayoutBlock::ColumnBreak(_))
+        | (BlockIn::Unsupported, LayoutBlock::Unsupported) => {}
+        _ => return Err("resident display block kind changed".to_owned()),
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResidentPageMetadata<'a> {
+    size: &'a crate::types::Size,
+    margins: &'a crate::types::PageMargins,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_margins: &'a Option<crate::types::PageMargins>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    columns: &'a Option<crate::types::ColumnLayout>,
+    section_id: &'a Option<String>,
+    section_index: Option<u64>,
+    section_page_index: Option<u64>,
+    section_page_number: Option<u64>,
+    page_label: &'a Option<String>,
+    number: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    header_footer_refs: &'a Option<crate::types::HeaderFooterRefs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parity_filler: Option<bool>,
+}
+
+fn convert_resident_page(
+    transcoder: &mut crate::transcode::Transcoder,
+    page: &crate::types::Page,
+    index: usize,
+    build: bool,
+    unreadable: &mut Vec<UnreadableDisplayInput>,
+) -> Result<PageIn, String> {
+    #[cfg(any(test, feature = "test-support"))]
+    let build = build || resident_conversion_test_support::force_full();
+    if build {
+        #[cfg(any(test, feature = "test-support"))]
+        resident_conversion_test_support::count_pages(1);
+        return transcoder.convert(page).or_else(|error| {
+            let mut readable = page.clone();
+            readable.fragments.retain(|fragment| {
+                let Err(reason) = transcoder.convert::<_, FragmentIn>(fragment) else {
+                    return true;
+                };
+                record_unreadable(
+                    unreadable,
+                    UnreadableDisplayInput {
+                        block: resident_fragment_block_key(fragment).into_owned(),
+                        page: Some(index),
+                        reason,
+                    },
+                );
+                false
+            });
+            if readable.fragments.len() == page.fragments.len() {
+                return Err(error);
+            }
+            transcoder.convert(&readable)
+        });
+    }
+    transcoder.convert(&ResidentPageMetadata {
+        size: &page.size,
+        margins: &page.margins,
+        body_margins: &page.body_margins,
+        columns: &page.columns,
+        section_id: &page.section_id,
+        section_index: page.section_index,
+        section_page_index: page.section_page_index,
+        section_page_number: page.section_page_number,
+        page_label: &page.page_label,
+        number: page.number,
+        header_footer_refs: &page.header_footer_refs,
+        parity_filler: page.parity_filler,
+    })
+}
+
+fn convert_resident_layout(
+    transcoder: &mut crate::transcode::Transcoder,
+    layout: &crate::types::Layout,
+    pages: Option<&HashSet<usize>>,
+    unreadable: &mut Vec<UnreadableDisplayInput>,
+) -> Result<LayoutIn, String> {
+    Ok(LayoutIn {
+        pages: layout
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                let build = pages.is_none_or(|pages| pages.contains(&index));
+                convert_resident_page(transcoder, page, index, build, unreadable)
+            })
+            .collect::<Result<_, _>>()?,
+        partial: layout.partial,
+        cached_page_totals: layout.cached_page_totals,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod resident_conversion_test_support {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static STATE: Cell<(bool, usize)> = const { Cell::new((false, 0)) };
+        static MEASURED_BLOCKS: Cell<usize> = const { Cell::new(0) };
+        static REUSE_MEASUREMENTS: Cell<bool> = const { Cell::new(true) };
+    }
+
+    pub(super) fn force_full() -> bool {
+        STATE.with(|state| state.get().0)
+    }
+
+    pub(super) fn count_pages(pages: usize) {
+        STATE.with(|state| {
+            let (force_full, converted) = state.get();
+            state.set((force_full, converted + pages));
+        });
+    }
+
+    pub(super) fn count_measured_block() {
+        MEASURED_BLOCKS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn reuse_measurements() -> bool {
+        REUSE_MEASUREMENTS.with(Cell::get)
+    }
+
+    pub fn with_measured_block_conversion<T>(reuse: bool, build: impl FnOnce() -> T) -> (T, usize) {
+        struct Restore(usize, bool);
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MEASURED_BLOCKS.with(|count| count.set(self.0));
+                REUSE_MEASUREMENTS.with(|enabled| enabled.set(self.1));
+            }
+        }
+
+        let _restore = Restore(
+            MEASURED_BLOCKS.with(|count| count.replace(0)),
+            REUSE_MEASUREMENTS.with(|enabled| enabled.replace(reuse)),
+        );
+        let result = build();
+        (result, MEASURED_BLOCKS.with(Cell::get))
+    }
+
+    pub fn with_layout_conversion<T>(force_full: bool, build: impl FnOnce() -> T) -> (T, usize) {
+        struct Restore((bool, usize));
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                STATE.with(|state| state.set(self.0));
+            }
+        }
+
+        let _restore = Restore(STATE.with(|state| state.replace((force_full, 0))));
+        let result = build();
+        (result, STATE.with(|state| state.get().1))
+    }
+}
+
+/// Rebuild only pages dirtied by incremental pagination, retain the remaining
+/// typed display pages, and patch absolute body positions on the converged
+/// suffix. The caller gates extras/page-count changes before selecting this
+/// path; violations widen to a full display build here as a final safeguard.
+pub fn build_display_list_value_from_resident_incremental_with_fonts(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+    fonts: &ooxml_text::FontStore,
+    previous: &DisplayList,
+    rebuilt_page_start: usize,
+    rebuilt_page_end: usize,
+    position_deltas: &HashMap<String, i64>,
+) -> Result<DisplayList, String> {
+    let parsed = resident_build_input(pagination, layout, extras)?;
+    if previous.pages.len() != parsed.layout.pages.len()
+        || rebuilt_page_start > rebuilt_page_end
+        || rebuilt_page_end > parsed.layout.pages.len()
+    {
+        return Ok(build_display_list(&parsed, fonts));
+    }
+
+    let selected: HashSet<_> = (rebuilt_page_start..rebuilt_page_end).collect();
+    let rebuilt = build_display_list_selected(&parsed, fonts, Some(&selected));
+    let mut rebuilt_by_index: HashMap<usize, DisplayPage> = rebuilt
+        .pages
+        .into_iter()
+        .map(|page| (page.page_index as usize, page))
+        .collect();
+    let mut pages = Vec::with_capacity(previous.pages.len());
+    for (page_index, previous_page) in previous.pages.iter().enumerate() {
+        if let Some(page) = rebuilt_by_index.remove(&page_index) {
+            pages.push(page);
+            continue;
+        }
+        let mut page = previous_page.clone();
+        page.page_index = page_index as u64;
+        if page_index >= rebuilt_page_end {
+            shift_page_body_positions(&mut page, position_deltas);
+            shift_unbuilt_span(&mut page, layout.pages.get(page_index), position_deltas);
+        }
+        pages.push(page);
+    }
+    Ok(DisplayList {
+        contract_version: rebuilt.contract_version,
+        pages,
+    })
+}
+
+/// In-place counterpart to
+/// [`build_display_list_value_from_resident_incremental_with_fonts`]. Engine
+/// sessions already own the previous display arena, so unchanged pages do not
+/// need to be deep-cloned for every keystroke. Dirty pages are replaced after
+/// they have been built successfully; the converged suffix receives only its
+/// absolute-position adjustment.
+pub fn update_display_list_value_from_resident_incremental_with_fonts(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+    fonts: &ooxml_text::FontStore,
+    previous: &mut DisplayList,
+    rebuilt_page_start: usize,
+    rebuilt_page_end: usize,
+    position_deltas: &HashMap<String, i64>,
+) -> Result<bool, String> {
+    update_display_list_value_from_resident_incremental_with_fonts_observed(
+        pagination,
+        layout,
+        extras,
+        fonts,
+        previous,
+        rebuilt_page_start,
+        rebuilt_page_end,
+        position_deltas,
+        &mut || {},
+    )
+}
+
+pub fn update_display_list_value_from_resident_incremental_with_fonts_observed(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    extras: &str,
+    fonts: &ooxml_text::FontStore,
+    previous: &mut DisplayList,
+    rebuilt_page_start: usize,
+    rebuilt_page_end: usize,
+    position_deltas: &HashMap<String, i64>,
+    observe_phase: &mut impl FnMut(),
+) -> Result<bool, String> {
+    let parsed = resident_build_input(pagination, layout, extras)?;
+    observe_phase();
+    if previous.pages.len() != parsed.layout.pages.len()
+        || rebuilt_page_start > rebuilt_page_end
+        || rebuilt_page_end > parsed.layout.pages.len()
+    {
+        *previous = build_display_list(&parsed, fonts);
+        observe_phase();
+        return Ok(false);
+    }
+
+    let selected: HashSet<_> = (rebuilt_page_start..rebuilt_page_end).collect();
+    let rebuilt = build_display_list_selected(&parsed, fonts, Some(&selected));
+    observe_phase();
+    previous.contract_version = rebuilt.contract_version;
+    for page in rebuilt.pages {
+        let page_index = page.page_index as usize;
+        previous.pages[page_index] = page;
+    }
+    for (page_index, page) in previous.pages.iter_mut().enumerate().skip(rebuilt_page_end) {
+        page.page_index = page_index as u64;
+        shift_page_body_positions(page, position_deltas);
+        shift_unbuilt_span(page, layout.pages.get(page_index), position_deltas);
+    }
+    Ok(true)
+}
+
+/// Incremental engine path backed by a retained parsed display input. Only
+/// rebuilt layout pages and the measured blocks referenced by those pages
+/// cross the typed-layout compatibility adapter on each edit.
+/// `extra_pages` outside the range are rebuilt too: pages whose note areas
+/// changed although their body did not.
+#[allow(clippy::too_many_arguments)]
+pub fn update_resident_display_list_incremental_with_fonts_observed(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    fonts: &ooxml_text::FontStore,
+    resident: &mut ResidentDisplayInput,
+    previous: &mut DisplayList,
+    rebuilt_page_start: usize,
+    rebuilt_page_end: usize,
+    extra_pages: &[usize],
+    position_deltas: &HashMap<String, i64>,
+    observe_phase: &mut impl FnMut(),
+) -> Result<bool, String> {
+    update_resident_display_list_incremental_partial_with_fonts_observed(
+        pagination,
+        layout,
+        fonts,
+        resident,
+        previous,
+        rebuilt_page_start,
+        rebuilt_page_end,
+        extra_pages,
+        position_deltas,
+        &|_| true,
+        observe_phase,
+    )
+}
+
+/// [`update_resident_display_list_incremental_with_fonts_observed`] that builds
+/// only the rebuilt pages `build` selects; the others become unbuilt
+/// placeholders even if previously built. Untouched pages retain their display.
+#[allow(clippy::too_many_arguments)]
+pub fn update_resident_display_list_incremental_partial_with_fonts_observed(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    fonts: &ooxml_text::FontStore,
+    resident: &mut ResidentDisplayInput,
+    previous: &mut DisplayList,
+    rebuilt_page_start: usize,
+    rebuilt_page_end: usize,
+    extra_pages: &[usize],
+    position_deltas: &HashMap<String, i64>,
+    build: &dyn Fn(usize) -> bool,
+    observe_phase: &mut impl FnMut(),
+) -> Result<bool, String> {
+    update_resident_display_list_incremental_partial_with_fonts_shifts(
+        pagination,
+        layout,
+        fonts,
+        resident,
+        previous,
+        rebuilt_page_start,
+        rebuilt_page_end,
+        extra_pages,
+        position_deltas,
+        build,
+        observe_phase,
+    )
+    .map(|result| result.is_some())
+}
+
+/// A contiguous range of retained pages shifted by one position delta.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DisplayShiftRun {
+    pub start: usize,
+    pub end: usize,
+    pub delta: i64,
+}
+
+/// Position changes on retained pages after an incremental display update.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct IncrementalDisplayShifts {
+    pub runs: Vec<DisplayShiftRun>,
+    pub mixed: Vec<usize>,
+}
+
+impl IncrementalDisplayShifts {
+    /// Appends a page's shift, coalescing adjacent uniform and inert pages.
+    fn push(&mut self, index: usize, shift: DisplayShift) {
+        match shift {
+            DisplayShift::Uniform(delta) => {
+                if let Some(last) = self.runs.last_mut()
+                    && last.end == index
+                    && last.delta == delta
+                {
+                    last.end = index + 1;
+                } else {
+                    self.runs.push(DisplayShiftRun {
+                        start: index,
+                        end: index + 1,
+                        delta,
+                    });
+                }
+            }
+            DisplayShift::Inert => {
+                if let Some(last) = self.runs.last_mut()
+                    && last.end == index
+                {
+                    last.end = index + 1;
+                }
+            }
+            DisplayShift::Mixed => self.mixed.push(index),
+            DisplayShift::Unchanged => {}
+        }
+    }
+}
+
+/// Updates selected pages and reports position shifts on retained suffix pages.
+#[allow(clippy::too_many_arguments)]
+pub fn update_resident_display_list_incremental_partial_with_fonts_shifts(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    fonts: &ooxml_text::FontStore,
+    resident: &mut ResidentDisplayInput,
+    previous: &mut DisplayList,
+    rebuilt_page_start: usize,
+    rebuilt_page_end: usize,
+    extra_pages: &[usize],
+    position_deltas: &HashMap<String, i64>,
+    build: &dyn Fn(usize) -> bool,
+    observe_phase: &mut impl FnMut(),
+) -> Result<Option<IncrementalDisplayShifts>, String> {
+    update_resident_display_list_incremental_partial_with_fonts_cached(
+        pagination,
+        layout,
+        fonts,
+        resident,
+        previous,
+        rebuilt_page_start,
+        rebuilt_page_end,
+        extra_pages,
+        position_deltas,
+        build,
+        observe_phase,
+        None,
+    )
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn update_resident_display_list_incremental_partial_with_fonts_cached(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    fonts: &ooxml_text::FontStore,
+    resident: &mut ResidentDisplayInput,
+    previous: &mut DisplayList,
+    rebuilt_page_start: usize,
+    rebuilt_page_end: usize,
+    extra_pages: &[usize],
+    position_deltas: &HashMap<String, i64>,
+    build: &dyn Fn(usize) -> bool,
+    observe_phase: &mut impl FnMut(),
+    fingerprints: Option<&[u128]>,
+) -> Result<Option<IncrementalDisplayShifts>, String> {
+    if previous.pages.len() != layout.pages.len()
+        || resident.input.layout.pages.len() != layout.pages.len()
+    {
+        return Ok(None);
+    }
+    if rebuilt_page_start > rebuilt_page_end
+        || rebuilt_page_end > layout.pages.len()
+        || extra_pages.iter().any(|&page| page >= layout.pages.len())
+    {
+        return Err("resident display incremental page range is invalid".to_owned());
+    }
+    let selected: HashSet<_> = (rebuilt_page_start..rebuilt_page_end)
+        .chain(extra_pages.iter().copied())
+        .collect();
+
+    let built: HashSet<usize> = selected
+        .iter()
+        .copied()
+        .filter(|&page| build(page))
+        .collect();
+    refresh_resident_display_pages_reading(
+        &mut resident.input,
+        pagination,
+        layout,
+        selected.iter().copied(),
+        &built,
+        fingerprints,
+    )?;
+    observe_phase();
+
+    let rebuilt = build_display_list_selected(&resident.input, fonts, Some(&built));
+    observe_phase();
+    previous.contract_version = rebuilt.contract_version;
+    for page in rebuilt.pages {
+        let page_index = page.page_index as usize;
+        previous.pages[page_index] = page;
+    }
+    if built.len() < selected.len() {
+        let blocks = source_blocks_by_key(
+            pagination,
+            selected
+                .difference(&built)
+                .map(|&index| &layout.pages[index]),
+        );
+        for &page_index in selected.difference(&built) {
+            previous.pages[page_index] = unbuilt_page_with_span(
+                &resident.input.layout.pages[page_index],
+                page_index,
+                layout_page_position_span(&layout.pages[page_index], &blocks)?,
+                resident.input.headers_footers.as_ref(),
+            );
+        }
+    }
+    let mut shifts = IncrementalDisplayShifts::default();
+    for (page_index, page) in previous.pages.iter_mut().enumerate().skip(rebuilt_page_end) {
+        if selected.contains(&page_index) {
+            continue;
+        }
+        page.page_index = page_index as u64;
+        let body = shift_page_body_positions(page, position_deltas);
+        let span = shift_unbuilt_span(page, layout.pages.get(page_index), position_deltas);
+        shifts.push(page_index, body.combine(span));
+    }
+    if built.len() < selected.len() {
+        prune_resident_display_measured(resident, previous);
+    }
+    Ok(Some(shifts))
+}
+
+/// Refreshes the layout pages `rebuilt_pages`, and the measured blocks of those
+/// among them in `reading`.
+fn refresh_resident_display_pages_reading(
+    input: &mut BuildInput,
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    rebuilt_pages: impl IntoIterator<Item = usize>,
+    reading: &HashSet<usize>,
+    fingerprints: Option<&[u128]>,
+) -> Result<(), String> {
+    #[cfg(any(test, feature = "test-support"))]
+    let fingerprints =
+        fingerprints.filter(|_| resident_conversion_test_support::reuse_measurements());
+    let fingerprints = fingerprints.filter(|values| values.len() == pagination.measured.len());
+    let document_keys: HashSet<_> = pagination
+        .measured
+        .iter()
+        .filter_map(|measured| resident_block_key(&measured.block))
+        .collect();
+    input
+        .converted_measurements
+        .retain(|key, _| document_keys.contains(key.as_str()));
+    if fingerprints.is_some() {
+        input.measured.retain(|measured| {
+            measured_block_key(measured).is_none_or(|key| document_keys.contains(&key))
+        });
+    }
+    let mut selected_blocks = HashSet::new();
+    let mut transcoder = crate::transcode::Transcoder::default();
+    for page_index in rebuilt_pages {
+        let mut recorded = Vec::new();
+        let page = convert_resident_page(
+            &mut transcoder,
+            &layout.pages[page_index],
+            page_index,
+            reading.contains(&page_index),
+            &mut recorded,
+        )
+        .map_err(|error| format!("parse resident display layout page: {error}"))?;
+        input
+            .unreadable
+            .retain(|known| known.page != Some(page_index));
+        input.unreadable.extend(recorded);
+        if reading.contains(&page_index) {
+            for fragment in &layout.pages[page_index].fragments {
+                selected_blocks.insert(resident_fragment_block_key(fragment));
+            }
+        }
+        input.layout.pages[page_index] = page;
+    }
+
+    if selected_blocks.is_empty() {
+        prune_unreadable_blocks(input);
+        return Ok(());
+    }
+    let mut current_indices = HashMap::new();
+    for (index, measured) in input.measured.iter().enumerate() {
+        if let Some(key) = measured_block_key(measured) {
+            current_indices.entry(key.into_owned()).or_insert(index);
+        }
+    }
+    let mut pending_blocks = selected_blocks;
+    let mut added_blocks = false;
+    let mut unreadable_indices = Vec::new();
+    let mut extent_key = Vec::new();
+    for (source_index, measured) in pagination.measured.iter().enumerate() {
+        if pending_blocks.is_empty() {
+            break;
+        }
+        let Some(key) = resident_block_key(&measured.block) else {
+            continue;
+        };
+        if !pending_blocks.remove(key.as_ref()) {
+            continue;
+        }
+        let fingerprint = fingerprints.map(|values| values[source_index]);
+        extent_key.clear();
+        let extent_key_valid = fingerprint.is_some()
+            && crate::extent_key::encode(&mut extent_key, &measured.measure).is_ok();
+        if let Some(&index) = current_indices.get(key.as_ref())
+            && let Some(cached) = input.converted_measurements.get(key.as_ref())
+            && Some(cached.fingerprint) == fingerprint
+            && extent_key_valid
+            && cached.extent_key == extent_key
+            && cached.source == measured.block
+            && refresh_block_positions(
+                &mut input.measured[index].block,
+                &measured.block,
+                &mut transcoder,
+            )
+            .is_ok()
+        {
+            input
+                .unreadable
+                .retain(|known| known.page.is_some() || known.block.as_str() != key.as_ref());
+            continue;
+        }
+        input.converted_measurements.remove(key.as_ref());
+        let Some(block) = convert_measured_block(&mut transcoder, measured, &mut input.unreadable)
+        else {
+            unreadable_indices.extend(current_indices.get(key.as_ref()).copied());
+            continue;
+        };
+        if let Some(fingerprint) = fingerprint
+            && extent_key_valid
+        {
+            input.converted_measurements.insert(
+                key.to_string(),
+                ConvertedMeasurement {
+                    fingerprint,
+                    extent_key: extent_key.clone(),
+                    source: measured.block.clone(),
+                },
+            );
+        }
+        match current_indices.get(key.as_ref()) {
+            Some(&index) => input.measured[index] = block,
+            None => {
+                input.measured.push(block);
+                added_blocks = true;
+            }
+        }
+    }
+    if let Some(key) = pending_blocks.into_iter().next() {
+        return Err(format!(
+            "resident pagination measured block {key:?} is missing"
+        ));
+    }
+    unreadable_indices.sort_unstable();
+    for index in unreadable_indices.into_iter().rev() {
+        input.measured.remove(index);
+    }
+    if added_blocks && !input.defer_stale_block_pruning {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            input.stale_block_pruning_passes += 1;
+        }
+        let keys: HashSet<_> = pagination
+            .measured
+            .iter()
+            .filter_map(|measured| resident_block_key(&measured.block))
+            .collect();
+        input.measured.retain(|measured| {
+            measured_block_key(measured).is_none_or(|key| keys.contains(key.as_ref()))
+        });
+    }
+    prune_unreadable_blocks(input);
+    Ok(())
+}
+
+#[cfg(test)]
+fn convert_resident_value<T: Serialize, U: DeserializeOwned>(
+    input: &T,
+    label: &str,
+) -> Result<U, String> {
+    crate::transcode::transcode(input).map_err(|error| format!("parse {label}: {error}"))
+}
+
+/// [`measured_block_key`] of `block` once transcoded: none for the breaks and
+/// unsupported blocks the display input does not render.
+fn resident_block_key(block: &crate::types::LayoutBlock) -> Option<Cow<'_, str>> {
+    use crate::types::LayoutBlock;
+    match block {
+        LayoutBlock::Paragraph(value) => Some(resident_block_id_key(&value.id)),
+        LayoutBlock::Table(value) => Some(resident_block_id_key(&value.id)),
+        LayoutBlock::Image(value) => Some(resident_block_id_key(&value.id)),
+        LayoutBlock::TextBox(value) => Some(resident_block_id_key(&value.id)),
+        LayoutBlock::Shape(value) => Some(resident_block_id_key(&value.id)),
+        LayoutBlock::Chart(value) => Some(resident_block_id_key(&value.id)),
+        LayoutBlock::Reserved(value) => Some(resident_block_id_key(&value.id)),
+        LayoutBlock::SectionBreak(_)
+        | LayoutBlock::PageBreak(_)
+        | LayoutBlock::ColumnBreak(_)
+        | LayoutBlock::Unsupported => None,
+    }
+}
+
+/// Borrows pagination fragment ids with the resident display key text.
+fn resident_fragment_block_key(fragment: &crate::types::Fragment) -> Cow<'_, str> {
+    use crate::types::Fragment;
+    let id = match fragment {
+        Fragment::Paragraph(value) => &value.block_id,
+        Fragment::Table(value) => &value.block_id,
+        Fragment::Image(value) => &value.block_id,
+        Fragment::TextBox(value) => &value.block_id,
+        Fragment::Shape(value) => &value.block_id,
+        Fragment::Chart(value) => &value.block_id,
+        Fragment::Reserved(value) => &value.block_id,
+    };
+    resident_block_id_key(id)
+}
+
+/// [`block_key`] of `id` once transcoded, which reads an integral number back
+/// as an integer.
+fn resident_block_id_key(id: &crate::types::BlockId) -> Cow<'_, str> {
+    match id {
+        crate::types::BlockId::Str(value) => Cow::Borrowed(value),
+        crate::types::BlockId::Num(value)
+            if value.fract() == 0.0 && *value >= i64::MIN as f64 && *value <= i64::MAX as f64 =>
+        {
+            Cow::Owned((*value as i64).to_string())
+        }
+        crate::types::BlockId::Num(value) => Cow::Owned(
+            serde_json::Number::from_f64(*value)
+                .map_or_else(|| "null".to_owned(), |n| n.to_string()),
+        ),
+    }
+}
+
+/// Borrows rendered measured block ids with their canonical key text.
+fn measured_block_key(measured: &MeasuredBlockIn) -> Option<Cow<'_, str>> {
+    match &measured.block {
+        BlockIn::Paragraph(value) => Some(block_key(&value.id)),
+        BlockIn::Table(value) => Some(block_key(&value.id)),
+        BlockIn::Image(value) => Some(block_key(&value.id)),
+        BlockIn::TextBox(value) => Some(block_key(&value.id)),
+        BlockIn::Shape(value) => Some(block_key(&value.id)),
+        BlockIn::Chart(value) => Some(block_key(&value.id)),
+        BlockIn::Reserved(value) => Some(block_key(&value.id)),
+        BlockIn::Unsupported => None,
+    }
+}
+
+/// Borrows string block ids while preserving their canonical key text.
+fn fragment_block_key_ref(fragment: &FragmentIn) -> Option<Cow<'_, str>> {
+    let id = match fragment {
+        FragmentIn::Paragraph(value) => &value.block_id,
+        FragmentIn::Table(value) => &value.block_id,
+        FragmentIn::Image(value) => &value.block_id,
+        FragmentIn::TextBox(value) => &value.block_id,
+        FragmentIn::Shape(value) => &value.block_id,
+        FragmentIn::Chart(value) => &value.block_id,
+        FragmentIn::Reserved(value) => &value.block_id,
+        FragmentIn::Unsupported => return None,
+    };
+    Some(block_key(id))
+}
+
+/// Classifies effective position changes without revisiting primitives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayShift {
+    Inert,
+    Uniform(i64),
+    Unchanged,
+    Mixed,
+}
+
+impl DisplayShift {
+    /// Combines the movements of two positioned parts of a page.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Inert, shift) | (shift, Self::Inert) => shift,
+            (Self::Uniform(left), Self::Uniform(right)) if left == right => Self::Uniform(left),
+            (Self::Unchanged, Self::Unchanged) => Self::Unchanged,
+            _ => Self::Mixed,
+        }
+    }
+}
+
+/// Moves an unbuilt page's position span with the blocks `layout_page` places.
+fn shift_unbuilt_span(
+    page: &mut DisplayPage,
+    layout_page: Option<&crate::types::Page>,
+    deltas: &HashMap<String, i64>,
+) -> DisplayShift {
+    let Some(span) = &mut page.position_span else {
+        return DisplayShift::Inert;
+    };
+    let delta = layout_page
+        .and_then(|layout_page| {
+            layout_page
+                .fragments
+                .iter()
+                .find(|fragment| !matches!(fragment, crate::types::Fragment::Reserved(_)))
+        })
+        .map(resident_fragment_block_key)
+        .and_then(|key| deltas.get(key.as_ref()))
+        .filter(|&&delta| delta != 0);
+    if let Some(&delta) = delta {
+        span[0] += delta;
+        span[1] += delta;
+        DisplayShift::Uniform(delta)
+    } else {
+        DisplayShift::Unchanged
+    }
+}
+
+/// Shifts body positions and classifies the deltas applied to positioned primitives.
+fn shift_page_body_positions(
+    page: &mut DisplayPage,
+    deltas: &HashMap<String, i64>,
+) -> DisplayShift {
+    // Looked up by reference: a clone per primitive is an allocation per
+    // primitive on every page after the edit.
+    let mut id_key = String::new();
+    let mut shift = DisplayShift::Inert;
+    for primitive in &mut page.primitives {
+        let attrs = match primitive {
+            Primitive::Text(value) => &mut value.attrs,
+            Primitive::GlyphRun(value) => &mut value.attrs,
+            Primitive::Rect(value) => &mut value.attrs,
+            Primitive::Line(value) => &mut value.attrs,
+            Primitive::Image(value) => &mut value.attrs,
+            Primitive::Shape(value) => &mut value.attrs,
+            Primitive::Decoration(value) => &mut value.attrs,
+        };
+        if attrs.doc_start.is_none()
+            && attrs.doc_end.is_none()
+            && attrs.fragment_doc_start.is_none()
+            && attrs.fragment_doc_end.is_none()
+            && attrs.inline_sdt_widget.is_none()
+        {
+            continue;
+        }
+        if deltas.is_empty() {
+            return DisplayShift::Unchanged;
+        }
+        let key = match (&attrs.block_key, &attrs.block_id) {
+            (Some(key), _) => Some(key.as_str()),
+            (None, Some(id)) => {
+                id_key.clear();
+                std::fmt::Write::write_fmt(&mut id_key, format_args!("{id}"))
+                    .expect("writing to a String cannot fail");
+                Some(id_key.as_str())
+            }
+            (None, None) => None,
+        };
+        let Some(&delta) = key
+            .and_then(|key| deltas.get(key))
+            .filter(|&&delta| delta != 0)
+        else {
+            shift = shift.combine(DisplayShift::Unchanged);
+            continue;
+        };
+        shift = shift.combine(DisplayShift::Uniform(delta));
+        attrs.doc_start = attrs.doc_start.map(|value| value + delta);
+        attrs.doc_end = attrs.doc_end.map(|value| value + delta);
+        attrs.fragment_doc_start = attrs.fragment_doc_start.map(|value| value + delta);
+        attrs.fragment_doc_end = attrs.fragment_doc_end.map(|value| value + delta);
+        if let Some(widget) = &mut attrs.inline_sdt_widget {
+            widget.pos += delta;
+        }
+    }
+    shift
+}
+
+/// Rewrites losslessly-integral JSON floats as integers.
+///
+/// Several established display-input fields deserialize as `i64`, but the same
+/// values reach this builder as `f64` when they come from typed Rust state
+/// rather than through a host with a single number type. Canonicalizing here
+/// makes both paths parse identically.
+fn normalize_integral_json_numbers(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_integral_json_numbers(value);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                normalize_integral_json_numbers(value);
+            }
+        }
+        Value::Number(number) if !number.is_i64() && !number.is_u64() => {
+            let Some(float) = number.as_f64() else {
+                return;
+            };
+            if float.is_finite()
+                && float.fract() == 0.0
+                && float >= i64::MIN as f64
+                && float <= i64::MAX as f64
+            {
+                *number = Number::from(float as i64);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn header_styleref_follows_the_page_and_falls_back_to_earlier_pages() {
+        let paragraph = |style: &str, marker: &str, text: &str| -> ParagraphBlockIn {
+            serde_json::from_value(serde_json::json!({
+                "id": 1,
+                "runs": [{"kind": "text", "text": text}],
+                "attrs": {"styleId": "1", "styleName": style, "listMarker": marker}
+            }))
+            .unwrap()
+        };
+        let one = paragraph("heading 1", "第1章 ", "绪论");
+        let two = paragraph("heading 1", "第2章 ", "方法");
+        let body = paragraph("Normal", "", "正文");
+        let pages = vec![vec![&one, &body], vec![&body], vec![&body, &two]];
+        let field = |instruction: &str| -> FieldRunIn {
+            serde_json::from_value(serde_json::json!({
+                "fieldType": "OTHER",
+                "rawType": "STYLEREF",
+                "instruction": instruction,
+                "fallback": "cached"
+            }))
+            .unwrap()
+        };
+        let ctx = |page_index: usize| RenderCtx {
+            leader_fonts: None,
+            page_number: page_index as u64 + 1,
+            page_label: None,
+            page_index,
+            total_pages: 3,
+            cached_page_totals: false,
+            shape: None,
+            field_widths: None,
+            reservations: None,
+            gridlines: None,
+            style_refs: Some(&pages),
+            style_ref_last: false,
+        };
+        let title = field(" STYLEREF \"标题 1\" ");
+        let number = field(" STYLEREF \"标题 1\" \\n ");
+        assert_eq!(field_text(&title, &ctx(0)), "绪论");
+        assert_eq!(field_text(&title, &ctx(1)), "绪论");
+        assert_eq!(field_text(&title, &ctx(2)), "方法");
+        assert_eq!(field_text(&number, &ctx(0)), "第1章");
+        assert_eq!(field_text(&number, &ctx(2)), "第2章");
+        assert_eq!(field_text(&field(" STYLEREF Missing "), &ctx(0)), "cached");
+    }
+
+    #[test]
+    fn paragraph_scripts_take_kana_and_hangul_context_across_runs() {
+        let runs = |texts: &[&str]| -> Vec<RunIn> {
+            texts
+                .iter()
+                .map(|text| {
+                    serde_json::from_value(serde_json::json!({"kind": "text", "text": text}))
+                        .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(paragraph_scripts(&runs(&["骨", "かな"])), ["cjk-jp"]);
+        assert_eq!(paragraph_scripts(&runs(&["骨", "한국"])), ["cjk-kr"]);
+        assert_eq!(paragraph_scripts(&runs(&["骨"])), ["cjk-sc"]);
+        assert!(paragraph_scripts(&runs(&["Latin"])).is_empty());
+    }
+    use super::*;
+
+    #[test]
+    fn non_visible_font_resolution_is_scoped_to_implicit_defaults() {
+        let mut store = ooxml_text::FontStore::new();
+        let bytes = include_bytes!("../../ooxml-text/tests/fonts/LiberationSans-Regular.ttf");
+        let first = store.register(bytes.to_vec()).unwrap();
+        let last = store.register(bytes.to_vec()).unwrap();
+        let chain = [first, last];
+        for ch in ['\t', '\u{2060}', '\u{fe0f}', '\u{feff}'] {
+            assert_eq!(store.resolve(&chain, ch), None);
+            for (marked, expected) in [
+                (vec![], last),
+                (vec![first.to_u32()], last),
+                (vec![first.to_u32(), last.to_u32()], first),
+            ] {
+                let input: BuildInput = serde_json::from_value(serde_json::json!({
+                    "measured": [], "options": {}, "layout": {"pages": []},
+                    "fontChains": {
+                        "calibri|0|0": [first.to_u32(), last.to_u32()],
+                        "@nimbleoffice/fonts/coverage": marked,
+                    },
+                }))
+                .unwrap();
+                let fonts = ShapeFonts::build(&input, &store).unwrap();
+                let chain = fonts.chain_for("Calibri", false, false).unwrap();
+                assert_eq!((chain.resolve)(&store, &chain.ids, ch), Some(expected));
+                assert_eq!(
+                    (chain.resolve)(&store, &chain.ids, '\u{0939}'),
+                    if chain.coverage_only {
+                        None
+                    } else {
+                        Some(last)
+                    }
+                );
+            }
+            let unknown = ooxml_text::FontId::from_u32(u32::MAX);
+            let chain = ShapeFontChain::new(vec![unknown, first, last], true);
+            assert_eq!((chain.resolve)(&store, &chain.ids, ch), Some(first));
+        }
+        let fonts = ShapeFonts {
+            store: &store,
+            chains: HashMap::new(),
+            coverage_only: false,
+        };
+        let fmt = RunFormattingIn::default();
+        assert!(painted_text_width(&fonts, first, "\u{2060}", &fmt, 0, false, false).is_none());
+        assert!(painted_text_width(&fonts, first, "\u{2060}", &fmt, 0, false, true).is_some());
+    }
+
+    #[test]
+    fn unequal_column_bounds_and_separators_match_placement() {
+        for (count, widths, expected) in [
+            (
+                3,
+                vec![100.0],
+                vec![(20.0, 100.0), (140.0, 130.0), (290.0, 130.0)],
+            ),
+            (2, vec![300.0, 200.0], vec![(20.0, 228.0), (268.0, 152.0)]),
+        ] {
+            let columns = serde_json::json!({
+                "count": count, "gap": 20, "equalWidth": false, "separator": true,
+                "columns": widths.into_iter().map(|width| serde_json::json!({
+                    "width": width,
+                })).collect::<Vec<_>>(),
+            });
+            let margins = serde_json::json!({
+                "top": 20, "right": 20, "bottom": 20, "left": 20,
+            });
+            let page: PageIn = serde_json::from_value(serde_json::json!({
+                "size": {"w": 440, "h": 500}, "margins": margins, "columns": columns,
+            }))
+            .unwrap();
+            let paginator = crate::page_flow::Paginator::new(
+                crate::types::Size { w: 440.0, h: 500.0 },
+                serde_json::from_value(margins).unwrap(),
+                serde_json::from_value(columns).unwrap(),
+                None,
+            )
+            .unwrap();
+            let (_, bounds) = page_content_geometry(&page);
+            let mut separators = Vec::new();
+            emit_column_separators(&mut separators, &page);
+            assert_eq!(bounds.len(), expected.len());
+            assert_eq!(separators.len(), expected.len() - 1);
+            for (index, (x, width)) in expected.iter().copied().enumerate() {
+                assert!((paginator.get_column_x(index) - x).abs() < 1e-9);
+                assert!((paginator.get_column_width(index) - width).abs() < 1e-9);
+                assert_eq!(bounds[index].x, px(x));
+                assert_eq!(bounds[index].width, px(width));
+                assert!(x + width <= 420.0);
+                if let Some(Primitive::Line(line)) = separators.get(index) {
+                    let separator_x = (x + width + expected[index + 1].0) / 2.0;
+                    assert_eq!(line.x1, px(separator_x));
+                    assert_eq!(line.x2, px(separator_x));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_and_text_box_positions_ignore_legacy_metadata() {
+        let position = serde_json::json!({
+            "horizontal": {"relativeTo": "page", "posOffset": 914400},
+            "vertical": {"relativeTo": "margin", "posOffset": 0},
+            "relativeHeight": 7,
+        });
+        let measured = serde_json::json!([
+            {
+                "block": {"kind": "paragraph", "id": "image-anchor", "runs": [{
+                    "kind": "image", "src": "image", "width": 20, "height": 20,
+                    "displayMode": "float", "position": position,
+                }]},
+                "measure": {"kind": "paragraph", "totalHeight": 20, "lines": [{
+                    "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 1,
+                    "width": 0, "ascent": 15, "descent": 5, "lineHeight": 20,
+                }]},
+            },
+            {
+                "block": {"kind": "textBox", "id": "box", "width": 20, "height": 20,
+                          "displayMode": "float", "fillColor": "#eeeeee",
+                          "position": position, "content": []},
+                "measure": {"kind": "textBox", "width": 20, "height": 20,
+                            "innerMeasures": []},
+            },
+        ]);
+        let input = serde_json::json!({
+            "measured": measured,
+            "options": {},
+            "headersFooters": {"variants": [{
+                "rId": "header", "kind": "header", "type": "default",
+                "height": 20, "flowHeight": 20, "measured": measured,
+            }]},
+            "layout": {"pages": [{
+                "size": {"w": 500, "h": 500},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "fragments": [
+                    {"kind": "paragraph", "blockId": "image-anchor", "x": 96, "y": 96,
+                     "width": 308, "height": 20, "fromLine": 0, "toLine": 1},
+                    {"kind": "textBox", "blockId": "box", "x": 96, "y": 96,
+                     "width": 20, "height": 20},
+                ],
+            }]},
+        });
+        let expected = build_display_list_json(&input.to_string()).unwrap();
+        for metadata in [
+            serde_json::json!({"useSimplePos": 0}),
+            serde_json::json!({"behindDoc": "0"}),
+            serde_json::json!({"useSimplePos": [], "behindDoc": {}, "simplePos": false,
+                               "unknown": [1, 2]}),
+        ] {
+            let mut input = input.clone();
+            for path in ["/measured", "/headersFooters/variants/0/measured"] {
+                for measured in input.pointer_mut(path).unwrap().as_array_mut().unwrap() {
+                    let block = &mut measured["block"];
+                    let position = if block["kind"] == "paragraph" {
+                        &mut block["runs"][0]["position"]
+                    } else {
+                        &mut block["position"]
+                    };
+                    position
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(metadata.as_object().unwrap().clone());
+                }
+            }
+            assert_eq!(
+                build_display_list_json(&input.to_string()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "base-latin")]
+    fn browser_text_uses_the_resolved_backstop_family_and_style() {
+        let store = ooxml_text::FontStore::new();
+        let shape = ShapeFonts {
+            store: &store,
+            chains: HashMap::from([(
+                "calibri|1|0".to_owned(),
+                ShapeFontChain::new(vec![ooxml_text::FontId::base_latin(true, false)], false),
+            )]),
+            coverage_only: false,
+        };
+        let fmt = RunFormattingIn {
+            bold: Some(true),
+            emphasis_mark: Some("dot".to_owned()),
+            ..Default::default()
+        };
+        assert!(text_primitive_requires_browser_path(&fmt));
+        let latin = resolved_css_font(Some(&shape), "Latin", &fmt);
+        assert!(latin.contains(ooxml_text::BASE_LATIN_FAMILY));
+        assert!(latin.starts_with("700 "));
+        let greek = resolved_css_font(Some(&shape), "Ω", &fmt);
+        assert!(greek.contains(ooxml_text::BASE_LATIN_FAMILY));
+        assert!(greek.starts_with("400 "));
+    }
+
+    /// Every retained primitive carries its attributes inline, so rarely set
+    /// metadata stays boxed: 270k primitives cost 1.9 KB each before it was.
+    #[test]
+    fn retained_primitives_stay_compact() {
+        assert!(std::mem::size_of::<DocAttrs>() <= 800);
+        assert!(std::mem::size_of::<Primitive>() <= 1152);
+    }
+
+    /// The resident input as it was built before typed transcoding: every
+    /// value through a JSON tree, integral numbers normalized.
+    fn resident_build_input_via_json(
+        pagination: &crate::types::Input,
+        layout: &crate::types::Layout,
+        extras: &str,
+    ) -> BuildInput {
+        let mut wire: serde_json::Map<String, Value> = serde_json::from_str(extras).unwrap();
+        wire.insert(
+            "measured".to_owned(),
+            serde_json::to_value(&pagination.measured).unwrap(),
+        );
+        wire.insert(
+            "options".to_owned(),
+            serde_json::to_value(&pagination.options).unwrap(),
+        );
+        wire.insert("layout".to_owned(), serde_json::to_value(layout).unwrap());
+        let mut wire = Value::Object(wire);
+        normalize_integral_json_numbers(&mut wire);
+        serde_json::from_value(wire).unwrap()
+    }
+
+    #[test]
+    fn resident_display_input_matches_the_json_round_trip() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut names: Vec<String> = std::fs::read_dir(&fixtures)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".input.json").map(str::to_owned)
+            })
+            .collect();
+        names.sort();
+        let extras =
+            r#"{"contractVersion":2,"fontChains":{"arial|0|0":[]},"resolvedCommentIds":[3]}"#;
+        let mut compared = 0;
+        for name in names {
+            let read = |suffix: &str| {
+                std::fs::read_to_string(fixtures.join(format!("{name}.{suffix}.json"))).unwrap()
+            };
+            let Ok(mut pagination) = serde_json::from_str::<crate::types::Input>(&read("input"))
+            else {
+                continue;
+            };
+            let Ok(layout) = crate::compute_layout_input(&mut pagination) else {
+                continue;
+            };
+            let fonts = ooxml_text::FontStore::default();
+            let expected = build_display_list(
+                &resident_build_input_via_json(&pagination, &layout, extras),
+                &fonts,
+            );
+            let actual = build_display_list(
+                &resident_build_input(&pagination, &layout, extras).unwrap(),
+                &fonts,
+            );
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "{name}"
+            );
+            compared += 1;
+        }
+        assert!(compared >= 10, "compared only {compared} fixtures");
+        let pagination: crate::types::Input = serde_json::from_str(
+            &std::fs::read_to_string(fixtures.join("keep-lines-paragraph.input.json")).unwrap(),
+        )
+        .unwrap();
+        let layout = crate::compute_layout_input(&mut pagination.clone()).unwrap();
+        for extras in ["[]", "[2]", "null"] {
+            assert!(
+                resident_build_input(&pagination, &layout, extras).is_err(),
+                "{extras}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_resident_build_converts_only_built_pages_and_completes_to_a_full_build() {
+        use resident_conversion_test_support::with_layout_conversion;
+
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut names: Vec<String> = std::fs::read_dir(&fixtures)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".input.json").map(str::to_owned)
+            })
+            .collect();
+        names.sort();
+        let extras = r#"{"contractVersion":2,"fontChains":{"arial|0|0":[]}}"#;
+        let fonts = ooxml_text::FontStore::default();
+        let mut fewer_blocks = 0;
+        for name in names {
+            let text =
+                std::fs::read_to_string(fixtures.join(format!("{name}.input.json"))).unwrap();
+            let Ok(mut pagination) = serde_json::from_str::<crate::types::Input>(&text) else {
+                continue;
+            };
+            let Ok(layout) = crate::compute_layout_input(&mut pagination) else {
+                continue;
+            };
+            let expected = serde_json::to_value(build_display_list(
+                &resident_build_input(&pagination, &layout, extras).unwrap(),
+                &fonts,
+            ))
+            .unwrap();
+            let build = || {
+                build_resident_display_list_partial_with_fonts_observed(
+                    &pagination,
+                    &layout,
+                    extras,
+                    &fonts,
+                    &|index| index == 0,
+                    &mut || {},
+                )
+                .unwrap()
+            };
+            let ((mut resident, mut list), converted) = with_layout_conversion(false, build);
+            let ((_, legacy), legacy_converted) = with_layout_conversion(true, build);
+            assert_eq!(converted, usize::from(!layout.pages.is_empty()), "{name}");
+            assert_eq!(legacy_converted, layout.pages.len(), "{name}");
+            assert_eq!(
+                serde_json::to_value(&list).unwrap(),
+                serde_json::to_value(&legacy).unwrap(),
+                "{name} placeholders"
+            );
+            assert_eq!(resident.input.layout.partial, layout.partial);
+            assert_eq!(
+                resident.input.layout.cached_page_totals,
+                layout.cached_page_totals
+            );
+            assert!(
+                resident
+                    .input
+                    .layout
+                    .pages
+                    .iter()
+                    .skip(1)
+                    .all(|page| { page.fragments.is_empty() && page.note_areas.is_empty() })
+            );
+            if layout.pages.len() > 1 {
+                assert!(list.pages[1].unbuilt, "{name}");
+                if resident.input.measured.len() < pagination.measured.len() {
+                    fewer_blocks += 1;
+                }
+            }
+            let rest: Vec<usize> = (1..layout.pages.len()).collect();
+            build_resident_display_pages_with_fonts(
+                &pagination,
+                &layout,
+                &fonts,
+                &mut resident,
+                &mut list,
+                &rest,
+            )
+            .unwrap();
+            assert_eq!(serde_json::to_value(&list).unwrap(), expected, "{name}");
+        }
+        assert!(
+            fewer_blocks >= 3,
+            "only {fewer_blocks} fixtures skipped blocks"
+        );
+    }
+
+    /// Every page's header and footer parts, built and as unbuilt placeholders of a partial
+    /// build of page 0 and of a full build releasing every other page.
+    fn placeholder_and_built_parts(
+        pagination: &crate::types::Input,
+        layout: &crate::types::Layout,
+        extras: &str,
+    ) -> (Vec<HfParts>, Vec<HfParts>, Vec<HfParts>) {
+        let fonts = ooxml_text::FontStore::default();
+        let painted = |page: &DisplayPage| HfParts {
+            header: page.header.as_ref().map(|region| region.r_id.clone()),
+            footer: page.footer.as_ref().map(|region| region.r_id.clone()),
+        };
+        let placeholder = |page: &DisplayPage| {
+            assert!(page.unbuilt);
+            page.hf_parts.clone().unwrap_or_default()
+        };
+        let full = build_display_list(
+            &resident_build_input(pagination, layout, extras).unwrap(),
+            &fonts,
+        );
+        let (_, partial) = build_resident_display_list_partial_with_fonts_observed(
+            pagination,
+            layout,
+            extras,
+            &fonts,
+            &|index| index == 0,
+            &mut || {},
+        )
+        .unwrap();
+        let (mut resident, mut released) = build_resident_display_list_partial_with_fonts_observed(
+            pagination,
+            layout,
+            extras,
+            &fonts,
+            &|_| true,
+            &mut || {},
+        )
+        .unwrap();
+        let rest: Vec<usize> = (1..layout.pages.len()).collect();
+        release_resident_display_pages(pagination, layout, &mut resident, &mut released, &rest)
+            .unwrap();
+        (
+            full.pages.iter().skip(1).map(painted).collect(),
+            partial.pages.iter().skip(1).map(placeholder).collect(),
+            released.pages.iter().skip(1).map(placeholder).collect(),
+        )
+    }
+
+    #[test]
+    fn unbuilt_placeholders_name_the_header_and_footer_parts_their_build_paints() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut names: Vec<String> = std::fs::read_dir(&fixtures)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".input.json").map(str::to_owned)
+            })
+            .collect();
+        names.sort();
+        let extras = r#"{"contractVersion":2,"fontChains":{"arial|0|0":[]},"headersFooters":{
+            "titlePg":true,"evenAndOddHeaders":true,"variants":[
+            {"rId":"rIdH1","kind":"header","type":"default"},
+            {"rId":"rIdH2","kind":"header","type":"even"},
+            {"rId":"rIdF1","kind":"footer","type":"first"}]}}"#;
+        let mut headers = std::collections::BTreeSet::new();
+        for name in names {
+            let text =
+                std::fs::read_to_string(fixtures.join(format!("{name}.input.json"))).unwrap();
+            let mut pagination = serde_json::from_str::<crate::types::Input>(&text)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let layout = crate::compute_layout_input(&mut pagination)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let (painted, partial, released) =
+                placeholder_and_built_parts(&pagination, &layout, extras);
+            assert_eq!(partial, painted, "{name}");
+            assert_eq!(released, painted, "{name}");
+            headers.extend(painted.into_iter().filter_map(|parts| parts.header));
+        }
+        assert_eq!(headers.into_iter().collect::<Vec<_>>(), ["rIdH1", "rIdH2"]);
+    }
+
+    #[test]
+    fn placeholders_follow_section_refs_page_numbers_and_parity_fillers() {
+        let paragraph = |id: u64, text: &str| {
+            serde_json::json!({
+                "block": {"kind": "paragraph", "id": id, "runs": [{"kind": "text", "text": text}], "attrs": {}},
+                "measure": {"kind": "paragraph", "totalHeight": 24, "lines": [{
+                    "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": text.len(),
+                    "width": 120, "ascent": 19.2, "descent": 4.8, "lineHeight": 24
+                }]}
+            })
+        };
+        let page_break = |id: u64| serde_json::json!({"block": {"kind": "pageBreak", "id": id}, "measure": {"kind": "pageBreak"}});
+        let geometry = serde_json::json!({"pageSize": {"w": 800, "h": 1000}, "margins": {"top": 80, "right": 80, "bottom": 80, "left": 80}});
+        let mut section_break =
+            serde_json::json!({"kind": "sectionBreak", "id": 5, "type": "oddPage"});
+        section_break["pageSize"] = geometry["pageSize"].clone();
+        section_break["margins"] = geometry["margins"].clone();
+        let mut pagination: crate::types::Input = serde_json::from_value(serde_json::json!({
+            "measured": [
+                paragraph(0, "One"), page_break(1), paragraph(2, "Two"), page_break(3),
+                paragraph(4, "Three"),
+                {"block": section_break, "measure": {"kind": "sectionBreak"}},
+                paragraph(6, "Four"), page_break(7), paragraph(8, "Five"), page_break(9),
+                paragraph(10, "Six"),
+            ],
+            "options": {"pageSize": geometry["pageSize"], "margins": geometry["margins"], "pageGap": 20, "bodyBreakType": "oddPage"},
+        }))
+        .unwrap();
+        let mut layout = crate::compute_layout_input(&mut pagination).unwrap();
+        let regions: crate::regions::DocumentRegions = serde_json::from_value(serde_json::json!({
+            "evenAndOddHeaders": true,
+            "sections": [
+                {"headerFooterRefs": {"headerDefault": "rIdA", "headerEven": "rIdE", "footerDefault": "rIdF"}},
+                {"titlePg": true, "headerFooterRefs": {"headerFirst": "rIdB", "headerEven": "rIdC"}}
+            ]
+        }))
+        .unwrap();
+        crate::regions::apply_document_regions(&mut layout, &regions);
+        assert!(
+            layout
+                .pages
+                .iter()
+                .any(|page| page.parity_filler == Some(true))
+        );
+        assert!(
+            layout
+                .pages
+                .iter()
+                .all(|page| page.header_footer_refs.is_some())
+        );
+        let extras = r#"{"contractVersion":2,"fontChains":{"arial|0|0":[]},"headersFooters":{
+            "evenAndOddHeaders":true,"titlePageSections":[1],"variants":[
+            {"rId":"rIdA","kind":"header","type":"default"},
+            {"rId":"rIdE","kind":"header","type":"even","sectionIndex":0},
+            {"rId":"rIdZ","kind":"header","type":"default","sectionIndex":1},
+            {"rId":"rIdB","kind":"header","type":"first","sectionIndex":1},
+            {"rId":"rIdC","kind":"header","type":"even","sectionIndex":1},
+            {"rId":"rIdF","kind":"footer","type":"default"}]}}"#;
+        let (painted, partial, released) =
+            placeholder_and_built_parts(&pagination, &layout, extras);
+        assert_eq!(partial, painted);
+        assert_eq!(released, painted);
+        let filler = layout
+            .pages
+            .iter()
+            .position(|page| page.parity_filler == Some(true))
+            .unwrap();
+        assert_eq!(painted[filler - 1], HfParts::default());
+        // Built and unbuilt display pages both carry the flag, so a host can
+        // collapse the filler whichever way the page reached it.
+        let fonts = ooxml_text::FontStore::default();
+        let full = build_display_list(
+            &resident_build_input(&pagination, &layout, extras).unwrap(),
+            &fonts,
+        );
+        let (_, unbuilt) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            extras,
+            &fonts,
+            &|_| false,
+            &mut || {},
+        )
+        .unwrap();
+        for pages in [&full.pages, &unbuilt.pages] {
+            let flagged: Vec<bool> = pages.iter().map(|page| page.parity_filler).collect();
+            let expected: Vec<bool> = (0..layout.pages.len())
+                .map(|index| index == filler)
+                .collect();
+            assert_eq!(flagged, expected);
+        }
+        let wire = serde_json::to_value(&full.pages[filler]).unwrap();
+        assert_eq!(wire["parityFiller"], true);
+        assert!(
+            serde_json::to_value(&full.pages[0])
+                .unwrap()
+                .get("parityFiller")
+                .is_none()
+        );
+        let headers: std::collections::BTreeSet<_> = painted
+            .iter()
+            .filter_map(|parts| parts.header.as_deref())
+            .collect();
+        assert_eq!(
+            headers.into_iter().collect::<Vec<_>>(),
+            ["rIdA", "rIdB", "rIdC", "rIdE"]
+        );
+    }
+
+    fn table_split_fixture() -> crate::types::Input {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/table-splits-with-repeated-header.input.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn selective_conversion_fixture() -> (crate::types::Input, crate::types::Layout, String) {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let read = |name: &str| -> Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(fixtures.join(format!("{name}.input.json"))).unwrap(),
+            )
+            .unwrap()
+        };
+        let mut pagination = table_split_fixture();
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("expected a table");
+        };
+        for (index, cell) in table
+            .rows
+            .iter_mut()
+            .flat_map(|row| &mut row.cells)
+            .enumerate()
+        {
+            for block in &mut cell.blocks {
+                if let crate::types::LayoutBlock::Paragraph(paragraph) = block {
+                    paragraph.pm_start = Some(1.0 + index as f64 * 10.0);
+                    paragraph.pm_end = Some(9.0 + index as f64 * 10.0);
+                }
+            }
+        }
+        let mut layout = crate::compute_layout_input(&mut pagination).unwrap();
+        assert!(layout.pages.len() > 1);
+        while layout.pages.len() < 4 {
+            layout.pages.push(layout.pages.last().unwrap().clone());
+        }
+        let mut float_input: crate::types::Input =
+            serde_json::from_value(read("floating-image-with-text-wrap")).unwrap();
+        let float_layout = crate::compute_layout_input(&mut float_input).unwrap();
+        let float = float_layout.pages[0]
+            .fragments
+            .iter()
+            .find(|fragment| matches!(fragment, crate::types::Fragment::Image(_)))
+            .unwrap()
+            .clone();
+        pagination.measured.extend(float_input.measured);
+        let notes = read("notes/two-footnotes")["layout"]["pages"][0]["noteAreas"].clone();
+        for (index, page) in layout.pages.iter_mut().enumerate() {
+            let section = usize::from(index >= 2);
+            page.number = index as u32 + 1;
+            page.size.w += section as f64 * 80.0;
+            page.size.h += section as f64 * 40.0;
+            page.body_margins = Some(page.margins.clone());
+            page.body_margins.as_mut().unwrap().top += 12.0;
+            page.body_anchor_margins = Some(page.margins.clone());
+            page.columns = Some(
+                serde_json::from_value(json!({
+                    "count": 2, "gap": 18, "equalWidth": false,
+                    "columns": [{"width": 120, "space": 24}, {"width": 180}]
+                }))
+                .unwrap(),
+            );
+            page.section_id = Some(format!("s{section}"));
+            page.section_index = Some(section as u64);
+            page.section_page_index = Some(index.saturating_sub(section * 2) as u64);
+            page.section_page_number = Some(index.saturating_sub(section * 2) as u64 + 1);
+            page.page_label = Some(if section == 0 {
+                ["i", "ii"][index].to_owned()
+            } else {
+                (index - 1).to_string()
+            });
+            page.page_numbering = Some(json!({
+                "format": if section == 0 { "lowerRoman" } else { "decimal" }, "start": 1
+            }));
+            page.header_footer_refs = Some(
+                serde_json::from_value(json!({
+                    "headerDefault": "header", "footerDefault": "footer"
+                }))
+                .unwrap(),
+            );
+            page.note_areas = Some(serde_json::from_value(notes.clone()).unwrap());
+            page.fragments.push(float.clone());
+        }
+        let band = |kind: &str| {
+            json!({
+                "rId": kind, "kind": kind, "type": "default", "height": 16, "flowHeight": 16,
+                "measured": [{
+                    "block": {"kind": "paragraph", "id": kind, "runs": [
+                        {"kind": "field", "fieldType": "PAGE", "fallback": "0"},
+                        {"kind": "field", "fieldType": "NUMPAGES", "fallback": "97"}
+                    ]},
+                    "measure": {"kind": "paragraph", "totalHeight": 16, "lines": [{
+                        "headRun": 0, "headChar": 0, "tailRun": 1, "tailChar": 2,
+                        "width": 60, "ascent": 11, "descent": 3, "lineHeight": 16
+                    }]}
+                }]
+            })
+        };
+        let extras = json!({
+            "contractVersion": 2,
+            "headersFooters": {"variants": [band("header"), band("footer")]}
+        })
+        .to_string();
+        (pagination, layout, extras)
+    }
+
+    #[test]
+    fn equal_fingerprints_with_different_extents_reconvert() {
+        use resident_conversion_test_support::with_measured_block_conversion;
+
+        let mut pagination: crate::types::Input = serde_json::from_value(json!({
+            "measured": [{
+                "block": {"kind": "paragraph", "id": "p", "runs": [
+                    {"kind": "text", "text": "Text"}
+                ]},
+                "measure": {"kind": "paragraph", "totalHeight": 16, "lines": [{
+                    "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 4,
+                    "width": 60, "ascent": 11, "descent": 3, "lineHeight": 16
+                }]}
+            }],
+            "options": {}
+        }))
+        .unwrap();
+        let layout = crate::compute_layout_input(&mut pagination).unwrap();
+        let fonts = ooxml_text::FontStore::default();
+        let (mut resident, _) = build_resident_display_list_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .unwrap();
+        resident.remember_measurement_fingerprints(&pagination, &[1]);
+        let reading = HashSet::from([0]);
+        for (width, left_offset) in [
+            (61.0, None),
+            (61.0, Some(f64::NAN)),
+            (61.0, Some(f64::INFINITY)),
+            (61.0, Some(f64::NEG_INFINITY)),
+            (61.0, None),
+            (61.0, Some(0.0)),
+            (61.0, Some(-0.0)),
+            (61.0, Some(f64::from_bits(0x7ff8_0000_0000_0001))),
+            (61.0, Some(f64::from_bits(0x7ff8_0000_0000_0002))),
+        ] {
+            let crate::types::BlockExtent::Paragraph(extent) = &mut pagination.measured[0].measure
+            else {
+                panic!("expected a paragraph");
+            };
+            extent.lines[0].width = width;
+            extent.lines[0].left_offset = left_offset;
+            for expected in [1, 0] {
+                let (_, converted) = with_measured_block_conversion(true, || {
+                    refresh_resident_display_pages_reading(
+                        &mut resident.input,
+                        &pagination,
+                        &layout,
+                        [0],
+                        &reading,
+                        Some(&[1]),
+                    )
+                    .unwrap();
+                });
+                assert_eq!(converted, expected);
+                let cold = resident_build_input(&pagination, &layout, "{}").unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&build_display_list(&resident.input, &fonts)).unwrap(),
+                    serde_json::to_vec(&build_display_list(&cold, &fonts)).unwrap(),
+                );
+                assert_eq!(resident.unreadable(), cold.unreadable.as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn cached_table_conversion_refreshes_positions_and_drops_unreadable_and_released_blocks() {
+        use resident_conversion_test_support::with_measured_block_conversion;
+
+        let (mut pagination, mut layout, extras) = selective_conversion_fixture();
+        let fonts = ooxml_text::FontStore::default();
+        let mut fingerprints = vec![1; pagination.measured.len()];
+        let (mut resident, _) = build_resident_display_list_with_fonts_observed(
+            &pagination,
+            &layout,
+            &extras,
+            &fonts,
+            &mut || {},
+        )
+        .unwrap();
+        resident.remember_measurement_fingerprints(&pagination, &fingerprints);
+        let pages: Vec<_> = (0..layout.pages.len()).collect();
+        let reading: HashSet<_> = pages.iter().copied().collect();
+        let refresh = |resident: &mut ResidentDisplayInput,
+                       pagination: &crate::types::Input,
+                       layout: &crate::types::Layout,
+                       fingerprints: &[u128]| {
+            let (_, converted) = with_measured_block_conversion(true, || {
+                refresh_resident_display_pages_reading(
+                    &mut resident.input,
+                    pagination,
+                    layout,
+                    pages.iter().copied(),
+                    &reading,
+                    Some(fingerprints),
+                )
+                .unwrap();
+            });
+            let cold = resident_build_input(pagination, layout, &extras).unwrap();
+            assert_eq!(
+                build_display_list(&resident.input, &fonts),
+                build_display_list(&cold, &fonts)
+            );
+            assert_eq!(resident.unreadable(), cold.unreadable.as_slice());
+            converted
+        };
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("expected a table");
+        };
+        for cell in table.rows.iter_mut().flat_map(|row| &mut row.cells) {
+            for block in &mut cell.blocks {
+                if let crate::types::LayoutBlock::Paragraph(paragraph) = block {
+                    paragraph.pm_start = paragraph.pm_start.map(|position| position + 3.0);
+                    paragraph.pm_end = paragraph.pm_end.map(|position| position + 3.0);
+                }
+            }
+        }
+        assert_eq!(
+            refresh(&mut resident, &pagination, &layout, &fingerprints),
+            0
+        );
+        fingerprints[0] += 1;
+        assert_eq!(
+            refresh(&mut resident, &pagination, &layout, &fingerprints),
+            1
+        );
+
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("expected a table");
+        };
+        let crate::types::LayoutBlock::Paragraph(paragraph) = &mut table.rows[0].cells[0].blocks[0]
+        else {
+            panic!("expected a paragraph");
+        };
+        let position = paragraph.pm_start;
+        paragraph.pm_start = Some(1.5);
+        assert_eq!(
+            refresh(&mut resident, &pagination, &layout, &fingerprints),
+            1
+        );
+        let table_key = resident_block_key(&pagination.measured[0].block)
+            .unwrap()
+            .into_owned();
+        assert!(
+            !resident
+                .input
+                .converted_measurements
+                .contains_key(&table_key)
+        );
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("expected a table");
+        };
+        let crate::types::LayoutBlock::Paragraph(paragraph) = &mut table.rows[0].cells[0].blocks[0]
+        else {
+            panic!("expected a paragraph");
+        };
+        paragraph.pm_start = position;
+        assert_eq!(
+            refresh(&mut resident, &pagination, &layout, &fingerprints),
+            1
+        );
+        let mut list = build_display_list(&resident.input, &fonts);
+        release_resident_display_pages(&pagination, &layout, &mut resident, &mut list, &[0])
+            .unwrap();
+        assert!(
+            resident
+                .input
+                .converted_measurements
+                .contains_key(&table_key)
+        );
+        let (_, converted) = with_measured_block_conversion(true, || {
+            build_resident_display_pages_with_fonts_and_fingerprints(
+                &pagination,
+                &layout,
+                &fonts,
+                &mut resident,
+                &mut list,
+                &[0],
+                Some(&fingerprints),
+            )
+            .unwrap();
+        });
+        assert_eq!(converted, 0);
+        assert_eq!(
+            list,
+            build_display_list(
+                &resident_build_input(&pagination, &layout, &extras).unwrap(),
+                &fonts,
+            )
+        );
+        release_resident_display_pages(&pagination, &layout, &mut resident, &mut list, &pages)
+            .unwrap();
+        assert!(resident.input.converted_measurements.is_empty());
+        assert!(resident.input.measured.is_empty());
+        build_resident_display_pages_with_fonts_and_fingerprints(
+            &pagination,
+            &layout,
+            &fonts,
+            &mut resident,
+            &mut list,
+            &pages,
+            Some(&fingerprints),
+        )
+        .unwrap();
+        assert!(
+            resident
+                .input
+                .converted_measurements
+                .contains_key(&table_key)
+        );
+        pagination.measured.clear();
+        for page in &mut layout.pages {
+            page.fragments.clear();
+        }
+        assert_eq!(refresh(&mut resident, &pagination, &layout, &[]), 0);
+        assert!(resident.input.converted_measurements.is_empty());
+        assert!(resident.input.measured.is_empty());
+    }
+
+    #[test]
+    fn selective_resident_conversion_matches_legacy_across_refresh_release_and_completion() {
+        use resident_conversion_test_support::with_layout_conversion;
+
+        let (mut pagination, mut layout, extras) = selective_conversion_fixture();
+        let fonts = ooxml_text::FontStore::default();
+        let last = layout.pages.len() - 1;
+        let all: Vec<_> = (0..layout.pages.len()).collect();
+        for (partial, cached_page_totals) in [(false, false), (true, false), (true, true)] {
+            layout.partial = partial;
+            layout.cached_page_totals = cached_page_totals;
+            let build = || {
+                build_resident_display_list_partial_with_fonts_observed(
+                    &pagination,
+                    &layout,
+                    &extras,
+                    &fonts,
+                    &|index| index == 0 || index == last,
+                    &mut || {},
+                )
+                .unwrap()
+            };
+            let ((mut resident, mut list), converted) = with_layout_conversion(false, build);
+            let ((mut legacy_resident, mut legacy), legacy_converted) =
+                with_layout_conversion(true, build);
+            assert_eq!(converted, 2);
+            assert_eq!(legacy_converted, layout.pages.len());
+            let equal = |list: &DisplayList, legacy: &DisplayList| {
+                assert_eq!(
+                    serde_json::to_value(list).unwrap(),
+                    serde_json::to_value(legacy).unwrap()
+                );
+            };
+            equal(&list, &legacy);
+            assert!(list.pages[0].header.is_some() && list.pages[0].footer.is_some());
+            assert!(!list.pages[0].note_areas.is_empty());
+            assert!(
+                list.pages[0]
+                    .primitives
+                    .iter()
+                    .any(|p| matches!(p, Primitive::Image(_)))
+            );
+            let page = serde_json::to_value(&list.pages[0]).unwrap();
+            let total = if partial {
+                if cached_page_totals {
+                    "97".to_owned()
+                } else {
+                    String::new()
+                }
+            } else {
+                layout.pages.len().to_string()
+            };
+            for kind in ["header", "footer"] {
+                let primitives = page[kind]["primitives"].as_array().unwrap();
+                assert!(
+                    primitives
+                        .iter()
+                        .any(|p| p["field"]["category"] == "PAGE" && p["text"] == "i")
+                );
+                if !total.is_empty() {
+                    assert!(
+                        primitives
+                            .iter()
+                            .any(|p| p["field"]["category"] == "NUMPAGES" && p["text"] == total)
+                    );
+                } else {
+                    assert!(
+                        !primitives
+                            .iter()
+                            .any(|p| p["field"]["category"] == "NUMPAGES"
+                                && p["text"].as_str().is_some_and(|text| !text.is_empty()))
+                    );
+                }
+            }
+            let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+                panic!("expected a table");
+            };
+            for cell in table.rows.iter_mut().flat_map(|row| &mut row.cells) {
+                for block in &mut cell.blocks {
+                    if let crate::types::LayoutBlock::Paragraph(paragraph) = block {
+                        paragraph.pm_start = paragraph.pm_start.map(|position| position + 3.0);
+                        paragraph.pm_end = paragraph.pm_end.map(|position| position + 3.0);
+                    }
+                }
+            }
+            layout.pages[1].body_margins.as_mut().unwrap().top += 4.0;
+            let deltas = HashMap::from([("50".to_owned(), 3)]);
+            let suffix_span = list.pages[2].position_span.unwrap();
+            let refresh = |resident: &mut ResidentDisplayInput, list: &mut DisplayList| {
+                update_resident_display_list_incremental_partial_with_fonts_observed(
+                    &pagination,
+                    &layout,
+                    &fonts,
+                    resident,
+                    list,
+                    0,
+                    2,
+                    &[last],
+                    &deltas,
+                    &|index| index == 0,
+                    &mut || {},
+                )
+                .unwrap()
+            };
+            let (updated, converted) =
+                with_layout_conversion(false, || refresh(&mut resident, &mut list));
+            assert!(updated);
+            assert_eq!(converted, 1);
+            let (updated, converted) =
+                with_layout_conversion(true, || refresh(&mut legacy_resident, &mut legacy));
+            assert!(updated);
+            assert_eq!(converted, 3);
+            equal(&list, &legacy);
+            assert_eq!(
+                list.pages[2].position_span,
+                Some([suffix_span[0] + 3, suffix_span[1] + 3])
+            );
+            let full = build_display_list(
+                &resident_build_input(&pagination, &layout, &extras).unwrap(),
+                &fonts,
+            );
+            for (force_full, resident, list) in [
+                (false, &mut resident, &mut list),
+                (true, &mut legacy_resident, &mut legacy),
+            ] {
+                with_layout_conversion(force_full, || {
+                    build_resident_display_pages_with_fonts(
+                        &pagination,
+                        &layout,
+                        &fonts,
+                        resident,
+                        list,
+                        &all,
+                    )
+                    .unwrap()
+                });
+                equal(list, &full);
+            }
+            let (released, converted) = with_layout_conversion(false, || {
+                release_resident_display_pages(&pagination, &layout, &mut resident, &mut list, &all)
+                    .unwrap()
+            });
+            assert_eq!(released, all);
+            assert_eq!(converted, 0);
+            let (_, converted) = with_layout_conversion(true, || {
+                release_resident_display_pages(
+                    &pagination,
+                    &layout,
+                    &mut legacy_resident,
+                    &mut legacy,
+                    &all,
+                )
+                .unwrap()
+            });
+            assert_eq!(converted, all.len());
+            equal(&list, &legacy);
+            assert!(
+                resident
+                    .input
+                    .layout
+                    .pages
+                    .iter()
+                    .all(|page| page.fragments.is_empty() && page.note_areas.is_empty())
+            );
+            build_resident_display_pages_with_fonts(
+                &pagination,
+                &layout,
+                &fonts,
+                &mut resident,
+                &mut list,
+                &all,
+            )
+            .unwrap();
+            equal(&list, &full);
+        }
+    }
+
+    #[test]
+    fn native_unbuilt_span_shifts_match_converted_block_keys() {
+        use crate::types::{BlockId, Fragment};
+
+        let (_, mut layout, _) = selective_conversion_fixture();
+        for id in [
+            BlockId::Num(50.0),
+            BlockId::Num(-0.0),
+            BlockId::Num(-42.0),
+            BlockId::Num(50.5),
+            BlockId::Num(1e30),
+            BlockId::Num(f64::NAN),
+            BlockId::Num(f64::INFINITY),
+            BlockId::Str("50".to_owned()),
+            BlockId::Str("50.0".to_owned()),
+        ] {
+            let Fragment::Table(table) = &mut layout.pages[0].fragments[0] else {
+                panic!("expected a table");
+            };
+            table.block_id = id;
+            let converted: PageIn = convert_resident_value(&layout.pages[0], "page").unwrap();
+            let key = converted
+                .fragments
+                .iter()
+                .find_map(fragment_block_key_ref)
+                .unwrap()
+                .into_owned();
+            let metadata = convert_resident_page(
+                &mut crate::transcode::Transcoder::default(),
+                &layout.pages[0],
+                0,
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert!(metadata.fragments.is_empty());
+            let mut page = unbuilt_page_with_span(&metadata, 0, Some([10, 20]), None);
+            shift_unbuilt_span(
+                &mut page,
+                Some(&layout.pages[0]),
+                &HashMap::from([(key.clone(), 7)]),
+            );
+            assert_eq!(page.position_span, Some([17, 27]));
+            let missing = if key == "0" { "unplaced" } else { "0" };
+            shift_unbuilt_span(
+                &mut page,
+                Some(&layout.pages[0]),
+                &HashMap::from([(missing.to_owned(), 9)]),
+            );
+            assert_eq!(page.position_span, Some([17, 27]));
+        }
+    }
+
+    /// Source lookup keeps the first required block and excludes unplaced keys.
+    #[test]
+    fn source_block_lookup_is_scoped_and_keeps_the_first_occurrence() {
+        let mut pagination = table_split_fixture();
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("expected a table");
+        };
+        table.id = crate::types::BlockId::Str("selected".to_owned());
+        let layout = crate::compute_layout_input(&mut pagination).unwrap();
+        let duplicate = pagination.measured[0].clone();
+        let mut unplaced = duplicate.clone();
+        let crate::types::LayoutBlock::Table(table) = &mut unplaced.block else {
+            panic!("expected a table");
+        };
+        table.id = crate::types::BlockId::Str("unplaced".to_owned());
+        pagination.measured.insert(0, unplaced);
+        pagination.measured.push(duplicate);
+        let blocks = source_blocks_by_key(&pagination, &layout.pages[..1]);
+        assert!(std::ptr::eq(blocks["selected"], &pagination.measured[1]));
+        assert!(!blocks.contains_key("unplaced"));
+        assert!(matches!(
+            blocks.keys().find(|key| key.as_ref() == "selected"),
+            Some(Cow::Borrowed("selected")),
+        ));
+        assert!(source_blocks_by_key(&pagination, std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn releasing_resident_pages_prunes_exclusive_blocks_and_keeps_a_split_table() {
+        let mut pagination = table_split_fixture();
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("expected a table");
+        };
+        let mut position = 1.0;
+        for cell in table.rows.iter_mut().flat_map(|row| row.cells.iter_mut()) {
+            for block in &mut cell.blocks {
+                if let crate::types::LayoutBlock::Paragraph(paragraph) = block {
+                    paragraph.pm_start = Some(position);
+                    paragraph.pm_end = Some(position + 8.0);
+                    position += 10.0;
+                }
+            }
+        }
+        let mut layout = crate::compute_layout_input(&mut pagination).unwrap();
+        assert!(layout.pages.len() > 1);
+        let mut exclusive = pagination.measured[0].clone();
+        let crate::types::LayoutBlock::Table(table) = &mut exclusive.block else {
+            panic!("expected a table");
+        };
+        table.id = crate::types::BlockId::Str("exclusive".to_owned());
+        pagination.measured.push(exclusive);
+        let mut page = layout.pages[0].clone();
+        for fragment in &mut page.fragments {
+            if let crate::types::Fragment::Table(table) = fragment {
+                table.block_id = crate::types::BlockId::Str("exclusive".to_owned());
+            }
+        }
+        layout.pages.push(page);
+        let last = layout.pages.len() - 1;
+        let fonts = ooxml_text::FontStore::default();
+        let (mut resident, mut list) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|_| true,
+            &mut || {},
+        )
+        .unwrap();
+        let full = list.clone();
+        let (_, placeholders) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|_| false,
+            &mut || {},
+        )
+        .unwrap();
+        assert_eq!(resident.input.measured.len(), 2);
+        assert_eq!(
+            release_resident_display_pages(
+                &pagination,
+                &layout,
+                &mut resident,
+                &mut list,
+                &[last, 0, last],
+            )
+            .unwrap(),
+            [0, last]
+        );
+        assert_eq!(list.pages[0], placeholders.pages[0]);
+        assert_eq!(list.pages[last], placeholders.pages[last]);
+        assert!(list.pages[0].position_span.is_some());
+        assert_eq!(resident.input.measured.len(), 1);
+        assert_ne!(
+            measured_block_key(&resident.input.measured[0]).unwrap(),
+            "exclusive"
+        );
+        assert_eq!(list.pages[1], full.pages[1]);
+        assert!(
+            release_resident_display_pages(
+                &pagination,
+                &layout,
+                &mut resident,
+                &mut list,
+                &[0, last],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        build_resident_display_pages_with_fonts(
+            &pagination,
+            &layout,
+            &fonts,
+            &mut resident,
+            &mut list,
+            &[0, last],
+        )
+        .unwrap();
+        assert_eq!(list, full);
+        let all: Vec<usize> = (0..layout.pages.len()).collect();
+        release_resident_display_pages(&pagination, &layout, &mut resident, &mut list, &all)
+            .unwrap();
+        assert!(resident.input.measured.is_empty());
+        assert_eq!(list, placeholders);
+        resident.input.measured = resident_build_input(&pagination, &layout, "{}")
+            .unwrap()
+            .measured;
+        release_resident_display_pages(&pagination, &layout, &mut resident, &mut list, &[])
+            .unwrap();
+        assert!(resident.input.measured.is_empty());
+    }
+
+    #[test]
+    fn released_table_spans_read_current_pagination_blocks() {
+        let mut pagination = table_split_fixture();
+        let layout = crate::compute_layout_input(&mut pagination).unwrap();
+        let fonts = ooxml_text::FontStore::default();
+        let (mut resident, mut list) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|_| true,
+            &mut || {},
+        )
+        .unwrap();
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("expected a table");
+        };
+        let mut position = 100.0;
+        for cell in table.rows.iter_mut().flat_map(|row| row.cells.iter_mut()) {
+            for block in &mut cell.blocks {
+                if let crate::types::LayoutBlock::Paragraph(paragraph) = block {
+                    paragraph.pm_start = Some(position);
+                    paragraph.pm_end = Some(position + 8.0);
+                    position += 10.0;
+                }
+            }
+        }
+        let (_, expected) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|_| false,
+            &mut || {},
+        )
+        .unwrap();
+        let last = layout.pages.len() - 1;
+        release_resident_display_pages(&pagination, &layout, &mut resident, &mut list, &[0, last])
+            .unwrap();
+        for index in [0, last] {
+            assert_eq!(list.pages[index], expected.pages[index]);
+            assert!(list.pages[index].position_span.unwrap()[0] >= 100);
+        }
+    }
+
+    #[test]
+    fn resident_page_release_prepares_every_replacement_before_mutation() {
+        let mut pagination = table_split_fixture();
+        let mut layout = crate::compute_layout_input(&mut pagination).unwrap();
+        let fonts = ooxml_text::FontStore::default();
+        let (mut resident, mut list) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|_| true,
+            &mut || {},
+        )
+        .unwrap();
+        let before = list.clone();
+        let measured = resident
+            .input
+            .measured
+            .iter()
+            .filter_map(measured_block_key)
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        let last = layout.pages.len() - 1;
+        assert!(last > 0);
+        assert!(
+            release_resident_display_pages(
+                &pagination,
+                &layout,
+                &mut resident,
+                &mut list,
+                &[0, layout.pages.len()],
+            )
+            .is_err()
+        );
+        assert_eq!(list, before);
+        layout.pages[last].size.w = f64::NAN;
+        assert!(
+            release_resident_display_pages(
+                &pagination,
+                &layout,
+                &mut resident,
+                &mut list,
+                &[0, last],
+            )
+            .is_err()
+        );
+        assert_eq!(list, before);
+        assert_eq!(
+            resident
+                .input
+                .measured
+                .iter()
+                .filter_map(measured_block_key)
+                .map(Cow::into_owned)
+                .collect::<Vec<_>>(),
+            measured
+        );
+        layout.pages.pop();
+        assert!(
+            release_resident_display_pages(&pagination, &layout, &mut resident, &mut list, &[0],)
+                .is_err()
+        );
+        assert_eq!(list, before);
+    }
+
+    #[test]
+    fn incremental_placeholders_prune_converted_measured_blocks() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/keep-lines-paragraph.input.json");
+        let mut pagination: crate::types::Input =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let layout = crate::compute_layout_input(&mut pagination).unwrap();
+        assert!(layout.pages.len() > 1);
+        let fonts = ooxml_text::FontStore::default();
+        let (mut resident, mut list) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|_| true,
+            &mut || {},
+        )
+        .unwrap();
+        let before = resident.input.measured.len();
+        assert!(
+            update_resident_display_list_incremental_partial_with_fonts_observed(
+                &pagination,
+                &layout,
+                &fonts,
+                &mut resident,
+                &mut list,
+                0,
+                layout.pages.len(),
+                &[],
+                &HashMap::new(),
+                &|index| index == 0,
+                &mut || {},
+            )
+            .unwrap()
+        );
+        assert!(resident.input.measured.len() < before);
+        let (_, expected) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|index| index == 0,
+            &mut || {},
+        )
+        .unwrap();
+        assert_eq!(list, expected);
+        let all: Vec<usize> = (0..layout.pages.len()).collect();
+        build_resident_display_pages_with_fonts(
+            &pagination,
+            &layout,
+            &fonts,
+            &mut resident,
+            &mut list,
+            &all,
+        )
+        .unwrap();
+        assert_eq!(
+            list,
+            build_display_list(
+                &resident_build_input(&pagination, &layout, "{}").unwrap(),
+                &fonts
+            )
+        );
+    }
+
+    /// Builds page 0 alone, then the rest, as a list to compare with a full build.
+    fn partial_then_rest(
+        pagination: &crate::types::Input,
+        layout: &crate::types::Layout,
+    ) -> (DisplayList, DisplayList) {
+        let fonts = ooxml_text::FontStore::default();
+        let (mut resident, mut list) = build_resident_display_list_partial_with_fonts_observed(
+            pagination,
+            layout,
+            "{}",
+            &fonts,
+            &|index| index == 0,
+            &mut || {},
+        )
+        .unwrap();
+        let first = list.clone();
+        let rest: Vec<usize> = (1..layout.pages.len()).collect();
+        build_resident_display_pages_with_fonts(
+            pagination,
+            layout,
+            &fonts,
+            &mut resident,
+            &mut list,
+            &rest,
+        )
+        .unwrap();
+        (first, list)
+    }
+
+    #[test]
+    fn a_partial_resident_build_keys_numeric_block_ids_as_the_transcoder_does() {
+        for id in [-0.0, 1e21] {
+            let mut pagination = table_split_fixture();
+            let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+                panic!("the fixture opens with a table");
+            };
+            table.id = crate::types::BlockId::Num(id);
+            let layout = crate::compute_layout_input(&mut pagination).unwrap();
+            assert!(layout.pages.len() > 1);
+            let full = build_display_list(
+                &resident_build_input(&pagination, &layout, "{}").unwrap(),
+                &ooxml_text::FontStore::default(),
+            );
+            let (first, list) = partial_then_rest(&pagination, &layout);
+            assert_eq!(first.pages[0], full.pages[0], "{id}");
+            assert_eq!(list, full, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_break_sharing_a_rendered_block_id_does_not_stand_in_for_it() {
+        let mut pagination = table_split_fixture();
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("the fixture opens with a table");
+        };
+        let mut position = 1.0;
+        for cell in table.rows.iter_mut().flat_map(|row| row.cells.iter_mut()) {
+            for block in &mut cell.blocks {
+                if let crate::types::LayoutBlock::Paragraph(paragraph) = block {
+                    paragraph.pm_start = Some(position);
+                    paragraph.pm_end = Some(position + 8.0);
+                    position += 10.0;
+                }
+            }
+        }
+        let layout = crate::compute_layout_input(&mut pagination.clone()).unwrap();
+        let crate::types::LayoutBlock::Table(table) = &pagination.measured[0].block else {
+            panic!("the fixture opens with a table");
+        };
+        let mut shadowed = pagination.clone();
+        let page_break: crate::types::LayoutBlock = serde_json::from_value(serde_json::json!({
+            "kind": "pageBreak",
+            "id": serde_json::to_value(&table.id).unwrap(),
+        }))
+        .unwrap();
+        shadowed.measured.insert(
+            0,
+            crate::types::MeasuredBlock {
+                block: page_break,
+                ..pagination.measured[0].clone()
+            },
+        );
+        let unbuilt = |_: usize| false;
+        let fonts = ooxml_text::FontStore::default();
+        let spans = |pagination: &crate::types::Input| {
+            build_resident_display_list_partial_with_fonts_observed(
+                pagination,
+                &layout,
+                "{}",
+                &fonts,
+                &unbuilt,
+                &mut || {},
+            )
+            .unwrap()
+            .1
+        };
+        let expected = spans(&pagination);
+        assert!(expected.pages[1].position_span.is_some());
+        assert_eq!(spans(&shadowed), expected);
+        assert_eq!(
+            partial_then_rest(&shadowed, &layout),
+            partial_then_rest(&pagination, &layout)
+        );
+    }
+
+    #[test]
+    fn body_positions_shift_by_block_key_or_else_block_id() {
+        let mut page: DisplayPage = serde_json::from_value(serde_json::json!({
+            "pageIndex": 3, "width": 816, "height": 1056,
+            "primitives": [
+                {"kind": "text", "text": "a", "x": 0, "baselineY": 10, "width": 5,
+                 "font": "10px serif", "color": "#000", "docStart": 10, "docEnd": 11,
+                 "blockKey": "b1", "blockId": 7},
+                {"kind": "text", "text": "b", "x": 0, "baselineY": 20, "width": 5,
+                 "font": "10px serif", "color": "#000", "docStart": 20, "docEnd": 21,
+                 "blockId": 7},
+                {"kind": "rect", "x": 0, "y": 0, "w": 5, "h": 5, "fill": "#000",
+                 "fragmentDocStart": 30, "fragmentDocEnd": 40, "blockId": 7.5},
+                {"kind": "text", "text": "c", "x": 0, "baselineY": 30, "width": 5,
+                 "font": "10px serif", "color": "#000", "docStart": 50, "docEnd": 51}
+            ]
+        }))
+        .unwrap();
+        let deltas = HashMap::from([
+            ("b1".to_owned(), 3),
+            ("7".to_owned(), -2),
+            ("7.5".to_owned(), 4),
+        ]);
+        shift_page_body_positions(&mut page, &deltas);
+        let positions: Vec<_> = page
+            .primitives
+            .iter()
+            .map(|primitive| {
+                let attrs = match primitive {
+                    Primitive::Text(value) => &value.attrs,
+                    Primitive::Rect(value) => &value.attrs,
+                    _ => unreachable!(),
+                };
+                (
+                    attrs.doc_start,
+                    attrs.fragment_doc_start,
+                    attrs.fragment_doc_end,
+                )
+            })
+            .collect();
+        assert_eq!(
+            positions,
+            [
+                (Some(13), None, None),
+                (Some(18), None, None),
+                (None, Some(34), Some(44)),
+                (Some(50), None, None),
+            ]
+        );
+    }
+
+    /// Positioned primitives classify uniformly only when all effective deltas agree.
+    #[test]
+    fn body_position_shifts_classify_uniform_mixed_unchanged_and_inert_pages() {
+        let template: Primitive = serde_json::from_value(serde_json::json!({
+            "kind": "text", "text": "a", "x": 0, "baselineY": 10, "width": 5,
+            "font": "10px serif", "color": "#000"
+        }))
+        .unwrap();
+        let positioned = |key: Option<&str>, start| DocAttrs {
+            block_key: key.map(str::to_owned),
+            doc_start: Some(start),
+            ..Default::default()
+        };
+        let widget: DocAttrs = serde_json::from_value(serde_json::json!({
+            "blockKey": "a",
+            "inlineSdtWidget": {"kind": "checkbox", "groupId": "widget", "pos": 7}
+        }))
+        .unwrap();
+        let deltas = HashMap::from([("a".to_owned(), 3), ("b".to_owned(), -2)]);
+        for (attrs, expected) in [
+            (
+                vec![positioned(Some("a"), 10), widget],
+                DisplayShift::Uniform(3),
+            ),
+            (
+                vec![positioned(Some("a"), 10), positioned(None, 20)],
+                DisplayShift::Mixed,
+            ),
+            (
+                vec![positioned(Some("a"), 10), positioned(Some("b"), 20)],
+                DisplayShift::Mixed,
+            ),
+            (
+                vec![positioned(Some("a"), 10), positioned(Some("absent"), 20)],
+                DisplayShift::Mixed,
+            ),
+            (
+                vec![positioned(Some("absent"), 10), positioned(None, 20)],
+                DisplayShift::Unchanged,
+            ),
+            (vec![DocAttrs::default()], DisplayShift::Inert),
+            (vec![], DisplayShift::Inert),
+        ] {
+            let mut page: DisplayPage = serde_json::from_value(serde_json::json!({
+                "pageIndex": 0, "width": 816, "height": 1056, "primitives": []
+            }))
+            .unwrap();
+            for attrs in attrs {
+                let mut primitive = template.clone();
+                let Primitive::Text(value) = &mut primitive else {
+                    unreachable!()
+                };
+                value.attrs = attrs;
+                page.primitives.push(primitive);
+            }
+            assert_eq!(shift_page_body_positions(&mut page, &deltas), expected);
+            assert_eq!(
+                shift_page_body_positions(&mut page, &HashMap::new()),
+                if expected == DisplayShift::Inert {
+                    DisplayShift::Inert
+                } else {
+                    DisplayShift::Unchanged
+                }
+            );
+        }
+    }
+
+    /// Span shifts borrow string ids and combine with body movements exactly.
+    #[test]
+    fn unbuilt_span_shifts_classify_and_preserve_block_key_text() {
+        let mut page: DisplayPage = serde_json::from_value(serde_json::json!({
+            "pageIndex": 0, "width": 816, "height": 1056, "primitives": [], "unbuilt": true
+        }))
+        .unwrap();
+        let deltas = HashMap::from([("a".to_owned(), 3)]);
+        assert_eq!(
+            shift_unbuilt_span(&mut page, None, &deltas),
+            DisplayShift::Inert
+        );
+        page.position_span = Some([10, 20]);
+        assert_eq!(
+            shift_unbuilt_span(&mut page, None, &deltas),
+            DisplayShift::Unchanged
+        );
+        let layout: PageIn = serde_json::from_value(serde_json::json!({
+            "size": {"width": 816, "height": 1056},
+            "fragments": [{"kind": "paragraph", "blockId": "a"}]
+        }))
+        .unwrap();
+        assert!(matches!(
+            fragment_block_key_ref(&layout.fragments[0]),
+            Some(Cow::Borrowed("a"))
+        ));
+        let (_, mut native, _) = selective_conversion_fixture();
+        let crate::types::Fragment::Table(table) = &mut native.pages[0].fragments[0] else {
+            panic!("expected a table");
+        };
+        table.block_id = crate::types::BlockId::Str("a".to_owned());
+        assert_eq!(
+            shift_unbuilt_span(&mut page, native.pages.first(), &deltas),
+            DisplayShift::Uniform(3)
+        );
+        assert_eq!(page.position_span, Some([13, 23]));
+        for id in [
+            serde_json::json!(7),
+            serde_json::json!(7.5),
+            serde_json::json!(-0.0),
+        ] {
+            let fragment: FragmentIn = serde_json::from_value(serde_json::json!({
+                "kind": "paragraph", "blockId": id
+            }))
+            .unwrap();
+            assert_eq!(
+                fragment_block_key_ref(&fragment).unwrap().as_ref(),
+                block_key(&id).as_ref()
+            );
+        }
+        assert_eq!(
+            DisplayShift::Inert.combine(DisplayShift::Uniform(3)),
+            DisplayShift::Uniform(3)
+        );
+        assert_eq!(
+            DisplayShift::Uniform(3).combine(DisplayShift::Inert),
+            DisplayShift::Uniform(3)
+        );
+        assert_eq!(
+            DisplayShift::Uniform(3).combine(DisplayShift::Uniform(3)),
+            DisplayShift::Uniform(3)
+        );
+        assert_eq!(
+            DisplayShift::Uniform(3).combine(DisplayShift::Uniform(4)),
+            DisplayShift::Mixed
+        );
+        assert_eq!(
+            DisplayShift::Uniform(3).combine(DisplayShift::Unchanged),
+            DisplayShift::Mixed
+        );
+        assert_eq!(
+            DisplayShift::Unchanged.combine(DisplayShift::Unchanged),
+            DisplayShift::Unchanged
+        );
+    }
+
+    /// Runs join equal adjacent shifts and inert extensions while leaving gaps separate.
+    #[test]
+    fn display_shift_runs_coalesce_and_split() {
+        let mut shifts = IncrementalDisplayShifts::default();
+        for (index, shift) in [
+            (0, DisplayShift::Inert),
+            (1, DisplayShift::Uniform(3)),
+            (2, DisplayShift::Uniform(3)),
+            (3, DisplayShift::Inert),
+            (4, DisplayShift::Uniform(3)),
+            (5, DisplayShift::Uniform(-2)),
+            (6, DisplayShift::Unchanged),
+            (7, DisplayShift::Inert),
+            (8, DisplayShift::Uniform(-2)),
+            (9, DisplayShift::Mixed),
+            (10, DisplayShift::Inert),
+            (11, DisplayShift::Uniform(-2)),
+            (13, DisplayShift::Uniform(-2)),
+        ] {
+            shifts.push(index, shift);
+        }
+        assert_eq!(
+            shifts.runs,
+            [
+                DisplayShiftRun {
+                    start: 1,
+                    end: 5,
+                    delta: 3
+                },
+                DisplayShiftRun {
+                    start: 5,
+                    end: 6,
+                    delta: -2
+                },
+                DisplayShiftRun {
+                    start: 8,
+                    end: 9,
+                    delta: -2
+                },
+                DisplayShiftRun {
+                    start: 11,
+                    end: 12,
+                    delta: -2
+                },
+                DisplayShiftRun {
+                    start: 13,
+                    end: 14,
+                    delta: -2
+                },
+            ]
+        );
+        assert_eq!(shifts.mixed, [9]);
+    }
+
+    #[test]
+    fn a_centred_chart_label_is_centred_in_its_box() {
+        let attrs = DocAttrs::default();
+        let mut prims = Vec::new();
+        let mut sink = PrimitiveSink {
+            prims: &mut prims,
+            attrs: &attrs,
+        };
+        let font = ooxml_drawingml::chart::chart_label_font();
+        for align in [PlotTextAlign::Start, PlotTextAlign::Center] {
+            sink.push_op(PlotOp::Text {
+                text: "Revenue".to_owned(),
+                x: 10.0,
+                baseline_y: 20.0,
+                width: 200.0,
+                font: font.clone(),
+                color: "#000000".to_owned(),
+                align,
+                rotation_deg: 0.0,
+            });
+        }
+        let starts: Vec<f64> = prims
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Text(text) => text.x.as_f64(),
+                _ => None,
+            })
+            .collect();
+        let estimate = fallback_label_width("Revenue", &font);
+        assert_eq!(starts[0], 10.0);
+        assert!(
+            (starts[1] - (10.0 + (200.0 - estimate) / 2.0)).abs() < 0.01,
+            "{starts:?}"
+        );
+        let widths: Vec<f64> = prims
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Text(text) => text.width.as_f64(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            (widths[1] - estimate).abs() < 0.01,
+            "a centred run reports its own width"
+        );
+    }
+
+    #[test]
+    fn a_label_wider_than_its_box_spills_evenly_both_ways() {
+        let attrs = DocAttrs::default();
+        let mut prims = Vec::new();
+        let mut sink = PrimitiveSink {
+            prims: &mut prims,
+            attrs: &attrs,
+        };
+        let font = ooxml_drawingml::chart::chart_label_font();
+        let text = "North / Q1 / 10.0";
+        sink.push_op(PlotOp::Text {
+            text: text.to_owned(),
+            x: 100.0,
+            baseline_y: 20.0,
+            width: 40.0,
+            font: font.clone(),
+            color: "#000000".to_owned(),
+            align: PlotTextAlign::Center,
+            rotation_deg: 0.0,
+        });
+        let Some(Primitive::Text(run)) = prims.first() else {
+            panic!("a text run");
+        };
+        let (left, width) = (run.x.as_f64().unwrap(), run.width.as_f64().unwrap());
+        assert!(width > 40.0 && left < 100.0);
+        assert!(
+            (left + width / 2.0 - 120.0).abs() < 0.01,
+            "centred on the box"
+        );
+    }
+
+    #[test]
+    fn a_wrapping_float_is_clamped_to_the_page_and_wrap_none_is_not() {
+        // Word 16.112 on a 792 pt page, 100 pt float: a wrapSquare anchor at
+        // 720.4 / 775.6 / 830.8 all render at 692; wrapNone renders where the
+        // anchor puts it and vanishes once it clears the sheet.
+        for square in [720.38, 775.57, 830.8] {
+            assert_eq!(
+                clamp_wrapped_float_y(square, 100.0, Some("square"), 792.0),
+                692.0
+            );
+            assert_eq!(
+                clamp_wrapped_float_y(square, 100.0, Some("inFront"), 792.0),
+                square
+            );
+        }
+        assert_eq!(
+            clamp_wrapped_float_y(665.18, 100.0, Some("square"), 792.0),
+            665.18
+        );
+        assert_eq!(
+            clamp_wrapped_float_y(-34.8, 100.0, Some("square"), 792.0),
+            0.0
+        );
+        assert_eq!(
+            clamp_wrapped_float_y(665.18, 900.0, Some("square"), 792.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn resident_adapter_normalizes_integral_json_numbers() {
+        let mut value = serde_json::json!({
+            "pmStart": 16.0,
+            "fractional": 16.25,
+            "nested": [3.0, -4.0],
+            "fontChains": { "calibri|0|0": [1.0] }
+        });
+        normalize_integral_json_numbers(&mut value);
+        assert!(value["pmStart"].as_i64().is_some());
+        assert_eq!(value["fractional"].as_f64(), Some(16.25));
+        assert_eq!(value["nested"][0].as_i64(), Some(3));
+        assert_eq!(value["nested"][1].as_i64(), Some(-4));
+        let chains: HashMap<String, Vec<u32>> =
+            serde_json::from_value(value["fontChains"].clone()).unwrap();
+        assert_eq!(chains["calibri|0|0"], vec![1]);
+    }
+    use serde_json::json;
+
+    #[test]
+    fn list_marker_emits_as_a_tracked_first_line_primitive() {
+        let mut input = json!({
+            "contractVersion": 1,
+            "measured": [{
+                "block": {
+                    "kind": "paragraph",
+                    "id": "list-item",
+                    "runs": [{ "kind": "text", "text": "item", "pmStart": 1, "pmEnd": 5 }],
+                    "attrs": {
+                        "listMarker": "1.",
+                        "listMarkerFontFamily": "Aptos",
+                        "listMarkerFontSize": 12,
+                        "listMarkerBold": true,
+                        "listMarkerItalic": true,
+                        "listMarkerColor": "#FF0000",
+                        "listMarkerRevision": "ins",
+                        "indent": { "left": 48, "hanging": 24 }
+                    },
+                    "pmStart": 0,
+                    "pmEnd": 5
+                },
+                "measure": {
+                    "kind": "paragraph",
+                    "totalHeight": 20,
+                    "lines": [{
+                        "headRun": 0,
+                        "headChar": 0,
+                        "tailRun": 0,
+                        "tailChar": 4,
+                        "width": 28,
+                        "ascent": 14,
+                        "descent": 4,
+                        "lineHeight": 20
+                    }]
+                }
+            }],
+            "options": {},
+            "layout": {
+                "pages": [{
+                    "number": 1,
+                    "size": { "w": 300, "h": 400 },
+                    "margins": { "top": 20, "right": 20, "bottom": 20, "left": 20 },
+                    "fragments": [{
+                        "kind": "paragraph",
+                        "blockId": "list-item",
+                        "x": 20,
+                        "y": 20,
+                        "width": 260,
+                        "height": 20,
+                        "fromLine": 0,
+                        "toLine": 1,
+                        "pmStart": 0,
+                        "pmEnd": 5
+                    }]
+                }]
+            }
+        });
+        let output: Value = serde_json::from_str(
+            &build_display_list_json(&input.to_string()).expect("display list builds"),
+        )
+        .expect("valid display JSON");
+        let marker = output["pages"][0]["primitives"]
+            .as_array()
+            .expect("primitive array")
+            .iter()
+            .find(|primitive| primitive["listMarker"] == true)
+            .expect("synthetic list marker");
+        assert_eq!(marker["text"], "1.");
+        assert_eq!(marker["listMarkerRevision"], "ins");
+        assert_eq!(marker["color"], REVISION_INS_COLOR);
+        assert!(marker["font"].as_str().unwrap().contains("Aptos"));
+        assert!(marker["font"].as_str().unwrap().contains("700"));
+        assert!(marker["font"].as_str().unwrap().contains("italic"));
+        input["measured"][0]["block"]["attrs"]["listMarkerRevision"] = Value::Null;
+        let output: Value =
+            serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap()).unwrap();
+        let marker = output["pages"][0]["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|primitive| primitive["listMarker"] == true)
+            .unwrap();
+        assert_eq!(marker["color"], "#FF0000");
+    }
+
+    /// Marker overrun extends its slot and shifts only the first line's text.
+    #[test]
+    fn list_marker_tab_overrun_extends_the_first_line_marker_slot() {
+        for (left, hanging, offset) in [(113.0, 113.0, 30.0), (16.0, 4.0, 8.0)] {
+            let input = json!({
+                "contractVersion": 1,
+                "measured": [{
+                    "block": {
+                        "kind": "paragraph",
+                        "id": "list-item",
+                        "runs": [{ "kind": "text", "text": "firstsecond" }],
+                        "attrs": {
+                            "listMarker": "1.2.3.4.5.6.7.8.9",
+                            "listMarkerFontFamily": "Aptos",
+                            "listMarkerFontSize": 12,
+                            "indent": { "left": left, "hanging": hanging }
+                        }
+                    },
+                    "measure": {
+                        "kind": "paragraph",
+                        "totalHeight": 40,
+                        "lines": [
+                            {
+                                "headRun": 0,
+                                "headChar": 0,
+                                "tailRun": 0,
+                                "tailChar": 5,
+                                "width": 28,
+                                "ascent": 14,
+                                "descent": 4,
+                                "lineHeight": 20,
+                                "markerTabOffset": offset
+                            },
+                            {
+                                "headRun": 0,
+                                "headChar": 5,
+                                "tailRun": 0,
+                                "tailChar": 11,
+                                "width": 36,
+                                "ascent": 14,
+                                "descent": 4,
+                                "lineHeight": 20
+                            }
+                        ]
+                    }
+                }],
+                "options": {},
+                "layout": {
+                    "pages": [{
+                        "number": 1,
+                        "size": { "w": 400, "h": 400 },
+                        "margins": { "top": 20, "right": 20, "bottom": 20, "left": 20 },
+                        "fragments": [{
+                            "kind": "paragraph",
+                            "blockId": "list-item",
+                            "x": 20,
+                            "y": 20,
+                            "width": 360,
+                            "height": 40,
+                            "fromLine": 0,
+                            "toLine": 2
+                        }]
+                    }]
+                }
+            });
+            let output: Value =
+                serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap())
+                    .unwrap();
+            let primitives = output["pages"][0]["primitives"].as_array().unwrap();
+            let markers: Vec<_> = primitives
+                .iter()
+                .filter(|primitive| primitive["listMarker"] == true)
+                .collect();
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0]["x"], 20.0 + left - hanging);
+            assert_eq!(markers[0]["width"], hanging + offset);
+            let first = primitives
+                .iter()
+                .find(|primitive| primitive["text"] == "first")
+                .unwrap();
+            let second = primitives
+                .iter()
+                .find(|primitive| primitive["text"] == "second")
+                .unwrap();
+            assert_eq!(first["x"], 20.0 + left + offset);
+            assert_eq!(second["x"], 20.0 + left);
+        }
+    }
+
+    #[test]
+    fn underlined_tabs_paint_their_resolved_advance_without_a_leader() {
+        for authoritative in [false, true] {
+            for underline in [json!(true), json!({"style": "single", "color": "#123456"})] {
+                let mut input = json!({
+                    "contractVersion": 1,
+                    "measured": [{
+                        "block": {"kind": "paragraph", "id": "form", "runs": [
+                            {"kind": "text", "text": "Name", "pmStart": 1, "pmEnd": 5},
+                            {"kind": "tab", "width": 15, "pmStart": 5, "pmEnd": 6},
+                            {"kind": "tab", "width": 85, "underline": underline, "pmStart": 6, "pmEnd": 7}
+                        ], "attrs": {"tabs": [{"pos": 2100, "leader": "none"}]}},
+                        "measure": {"kind": "paragraph", "totalHeight": 20, "lines": [{
+                            "headRun": 0, "headChar": 0, "tailRun": 2, "tailChar": 1,
+                            "width": 140, "ascent": 14, "descent": 4, "lineHeight": 20
+                        }]}
+                    }],
+                    "options": {},
+                    "layout": {"pages": [{"number": 1, "size": {"w": 300, "h": 400},
+                        "margins": {"top": 20, "right": 20, "bottom": 20, "left": 20},
+                        "fragments": [{"kind": "paragraph", "blockId": "form", "x": 20, "y": 20,
+                            "width": 260, "height": 20, "fromLine": 0, "toLine": 1}]
+                    }]}
+                });
+                if authoritative {
+                    input["measured"][0]["measure"]["lines"][0]["runAdvances"] = json!([
+                        {"runIndex": 0, "startChar": 0, "endChar": 4, "advance": 40},
+                        {"runIndex": 1, "startChar": 0, "endChar": 1, "advance": 15},
+                        {"runIndex": 2, "startChar": 0, "endChar": 1, "advance": 85}
+                    ]);
+                }
+                let output: Value =
+                    serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap())
+                        .unwrap();
+                let decorations: Vec<_> = output["pages"][0]["primitives"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|primitive| primitive["kind"] == "decoration")
+                    .collect();
+                assert_eq!(decorations.len(), 1);
+                assert_eq!(decorations[0]["deco"], "underline");
+                assert_eq!(decorations[0]["x"], 75.0);
+                assert_eq!(decorations[0]["w"], 85.0);
+                assert_eq!(decorations[0]["docStart"], 6);
+                assert_eq!(decorations[0]["docEnd"], 7);
+                assert_eq!(
+                    decorations[0]["color"],
+                    underline.get("color").cloned().unwrap_or(json!("#000000"))
+                );
+                for suppressed in [
+                    json!(false),
+                    json!({"style": "none"}),
+                    json!({"style": "words"}),
+                ] {
+                    input["measured"][0]["block"]["runs"][2]["underline"] = suppressed;
+                    let output: Value =
+                        serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap())
+                            .unwrap();
+                    assert!(
+                        !output["pages"][0]["primitives"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|primitive| primitive["kind"] == "decoration")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_clusters_leaders_and_transformed_images_serialize_exact_geometry() {
+        let input = json!({
+            "contractVersion": 1,
+            "measured": [
+                {
+                    "block": {
+                        "kind": "paragraph",
+                        "id": "p",
+                        "runs": [
+                            {
+                                "kind": "text",
+                                "text": "A😀B",
+                                "pmStart": 10,
+                                "pmEnd": 14,
+                                "highlight": "#ffff00",
+                                "emphasisMark": "dot"
+                            },
+                            {
+                                "kind": "tab",
+                                "pmStart": 14,
+                                "pmEnd": 15,
+                                "width": 10,
+                                "leaderGlyphs": {
+                                    "glyph": "·",
+                                    "count": 2,
+                                    "advance": 4,
+                                    "font": "Calibri",
+                                    "fontSize": 11,
+                                    "color": "#123456"
+                                }
+                            }
+                        ],
+                        "attrs": { "tabs": [{ "pos": 1440, "leader": "middleDot" }] },
+                        "pmStart": 10,
+                        "pmEnd": 15
+                    },
+                    "measure": {
+                        "kind": "paragraph",
+                        "totalHeight": 20,
+                        "lines": [{
+                            "headRun": 0,
+                            "headChar": 0,
+                            "tailRun": 1,
+                            "tailChar": 1,
+                            "width": 35,
+                            "ascent": 14,
+                            "descent": 4,
+                            "lineHeight": 20,
+                            "runAdvances": [
+                                { "runIndex": 0, "startChar": 0, "endChar": 4, "advance": 25, "logicalOrder": 0 },
+                                { "runIndex": 1, "startChar": 0, "endChar": 1, "advance": 10, "logicalOrder": 1000000 }
+                            ],
+                            "clusterAdvances": [
+                                { "runIndex": 0, "startChar": 0, "endChar": 1, "advance": 5, "xOffset": 20, "bidiLevel": 0, "logicalOrder": 0 },
+                                { "runIndex": 0, "startChar": 1, "endChar": 3, "advance": 13, "xOffset": 7, "bidiLevel": 1, "logicalOrder": 1 },
+                                { "runIndex": 0, "startChar": 3, "endChar": 4, "advance": 7, "xOffset": 0, "bidiLevel": 0, "logicalOrder": 2 }
+                            ],
+                            "bidiSlices": [
+                                { "runIndex": 0, "startChar": 3, "endChar": 4, "advance": 7, "bidiLevel": 0, "visualOrder": 0, "logicalOrder": 2 },
+                                { "runIndex": 0, "startChar": 1, "endChar": 3, "advance": 13, "bidiLevel": 1, "visualOrder": 1, "logicalOrder": 1 },
+                                { "runIndex": 0, "startChar": 0, "endChar": 1, "advance": 5, "bidiLevel": 0, "visualOrder": 2, "logicalOrder": 0 },
+                                { "runIndex": 1, "startChar": 0, "endChar": 1, "advance": 10, "bidiLevel": 0, "visualOrder": 3, "logicalOrder": 1000000 }
+                            ]
+                        }]
+                    }
+                },
+                {
+                    "block": {
+                        "kind": "image",
+                        "id": "img",
+                        "src": "rId9",
+                        "width": 40,
+                        "height": 20,
+                        "opacity": 0.4,
+                        "rotationDeg": 30,
+                        "flipH": true,
+                        "rotationBounds": { "width": 44.641, "height": 37.321, "offsetX": 2.321, "offsetY": 8.66 }
+                    },
+                    "measure": { "kind": "image", "width": 44.641, "height": 37.321 }
+                }
+            ],
+            "options": {},
+            "layout": {
+                "pages": [{
+                    "number": 1,
+                    "size": { "w": 300, "h": 400 },
+                    "margins": { "top": 20, "right": 20, "bottom": 20, "left": 20 },
+                    "fragments": [
+                        { "kind": "paragraph", "blockId": "p", "x": 20, "y": 20, "width": 260, "height": 20, "fromLine": 0, "toLine": 1, "pmStart": 10, "pmEnd": 15 },
+                        { "kind": "image", "blockId": "img", "x": 20, "y": 50, "width": 44.641, "height": 37.321 }
+                    ]
+                }]
+            }
+        });
+        let output: Value = serde_json::from_str(
+            &build_display_list_json(&input.to_string()).expect("display list builds"),
+        )
+        .expect("valid display JSON");
+        assert_eq!(output["contractVersion"], 1);
+        let primitives = output["pages"][0]["primitives"]
+            .as_array()
+            .expect("primitive array");
+        let text: Vec<&Value> = primitives
+            .iter()
+            .filter(|primitive| primitive["kind"] == "text" && primitive["text"] != "··")
+            .collect();
+        assert_eq!(
+            text.iter()
+                .map(|p| p["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["B", "😀", "A"]
+        );
+        assert_eq!(
+            text.iter()
+                .map(|p| p["width"].as_f64().unwrap())
+                .collect::<Vec<_>>(),
+            [7.0, 13.0, 5.0]
+        );
+        assert_eq!(text[1]["docStart"], 11);
+        assert_eq!(text[1]["docEnd"], 13);
+        assert_eq!(text[1]["logicalOrder"], 1);
+        assert_eq!(text[1]["bidiLevel"], 1);
+        let leader = primitives
+            .iter()
+            .find(|primitive| primitive["leaderGlyphs"].is_object())
+            .expect("shaped leader primitive");
+        assert_eq!(leader["text"], "··");
+        assert_eq!(leader["leaderGlyphs"]["advance"], 4);
+        let image = primitives
+            .iter()
+            .find(|primitive| primitive["kind"] == "image")
+            .expect("image primitive");
+        assert_eq!(image["opacity"], 0.4);
+        assert_eq!(image["flipH"], true);
+        assert_eq!(image["w"], 44.641);
+        assert_eq!(image["contentFrame"]["w"], 40);
+    }
+
+    #[test]
+    fn centered_and_right_aligned_first_lines_use_the_indented_width() {
+        for (alignment, first_line, hanging, expected_x) in [
+            ("center", 20, 0, 130.0),
+            ("center", 0, 20, 110.0),
+            ("right", 20, 0, 190.0),
+            ("right", 0, 20, 190.0),
+        ] {
+            let input = json!({
+                "measured":[{
+                    "block":{"kind":"paragraph","id":"p","runs":[{"kind":"text","text":"X"}],"attrs":{"alignment":alignment,"indent":{"left":40,"firstLine":first_line,"hanging":hanging}}},
+                    "measure":{"kind":"paragraph","totalHeight":20,"lines":[{"headRun":0,"headChar":0,"tailRun":0,"tailChar":1,"width":20,"ascent":11,"descent":3,"lineHeight":20}]}
+                }],
+                "options":{},
+                "layout":{"pages":[{"number":1,"size":{"w":300,"h":500},"margins":{"top":20,"right":20,"bottom":20,"left":20},"fragments":[{"kind":"paragraph","blockId":"p","x":10,"y":20,"width":200,"height":20,"fromLine":0,"toLine":1}]}]}
+            });
+            let output: Value =
+                serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap())
+                    .unwrap();
+            let text = output["pages"][0]["primitives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|primitive| primitive["text"] == "X")
+                .unwrap();
+            assert_eq!(
+                text["x"], expected_x,
+                "{alignment}, first {first_line}, hanging {hanging}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_footer_spacing_collapses_and_short_footers_anchor_to_their_height() {
+        for (kind, height, spacings, expected) in [
+            ("header", 59.0, [(5.0, 8.0), (4.0, 6.0)], vec![56.0, 84.0]),
+            ("footer", 59.0, [(5.0, 8.0), (4.0, 6.0)], vec![417.0, 445.0]),
+            ("footer", 20.0, [(0.0, 0.0), (0.0, 0.0)], vec![451.0]),
+        ] {
+            let count = expected.len();
+            let measured: Vec<Value> = spacings.into_iter().take(count).enumerate().map(|(i,(before,after))|json!({
+                "block":{"kind":"paragraph","id":i,"runs":[{"kind":"text","text":"X"}],"attrs":{"spacing":{"before":before,"after":after}}},
+                "measure":{"kind":"paragraph","totalHeight":20.0+before+after,"lines":[{"headRun":0,"headChar":0,"tailRun":0,"tailChar":1,"width":10,"ascent":11,"descent":3,"lineHeight":20}]}
+            })).collect();
+            let input = json!({
+                "measured":[],"options":{},
+                "headersFooters":{"variants":[{"rId":"hf","kind":kind,"type":"default","height":height,"flowHeight":height,"measured":measured}]},
+                "layout":{"pages":[{"number":1,"size":{"w":300,"h":500},"margins":{"top":80,"right":20,"bottom":80,"left":20,"header":40,"footer":40},"fragments":[]}]}
+            });
+            let output: Value =
+                serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap())
+                    .unwrap();
+            let ys: Vec<f64> = output["pages"][0][kind]["primitives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["text"] == "X")
+                .map(|p| p["baselineY"].as_f64().unwrap())
+                .collect();
+            assert_eq!(ys, expected, "{kind} {height}");
+        }
+    }
+
+    #[test]
+    fn parity_filler_suppresses_header_footer_with_page_fields() {
+        let band = |id: &str, label: &str| {
+            json!({
+                "block": {"kind": "paragraph", "id": id, "runs": [
+                    {"kind": "text", "text": label},
+                    {"kind": "field", "fieldType": "PAGE", "fallback": "0"}
+                ]},
+                "measure": {"kind": "paragraph", "totalHeight": 16, "lines": [
+                    {"headRun": 0, "headChar": 0, "tailRun": 1, "tailChar": 1,
+                        "width": 60, "ascent": 11, "descent": 3, "lineHeight": 16}
+                ]}
+            })
+        };
+        let page = |number: u64, filler: bool| {
+            let mut page = json!({
+                "number": number,
+                "size": {"w": 300, "h": 500},
+                "margins": {"top": 80, "right": 20, "bottom": 80, "left": 20,
+                    "header": 40, "footer": 40},
+                "fragments": []
+            });
+            if filler {
+                page["parityFiller"] = json!(true);
+            }
+            page
+        };
+        let input = json!({
+            "measured": [], "options": {},
+            "headersFooters": {"variants": [
+                {"rId": "hdr", "kind": "header", "type": "default",
+                    "height": 32, "flowHeight": 32, "measured": [band("hf-hdr", "HDR ")]},
+                {"rId": "ftr", "kind": "footer", "type": "default",
+                    "height": 32, "flowHeight": 32, "measured": [band("hf-ftr", "FTR ")]}
+            ]},
+            "layout": {"pages": [page(1, false), page(2, true), page(3, false), page(4, false)]}
+        });
+        let output: Value =
+            serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap()).unwrap();
+        let pages = output["pages"].as_array().unwrap();
+        assert_eq!(pages.len(), 4);
+        for (index, expected) in [(0, "1"), (2, "3"), (3, "4")] {
+            let header = pages[index]["header"]["primitives"]
+                .as_array()
+                .unwrap_or_else(|| panic!("page {index} keeps its header"));
+            assert!(
+                header.iter().any(|p| p["text"] == "HDR "),
+                "page {index} header text"
+            );
+            let field = header
+                .iter()
+                .find(|p| p["text"] == expected)
+                .unwrap_or_else(|| panic!("page {index} header PAGE field"));
+            assert_eq!(field["field"]["category"], "PAGE");
+            let footer = pages[index]["footer"]["primitives"]
+                .as_array()
+                .unwrap_or_else(|| panic!("page {index} keeps its footer"));
+            assert!(
+                footer.iter().any(|p| p["text"] == "FTR "),
+                "page {index} footer text"
+            );
+            assert!(
+                footer.iter().any(|p| p["text"] == expected),
+                "page {index} footer PAGE"
+            );
+        }
+        assert!(pages[1]["header"].is_null(), "filler suppresses header");
+        assert!(pages[1]["footer"].is_null(), "filler suppresses footer");
+    }
+
+    #[test]
+    fn page_regions_emit_columns_notes_and_hf_floating_content() {
+        let paragraph = |id: &str, text: &str| {
+            json!({
+                "block": { "kind": "paragraph", "id": id, "runs": [{ "kind": "text", "text": text, "pmStart": 1, "pmEnd": 1 + text.len() }], "pmStart": 1, "pmEnd": 1 + text.len() },
+                "measure": { "kind": "paragraph", "totalHeight": 16, "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": text.len(), "width": 30, "ascent": 11, "descent": 3, "lineHeight": 16 }] }
+            })
+        };
+        let note = paragraph("note-p", "note");
+        let input = json!({
+            "measured": [],
+            "options": {},
+            "headersFooters": {
+                "titlePg": false,
+                "variants": [{
+                    "rId": "rH",
+                    "kind": "header",
+                    "type": "default",
+                    "height": 32,
+                    "flowHeight": 32,
+                    "measured": [
+                        {
+                            "block": { "kind": "paragraph", "id": "hf-p", "runs": [{ "kind": "image", "src": "logo", "width": 30, "height": 12, "displayMode": "float", "wrapType": "inFront", "opacity": 0.6, "position": { "horizontal": { "relativeTo": "page", "posOffset": 914400 }, "vertical": { "relativeTo": "page", "posOffset": 457200 } } }] },
+                            "measure": { "kind": "paragraph", "totalHeight": 16, "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 1, "width": 30, "ascent": 11, "descent": 3, "lineHeight": 16 }] }
+                        },
+                        {
+                            "block": { "kind": "textBox", "id": "hf-box", "width": 100, "height": 16, "fillColor": "#eeeeee", "content": [{ "kind": "paragraph", "id": "box-p", "runs": [{ "kind": "text", "text": "box", "pmStart": 1, "pmEnd": 4 }] }] },
+                            "measure": { "kind": "textBox", "width": 100, "height": 16, "innerMeasures": [{ "kind": "paragraph", "totalHeight": 16, "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 3, "width": 24, "ascent": 11, "descent": 3, "lineHeight": 16 }] }] }
+                        }
+                    ]
+                }]
+            },
+            "layout": {
+                "pages": [{
+                    "number": 1,
+                    "size": { "w": 300, "h": 400 },
+                    "margins": { "top": 40, "right": 20, "bottom": 40, "left": 20, "header": 20 },
+                    "columns": { "count": 2, "gap": 20, "separator": true },
+                    "noteAreas": [{ "kind": "footnote", "y": 330, "height": 30, "columns": 1, "notes": [{ "id": 7, "blocks": [note["block"].clone()], "measures": [note["measure"].clone()], "height": 16 }] }],
+                    "fragments": []
+                }]
+            }
+        });
+        let output: Value = serde_json::from_str(
+            &build_display_list_json(&input.to_string()).expect("display list builds"),
+        )
+        .expect("valid display JSON");
+        let page = &output["pages"][0];
+        assert!(
+            page["primitives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|primitive| primitive["role"] == "separator")
+        );
+        assert_eq!(page["noteAreas"][0]["noteIds"], json!([7]));
+        assert!(
+            page["noteAreas"][0]["primitives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|primitive| primitive["text"] == "note")
+        );
+        let header = page["header"]["primitives"]
+            .as_array()
+            .expect("header primitives");
+        assert!(header.iter().any(|primitive| primitive["kind"] == "image"
+            && primitive["relId"] == "logo"
+            && primitive["opacity"] == 0.6));
+        assert!(
+            header
+                .iter()
+                .any(|primitive| primitive["kind"] == "text" && primitive["text"] == "box")
+        );
+    }
+
+    /// Every primitive a note paints addresses the note's own story, so one
+    /// carrying no position of its own must stay unpositioned rather than
+    /// inherit the body range of the reference mark that anchors the note —
+    /// that range would hand a click inside the note a body position under a
+    /// note region. The reference label leading every note is exactly such a
+    /// primitive: it is presentation, not story content.
+    #[test]
+    fn note_primitives_never_inherit_the_body_anchor_range() {
+        let input = json!({
+            "measured": [],
+            "options": {},
+            "layout": { "pages": [{
+                "number": 1,
+                "size": { "w": 300, "h": 400 },
+                "margins": { "top": 20, "right": 20, "bottom": 20, "left": 20 },
+                "noteAreas": [{
+                    "kind": "footnote", "y": 330, "height": 40, "columns": 1,
+                    "notes": [{
+                        "id": 7, "anchorDocStart": 3, "anchorDocEnd": 4, "height": 30,
+                        "blocks": [{
+                            "kind": "paragraph",
+                            "id": "note-p",
+                            "runs": [
+                                { "kind": "text", "text": "1  " },
+                                { "kind": "text", "text": "note", "pmStart": 1, "pmEnd": 5 }
+                            ],
+                            "pmStart": 1,
+                            "pmEnd": 6
+                        }],
+                        "measures": [{ "kind": "paragraph", "totalHeight": 16, "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 1, "tailChar": 4, "width": 50, "ascent": 11, "descent": 3, "lineHeight": 16 }] }]
+                    }]
+                }],
+                "fragments": []
+            }]}
+        });
+        let output: Value = serde_json::from_str(
+            &build_display_list_json(&input.to_string()).expect("display list builds"),
+        )
+        .expect("valid display JSON");
+        let primitives = output["pages"][0]["noteAreas"][0]["primitives"]
+            .as_array()
+            .expect("note primitives");
+
+        let label = &primitives[0];
+        assert_eq!(label["text"], "1  ");
+        assert_eq!(label["groupId"], "footnote-7");
+        assert!(label["docStart"].is_null() && label["docEnd"].is_null());
+
+        let text = &primitives[1];
+        assert_eq!(text["text"], "note");
+        assert_eq!(text["groupId"], "footnote-7");
+        assert_eq!((&text["docStart"], &text["docEnd"]), (&json!(1), &json!(5)));
+    }
+
+    #[test]
+    fn table_fragments_emit_clip_border_and_accessibility_contracts() {
+        let para = |id: &str, text: &str| {
+            json!({
+                "kind": "paragraph",
+                "id": id,
+                "runs": [{ "kind": "text", "text": text, "pmStart": 1, "pmEnd": 2 }],
+                "pmStart": 1,
+                "pmEnd": 2
+            })
+        };
+        let para_measure = || {
+            json!({
+                "kind": "paragraph",
+                "totalHeight": 16,
+                "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 1, "width": 8, "ascent": 11, "descent": 3, "lineHeight": 16 }]
+            })
+        };
+        let input = json!({
+            "measured": [{
+                "block": {
+                    "kind": "table",
+                    "id": "table-1",
+                    "caption": "Example",
+                    "description": "Two row table",
+                    "rows": [
+                        {
+                            "isHeader": true,
+                            "cells": [{
+                                "blocks": [para("head", "H")],
+                                "borders": {
+                                    "top": { "style": "double", "width": 2, "color": "#111111" },
+                                    "right": { "style": "dotted", "width": 1, "color": "#222222" },
+                                    "bottom": { "style": "dashDot", "width": 1, "color": "#333333" },
+                                    "left": { "style": "single", "width": 1, "color": "#444444" }
+                                }
+                            }]
+                        },
+                        {
+                            "cells": [{
+                                "noWrap": true,
+                                "blocks": [
+                                    para("data", "D"),
+                                    { "kind": "textBox", "id": "cell-box", "width": 80, "height": 16, "fillColor": "#eeeeee", "content": [para("cell-box-p", "T")] }
+                                ],
+                                "borders": {
+                                    "right": { "style": "double", "width": 2, "color": "#555555" },
+                                    "bottom": { "style": "dashed", "width": 1, "color": "#666666" },
+                                    "left": { "style": "single", "width": 1, "color": "#777777" }
+                                }
+                            }]
+                        }
+                    ]
+                },
+                "measure": {
+                    "kind": "table",
+                    "columnWidths": [120],
+                    "totalWidth": 120,
+                    "totalHeight": 64,
+                    "rows": [
+                        { "height": 24, "cells": [{ "width": 120, "height": 24, "blocks": [para_measure()] }] },
+                        { "height": 40, "cells": [{ "width": 120, "height": 40, "blocks": [para_measure(), { "kind": "textBox", "width": 80, "height": 16, "innerMeasures": [para_measure()] }] }] }
+                    ]
+                }
+            }],
+            "options": {},
+            "layout": {
+                "pages": [{
+                    "number": 2,
+                    "size": { "w": 300, "h": 400 },
+                    "margins": { "top": 20, "right": 20, "bottom": 20, "left": 20 },
+                    "fragments": [{
+                        "kind": "table",
+                        "blockId": "table-1",
+                        "x": 20,
+                        "y": 20,
+                        "width": 120,
+                        "height": 64,
+                        "rowStart": 1,
+                        "rowEnd": 2,
+                        "headerRowCount": 1,
+                        "carriedFromPrev": true
+                    }]
+                }]
+            }
+        });
+        let output: Value = serde_json::from_str(
+            &build_display_list_json(&input.to_string()).expect("display list builds"),
+        )
+        .expect("valid display JSON");
+        let primitives = output["pages"][0]["primitives"]
+            .as_array()
+            .expect("primitive array");
+        assert!(
+            primitives
+                .iter()
+                .any(|primitive| primitive["kind"] == "line"
+                    && primitive["borderStyle"] == "double"
+                    && primitive["borderOwner"] == "cell")
+        );
+        let header = primitives
+            .iter()
+            .find(|primitive| primitive["text"] == "H")
+            .expect("repeated header text");
+        assert_eq!(header["cell"]["isHeader"], true);
+        assert_eq!(header["cell"]["repeatedHeader"], true);
+        let data = primitives
+            .iter()
+            .find(|primitive| primitive["text"] == "D")
+            .expect("data text");
+        assert_eq!(data["cell"]["noWrap"], true);
+        assert_eq!(data["cell"]["headerIds"], json!(["table-1-r0-c0"]));
+        assert_eq!(data["table"]["rowStart"], 1);
+        assert_eq!(data["table"]["rowEnd"], 2);
+        assert_eq!(data["table"]["caption"], "Example");
+        assert!(data["clipGroup"]["clip"].is_object());
+        assert!(primitives.iter().any(|primitive| primitive["text"] == "T"));
+    }
+
+    #[test]
+    fn sdt_links_and_resolved_review_metadata_emit_without_fallback() {
+        let input = json!({
+            "contractVersion": 1,
+            "resolvedCommentIds": [4],
+            "commentAuthors": [{ "id": "reviewer-1", "name": "Ada", "paletteIndex": 2, "color": "#123456" }],
+            "measured": [{
+                "block": {
+                    "kind": "paragraph",
+                    "id": "review",
+                    "sdtGroups": [
+                        { "id": "outer", "sdtType": "repeatingSection", "alias": "Items" },
+                        { "id": "inner", "sdtType": "dropDownList", "tag": "choice", "lock": "sdtLocked" }
+                    ],
+                    "runs": [
+                        { "kind": "text", "text": "R", "pmStart": 1, "pmEnd": 2, "commentIds": [4] },
+                        { "kind": "text", "text": "A", "pmStart": 2, "pmEnd": 3, "commentIds": [5], "changeAuthor": "Ada", "changeRevisionId": 9, "isInsertion": true },
+                        {
+                            "kind": "text",
+                            "text": "L",
+                            "pmStart": 3,
+                            "pmEnd": 4,
+                            "hyperlink": { "href": "https://example.test", "tooltip": "Open example", "target": "_blank", "history": true },
+                            "inlineSdtWidget": {
+                                "kind": "checkbox",
+                                "controlKind": "dropDownList",
+                                "groupId": "inner",
+                                "pos": 3,
+                                "controlId": 42,
+                                "value": "b",
+                                "selectedIndex": 1,
+                                "listItems": [{ "displayText": "Alpha", "value": "a" }, { "displayText": "Beta", "value": "b" }],
+                                "locked": true
+                            }
+                        }
+                    ],
+                    "pmStart": 1,
+                    "pmEnd": 4
+                },
+                "measure": {
+                    "kind": "paragraph",
+                    "totalHeight": 16,
+                    "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 2, "tailChar": 1, "width": 24, "ascent": 11, "descent": 3, "lineHeight": 16 }]
+                }
+            }],
+            "options": {},
+            "layout": { "pages": [{
+                "number": 1,
+                "size": { "w": 300, "h": 400 },
+                "margins": { "top": 20, "right": 20, "bottom": 20, "left": 20 },
+                "fragments": [{ "kind": "paragraph", "blockId": "review", "x": 20, "y": 20, "width": 260, "height": 16, "fromLine": 0, "toLine": 1, "pmStart": 1, "pmEnd": 4 }]
+            }]}
+        });
+        let output: Value = serde_json::from_str(
+            &build_display_list_json(&input.to_string()).expect("display list builds"),
+        )
+        .expect("valid display JSON");
+        let primitives = output["pages"][0]["primitives"]
+            .as_array()
+            .expect("primitive array");
+        let resolved = primitives
+            .iter()
+            .find(|primitive| primitive["kind"] == "text" && primitive["text"] == "R")
+            .expect("resolved comment text");
+        assert_eq!(resolved["comment"]["status"], "resolved");
+        assert!(!primitives.iter().any(|primitive| {
+            primitive["kind"] == "decoration"
+                && primitive["deco"] == "comment-range"
+                && primitive["docStart"] == 1
+        }));
+        let active_wash = primitives
+            .iter()
+            .find(|primitive| {
+                primitive["kind"] == "decoration"
+                    && primitive["deco"] == "comment-range"
+                    && primitive["docStart"] == 2
+            })
+            .expect("active reviewer wash");
+        assert_eq!(active_wash["comment"]["status"], "active");
+        assert_eq!(active_wash["comment"]["authorId"], "reviewer-1");
+        assert_eq!(active_wash["color"], "rgba(18, 52, 86, 0.15)");
+        let linked = primitives
+            .iter()
+            .find(|primitive| primitive["kind"] == "text" && primitive["text"] == "L")
+            .expect("linked widget text");
+        assert_eq!(linked["tooltip"], "Open example");
+        assert_eq!(linked["linkTitle"], "Open example");
+        assert_eq!(linked["inlineSdtWidget"]["controlKind"], "dropDownList");
+        assert_eq!(linked["inlineSdtWidget"]["listItems"][1]["value"], "b");
+        assert_eq!(linked["sdt"]["groupId"], "inner");
+        assert_eq!(linked["sdtPath"][0]["groupId"], "outer");
+        assert_eq!(linked["sdtPath"][1]["groupId"], "inner");
+    }
+
+    /// Emits field, note, and comment accessibility metadata.
+    #[test]
+    fn field_note_and_comment_thread_a11y_metadata_emit() {
+        let note = json!({
+            "block": { "kind": "paragraph", "id": "note-p", "runs": [{ "kind": "text", "text": "1  note body" }] },
+            "measure": { "kind": "paragraph", "totalHeight": 16, "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 12, "width": 60, "ascent": 11, "descent": 3, "lineHeight": 16 }] }
+        });
+        let input = json!({
+            "contractVersion": 1,
+            "commentAuthors": [{ "id": "reviewer-1", "name": "Ada", "paletteIndex": 2 }],
+            "commentThreads": [{
+                "id": 4,
+                "authorId": "reviewer-1",
+                "authorName": "Ada Lovelace",
+                "date": "2026-07-01T10:00:00Z",
+                "text": "Please tighten this sentence.",
+                "replies": [
+                    { "authorName": "Bob", "date": "2026-07-02T09:00:00Z", "text": "Agreed." },
+                    { "authorName": "Ada Lovelace", "text": "Done." }
+                ]
+            }],
+            "measured": [{
+                "block": {
+                    "kind": "paragraph",
+                    "id": "body",
+                    "runs": [
+                        { "kind": "text", "text": "C", "pmStart": 1, "pmEnd": 2, "commentIds": [4] },
+                        { "kind": "field", "fieldType": "OTHER", "rawType": "PAGEREF", "instruction": " PAGEREF _Toc42 \\h ", "fallback": "7", "pmStart": 2, "pmEnd": 3 },
+                        { "kind": "text", "text": "1", "pmStart": 3, "pmEnd": 4, "superscript": true, "footnoteRefId": 7 }
+                    ],
+                    "pmStart": 1,
+                    "pmEnd": 4
+                },
+                "measure": {
+                    "kind": "paragraph",
+                    "totalHeight": 16,
+                    "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 2, "tailChar": 1, "width": 24, "ascent": 11, "descent": 3, "lineHeight": 16 }]
+                }
+            }],
+            "options": {},
+            "layout": { "pages": [{
+                "number": 1,
+                "size": { "w": 300, "h": 400 },
+                "margins": { "top": 20, "right": 20, "bottom": 20, "left": 20 },
+                "noteAreas": [{
+                    "kind": "footnote", "y": 330, "height": 30, "columns": 1,
+                    "notes": [{ "id": 7, "displayLabel": "1", "anchorDocStart": 3, "anchorDocEnd": 4, "blocks": [note["block"].clone()], "measures": [note["measure"].clone()], "height": 16 }]
+                }],
+                "fragments": [{ "kind": "paragraph", "blockId": "body", "x": 20, "y": 20, "width": 260, "height": 16, "fromLine": 0, "toLine": 1, "pmStart": 1, "pmEnd": 4 }]
+            }]}
+        });
+        let output: Value = serde_json::from_str(
+            &build_display_list_json(&input.to_string()).expect("display list builds"),
+        )
+        .expect("valid display JSON");
+        let page = &output["pages"][0];
+        let primitives = page["primitives"].as_array().expect("primitive array");
+
+        // 1) inert field identity on the field-result primitive
+        let field = primitives
+            .iter()
+            .find(|primitive| primitive["kind"] == "text" && primitive["text"] == "7")
+            .expect("field result text");
+        assert_eq!(field["field"]["category"], "OTHER");
+        assert_eq!(field["field"]["type"], "PAGEREF");
+        assert_eq!(field["field"]["instruction"], " PAGEREF _Toc42 \\h ");
+        // ordinary text never carries field identity
+        let plain = primitives
+            .iter()
+            .find(|primitive| primitive["kind"] == "text" && primitive["text"] == "C")
+            .expect("plain text");
+        assert!(plain["field"].is_null());
+
+        // 2) note backlinks: body reference mark + region note metadata
+        let ref_mark = primitives
+            .iter()
+            .find(|primitive| primitive["kind"] == "text" && primitive["text"] == "1")
+            .expect("footnote reference mark");
+        assert_eq!(ref_mark["noteRef"]["kind"], "footnote");
+        assert_eq!(ref_mark["noteRef"]["id"], 7);
+        let region_notes = page["noteAreas"][0]["notes"]
+            .as_array()
+            .expect("note backlink metadata");
+        assert_eq!(region_notes[0]["id"], 7);
+        assert_eq!(region_notes[0]["anchorDocStart"], 3);
+        assert_eq!(region_notes[0]["anchorDocEnd"], 4);
+        assert_eq!(region_notes[0]["label"], "1");
+
+        // 3) comment-thread announcement metadata joined by comment id
+        assert_eq!(plain["comment"]["status"], "active");
+        assert_eq!(plain["comment"]["authorId"], "reviewer-1");
+        assert_eq!(plain["comment"]["authorName"], "Ada Lovelace");
+        assert_eq!(plain["comment"]["date"], "2026-07-01T10:00:00Z");
+        assert_eq!(plain["comment"]["text"], "Please tighten this sentence.");
+        assert_eq!(plain["comment"]["replyCount"], 2);
+        assert_eq!(plain["comment"]["replies"][0]["authorName"], "Bob");
+        assert_eq!(plain["comment"]["replies"][0]["text"], "Agreed.");
+        assert_eq!(plain["comment"]["replies"][1]["text"], "Done.");
+    }
+
+    #[test]
+    fn word_page_decoration_shape_and_combo_chart_contracts_emit() {
+        let input = json!({
+            "contractVersion": 1,
+            "measured": [
+                {
+                    "block": { "kind": "paragraph", "id": "u", "runs": [{ "kind": "text", "text": "wave", "pmStart": 1, "pmEnd": 5, "underline": { "style": "wave", "color": "#123456" } }] },
+                    "measure": { "kind": "paragraph", "totalHeight": 16, "lines": [{ "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 4, "width": 32, "ascent": 11, "descent": 3, "lineHeight": 16 }] }
+                },
+                {
+                    "block": {
+                        "kind": "shape",
+                        "id": "rich-shape",
+                        "shapeType": "rect",
+                        "geometryPath": [{ "type": "move", "x": 0, "y": 0 }, { "type": "line", "x": 1, "y": 1 }, { "type": "close" }],
+                        "fill": { "type": "gradient", "gradientAngle": 45, "gradientStops": [{ "position": 0, "color": "#ff0000" }, { "position": 1, "color": "#0000ff" }] },
+                        "stroke": { "color": "#222222", "width": 2, "dash": "dashDot", "compound": "double", "headEnd": { "type": "triangle" } },
+                        "effects": [{ "kind": "glow", "color": "#00ff00", "blurRadius": 4 }],
+                        "effectExtent": { "top": 4, "right": 4, "bottom": 4, "left": 4 },
+                        "textBodyProperties": { "anchor": "middle", "margins": { "left": 5, "right": 5, "top": 3, "bottom": 3 } },
+                        "scene": { "version": 1, "root": { "kind": "group", "id": "group-7" } },
+                        "title": "Process box",
+                        "description": "A gradient process shape",
+                        "decorative": false,
+                        "width": 100,
+                        "height": 60
+                    },
+                    "measure": { "kind": "shape", "width": 100, "height": 60 }
+                },
+                {
+                    "block": {
+                        "kind": "chart",
+                        "id": "combo",
+                        "width": 180,
+                        "height": 120,
+                        "chart": {
+                            "type": "chart",
+                            "chartType": "column",
+                            "title": "Quarterly",
+                            "description": "Revenue and trend",
+                            "decorative": true,
+                            "series": [],
+                            "plotGroups": [
+                                { "chartType": "column", "grouping": "clustered", "series": [{ "name": "Revenue", "categories": ["Q1", "Q2"], "values": [5, 9], "points": [{ "index": 1, "value": 10, "color": "#abcdef", "label": "Ten" }] }] },
+                                { "chartType": "line", "series": [{ "name": "Trend", "categories": ["Q1", "Q2"], "values": [4, 8], "marker": { "size": 6 } }] }
+                            ]
+                        }
+                    },
+                    "measure": { "kind": "chart", "width": 180, "height": 120 }
+                }
+            ],
+            "options": {},
+            "layout": { "pages": [{
+                "number": 7,
+                "pageLabel": "vii",
+                "sectionId": "sect-2",
+                "sectionIndex": 1,
+                "sectionPageIndex": 2,
+                "sectionPageNumber": 7,
+                "size": { "w": 400, "h": 500 },
+                "margins": { "top": 20, "right": 20, "bottom": 20, "left": 20 },
+                "fragments": [
+                    { "kind": "paragraph", "blockId": "u", "x": 20, "y": 20, "width": 360, "height": 16, "fromLine": 0, "toLine": 1 },
+                    { "kind": "shape", "blockId": "rich-shape", "x": 20, "y": 50, "width": 100, "height": 60 },
+                    { "kind": "chart", "blockId": "combo", "x": 150, "y": 50, "width": 180, "height": 120 }
+                ]
+            }]}
+        });
+        let output: Value = serde_json::from_str(
+            &build_display_list_json(&input.to_string()).expect("display list builds"),
+        )
+        .expect("valid display JSON");
+        let page = &output["pages"][0];
+        assert_eq!(page["pageLabel"], "vii");
+        assert_eq!(page["sectionId"], "sect-2");
+        assert_eq!(page["sectionPageNumber"], 7);
+        let primitives = page["primitives"].as_array().expect("primitive array");
+        assert!(primitives.iter().any(|primitive| {
+            primitive["kind"] == "decoration"
+                && primitive["deco"] == "underline"
+                && primitive["style"] == "wave"
+        }));
+        let shape = primitives
+            .iter()
+            .find(|primitive| primitive["kind"] == "shape" && primitive["blockKey"] == "rich-shape")
+            .expect("rich shape primitive");
+        assert_eq!(shape["fillPaint"]["kind"], "gradient");
+        assert_eq!(shape["fillPaint"]["stops"][1]["color"], "#0000ff");
+        assert_eq!(shape["strokePaint"]["headEnd"]["type"], "triangle");
+        assert_eq!(shape["effects"][0]["kind"], "glow");
+        assert_eq!(shape["ariaLabel"], "Process box");
+        assert_eq!(shape["groupId"], "group-7");
+        let chart = primitives
+            .iter()
+            .find(|primitive| primitive["chart"]["label"].is_string())
+            .expect("combo chart primitive");
+        assert!(
+            chart["chart"]["label"]
+                .as_str()
+                .unwrap()
+                .contains("combo chart")
+        );
+        assert_eq!(chart["ariaDescription"], "Revenue and trend");
+        assert_eq!(chart["decorative"], true);
+        assert!(
+            primitives
+                .iter()
+                .any(|primitive| primitive["fill"] == "#abcdef")
+        );
+    }
+
+    #[test]
+    fn a_group_delete_suppresses_a_series_that_sets_other_switches() {
+        let group = ChartDataLabelsIn {
+            delete: Some(true),
+            ..Default::default()
+        };
+        let series = ChartDataLabelsIn {
+            show_value: Some(true),
+            ..Default::default()
+        };
+        assert!(plot_labels_from(Some(&group), Some(&series)).is_none());
+
+        let restoring = ChartDataLabelsIn {
+            delete: Some(false),
+            show_value: Some(true),
+            ..Default::default()
+        };
+        let resolved = plot_labels_from(Some(&group), Some(&restoring)).unwrap();
+        assert!(resolved.show_value);
+
+        let series_only = ChartDataLabelsIn {
+            delete: Some(true),
+            ..Default::default()
+        };
+        assert!(plot_labels_from(None, Some(&series_only)).is_none());
+    }
+
+    #[test]
+    fn inline_shape_paints_native_geometry_children_and_paint() {
+        let inline_shape = json!({
+            "id": "shape:inline-test",
+            "shapeType": "rect",
+            "geometryPath": [
+                {"type": "move", "x": 0.1, "y": 0.2},
+                {"type": "line", "x": 0.9, "y": 0.8},
+                {"type": "close"}
+            ],
+            "fill": {"type": "solid", "color": "#112233"},
+            "stroke": {"color": "#445566", "width": 2.5, "dash": "dash"},
+            "transform": {"rotation": 12.0, "flipH": true},
+            "width": 60.0,
+            "height": 18.0,
+            "children": [{
+                "id": "shape:inline-test:child:0",
+                "shapeType": "ellipse",
+                "geometryPath": [
+                    {"type": "move", "x": 0.0, "y": 0.0},
+                    {"type": "line", "x": 1.0, "y": 1.0}
+                ],
+                "width": 10.0,
+                "height": 8.0,
+                "x": 5.0,
+                "y": 4.0
+            }],
+            "title": "Oval callout",
+            "pmStart": 2,
+            "pmEnd": 3
+        });
+        let input = json!({
+            "contractVersion": 1,
+            "measured": [{
+                "block": {
+                    "kind": "paragraph",
+                    "id": "inline-para",
+                    "runs": [
+                        {"kind": "text", "text": "A", "pmStart": 1, "pmEnd": 2},
+                        {
+                            "kind": "image",
+                            "src": "",
+                            "width": 60.0,
+                            "height": 18.0,
+                            "wrapType": "inline",
+                            "displayMode": "inline",
+                            "cssFloat": "none",
+                            "pmStart": 2,
+                            "pmEnd": 3,
+                            "inlineShape": inline_shape
+                        },
+                        {"kind": "text", "text": "B", "pmStart": 3, "pmEnd": 4}
+                    ],
+                    "pmStart": 0,
+                    "pmEnd": 5
+                },
+                "measure": {
+                    "kind": "paragraph",
+                    "totalHeight": 22,
+                    "lines": [{
+                        "headRun": 0, "headChar": 0, "tailRun": 2, "tailChar": 1,
+                        "width": 120, "ascent": 16, "descent": 6, "lineHeight": 22
+                    }]
+                }
+            }],
+            "options": {},
+            "layout": {"pages": [{"number": 1, "size": {"w": 400, "h": 400},
+                "margins": {"top": 20, "right": 20, "bottom": 20, "left": 20},
+                "fragments": [{"kind": "paragraph", "blockId": "inline-para", "x": 20, "y": 20,
+                    "width": 360, "height": 22, "fromLine": 0, "toLine": 1,
+                    "pmStart": 0, "pmEnd": 5}]
+            }]}
+        });
+        let output: Value =
+            serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap()).unwrap();
+        let primitives = output["pages"][0]["primitives"].as_array().unwrap();
+        assert!(
+            !primitives
+                .iter()
+                .any(|primitive| primitive["kind"] == "image" && primitive["relId"] == ""),
+            "no empty placeholder image"
+        );
+        let shapes: Vec<_> = primitives
+            .iter()
+            .filter(|primitive| primitive["kind"] == "shape")
+            .collect();
+        assert_eq!(
+            shapes.len(),
+            2,
+            "parent plus one child, not first-child only"
+        );
+        let parent = shapes
+            .iter()
+            .find(|primitive| primitive["blockKey"] == "shape:inline-test")
+            .expect("parent shape with original id");
+        assert_eq!(parent["fill"], "#112233");
+        assert_eq!(parent["stroke"]["color"], "#445566");
+        assert_eq!(parent["ariaLabel"], "Oval callout");
+        assert_eq!(parent["docStart"], 2);
+        assert_eq!(parent["docEnd"], 3);
+        let path = parent["geometryPath"].as_array().unwrap();
+        assert_eq!(path.len(), 3, "custom path preserved, not preset rect");
+        assert_eq!(path[0]["type"], "move");
+        assert_eq!(path[1]["type"], "line");
+        assert_eq!(path[2]["type"], "close");
+        assert!(parent["transform"]["flipH"] == true);
+        let child = shapes
+            .iter()
+            .find(|primitive| primitive["blockKey"] == "shape:inline-test:child:0")
+            .expect("child shape with original id");
+        assert!(child.get("docStart").is_none());
+        assert!(child.get("docEnd").is_none());
+    }
+
+    #[test]
+    fn inline_chart_preserves_run_attributes() {
+        let input = json!({
+            "contractVersion": 1,
+            "measured": [{
+                "block": {
+                    "kind": "paragraph", "id": "inline-para", "pmStart": 0, "pmEnd": 3,
+                    "runs": [{
+                        "kind": "image", "width": 192, "height": 96,
+                        "pmStart": 1, "pmEnd": 2,
+                        "hyperlink": {"href": "https://example.com", "tooltip": "Sales link"},
+                        "isInsertion": true, "changeAuthor": "Ada",
+                        "changeDate": "2026-01-01", "changeRevisionId": 9,
+                        "inlineChart": {
+                            "id": "chart:inline", "width": 192, "height": 96,
+                            "chart": {"chartType": "column", "title": "Sales", "series": [{
+                                "name": "North", "categories": ["Q1"], "values": [2.0]
+                            }]}
+                        }
+                    }]
+                },
+                "measure": {
+                    "kind": "paragraph", "totalHeight": 96,
+                    "lines": [{
+                        "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 1,
+                        "width": 192, "ascent": 96, "descent": 0, "lineHeight": 96,
+                        "bidiSlices": [{
+                            "runIndex": 0, "startChar": 0, "endChar": 1,
+                            "advance": 192, "bidiLevel": 1, "visualOrder": 0, "logicalOrder": 7
+                        }]
+                    }]
+                }
+            }],
+            "options": {},
+            "layout": {"pages": [{
+                "number": 1, "size": {"w": 400, "h": 400},
+                "margins": {"top": 20, "right": 20, "bottom": 20, "left": 20},
+                "fragments": [{
+                    "kind": "paragraph", "blockId": "inline-para", "x": 20, "y": 20,
+                    "width": 360, "height": 96, "fromLine": 0, "toLine": 1,
+                    "pmStart": 0, "pmEnd": 3
+                }]
+            }]}
+        });
+        let output: Value =
+            serde_json::from_str(&build_display_list_json(&input.to_string()).unwrap()).unwrap();
+        let charts: Vec<_> = output["pages"][0]["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|primitive| !primitive["chart"].is_null())
+            .collect();
+        assert!(!charts.is_empty());
+        for primitive in charts {
+            assert_eq!(primitive["href"], "https://example.com");
+            assert_eq!(primitive["tooltip"], "Sales link");
+            assert_eq!(primitive["logicalOrder"], 7);
+            assert_eq!(primitive["bidiLevel"], 1);
+            assert_eq!(primitive["revision"]["kind"], "ins");
+            assert_eq!(primitive["revision"]["author"], "Ada");
+            assert_eq!(primitive["revision"]["date"], "2026-01-01");
+            assert_eq!(primitive["revision"]["revisionId"], "9");
+        }
+    }
+
+    /// A body paragraph followed by a three-category column chart.
+    fn charted_page(values: Value) -> (crate::types::Input, crate::types::Layout) {
+        let mut pagination: crate::types::Input = serde_json::from_value(serde_json::json!({
+            "options": {
+                "pageSize": {"w": 816, "h": 1056},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96}
+            },
+            "measured": [
+                {
+                    "block": {"kind": "paragraph", "id": "intro", "attrs": {}, "pmStart": 1, "pmEnd": 7,
+                              "runs": [{"kind": "text", "text": "Intro", "pmStart": 1, "pmEnd": 6}]},
+                    "measure": {"kind": "paragraph", "totalHeight": 24, "lines": [{
+                        "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 5,
+                        "width": 40, "ascent": 19, "descent": 5, "lineHeight": 24
+                    }]}
+                },
+                {
+                    "block": {"kind": "chart", "id": "sales", "width": 300, "height": 200, "chart": {
+                        "chartType": "column",
+                        "series": [{"name": "Sales", "categories": ["A", "B", "C"],
+                                    "values": values, "color": "#4472C4"}]
+                    }},
+                    "measure": {"kind": "chart", "width": 300, "height": 200}
+                }
+            ]
+        }))
+        .unwrap();
+        let layout = crate::compute_layout_input(&mut pagination).unwrap();
+        (pagination, layout)
+    }
+
+    /// The chart rects in the series colour: its bars and its legend key.
+    fn series_rects(page: &DisplayPage) -> usize {
+        page.primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(primitive, Primitive::Rect(rect)
+                    if rect.attrs.chart.is_some() && rect.fill.eq_ignore_ascii_case("#4472c4"))
+            })
+            .count()
+    }
+
+    fn paints_block(page: &DisplayPage, key: &str) -> bool {
+        serde_json::to_value(&page.primitives)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|primitive| primitive["blockKey"] == key)
+    }
+
+    #[test]
+    fn a_blank_chart_point_leaves_a_gap_in_both_display_input_paths() {
+        let fonts = ooxml_text::FontStore::default();
+        let (pagination, layout) = charted_page(serde_json::json!([2, 1, 3]));
+        let complete =
+            build_display_list_value_from_resident_with_fonts(&pagination, &layout, "{}", &fonts)
+                .unwrap();
+        let rects = series_rects(&complete.pages[0]);
+        assert!(rects >= 3);
+
+        let (pagination, layout) = charted_page(serde_json::json!([2, null, 3]));
+        let (resident, list) = build_resident_display_list_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .expect("a blank chart point must not fail the document");
+        assert!(resident.unreadable().is_empty());
+        assert_eq!(series_rects(&list.pages[0]), rects - 1);
+        assert!(paints_block(&list.pages[0], "intro"));
+        let json = build_display_list(
+            &resident_build_input_via_json(&pagination, &layout, "{}"),
+            &fonts,
+        );
+        assert_eq!(json, list);
+    }
+
+    #[test]
+    fn an_unreadable_measured_block_leaves_only_its_own_fragments_unpainted() {
+        let fonts = ooxml_text::FontStore::default();
+        let (mut pagination, layout) = charted_page(serde_json::json!([2, 1, 3]));
+        let clean =
+            build_display_list_value_from_resident_with_fonts(&pagination, &layout, "{}", &fonts)
+                .unwrap();
+        assert!(paints_block(&clean.pages[0], "intro"));
+        let rects = series_rects(&clean.pages[0]);
+        let crate::types::BlockExtent::Paragraph(extent) = &mut pagination.measured[0].measure
+        else {
+            unreachable!()
+        };
+        extent.lines[0].width = f64::NAN;
+        let unreadable = |resident: &ResidentDisplayInput| {
+            resident
+                .unreadable()
+                .iter()
+                .map(|entry| (entry.block.clone(), entry.page))
+                .collect::<Vec<_>>()
+        };
+        let (resident, list) = build_resident_display_list_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .expect("one unreadable block must not fail the document");
+        assert!(!paints_block(&list.pages[0], "intro"));
+        assert_eq!(series_rects(&list.pages[0]), rects);
+        assert_eq!(unreadable(&resident), [("intro".to_owned(), None)]);
+
+        let (mut resident, mut list) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|_| false,
+            &mut || {},
+        )
+        .unwrap();
+        build_resident_display_pages_with_fonts(
+            &pagination,
+            &layout,
+            &fonts,
+            &mut resident,
+            &mut list,
+            &[0],
+        )
+        .expect("one unreadable block must not fail the page");
+        assert!(!paints_block(&list.pages[0], "intro"));
+        assert_eq!(series_rects(&list.pages[0]), rects);
+        assert_eq!(unreadable(&resident), [("intro".to_owned(), None)]);
+    }
+
+    #[test]
+    fn a_refresh_tracks_a_block_turning_unreadable_and_readable_again() {
+        let fonts = ooxml_text::FontStore::default();
+        let (clean, layout) = charted_page(serde_json::json!([2, 1, 3]));
+        let (mut resident, mut list) = build_resident_display_list_with_fonts_observed(
+            &clean,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .unwrap();
+        let mut broken = clean.clone();
+        let crate::types::BlockExtent::Paragraph(extent) = &mut broken.measured[0].measure else {
+            unreachable!()
+        };
+        extent.lines[0].width = f64::NAN;
+        let mut refresh = |pagination: &crate::types::Input| {
+            assert!(
+                update_resident_display_list_incremental_with_fonts_observed(
+                    pagination,
+                    &layout,
+                    &fonts,
+                    &mut resident,
+                    &mut list,
+                    0,
+                    1,
+                    &[],
+                    &HashMap::new(),
+                    &mut || {},
+                )
+                .unwrap()
+            );
+            (
+                paints_block(&list.pages[0], "intro"),
+                resident
+                    .unreadable()
+                    .iter()
+                    .map(|entry| entry.block.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(refresh(&broken), (false, vec!["intro".to_owned()]));
+        assert_eq!(refresh(&clean), (true, Vec::new()));
+    }
+
+    #[test]
+    fn an_unreadable_layout_fragment_leaves_the_rest_of_its_page_painted() {
+        let fonts = ooxml_text::FontStore::default();
+        let (pagination, mut layout) = charted_page(serde_json::json!([2, 1, 3]));
+        let clean =
+            build_display_list_value_from_resident_with_fonts(&pagination, &layout, "{}", &fonts)
+                .unwrap();
+        assert!(paints_block(&clean.pages[0], "intro"));
+        let rects = series_rects(&clean.pages[0]);
+        let Some(crate::types::Fragment::Paragraph(fragment)) = layout.pages[0]
+            .fragments
+            .iter_mut()
+            .find(|fragment| matches!(fragment, crate::types::Fragment::Paragraph(_)))
+        else {
+            unreachable!()
+        };
+        fragment.x = f64::INFINITY;
+        let (resident, list) = build_resident_display_list_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .expect("one unreadable fragment must not fail the document");
+        assert!(!paints_block(&list.pages[0], "intro"));
+        assert_eq!(series_rects(&list.pages[0]), rects);
+        assert_eq!(
+            resident
+                .unreadable()
+                .iter()
+                .map(|entry| (entry.block.as_str(), entry.page))
+                .collect::<Vec<_>>(),
+            [("intro", Some(0))]
+        );
+    }
+
+    #[test]
+    fn shared_border_resolver_matches_word_conflict_and_equal_weight_rules() {
+        let edge = |ooxml: &str, sz: u32, color: &str| BorderEdgeIn {
+            color: Some(format!("#{color}")),
+            style: Some(
+                match ooxml {
+                    "double" | "triple" | "thinThickSmallGap" => "double",
+                    "dotted" => "dotted",
+                    "dashed" => "dashed",
+                    "nil" | "none" => "none",
+                    _ => "solid",
+                }
+                .to_string(),
+            ),
+            ooxml_style: Some(ooxml.to_string()),
+            width: Some(f64::from(sz) / 6.0),
+            space: None,
+        };
+        let (red, blue, gray, black) = ("FF0000", "0000FF", "808080", "000000");
+        let cases: &[((&str, u32, &str), (&str, u32, &str), bool)] = &[
+            (("single", 4, red), ("single", 24, blue), false),
+            (("double", 4, red), ("single", 8, blue), true),
+            (("single", 12, gray), ("single", 12, black), false),
+            (("single", 24, red), ("single", 4, blue), true),
+            (("single", 12, red), ("double", 4, blue), false),
+            (("double", 4, red), ("single", 12, blue), true),
+            (("dotted", 6, red), ("double", 8, blue), false),
+            (("dotted", 3, red), ("single", 12, blue), false),
+            (("single", 12, red), ("dotted", 3, blue), true),
+            (("dashed", 6, red), ("double", 10, blue), false),
+            (("dotted", 6, red), ("thick", 12, blue), false),
+            (("thick", 6, red), ("single", 12, blue), true),
+            (("triple", 3, red), ("double", 8, blue), true),
+            (("thinThickSmallGap", 4, red), ("double", 12, blue), true),
+            (("dashed", 4, red), ("dotted", 5, blue), true),
+            (("single", 12, red), ("single", 12, blue), true),
+            (("nil", 0, black), ("single", 6, black), false),
+            (("single", 6, black), ("nil", 0, black), true),
+        ];
+        for &(left, right, left_wins) in cases {
+            let l = edge(left.0, left.1, left.2);
+            let r = edge(right.0, right.1, right.2);
+            let expected = if left_wins { &l } else { &r };
+            let resolved = resolve_shared_border(Some(&l), Some(&r)).expect("visible winner");
+            assert_eq!(resolved, expected, "{left:?} vs {right:?}");
+        }
+        let odd = BorderEdgeIn {
+            color: Some("#\u{20ac}\u{20ac}".to_string()),
+            ..edge("single", 12, black)
+        };
+        assert!(resolve_shared_border(Some(&odd), Some(&odd)).is_some());
+        let nil = edge("nil", 0, black);
+        assert!(resolve_shared_border(Some(&nil), None).is_none());
+        assert!(resolve_shared_border(None, Some(&nil)).is_none());
+    }
+
+    #[test]
+    fn group_pictures_emit_composed_shape_primitives() {
+        let rect_path = serde_json::json!([
+            {"type": "move", "x": 0.0, "y": 0.0},
+            {"type": "line", "x": 1.0, "y": 0.0},
+            {"type": "line", "x": 1.0, "y": 1.0},
+            {"type": "line", "x": 0.0, "y": 1.0},
+            {"type": "close"}
+        ]);
+        let input = serde_json::json!({
+            "measured": [
+                {
+                    "block": {
+                        "kind": "shape",
+                        "id": "group-flat",
+                        "shapeType": "rect",
+                        "width": 200.0,
+                        "height": 100.0,
+                        "geometryPath": rect_path,
+                        "children": [
+                            {
+                                "id": "group-flat:child:0",
+                                "shapeType": "rect",
+                                "x": 20.0,
+                                "y": 10.0,
+                                "width": 60.0,
+                                "height": 30.0,
+                                "geometryPath": rect_path,
+                                "fill": {
+                                    "type": "picture",
+                                    "pictureSrc": "media:0",
+                                    "pictureRelId": "rIdPic",
+                                    "pictureFillMode": "stretch"
+                                }
+                            },
+                            {
+                                "id": "group-flat:child:1",
+                                "shapeType": "rect",
+                                "x": 100.0,
+                                "y": 20.0,
+                                "width": 40.0,
+                                "height": 20.0,
+                                "geometryPath": rect_path,
+                                "fill": {
+                                    "type": "solid",
+                                    "color": "#336699"
+                                }
+                            }
+                        ]
+                    },
+                    "measure": {"kind": "shape", "width": 200.0, "height": 100.0}
+                },
+                {
+                    "block": {
+                        "kind": "shape",
+                        "id": "group-nested",
+                        "shapeType": "rect",
+                        "width": 400.0,
+                        "height": 200.0,
+                        "geometryPath": rect_path,
+                        "children": [
+                            {
+                                "id": "group-nested:child:0",
+                                "shapeType": "rect",
+                                "x": 40.0,
+                                "y": 20.0,
+                                "width": 200.0,
+                                "height": 100.0,
+                                "geometryPath": rect_path,
+                                "children": [
+                                    {
+                                        "id": "group-nested:child:0:child:0",
+                                        "shapeType": "rect",
+                                        "x": 20.0,
+                                        "y": 20.0,
+                                        "width": 40.0,
+                                        "height": 20.0,
+                                        "geometryPath": rect_path,
+                                        "fill": {
+                                            "type": "picture",
+                                            "pictureSrc": "media:1",
+                                            "pictureRelId": "rIdNested"
+                                        }
+                                    },
+                                    {
+                                        "id": "group-nested:child:0:child:1",
+                                        "shapeType": "rect",
+                                        "x": 80.0,
+                                        "y": 40.0,
+                                        "width": 20.0,
+                                        "height": 10.0,
+                                        "geometryPath": rect_path,
+                                        "fill": {
+                                            "type": "solid",
+                                            "color": "#112233"
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    "measure": {"kind": "shape", "width": 400.0, "height": 200.0}
+                },
+                {
+                    "block": {
+                        "kind": "shape",
+                        "id": "group-crop-rot",
+                        "shapeType": "rect",
+                        "width": 200.0,
+                        "height": 100.0,
+                        "geometryPath": rect_path,
+                        "children": [
+                            {
+                                "id": "group-crop-rot:child:0",
+                                "shapeType": "rect",
+                                "x": 20.0,
+                                "y": 10.0,
+                                "width": 80.0,
+                                "height": 40.0,
+                                "geometryPath": rect_path,
+                                "fill": {
+                                    "type": "picture",
+                                    "pictureSrc": "media:2",
+                                    "pictureRelId": "rIdCrop",
+                                    "pictureSrcRect": {
+                                        "left": 0.1,
+                                        "top": 0.2,
+                                        "right": 0.15,
+                                        "bottom": 0.25
+                                    }
+                                },
+                                "transform": {
+                                    "rotation": 90.0,
+                                    "flipH": true,
+                                    "flipV": true
+                                }
+                            }
+                        ]
+                    },
+                    "measure": {"kind": "shape", "width": 200.0, "height": 100.0}
+                },
+                {
+                    "block": {
+                        "kind": "shape",
+                        "id": "group-missing-media",
+                        "shapeType": "rect",
+                        "width": 100.0,
+                        "height": 50.0,
+                        "geometryPath": rect_path,
+                        "children": [
+                            {
+                                "id": "group-missing-media:child:0",
+                                "shapeType": "rect",
+                                "x": 10.0,
+                                "y": 10.0,
+                                "width": 20.0,
+                                "height": 10.0,
+                                "geometryPath": rect_path,
+                                "fill": {
+                                    "type": "picture",
+                                    "pictureRelId": "rIdMissing"
+                                }
+                            },
+                            {
+                                "id": "group-missing-media:child:1",
+                                "shapeType": "rect",
+                                "x": 40.0,
+                                "y": 10.0,
+                                "width": 20.0,
+                                "height": 10.0,
+                                "geometryPath": rect_path,
+                                "fill": {
+                                    "type": "solid",
+                                    "color": "#aa0000"
+                                }
+                            }
+                        ]
+                    },
+                    "measure": {"kind": "shape", "width": 100.0, "height": 50.0}
+                }
+            ],
+            "options": {},
+            "layout": {
+                "pages": [{
+                    "size": {"w": 800, "h": 1000},
+                    "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                    "fragments": [
+                        {"kind": "shape", "blockId": "group-flat", "x": 96.0, "y": 96.0, "width": 200.0, "height": 100.0},
+                        {"kind": "shape", "blockId": "group-nested", "x": 96.0, "y": 220.0, "width": 400.0, "height": 200.0},
+                        {"kind": "shape", "blockId": "group-crop-rot", "x": 96.0, "y": 450.0, "width": 200.0, "height": 100.0},
+                        {"kind": "shape", "blockId": "group-missing-media", "x": 96.0, "y": 580.0, "width": 100.0, "height": 50.0}
+                    ]
+                }]
+            }
+        });
+
+        let list = build_display_list_value_with_fonts(
+            &input.to_string(),
+            &ooxml_text::FontStore::default(),
+        )
+        .expect("display list builds");
+        let page = serde_json::to_value(&list.pages[0]).unwrap();
+        let primitives = page["primitives"].as_array().expect("primitives");
+        let by_id = |id: &str| -> &Value {
+            primitives
+                .iter()
+                .find(|prim| prim["kind"] == "shape" && prim["blockKey"] == id)
+                .unwrap_or_else(|| panic!("missing shape primitive {id}"))
+        };
+
+        let flat_pic = by_id("group-flat:child:0");
+        assert_eq!(flat_pic["x"], serde_json::json!(116));
+        assert_eq!(flat_pic["y"], serde_json::json!(106));
+        assert_eq!(flat_pic["w"], serde_json::json!(60));
+        assert_eq!(flat_pic["h"], serde_json::json!(30));
+        assert_eq!(flat_pic["fillPaint"]["kind"], "picture");
+        assert_eq!(flat_pic["fillPaint"]["pictureSrc"], "media:0");
+        assert_eq!(flat_pic["fillPaint"]["pictureRelId"], "rIdPic");
+        assert_eq!(flat_pic["fillPaint"]["pictureFillMode"], "stretch");
+
+        let flat_shape = by_id("group-flat:child:1");
+        assert_eq!(flat_shape["x"], serde_json::json!(196));
+        assert_eq!(flat_shape["y"], serde_json::json!(116));
+        assert_eq!(flat_shape["w"], serde_json::json!(40));
+        assert_eq!(flat_shape["h"], serde_json::json!(20));
+        assert_eq!(flat_shape["fill"], "#336699");
+
+        let nested_pic = by_id("group-nested:child:0:child:0");
+        assert_eq!(nested_pic["x"], serde_json::json!(156));
+        assert_eq!(nested_pic["y"], serde_json::json!(260));
+        assert_eq!(nested_pic["w"], serde_json::json!(40));
+        assert_eq!(nested_pic["h"], serde_json::json!(20));
+        assert_eq!(nested_pic["fillPaint"]["pictureSrc"], "media:1");
+
+        let nested_shape = by_id("group-nested:child:0:child:1");
+        assert_eq!(nested_shape["x"], serde_json::json!(216));
+        assert_eq!(nested_shape["y"], serde_json::json!(280));
+        assert_eq!(nested_shape["w"], serde_json::json!(20));
+        assert_eq!(nested_shape["h"], serde_json::json!(10));
+
+        let crop_rot = by_id("group-crop-rot:child:0");
+        assert_eq!(crop_rot["x"], serde_json::json!(116));
+        assert_eq!(crop_rot["y"], serde_json::json!(460));
+        assert_eq!(crop_rot["w"], serde_json::json!(80));
+        assert_eq!(crop_rot["h"], serde_json::json!(40));
+        assert_eq!(crop_rot["fillPaint"]["pictureSrc"], "media:2");
+        assert_eq!(
+            crop_rot["fillPaint"]["pictureSrcRect"],
+            serde_json::json!({"left": 0.1, "top": 0.2, "right": 0.15, "bottom": 0.25})
+        );
+        assert_eq!(
+            crop_rot["transform"],
+            serde_json::json!({"rotation": 90, "flipH": true, "flipV": true})
+        );
+
+        let missing_pic = by_id("group-missing-media:child:0");
+        assert_eq!(missing_pic["x"], serde_json::json!(106));
+        assert_eq!(missing_pic["y"], serde_json::json!(590));
+        assert_eq!(missing_pic["fillPaint"]["kind"], "picture");
+        assert_eq!(missing_pic["fillPaint"]["pictureRelId"], "rIdMissing");
+        assert!(missing_pic["fillPaint"].get("pictureSrc").is_none());
+
+        let surviving_sibling = by_id("group-missing-media:child:1");
+        assert_eq!(surviving_sibling["x"], serde_json::json!(136));
+        assert_eq!(surviving_sibling["y"], serde_json::json!(590));
+        assert_eq!(surviving_sibling["fill"], "#aa0000");
+    }
+    #[test]
+    fn nested_shape_offsets_remain_parent_relative() {
+        let input = serde_json::json!({
+            "measured": [{"block": {"kind": "shape", "id": "root", "shapeType": "rect",
+                "width": 100, "height": 100, "children": [{"id": "child", "shapeType": "rect",
+                    "x": 40, "y": 20, "width": 40, "height": 40,
+                    "children": [{"id": "grandchild", "shapeType": "rect", "x": 5, "y": 5,
+                        "width": 10, "height": 10}]}]},
+                "measure": {"kind": "shape", "width": 100, "height": 100}}],
+            "options": {}, "layout": {"pages": [{"size": {"w": 800, "h": 1000},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96},
+                "fragments": [{"kind": "shape", "blockId": "root", "x": 100, "y": 100,
+                    "width": 100, "height": 100}]}]}
+        });
+        let list = build_display_list_value_with_fonts(
+            &input.to_string(),
+            &ooxml_text::FontStore::default(),
+        )
+        .unwrap();
+        let page = serde_json::to_value(&list.pages[0]).unwrap();
+        let child = page["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["blockKey"] == "grandchild")
+            .unwrap();
+        assert_eq!(
+            (child["x"].as_i64(), child["y"].as_i64()),
+            (Some(145), Some(125))
+        );
+    }
+
+    #[test]
+    fn rotated_cell_content_turns_the_chart_frame_with_its_primitives() {
+        let attrs = DocAttrs {
+            chart: Some(ChartA11yAttrs {
+                label: "Chart".to_owned(),
+                frame: Some(Box::new(ContentFrame {
+                    x: Some(px(10.0)),
+                    y: Some(px(20.0)),
+                    w: Some(px(40.0)),
+                    h: Some(px(30.0)),
+                })),
+            }),
+            ..DocAttrs::default()
+        };
+        let mut prims = vec![
+            Primitive::Rect(RectPrimitive {
+                x: px(10.0),
+                y: px(20.0),
+                w: px(40.0),
+                h: px(30.0),
+                fill: "#000000".to_owned(),
+                attrs: attrs.clone(),
+            }),
+            Primitive::Rect(RectPrimitive {
+                x: px(15.0),
+                y: px(25.0),
+                w: px(10.0),
+                h: px(5.0),
+                fill: "#ffffff".to_owned(),
+                attrs,
+            }),
+        ];
+        rotate_cell_content(&mut prims, (0.0, 0.0, 100.0, 200.0), 90.0);
+        let Primitive::Rect(rect) = &prims[0] else {
+            unreachable!()
+        };
+        let expected = (
+            Some(rect.x.clone()),
+            Some(rect.y.clone()),
+            Some(rect.w.clone()),
+            Some(rect.h.clone()),
+        );
+        assert_ne!(expected.0, Some(px(10.0)));
+        for primitive in &prims {
+            let Primitive::Rect(RectPrimitive { attrs, .. }) = primitive else {
+                unreachable!()
+            };
+            let frame = attrs.chart.as_ref().unwrap().frame.as_ref().unwrap();
+            assert_eq!(
+                (
+                    frame.x.clone(),
+                    frame.y.clone(),
+                    frame.w.clone(),
+                    frame.h.clone()
+                ),
+                expected
+            );
+        }
+    }
+}

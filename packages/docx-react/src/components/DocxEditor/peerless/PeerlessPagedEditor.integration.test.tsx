@@ -1,0 +1,1555 @@
+import { GlobalRegistrator } from '@happy-dom/global-registrator';
+import { afterAll, afterEach, expect, jest, mock, spyOn, test } from 'bun:test';
+import type {
+  DocxCommandAck, DocxCommandEnvelope, DocxCommandFrame, DocxCommandConnection,
+} from '@nimbleoffice/docx/worker';
+import {
+  applyFrameDeltaOwned, buildMirrorPage, displayPageRevision, FRAME_DELTA_VERSION,
+  type DecodedFrameDelta, type DisplayPage, type FramePageOperation,
+} from '@nimbleoffice/docx/layout/render';
+import type { PeerlessEditSessionBinding, UsePeerlessEditSessionOptions } from '../hooks/usePeerlessEditSession';
+import * as composition from './composition';
+import * as display from '@nimbleoffice/docx/layout/render';
+import { installCompositionEventPolyfill } from './compositionEventPolyfill.testing';
+import { PeerlessPagedEditor, type PeerlessPagedEditorProps } from './PeerlessPagedEditor';
+import { glyphChar, installGlyphPaths, testEchoGlyphLine, testEchoGlyphSet } from './echoGlyphs.testing';
+import { fakeIdleScheduler } from '../__fixtures__/fakeIdleScheduler';
+
+const ownsDom = !GlobalRegistrator.isRegistered;
+if (ownsDom) GlobalRegistrator.register();
+const restoreCompositionEvent = installCompositionEventPolyfill();
+const { act, cleanup, fireEvent, render, waitFor } = await import('@testing-library/react');
+const restorers: (() => void)[] = [];
+const caretAt = (target: HTMLElement | CSSStyleDeclaration | null | undefined) => {
+  const style = target && 'style' in target ? target.style : target;
+  const match = /^translate\((-?[\d.]+)px, (-?[\d.]+)px\)$/.exec(style?.transform ?? '');
+  return match ? { left: `${match[1]}px`, top: `${match[2]}px` } : undefined;
+};
+afterEach(() => {
+  cleanup();
+  for (const restore of restorers.splice(0).reverse()) restore();
+});
+afterAll(async () => {
+  await act(async () => { await new Promise<void>((resolve) => setImmediate(resolve)); });
+  restoreCompositionEvent();
+  if (ownsDom) await GlobalRegistrator.unregister();
+});
+
+const identity = { session: 'integration', incarnation: 1, epoch: 1 };
+const page = { pageId: '1', pageIndex: 0 };
+
+function frame(revision: number, coverage: number, text = ''): DocxCommandFrame {
+  const bytes = new ArrayBuffer(88);
+  const data = new DataView(bytes);
+  new Uint8Array(bytes).set([0x46, 0x44, 0x56, 0x31]);
+  data.setUint16(4, 1, true);
+  data.setUint16(6, 80, true);
+  data.setUint32(8, 88, true);
+  data.setUint32(12, 1, true);
+  data.setBigUint64(16, 1n, true);
+  data.setBigUint64(24, 1n, true);
+  data.setBigUint64(32, BigInt(revision), true);
+  for (const offset of [56, 60]) data.setUint32(offset, 80, true);
+  data.setUint32(64, 4, true);
+  data.setUint32(68, 88, true);
+  const rect = { x: 0, y: 0, width: 200, height: 40 };
+  return { revision, coversThroughSeq: coverage, payload: {
+    frame: bytes, layoutRevision: revision, caret: { frameEpoch: revision, caretRect: null },
+    stagedPresentation: { frameEpoch: revision, pages: [{ page, frameEpoch: revision,
+      bitmap: { width: 200, height: 40, close: mock(() => {}) } as unknown as ImageBitmap,
+      backgrounds: [{ id: 'background', rect,
+        bitmap: { width: 200, height: 40, close: mock(() => {}) } as unknown as ImageBitmap }],
+    }] },
+    echoContext: { page, frameEpoch: revision, layoutRevision: revision,
+      serializedBytes: 900, text, shaping: 'simple-ltr', transform: [1, 0, 0, 1, 0, 0],
+      styleRuns: [{ startUtf16: 0, endUtf16: text.length, fontFamily: 'Arial', fontSizePx: 12,
+        color: '#000', bold: false, italic: false, underline: false, strike: false,
+        transform: [1, 0, 0, 1, 0, 0], baseline: { x: 0, y: 14 } }],
+      boundaries: Array.from({ length: text.length + 1 }, (_, utf16) => ({ utf16, grapheme: utf16,
+        caret: { x: utf16 * 10, y: 0, width: 1, height: 40 } })),
+      selection: { anchorGrapheme: text.length, focusGrapheme: text.length },
+      damage: [{ page, rect, backgroundId: 'background', omittedPrimitiveIds: [] }],
+      glyphs: testEchoGlyphLine({ device: { x: 0, y: 0, width: 200, height: 40 } }),
+    },
+    echoGlyphSets: [testEchoGlyphSet],
+  } };
+}
+
+async function mount(selection = false, accessible = false, table = false,
+  prepare?: UsePeerlessEditSessionOptions['prepareGeometry'], caretX: (revision: number) => number = () => 10,
+  props: Partial<PeerlessPagedEditorProps> = {}, multiCell = false) {
+  const events: string[] = [];
+  restorers.push(installGlyphPaths());
+  const canvas = document.createElement('canvas');
+  const ctx = {
+    save() {}, restore() {}, setTransform() {}, clearRect() {}, putImageData() {},
+    getImageData: () => ({ width: canvas.width, height: canvas.height }) as ImageData,
+    transform() {}, beginPath() {}, rect() {}, clip() {}, fillRect() {},
+    translate() {}, scale() {}, fill: (path: unknown) => { events.push(`echo:${glyphChar(path)}`); },
+    drawImage: () => { events.push('pixels'); },
+  };
+  Object.defineProperty(canvas, 'getContext', { value: () => ctx });
+  const position = { story: 'body', paraId: 'worker', offset: 0 };
+  const initial: DocxCommandConnection['initial'] = {
+    ...identity, version: 0, throughSeq: 0, outcomes: [], selection: { anchor: position, focus: position },
+    editState: { readOnly: false, toolbar: null, effectiveFormatting: null, storedMarks: null,
+      canUndo: false, canRedo: false, hyperlink: null, tableContext: table ? {
+        story: 'body', tableIndex: 0, rowIndex: 0, columnIndex: 0, rowCount: 1, columnCount: 2,
+        hasMultiCellSelection: multiCell, canSplitCell: false,
+      } : null },
+    frame: frame(1, 0),
+  };
+  const commands: DocxCommandEnvelope[] = [];
+  const replies: Array<(ack: DocxCommandAck) => void> = [];
+  let receive: ((candidate: DocxCommandFrame) => void) | undefined;
+  const connection: DocxCommandConnection = {
+    initial, requestFullFrame: async () => initial,
+    client: {
+      failure: undefined, onFailure: () => () => {}, dispose: async () => {},
+      onFrame(listener) { receive = listener; return () => { receive = undefined; }; },
+      call: {
+        checkpoint: async () => ({ state: new Uint8Array(), epoch: 1, version: 0, throughSeq: 0 }),
+        edit(command) {
+          commands.push(command);
+          return new Promise<DocxCommandAck>((resolve) => { replies.push(resolve); });
+        },
+      },
+    },
+  };
+  const sessionOptions: UsePeerlessEditSessionOptions = {
+    source: Uint8Array.of(1), openConnection: async () => connection, canvasForPage: () => canvas,
+    prepareGeometry: prepare ?? function (candidate) {
+      return { identity, coversThroughSeq: candidate.coversThroughSeq, frameEpoch: candidate.revision,
+        layoutRevision: candidate.payload.layoutRevision,
+        pages: accessible ? Array.from({ length: 20 }, (_, pageIndex) => ({
+          page: { pageId: String(pageIndex + 1), pageIndex },
+          bounds: { x: 0, y: pageIndex * 64, width: 200, height: 40 }, transform: [1, 0, 0, 1, 0, 0] as const,
+          displayPage: { pageIndex, width: 200, height: 40, primitives: [{
+            kind: 'text' as const, text: `Readable page ${pageIndex + 1}`, x: 0, baselineY: 14, width: 100, font: '12px Arial', color: '#000',
+          }] },
+        })) : [{ page, bounds: { x: 0, y: 0, width: 200, height: 40 }, transform: [1, 0, 0, 1, 0, 0] }],
+        caret: { x: caretX(candidate.revision), y: 0, width: 1, height: 20 },
+        selectionRects: selection ? [{ x: 0, y: 0, width: 10, height: 20 }] : [],
+      };
+    },
+  };
+  let binding: PeerlessEditSessionBinding | undefined;
+  const view = render(<PeerlessPagedEditor {...props} sessionOptions={sessionOptions} onReady={(ready) => { binding = ready; }} />);
+  await waitFor(() => { expect(binding).toBeDefined(); });
+  return { ...view, binding: binding!, commands, canvas, events, sessionOptions,
+    textarea: view.getByRole('textbox', { name: 'Document input' }) as HTMLTextAreaElement,
+    async acknowledge(index: number, status: 'applied' | 'refused' | 'noop', extra: Partial<DocxCommandAck> = {}) {
+      await waitFor(() => { expect(commands[index]).toBeDefined(); });
+      const command = commands[index]!;
+      await act(async () => { replies[index]!({ ...initial, frame: undefined, version: index + 1,
+        throughSeq: command.seq, outcomes: [{ seq: command.seq, status,
+          ...(status === 'refused' ? { reason: 'locked-target' } : {}) }],
+        ...extra,
+      }); });
+    },
+    present(candidate: DocxCommandFrame) { act(() => { receive?.(candidate); }); },
+  };
+}
+
+async function warmupEditor({ primitiveCounts = [0, 0, 0], timers = false } = {}) {
+  const scheduler = fakeIdleScheduler();
+  restorers.push(() => scheduler.restore());
+  const loaded = spyOn(display, 'loadedRustDisplayListQueryEngine').mockReturnValue({} as display.RustDisplayListQueryEngine);
+  const hitTestRegions = mock((_pageIndex: number, _x: number, _y: number) => null);
+  const queries = spyOn(display, 'createDisplayListQueries').mockImplementation(() => ({
+    hitTestRegions, caretRect: () => null, dispose() {},
+  }) as unknown as display.DisplayListQueries);
+  restorers.push(() => loaded.mockRestore(), () => queries.mockRestore());
+  const displayPages: DisplayPage[] = primitiveCounts.map((count, pageIndex) => ({ pageIndex, width: 200, height: 40,
+    primitives: Array.from({ length: count }, () => ({ kind: 'rect' as const, x: 0, y: 0, w: 1, h: 1, fill: '#000' })),
+  }));
+  const editor = await mount(false, false, false, candidate => ({
+    identity, coversThroughSeq: candidate.coversThroughSeq, frameEpoch: candidate.revision, layoutRevision: 1,
+    documentVersion: 'v1',
+    pages: displayPages.map((displayPage, pageIndex) => ({ page: { pageId: String(pageIndex + 1), pageIndex },
+      bounds: { x: 0, y: pageIndex * 64, width: 200, height: 40 }, transform: [1, 0, 0, 1, 0, 0], displayPage })),
+    caret: null, selectionRects: [],
+  }));
+  if (timers) {
+    let id = 0;
+    const clock = spyOn(performance, 'now').mockImplementation(() => scheduler.now);
+    const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((run: () => void, delay = 0) => {
+      scheduler.timers.set(++id, { at: scheduler.now + delay, run });
+      return id;
+    }) as unknown as typeof setTimeout);
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation((timer) => { scheduler.timers.delete(timer as unknown as number); });
+    restorers.push(() => clock.mockRestore(), () => timeout.mockRestore(), () => clear.mockRestore());
+  }
+  return { ...editor, scheduler, hitTestRegions, queries,
+    changeDocument(change: 'edit' | 'layout' = 'edit') {
+      const before = editor.binding.viewStore.getSnapshot().geometry!;
+      act(() => editor.binding.viewStore.installFrameGeometry({ ...before, frameEpoch: before.frameEpoch + 1,
+        ...(change === 'edit'
+          ? { documentVersion: `v${Number(before.documentVersion!.slice(1)) + 1}` }
+          : { layoutRevision: before.layoutRevision + 1 }),
+        pages: before.pages.map(entry => ({ ...entry, displayPage: { ...entry.displayPage! } })),
+      }));
+    },
+  };
+}
+
+test('hit-test warm-up yields when the idle budget ends and skips unchanged query objects', async () => {
+  const editor = await warmupEditor();
+  let clock = 0;
+  const now = spyOn(performance, 'now').mockImplementation(() => clock);
+  restorers.push(() => now.mockRestore());
+  const timeouts = () => [...editor.scheduler.idleWork.values()].map(({ timeout }) => timeout);
+  let remaining = 8;
+  editor.hitTestRegions.mockImplementation(() => { remaining = 0; return null; });
+  act(() => editor.scheduler.flushIdle({ didTimeout: false, timeRemaining: () => remaining }));
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(1);
+  expect(timeouts()).toEqual([1000]);
+  clock = 400;
+  act(() => editor.scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 0 }));
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(1);
+  expect(timeouts()).toEqual([600]);
+  clock = 1000;
+  act(() => editor.scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 0 }));
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(2);
+  editor.hitTestRegions.mockImplementation(() => null);
+  act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(3);
+  const store = editor.binding.viewStore;
+  let before = store.getSnapshot().geometry!;
+  act(() => {
+    store.installFrameGeometry({ ...before, frameEpoch: before.frameEpoch + 1,
+      pages: before.pages.map(entry => ({ ...entry, bounds: { ...entry.bounds, x: 10 } })) });
+  });
+  act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(3);
+  expect(editor.queries).toHaveBeenCalledTimes(1);
+  before = store.getSnapshot().geometry!;
+  act(() => {
+    store.installFrameGeometry({ ...before, frameEpoch: before.frameEpoch + 1,
+      pages: before.pages.map(entry => ({ ...entry, displayPage: { ...entry.displayPage! } })) });
+  });
+  for (let flush = 0; flush < 3; flush++) act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(6);
+  expect(editor.queries).toHaveBeenCalledTimes(2);
+});
+
+test('hit-test warm-up waits until 500 ms after the last keystroke', async () => {
+  const editor = await warmupEditor();
+  let now = 1000;
+  let id = 0;
+  const timers = new Map<number, { at: number; run: () => void }>();
+  const clock = spyOn(performance, 'now').mockImplementation(() => now);
+  const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((run: () => void, delay = 0) => {
+    timers.set(++id, { at: now + delay, run });
+    return id;
+  }) as unknown as typeof setTimeout);
+  const clear = spyOn(globalThis, 'clearTimeout').mockImplementation((timer) => { timers.delete(timer as unknown as number); });
+  restorers.push(() => clock.mockRestore(), () => timeout.mockRestore(), () => clear.mockRestore());
+  const advance = (ms: number) => act(() => {
+    now += ms;
+    for (const [timer, work] of [...timers]) if (work.at <= now && timers.delete(timer)) work.run();
+  });
+  act(() => fireEvent.keyDown(document, { key: 'a' }));
+  act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).not.toHaveBeenCalled();
+  advance(300);
+  act(() => fireEvent.keyDown(document, { key: 'b' }));
+  advance(499);
+  act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).not.toHaveBeenCalled();
+  advance(1);
+  act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(1);
+});
+
+for (const [focusTarget, change] of [['input', 'edit'], ['root', 'edit'], ['input', 'layout']] as const) {
+  test(`hit-test warm-up waits for 2 s after a document ${change} with the ${focusTarget} focused`, async () => {
+    const editor = await warmupEditor({ timers: true });
+    const { scheduler } = editor;
+    const root = editor.container.querySelector<HTMLElement>('[data-docx-worker-editor]')!;
+    root.tabIndex = 0;
+    await act(async () => { (focusTarget === 'input' ? editor.textarea : root).focus(); });
+    editor.changeDocument(change);
+    act(() => scheduler.flushIdle());
+    expect(editor.hitTestRegions).not.toHaveBeenCalled();
+    expect([...scheduler.timers.values()].map(({ at }) => at)).toEqual([2000]);
+    for (const at of [1001, 1999]) {
+      scheduler.now = at;
+      act(() => {
+        scheduler.flushDueTimers();
+        scheduler.flushIdle({ didTimeout: true, timeRemaining: () => 40 });
+      });
+      expect(editor.hitTestRegions).not.toHaveBeenCalled();
+      expect([...scheduler.timers.values()].map(({ at }) => at)).toEqual([2000]);
+    }
+    scheduler.now = 2000;
+    act(() => scheduler.flushDueTimers());
+    expect(scheduler.timers.size).toBe(0);
+    expect([...scheduler.idleWork.values()].map(({ timeout }) => timeout)).toEqual([1000]);
+    act(() => scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 0 }));
+    expect(editor.hitTestRegions).not.toHaveBeenCalled();
+    for (let flush = 0; flush < 3; flush++) act(() => scheduler.flushIdle());
+    expect(editor.hitTestRegions).toHaveBeenCalledTimes(3);
+    expect(scheduler.idleWork.size).toBe(0);
+  });
+}
+
+test('hit-test warm-up resumes on blur and does not guard blurred document changes', async () => {
+  const editor = await warmupEditor({ timers: true });
+  const { scheduler } = editor;
+  await act(async () => { editor.textarea.focus(); });
+  editor.changeDocument();
+  expect([...scheduler.timers.values()].map(({ at }) => at)).toEqual([2000]);
+  scheduler.now = 250;
+  await act(async () => { editor.textarea.blur(); });
+  expect(scheduler.timers.size).toBe(0);
+  act(() => scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 5 }));
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(1);
+  editor.changeDocument();
+  expect(scheduler.timers.size).toBe(0);
+  for (let flush = 0; flush < 3; flush++) act(() => scheduler.flushIdle());
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(4);
+});
+
+test('hit-test warm-up restarts the document quiet window and cancels its timer on scroll and cleanup', async () => {
+  const editor = await warmupEditor({ timers: true });
+  const { scheduler } = editor;
+  await act(async () => { editor.textarea.focus(); });
+  editor.changeDocument();
+  scheduler.now = 1000;
+  editor.changeDocument();
+  expect([...scheduler.timers.values()].map(({ at }) => at)).toEqual([3000]);
+  act(() => fireEvent.scroll(window));
+  expect([...scheduler.timers.values()].map(({ at }) => at)).toEqual([1150]);
+  scheduler.now = 1150;
+  act(() => scheduler.flushDueTimers());
+  expect([...scheduler.timers.values()].map(({ at }) => at)).toEqual([3000]);
+  editor.unmount();
+  expect(scheduler.timers.size).toBe(0);
+  expect(scheduler.idleWork.size).toBe(0);
+  scheduler.now = 3000;
+  act(() => { scheduler.flushDueTimers(); scheduler.flushIdle(); });
+  expect(editor.hitTestRegions).not.toHaveBeenCalled();
+});
+
+test('hit-test warm-up waits for a larger idle slice before a large page unless overdue', async () => {
+  const editor = await warmupEditor({ primitiveCounts: [2001, 2000, 2001], timers: true });
+  const { scheduler } = editor;
+  editor.changeDocument();
+  act(() => scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 5 }));
+  expect(editor.hitTestRegions).not.toHaveBeenCalled();
+  expect(editor.queries).not.toHaveBeenCalled();
+  act(() => scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 15 }));
+  expect(editor.hitTestRegions.mock.calls.map(([pageIndex]) => pageIndex)).toEqual([0]);
+  act(() => scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 5 }));
+  expect(editor.hitTestRegions.mock.calls.map(([pageIndex]) => pageIndex)).toEqual([0, 1]);
+  act(() => scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 5 }));
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(2);
+  scheduler.now = 1000;
+  act(() => scheduler.flushIdle({ didTimeout: false, timeRemaining: () => 0 }));
+  expect(editor.hitTestRegions.mock.calls.map(([pageIndex]) => pageIndex)).toEqual([0, 1, 2]);
+  expect(scheduler.idleWork.size).toBe(0);
+});
+
+test('hit-test warm-up pauses until 150 ms after the last scroll', async () => {
+  const editor = await warmupEditor();
+  let now = 0;
+  let id = 0;
+  const timers = new Map<number, { at: number; run: () => void }>();
+  const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((run: () => void, delay = 0) => {
+    timers.set(++id, { at: now + delay, run });
+    return id;
+  }) as unknown as typeof setTimeout);
+  const clear = spyOn(globalThis, 'clearTimeout').mockImplementation((timer) => { timers.delete(timer as unknown as number); });
+  restorers.push(() => timeout.mockRestore(), () => clear.mockRestore());
+  const advance = (ms: number) => act(() => {
+    now += ms;
+    for (const [timer, work] of [...timers]) if (work.at <= now && timers.delete(timer)) work.run();
+  });
+  act(() => fireEvent.scroll(window));
+  act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).not.toHaveBeenCalled();
+  advance(149);
+  act(() => fireEvent.scroll(window));
+  advance(149);
+  act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).not.toHaveBeenCalled();
+  advance(1);
+  for (let flush = 0; flush < 3; flush++) act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(3);
+  editor.unmount();
+  advance(150);
+  act(() => editor.scheduler.flushIdle());
+  expect(editor.hitTestRegions).toHaveBeenCalledTimes(3);
+});
+
+test('peerless accessibility exposes retained offscreen pages without allocating their canvases', async () => {
+  const editor = await mount(false, true);
+  await waitFor(() => expect(editor.getByText('Readable page 13')).toBeTruthy());
+  expect(editor.container.querySelector('[data-page-id="13"] canvas')).toBeNull();
+  expect(editor.getByRole('status').getAttribute('aria-live')).toBe('polite');
+});
+
+test('a page whose positions changed in place rebuilds its accessibility mirror', async () => {
+  const displayPage: DisplayPage = { pageIndex: 0, width: 200, height: 40, positionSpan: [1, 9], primitives: [{
+    kind: 'text', text: 'Shifted page', x: 0, baselineY: 14, width: 100, font: '12px Arial', color: '#000', docStart: 1, docEnd: 9,
+  }] };
+  const delta = (frameEpoch: number, operations: FramePageOperation[]): DecodedFrameDelta => ({
+    protocolVersion: FRAME_DELTA_VERSION, full: frameEpoch === 1, docEpoch: frameEpoch, layoutEpoch: frameEpoch, frameEpoch,
+    baseFrameEpoch: frameEpoch - 1, pageCount: 1, bytes: new Uint8Array(), operations });
+  let retained = applyFrameDeltaOwned(null, delta(1, [{ kind: 'upsert', pageId: 1n, pageIndex: 0, fingerprint: 1n,
+    primitiveIds: new BigUint64Array([1n]), page: displayPage }]));
+  const editor = await mount(false, false, false, (candidate) => {
+    if (candidate.revision > retained.frameEpoch) {
+      retained = applyFrameDeltaOwned(retained, delta(candidate.revision,
+        [{ kind: 'shift-range', pageIndex: 0, pageId: 1n, count: 1, delta: 2, salt: 3n }]));
+    }
+    return { identity, coversThroughSeq: candidate.coversThroughSeq, frameEpoch: candidate.revision,
+      layoutRevision: candidate.payload.layoutRevision, caret: null, selectionRects: [],
+      pages: [{ page, bounds: { x: 0, y: 0, width: 200, height: 40 }, transform: [1, 0, 0, 1, 0, 0],
+        displayPage: retained.pages[0]!.page }] };
+  });
+  const stamped = (root: Element | null | undefined) => [...root?.querySelectorAll<HTMLElement>('[data-doc-start]') ?? []]
+    .map((el) => [el.dataset.docStart, el.dataset.docEnd]);
+  const mirror = () => editor.container.querySelector('[data-page-id="1"] .canvas-page-mirror');
+  await waitFor(() => expect(stamped(mirror())).toContainEqual(['1', '9']));
+  editor.present(frame(2, 0));
+  expect(retained.pages[0]!.page).toBe(displayPage);
+  expect(displayPageRevision(displayPage)).toBe(1);
+  const fresh = stamped(buildMirrorPage(displayPage));
+  expect(fresh).toContainEqual(['3', '11']);
+  expect(fresh).not.toContainEqual(['1', '9']);
+  await waitFor(() => expect(stamped(mirror())).toEqual(fresh), { timeout: 5_000 });
+}, 15_000);
+
+function preedit(textarea: HTMLTextAreaElement, type: 'compositionstart' | 'compositionupdate' | 'compositionend', data = '') {
+  const event = type === 'compositionstart' ? fireEvent.compositionStart
+    : type === 'compositionupdate' ? fireEvent.compositionUpdate : fireEvent.compositionEnd;
+  event(textarea, { data });
+}
+
+function beforeinput(textarea: HTMLTextAreaElement, inputType: string, data: string) {
+  act(() => { textarea.dispatchEvent(new InputEvent('beforeinput', {
+    bubbles: true, cancelable: true, inputType, data,
+  })); });
+}
+
+test('table_typing_queues_behind_the_worker_inflight_window', async () => {
+  const editor = await mount(false, false, true);
+  beforeinput(editor.textarea, 'insertText', 'X');
+  fireEvent.keyDown(editor.textarea, { key: 'Tab', code: 'Tab' });
+  fireEvent.keyUp(editor.textarea, { key: 'Tab', code: 'Tab' });
+  beforeinput(editor.textarea, 'insertText', 'Y');
+  fireEvent.keyDown(editor.textarea, { key: 'Shift', code: 'ShiftLeft', shiftKey: true });
+  fireEvent.keyDown(editor.textarea, { key: 'Tab', code: 'Tab', shiftKey: true });
+  fireEvent.keyUp(editor.textarea, { key: 'Tab', code: 'Tab', shiftKey: true });
+  fireEvent.keyUp(editor.textarea, { key: 'Shift', code: 'ShiftLeft' });
+  beforeinput(editor.textarea, 'insertText', 'Z');
+  await waitFor(() => expect(editor.commands).toHaveLength(4));
+  expect(editor.binding.admission.getSnapshot().originalUnackedIntents).toBe(5);
+  expect(editor.commands.map(({ kind }) => kind)).toEqual(['insertText', 'navigateCell', 'insertText', 'navigateCell']);
+  await editor.acknowledge(0, 'applied');
+  await waitFor(() => expect(editor.commands).toHaveLength(5));
+  expect(editor.commands[4]!.payload).toEqual({ text: 'Z' });
+  for (let index = 1; index < editor.commands.length; index += 1) {
+    expect(editor.commands[index]!.afterSeq).toBe(editor.commands[index - 1]!.seq);
+    await editor.acknowledge(index, 'applied');
+  }
+  await editor.binding.session.flush();
+  expect(editor.binding.admission.getSnapshot().originalUnackedIntents).toBe(0);
+});
+
+test('refused_ime_retains_recoverable_draft', async () => {
+  const editor = await mount();
+  preedit(editor.textarea, 'compositionstart');
+  preedit(editor.textarea, 'compositionupdate', '日本語');
+  fireEvent.input(editor.textarea, { inputType: 'insertCompositionText', isComposing: true,
+    target: { value: '日本語' } });
+  expect(editor.commands).toEqual([]);
+  preedit(editor.textarea, 'compositionend', '日本語');
+  await editor.acknowledge(0, 'refused');
+  expect(editor.commands.map((command) => command.kind)).toEqual(['replaceSelection']);
+  expect(editor.binding.admission.getSnapshot().compositionSlot).toBeNull();
+  const recovered = editor.queryByRole('textbox', { name: 'Recoverable document text' }) as HTMLTextAreaElement | null;
+  expect(recovered?.value).toBe('日本語');
+  expect(recovered?.readOnly).toBe(true);
+  expect(editor.textarea.value).toBe('');
+});
+
+test('synthetic_composition_payload_commits_and_recovers_through_paged_editor', async () => {
+  const editor = await mount();
+  fireEvent.compositionStart(editor.textarea);
+  fireEvent.compositionUpdate(editor.textarea, { data: 'あ' });
+  expect(editor.textarea.value).toBe('');
+  expect(document.querySelector('[data-docx-composition]')?.textContent).toBe('あ');
+  fireEvent.compositionEnd(editor.textarea, { data: 'あ' });
+  expect(document.querySelector('[data-docx-composition]')).toBeNull();
+  beforeinput(editor.textarea, 'insertFromComposition', 'あ');
+  fireEvent.input(editor.textarea, { inputType: 'insertFromComposition', target: { value: 'あ' } });
+  await waitFor(() => { expect(editor.commands).toHaveLength(1); });
+  expect(editor.commands[0]!.kind).toBe('replaceSelection');
+  expect(editor.commands[0]!.payload).toEqual({ text: 'あ', selection: {
+    anchor: { story: 'body', paraId: 'worker', offset: 0 },
+    focus: { story: 'body', paraId: 'worker', offset: 0 },
+  } });
+  await editor.acknowledge(0, 'refused');
+  expect((editor.getByRole('textbox', { name: 'Recoverable document text' }) as HTMLTextAreaElement).value).toBe('あ');
+  beforeinput(editor.textarea, 'insertText', 'あ');
+  fireEvent.input(editor.textarea, { inputType: 'insertText', target: { value: 'あ' } });
+  await waitFor(() => { expect(editor.commands).toHaveLength(2); });
+  expect(editor.commands[1]!.kind).toBe('insertText');
+});
+
+test('delayed_composition_refusal_retains_draft_without_exposing_active_preedit_overlays', async () => {
+  const editor = await mount(true);
+  preedit(editor.textarea, 'compositionstart');
+  preedit(editor.textarea, 'compositionupdate', '先');
+  preedit(editor.textarea, 'compositionend', '先');
+  await waitFor(() => { expect(editor.commands).toHaveLength(1); });
+  preedit(editor.textarea, 'compositionstart');
+  preedit(editor.textarea, 'compositionupdate', '未確定');
+  fireEvent.input(editor.textarea, { inputType: 'insertCompositionText', isComposing: true,
+    target: { value: '未確定' } });
+  expect(editor.container.querySelectorAll('[aria-hidden="true"]:not([data-docx-composition])')).toHaveLength(0);
+  await editor.acknowledge(0, 'refused');
+  expect((editor.getByRole('textbox', { name: 'Recoverable document text' }) as HTMLTextAreaElement).value).toBe('先');
+  editor.present(frame(2, editor.commands[0]!.seq));
+  expect(editor.binding.viewStore.getSnapshot().geometry?.frameEpoch).toBe(2);
+  expect(editor.binding.admission.getSnapshot().compositionSlot).not.toBeNull();
+  expect(editor.textarea.value).toBe('未確定');
+  expect(editor.commands).toHaveLength(1);
+  expect(editor.container.querySelectorAll('[aria-hidden="true"]:not([data-docx-composition])')).toHaveLength(0);
+});
+
+test('recoverable_drafts_remain_until_individually_dismissed', async () => {
+  const editor = await mount();
+  for (const [index, text] of ['先', '後'].entries()) {
+    preedit(editor.textarea, 'compositionstart');
+    preedit(editor.textarea, 'compositionupdate', text);
+    preedit(editor.textarea, 'compositionend', text);
+    await editor.acknowledge(index, 'refused');
+  }
+  const drafts = () => editor.queryAllByRole('textbox', { name: 'Recoverable document text' })
+    .map((draft) => (draft as HTMLTextAreaElement).value);
+  expect(drafts()).toEqual(['先', '後']);
+  expect(editor.queryAllByRole('button', { name: 'Dismiss draft' })).toHaveLength(2);
+  fireEvent.click(editor.getAllByRole('button', { name: 'Dismiss draft' })[0]!);
+  expect(drafts()).toEqual(['後']);
+  preedit(editor.textarea, 'compositionstart');
+  preedit(editor.textarea, 'compositionupdate', '新');
+  preedit(editor.textarea, 'compositionend', '新');
+  await editor.acknowledge(2, 'refused');
+  expect(drafts()).toEqual(['後', '新']);
+  fireEvent.click(editor.getAllByRole('button', { name: 'Dismiss draft' })[1]!);
+  expect(drafts()).toEqual(['後']);
+  fireEvent.click(editor.getByRole('button', { name: 'Dismiss draft' }));
+  expect(drafts()).toEqual([]);
+  expect(editor.commands).toHaveLength(3);
+});
+
+test('composition_commits_as_one_replace_selection_through_paged_editor', async () => {
+  const begin = spyOn(composition, 'beginComposition');
+  const update = spyOn(composition, 'updateComposition');
+  const end = spyOn(composition, 'endComposition');
+  restorers.push(() => begin.mockRestore(), () => update.mockRestore(), () => end.mockRestore());
+  const editor = await mount();
+  beforeinput(editor.textarea, 'insertText', 'x');
+  preedit(editor.textarea, 'compositionstart');
+  preedit(editor.textarea, 'compositionupdate', 'に');
+  preedit(editor.textarea, 'compositionupdate', '日本語');
+  fireEvent.input(editor.textarea, { inputType: 'insertCompositionText', isComposing: true,
+    target: { value: '日本語' } });
+  await waitFor(() => { expect(editor.commands).toHaveLength(1); });
+  preedit(editor.textarea, 'compositionend', '日本語');
+  beforeinput(editor.textarea, 'insertFromComposition', '日本語');
+  fireEvent.input(editor.textarea, { inputType: 'insertFromComposition', target: { value: '日本語' } });
+  fireEvent.blur(editor.textarea);
+  await waitFor(() => { expect(editor.commands).toHaveLength(2); });
+  expect(editor.commands.map((command) => command.kind)).toEqual(['insertText', 'replaceSelection']);
+  expect(editor.commands[1]!.payload).toEqual({ text: '日本語' });
+  expect(editor.commands[1]!.afterSeq).toBe(editor.commands[0]!.seq);
+  expect(begin).toHaveBeenCalledTimes(1);
+  expect(update).toHaveBeenCalled();
+  expect(end).toHaveBeenCalledTimes(1);
+  await editor.acknowledge(0, 'applied');
+  await editor.acknowledge(1, 'applied');
+  expect(editor.queryByRole('textbox', { name: 'Recoverable document text' })).toBeNull();
+});
+
+test('worker_frame_installs_through_frame_presentation_and_retires_echo', async () => {
+  const editor = await mount();
+  const reconcile = spyOn(editor.binding.echoPainter, 'reconcile');
+  restorers.push(() => reconcile.mockRestore());
+  beforeinput(editor.textarea, 'insertText', 'x');
+  const ticket = editor.binding.admission.getSnapshot().tail!;
+  expect(editor.events).toContain('echo:x');
+  await editor.acknowledge(0, 'applied');
+  expect(reconcile).not.toHaveBeenCalled();
+  expect(editor.binding.viewStore.getSnapshot().presentedThroughSeq).toBe(0);
+  preedit(editor.textarea, 'compositionstart');
+  preedit(editor.textarea, 'compositionupdate', '未確定');
+  fireEvent.input(editor.textarea, { inputType: 'insertCompositionText', isComposing: true,
+    target: { value: '未確定' } });
+  const candidate = frame(2, ticket.seq!, 'x');
+  editor.events.length = 0;
+  editor.present(candidate);
+  expect(editor.events[0]).toBe('pixels');
+  expect(reconcile).toHaveBeenCalledTimes(1);
+  expect(reconcile.mock.calls[0]![0]).toBe(candidate);
+  expect(reconcile.mock.calls[0]![1].map((entry) => entry.ticket)).toEqual([ticket]);
+  expect(reconcile.mock.calls[0]![2]).toEqual([]);
+  expect(await ticket.presented).toBe('presented');
+  expect(editor.binding.viewStore.getSnapshot().geometry?.frameEpoch).toBe(2);
+  expect(editor.container.querySelector('[data-page-id="1"] canvas')).toBe(editor.canvas);
+  expect(editor.textarea.value).toBe('未確定');
+  expect(editor.commands).toHaveLength(1);
+  expect(editor.container.querySelectorAll('[aria-hidden="true"]:not([data-docx-composition])')).toHaveLength(0);
+});
+
+test('worker caret blinks on the hybrid interval only while the input is focused', async () => {
+  const editor = await mount(false, false, false, undefined, (revision) => revision * 10);
+  jest.useFakeTimers();
+  restorers.push(() => jest.useRealTimers());
+  const caret = () => {
+    const overlays = editor.container.querySelectorAll<HTMLElement>('[aria-hidden="true"]');
+    expect(overlays).toHaveLength(1);
+    return overlays[0]!.style;
+  };
+  const tick = (ms: number) => act(() => { jest.advanceTimersByTime(ms); });
+  expect(caret().opacity).toBe('0');
+  act(() => { editor.textarea.focus(); });
+  expect(caret().opacity).toBe('1');
+  tick(529);
+  expect(caret().opacity).toBe('1');
+  tick(1);
+  expect(caret().opacity).toBe('0');
+  tick(530);
+  expect(caret().opacity).toBe('1');
+  tick(530);
+  expect(caret().opacity).toBe('0');
+  editor.present(frame(2, 0));
+  expect(caretAt(caret())?.left).toBe('20px');
+  expect([caret().left, caret().top, caret().willChange]).toEqual(['0px', '0px', 'transform']);
+  expect(caret().opacity).toBe('1');
+  tick(529);
+  expect(caret().opacity).toBe('1');
+  tick(1);
+  expect(caret().opacity).toBe('0');
+  tick(530);
+  expect(caret().opacity).toBe('1');
+  act(() => { editor.textarea.blur(); });
+  expect(caret().opacity).toBe('0');
+  tick(530 * 3);
+  expect(caret().opacity).toBe('0');
+  act(() => { editor.textarea.focus(); });
+  expect(caret().opacity).toBe('1');
+});
+
+function pointerHost(container: HTMLElement) {
+  const host = container.querySelector<HTMLElement>('[data-docx-pages-host]')!;
+  const capture = mock(() => {});
+  const release = mock(() => {});
+  Object.defineProperties(host, {
+    getBoundingClientRect: { configurable: true, value: () => ({ x: 0, y: 0, left: 0, top: 0, right: 200, bottom: 40, width: 200, height: 40 }) },
+    setPointerCapture: { value: capture },
+    hasPointerCapture: { value: () => true },
+    releasePointerCapture: { value: release },
+  });
+  return { host, capture, release };
+}
+
+async function pictureEditor(floating = false, editable = true, selected = false, withDropPages = false, dropDirection?: 'rtl' | 'bidiLevel') {
+  const move = mock(() => {});
+  const resize = mock(() => {});
+  const state = { selected, editable, collaborative: false, nested: false, rotation: 0 };
+  const displayPage: DisplayPage = { pageIndex: 0, width: 200, height: 40, primitives: [] };
+  const nextDisplayPage: DisplayPage = { ...displayPage, pageIndex: 1, primitives: dropDirection ? [{
+    kind: 'text', text: 'שלום', x: 80, baselineY: 20, width: 40, font: '12px Arial', color: '#000', docStart: 10, docEnd: 20,
+    ...(dropDirection === 'rtl' ? { rtl: true } : { bidiLevel: 1 }),
+  }] : [] };
+  const box = (revision: number) => ({ pageId: '1', pageIndex: 0, x: revision * 10, y: 5, width: 40, height: 20 });
+  const editor = await mount(false, false, false, candidate => ({
+    identity, coversThroughSeq: candidate.coversThroughSeq, frameEpoch: candidate.revision,
+    layoutRevision: candidate.payload.layoutRevision, documentVersion: `v${candidate.revision}`,
+    pages: [{ page, bounds: { x: 30, y: 1200, width: 200, height: 40 }, transform: [1, 0, 0, 1, 30, 1200],
+      ...(withDropPages ? { displayPage } : {}) },
+    ...(withDropPages ? [{ page: { pageId: 'next', pageIndex: 1 }, bounds: { x: 30, y: 1300, width: 200, height: 40 },
+      transform: [1, 0, 0, 1, 30, 1300] as const, displayPage: nextDisplayPage }] : [])],
+    caret: null, selectionRects: [],
+    objects: { version: `v${candidate.revision}`, frameEpoch: candidate.revision, layoutRevision: candidate.payload.layoutRevision,
+      // An image-only paragraph also reports an empty-line marker rect: selection rects never decide the handles.
+      selection: state.selected ? [box(candidate.revision), { pageId: '1', pageIndex: 0, x: 0, y: 5, width: 4, height: 20 }] : [],
+      unbuiltPages: [], objects: [{ handle: 'sticky-image', kind: 'image', story: 'body', floating, nested: state.nested,
+        rotation: state.rotation, noChangeAspect: true, ...(state.selected ? { selected: true } : {}), rects: [box(candidate.revision)] }] },
+  }), undefined, { zoom: 2, pictures: { canMove: () => state.editable, canMoveInline: () => state.editable && !state.collaborative, move, resize } });
+  const { host, capture, release } = pointerHost(editor.container);
+  Object.defineProperty(host, 'getBoundingClientRect', { configurable: true, value: () => ({ left: 0, top: 0, width: 460, height: 2480 }) });
+  const point = { pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1, clientX: 100, clientY: 2420 };
+  const overlay = () => host.querySelector<HTMLElement>('.canvas-image-selection-overlay');
+  return { ...editor, host, capture, release, point, overlay, move, resize, state };
+}
+
+test('collaborative inline picture presses select without arming a drag', async () => {
+  const native = {} as display.RustDisplayListQueryEngine;
+  const getLoaded = spyOn(display, 'loadedRustDisplayListQueryEngine').mockReturnValue(native);
+  const hitTest = mock(() => ({ region: 'body', pos: 12 }));
+  const queries = spyOn(display, 'createDisplayListQueries').mockReturnValue({ hitTestRegions: hitTest,
+    caretRect: () => ({ pageIndex: 0, x: 80, y: 6, width: 0, height: 18 }),
+    rangeRectsOnPages: () => [{ pageIndex: 0, x: 80, y: 6, width: 10, height: 18 }], dispose() {},
+  } as unknown as display.DisplayListQueries);
+  restorers.push(() => getLoaded.mockRestore(), () => queries.mockRestore());
+  const editor = await pictureEditor(false, true, false, true);
+  editor.state.collaborative = true;
+  fireEvent.pointerDown(editor.host, editor.point);
+  await waitFor(() => expect(editor.commands[0]?.kind).toBe('selectPoint'));
+  await editor.acknowledge(0, 'noop');
+  await waitFor(() => expect(editor.commands[1]?.kind).toBe('select'));
+  fireEvent.pointerMove(editor.host, { ...editor.point, clientX: 260, clientY: 2630 });
+  expect(editor.host.querySelector('.paged-editor__picture-drop-caret') === null).toBe(true);
+  fireEvent.pointerUp(editor.host, { ...editor.point, buttons: 0 });
+  expect(editor.move).not.toHaveBeenCalled();
+});
+
+for (const end of ['drop', 'escape', 'escape-no-hit', 'cancel', 'lost-capture', 'no-hit', 'click', 'read-only'] as const) {
+  test(`inline picture drag uses a current cross-page drop caret and handles ${end}`, async () => {
+    const native = {} as display.RustDisplayListQueryEngine;
+    const hitTestRegions = mock((): display.DisplayListRegionHit | null => ({ region: 'body', pos: 12 }));
+    const getLoaded = spyOn(display, 'loadedRustDisplayListQueryEngine').mockReturnValue(native);
+    const queries = spyOn(display, 'createDisplayListQueries').mockReturnValue({ hitTestRegions,
+      caretRect: () => ({ pageIndex: 0, x: 80, y: 6, width: 0, height: 18 }),
+      rangeRectsOnPages: () => [{ pageIndex: 0, x: 80, y: 6, width: 10, height: 18 }], dispose() {},
+    } as unknown as display.DisplayListQueries);
+    restorers.push(() => getLoaded.mockRestore(), () => queries.mockRestore());
+    const editor = await pictureEditor(false, true, false, true);
+    fireEvent.pointerDown(editor.host, editor.point);
+    expect(editor.capture).toHaveBeenCalledWith(1);
+    editor.present(frame(7, 0));
+    const target = end === 'click' ? editor.point : { ...editor.point, clientX: 260, clientY: 2630 };
+    fireEvent.pointerMove(editor.host, target);
+    const caret = () => editor.host.querySelector<HTMLElement>('.paged-editor__picture-drop-caret');
+    expect(editor.host.querySelector('.paged-editor__picture-drag-preview')).toBeNull();
+    if (end === 'click') expect(caret()).toBeNull();
+    else {
+      expect(caret()?.style.left).toBe('110px');
+      expect(caret()?.style.top).toBe('1306px');
+      expect(caret()?.style.height).toBe('18px');
+    }
+    if (end === 'no-hit' || end === 'escape-no-hit') {
+      hitTestRegions.mockReturnValue(null);
+      fireEvent.pointerMove(editor.host, target);
+      expect(caret()).toBeNull();
+    }
+    if (end === 'escape' || end === 'escape-no-hit') {
+      fireEvent.keyDown(document, { key: 'Escape' });
+      expect(caret()).toBeNull();
+      expect(editor.release).toHaveBeenCalledWith(1);
+      hitTestRegions.mockReturnValue({ region: 'body', pos: 12 });
+      fireEvent.pointerMove(editor.host, { ...target, clientX: 280 });
+    }
+    if (end === 'cancel') fireEvent.pointerCancel(editor.host, target);
+    if (end === 'lost-capture') fireEvent.lostPointerCapture(editor.host, target);
+    if (end === 'read-only') editor.state.editable = false;
+    if (end === 'drop') editor.present(frame(8, 0));
+    fireEvent.pointerUp(editor.host, { ...target, buttons: 0 });
+    expect(caret()).toBeNull();
+    expect(editor.commands.map(command => command.kind)).not.toContain('extendSelection');
+    if (end === 'drop') {
+      expect(hitTestRegions).toHaveBeenLastCalledWith(1, 100, 15);
+      expect(editor.move).toHaveBeenCalledWith({ kind: 'moveEmbed', payload: {
+        handle: 'sticky-image', expectVersion: 'v1', drop: {
+          page: { pageId: 'next', pageIndex: 1 }, x: 100, y: 15, frameEpoch: 8, layoutRevision: 8,
+          clickCount: 1, modifiers: { shift: false, alt: false, ctrl: false, meta: false },
+        },
+      } });
+    } else expect(editor.move).not.toHaveBeenCalled();
+  });
+}
+
+for (const direction of ['rtl', 'bidiLevel'] as const) {
+  test(`an inline picture drop into ${direction} text reaches the worker without a provisional caret`, async () => {
+    const native = {} as display.RustDisplayListQueryEngine;
+    const hitTestRegions = mock((): display.DisplayListRegionHit | null => ({ region: 'body', pos: 12 }));
+    const getLoaded = spyOn(display, 'loadedRustDisplayListQueryEngine').mockReturnValue(native);
+    const queries = spyOn(display, 'createDisplayListQueries').mockReturnValue({ hitTestRegions,
+      caretRect: () => ({ pageIndex: 0, x: 80, y: 6, width: 0, height: 18 }),
+      rangeRectsOnPages: () => [{ pageIndex: 1, x: 80, y: 6, width: 10, height: 18 }], dispose() {},
+    } as unknown as display.DisplayListQueries);
+    restorers.push(() => getLoaded.mockRestore(), () => queries.mockRestore());
+    const editor = await pictureEditor(false, true, false, true, direction);
+    fireEvent.pointerDown(editor.host, editor.point);
+    editor.present(frame(7, 0));
+    const target = { ...editor.point, clientX: 260, clientY: 2630 };
+    fireEvent.pointerMove(editor.host, target);
+    expect(editor.host.querySelector('.paged-editor__picture-drop-caret')).toBeNull();
+    fireEvent.pointerUp(editor.host, { ...target, buttons: 0 });
+    expect(hitTestRegions).toHaveBeenLastCalledWith(1, 100, 15);
+    expect(editor.move).toHaveBeenCalledWith({ kind: 'moveEmbed', payload: {
+      handle: 'sticky-image', expectVersion: 'v1', drop: {
+        page: { pageId: 'next', pageIndex: 1 }, x: 100, y: 15, frameEpoch: 7, layoutRevision: 7,
+        clickCount: 1, modifiers: { shift: false, alt: false, ctrl: false, meta: false },
+      },
+    } });
+  });
+}
+
+test('a picture press places the caret, then selects the picture by handle, and the handles follow the worker selection', async () => {
+  const editor = await pictureEditor();
+  fireEvent.pointerDown(editor.host, editor.point);
+  // The picture selection is fenced behind the caret placement.
+  await waitFor(() => expect(editor.commands[0]?.kind).toBe('selectPoint'));
+  const fenced = editor.commands.length < 2;
+  if (fenced) await editor.acknowledge(0, 'noop');
+  await waitFor(() => expect(editor.commands.map(({ kind }) => kind)).toEqual(['selectPoint', 'select']));
+  expect(editor.commands[1]!.payload).toEqual({ object: { handle: 'sticky-image', expectVersion: 'v1' } });
+  expect(editor.overlay()).toBeNull();
+  if (!fenced) await editor.acknowledge(0, 'noop');
+  await editor.acknowledge(1, 'noop');
+  editor.state.selected = true;
+  editor.present(frame(2, editor.commands[1]!.seq));
+  await waitFor(() => expect(editor.overlay()?.querySelectorAll('[data-handle]').length).toBe(8));
+  expect(editor.overlay()?.style.left).toBe('50px');
+  expect(editor.overlay()?.style.top).toBe('1205px');
+  editor.state.selected = false;
+  editor.present(frame(3, editor.commands[1]!.seq));
+  await waitFor(() => expect(editor.overlay()).toBeNull());
+});
+
+test('a Shift press on a picture extends the selection through the ordinary path', async () => {
+  const editor = await pictureEditor();
+  fireEvent.pointerDown(editor.host, { ...editor.point, shiftKey: true });
+  await waitFor(() => expect(editor.commands.length).toBeGreaterThan(0));
+  expect(editor.commands.map(({ kind }) => kind)).not.toContain('select');
+  expect(editor.commands[0]!.payload).toMatchObject({ modifiers: { shift: true } });
+  fireEvent.pointerMove(editor.host, { ...editor.point, shiftKey: true, clientX: 140 });
+  await waitFor(() => expect(editor.commands.at(-1)?.kind).toBe('extendSelection'));
+  expect(editor.commands.map(({ kind }) => kind)).not.toContain('select');
+  expect(editor.move).not.toHaveBeenCalled();
+});
+
+test('Escape typed in the editor on a selected picture puts the caret after it, and Escape elsewhere is left alone', async () => {
+  const editor = await pictureEditor(false, true, true);
+  await waitFor(() => expect(editor.overlay()).not.toBeNull());
+  fireEvent.keyDown(document, { key: 'Escape' });
+  expect(editor.commands).toHaveLength(0);
+  fireEvent.keyDown(editor.textarea, { key: 'Escape' });
+  await waitFor(() => expect(editor.commands.map(({ kind }) => kind)).toEqual(['navigate']));
+  expect(editor.commands[0]!.payload).toEqual({ unit: 'character', direction: 'forward', extend: false });
+});
+
+test('Escape typed in the editor before a picture press is selected still leaves the picture', async () => {
+  const editor = await pictureEditor();
+  fireEvent.pointerDown(editor.host, editor.point);
+  fireEvent.pointerUp(editor.host, editor.point);
+  fireEvent.keyDown(editor.textarea, { key: 'Escape' });
+  await waitFor(() => expect(editor.commands[0]?.kind).toBe('selectPoint'));
+  const fenced = editor.commands.length < 2;
+  if (fenced) await editor.acknowledge(0, 'noop');
+  await waitFor(() => expect(editor.commands.slice(0, 2).map(({ kind }) => kind)).toEqual(['selectPoint', 'select']));
+  expect(editor.overlay()).toBeNull();
+  if (!fenced) await editor.acknowledge(0, 'noop');
+  await editor.acknowledge(1, 'noop');
+  await waitFor(() => expect(editor.commands.map(({ kind }) => kind)).toEqual(['selectPoint', 'select', 'navigate']));
+  expect(editor.commands[2]!.payload).toEqual({ unit: 'character', direction: 'forward', extend: false });
+});
+
+for (const end of ['drop', 'escape', 'cancel', 'lost-capture'] as const) {
+  test(`picture handle captures only a resize and handles ${end}`, async () => {
+    const editor = await pictureEditor(true, true, true);
+    await waitFor(() => expect(editor.overlay()).not.toBeNull());
+    const handle = editor.overlay()!.querySelector<HTMLDivElement>('[data-handle="nw"]')!;
+    const capture = mock(() => {});
+    Object.defineProperties(handle, { setPointerCapture: { value: capture }, hasPointerCapture: { value: () => true }, releasePointerCapture: { value: mock(() => {}) } });
+    fireEvent.pointerDown(handle, editor.point);
+    expect(capture).toHaveBeenCalledWith(1);
+    fireEvent.pointerMove(handle, { ...editor.point, clientX: 80, clientY: 2416 });
+    const preview = editor.host.querySelector<HTMLElement>('.paged-editor__picture-resize-preview');
+    expect(preview?.style.left).toBe('30px');
+    expect(preview?.style.top).toBe('1200px');
+    expect(preview?.style.width).toBe('50px');
+    expect(preview?.style.height).toBe('25px');
+    expect(editor.host.querySelector('.paged-editor__picture-drag-preview')).toBeNull();
+    if (end === 'escape') fireEvent.keyDown(document, { key: 'Escape' });
+    if (end === 'cancel') fireEvent.pointerCancel(handle, editor.point);
+    if (end === 'lost-capture') fireEvent.lostPointerCapture(handle, editor.point);
+    fireEvent.pointerUp(handle, { ...editor.point, clientX: 80, clientY: 2416, buttons: 0 });
+    expect(editor.host.querySelector('.paged-editor__picture-resize-preview')).toBeNull();
+    expect(editor.move).not.toHaveBeenCalled();
+    expect(editor.commands).toHaveLength(0);
+    if (end === 'drop') expect(editor.resize).toHaveBeenCalledWith({ kind: 'resizeObject', payload: {
+      handle: 'sticky-image', expectVersion: 'v1', widthEmu: 50 * 9525, heightEmu: 25 * 9525, hOffsetEmu: 0, vOffsetEmu: 0,
+    } });
+    else expect(editor.resize).not.toHaveBeenCalled();
+  });
+}
+
+for (const change of ['scroll', 'ancestor zoom'] as const) {
+  test(`picture resize tracks current page coordinates after ${change}`, async () => {
+    const editor = await pictureEditor(true, true, true);
+    await waitFor(() => expect(editor.overlay()).not.toBeNull());
+    let top = 0;
+    let scale = 2;
+    Object.defineProperty(editor.host, 'getBoundingClientRect', { value: () => ({ left: 0, top, width: 230 * scale, height: 1240 * scale }) });
+    const handle = editor.overlay()!.querySelector<HTMLDivElement>('[data-handle="se"]')!;
+    Object.defineProperties(handle, { setPointerCapture: { value() {} }, hasPointerCapture: { value: () => true }, releasePointerCapture: { value() {} } });
+    const start = { ...editor.point, clientX: 160, clientY: 2450 };
+    fireEvent.pointerDown(handle, start);
+    if (change === 'scroll') top = -100;
+    else scale = 3;
+    const end = { ...start, clientX: 100 * scale, clientY: top + 1235 * scale };
+    fireEvent.pointerMove(handle, end);
+    const preview = editor.host.querySelector<HTMLElement>('.paged-editor__picture-resize-preview');
+    expect(preview?.style.width).toBe('60px');
+    expect(preview?.style.height).toBe('30px');
+    fireEvent.pointerUp(handle, { ...end, buttons: 0 });
+    expect(editor.resize).toHaveBeenCalledWith({ kind: 'resizeObject', payload: {
+      handle: 'sticky-image', expectVersion: 'v1', widthEmu: 60 * 9525, heightEmu: 30 * 9525,
+    } });
+  });
+}
+
+test('a selected nested picture has no handles and keeps the ordinary selection path', async () => {
+  const editor = await pictureEditor(true, true, true);
+  editor.state.nested = true;
+  editor.present(frame(2, 0));
+  await waitFor(() => expect(editor.overlay()).toBeNull());
+  fireEvent.pointerDown(editor.host, editor.point);
+  await waitFor(() => expect(editor.commands[0]?.kind).toBe('selectPoint'));
+  fireEvent.pointerMove(editor.host, { ...editor.point, clientX: 120 });
+  fireEvent.pointerUp(editor.host, { ...editor.point, clientX: 120, buttons: 0 });
+  expect(editor.commands.map(({ kind }) => kind)).not.toContain('select');
+  expect(editor.move).not.toHaveBeenCalled();
+  expect(editor.resize).not.toHaveBeenCalled();
+});
+
+test('a resize rechecks editing permission immediately before drop', async () => {
+  const editor = await pictureEditor(true, true, true);
+  await waitFor(() => expect(editor.overlay()).not.toBeNull());
+  const handle = editor.overlay()!.querySelector<HTMLDivElement>('[data-handle="e"]')!;
+  Object.defineProperties(handle, { setPointerCapture: { value() {} }, hasPointerCapture: { value: () => true }, releasePointerCapture: { value() {} } });
+  fireEvent.pointerDown(handle, editor.point);
+  fireEvent.pointerMove(handle, { ...editor.point, clientX: 140 });
+  editor.state.editable = false;
+  fireEvent.pointerUp(handle, { ...editor.point, clientX: 140, buttons: 0 });
+  expect(editor.resize).not.toHaveBeenCalled();
+});
+
+test('a selected floating picture body still drags', async () => {
+  const editor = await pictureEditor(true, true, true);
+  await waitFor(() => expect(editor.overlay()).not.toBeNull());
+  fireEvent.pointerDown(editor.host, editor.point);
+  fireEvent.pointerMove(editor.host, { ...editor.point, clientX: 120 });
+  fireEvent.pointerUp(editor.host, { ...editor.point, clientX: 120, buttons: 0 });
+  expect(editor.move).toHaveBeenCalledWith({ kind: 'moveObject', payload: {
+    handle: 'sticky-image', expectVersion: 'v1', hOffsetEmu: 20 * 9525, vOffsetEmu: 5 * 9525,
+  } });
+  expect(editor.resize).not.toHaveBeenCalled();
+});
+
+test('read-only picture presses do not show resize handles', async () => {
+  const editor = await pictureEditor(false, false);
+  fireEvent.pointerDown(editor.host, editor.point);
+  expect(editor.overlay()).toBeNull();
+});
+
+async function provisionalEditor(region: display.DisplayListRegionHit['region'] = 'body', loaded = true) {
+  const native = {} as display.RustDisplayListQueryEngine;
+  const hitTestRegions = mock(() => ({ region, pos: 12 }));
+  const caretRect = mock(() => ({ pageIndex: 0, x: 47, y: 6, width: 0, height: 18 }));
+  const dispose = mock(() => {});
+  const getLoaded = spyOn(display, 'loadedRustDisplayListQueryEngine').mockReturnValue(loaded ? native : null);
+  let resolveEngine!: (engine: display.RustDisplayListQueryEngine) => void;
+  const loading = new Promise<display.RustDisplayListQueryEngine>((resolve) => { resolveEngine = resolve; });
+  const load = spyOn(display, 'loadRustDisplayListQueryEngine').mockReturnValue(loading);
+  const queries = spyOn(display, 'createDisplayListQueries').mockReturnValue({ hitTestRegions, caretRect, dispose } as unknown as display.DisplayListQueries);
+  restorers.push(() => getLoaded.mockRestore(), () => load.mockRestore(), () => queries.mockRestore());
+  const displayPage: DisplayPage = { pageIndex: 0, width: 200, height: 40, primitives: [] };
+  const editor = await mount(false, false, false, candidate => ({
+    identity, coversThroughSeq: candidate.coversThroughSeq, frameEpoch: candidate.revision,
+    layoutRevision: candidate.payload.layoutRevision,
+    pages: [{ page, bounds: { x: 30, y: 1200, width: 200, height: 40 },
+      transform: [1, 0, 0, 1, 30, 1200], displayPage }],
+    caret: { x: 95, y: 1208, width: 1, height: 21 }, selectionRects: [],
+  }), undefined, { zoom: 2 });
+  const { host } = pointerHost(editor.container);
+  const point = { pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1,
+    detail: 1, clientX: 160, clientY: 2420 };
+  const caret = () => host.querySelector<HTMLElement>('[aria-hidden="true"]');
+  return { ...editor, host, point, caret, hitTestRegions, caretRect, queries, dispose, load, native, displayPage,
+    async finishEngineLoad() {
+      await act(async () => {
+        getLoaded.mockReturnValue(native);
+        resolveEngine(native);
+        await loading;
+      });
+    },
+  };
+}
+
+test('mount requests the query engine before input and the first click uses it after loading', async () => {
+  const editor = await provisionalEditor('body', false);
+  expect(editor.load).toHaveBeenCalledTimes(1);
+  expect(editor.commands).toHaveLength(0);
+  expect(editor.queries).not.toHaveBeenCalled();
+  await editor.finishEngineLoad();
+  fireEvent.pointerDown(editor.host, editor.point);
+  expect(caretAt(editor.caret())?.left).toBe('77px');
+  expect(caretAt(editor.caret())?.top).toBe('1206px');
+  expect(editor.queries).toHaveBeenCalledWith({ pages: [editor.displayPage] }, editor.native);
+  expect(editor.load).toHaveBeenCalledTimes(1);
+});
+
+test('a cross-paragraph click ack updates toolbar and formatting before its frame', async () => {
+  const editor = await provisionalEditor();
+  const before = editor.binding.viewStore.getSnapshot();
+  const at = { story: 'body', paraId: 'another-paragraph', offset: 2 };
+  const editState: NonNullable<DocxCommandAck['editState']> = {
+    ...before.editState!,
+    toolbar: {
+      paraId: at.paraId, bold: true, italic: false, underline: false, strike: false, superscript: false, subscript: false,
+      fontFamily: 'Arial', fontSize: 24, color: null, highlight: null, styleId: null, alignment: null,
+      paragraphProperties: {}, hasSelection: false, isMultiParagraph: false, inTable: false,
+      isSingleEmbed: false, embedKind: null, isImage: false, inInsertion: false, inDeletion: false,
+    },
+    effectiveFormatting: {
+      bold: true, italic: false, underline: false, strike: false, superscript: false, subscript: false,
+      fontFamily: 'Arial', fontSizePt: 12, color: null, highlight: null, styleId: null, alignment: null,
+    },
+  };
+  fireEvent.pointerDown(editor.host, editor.point);
+  await editor.acknowledge(0, 'noop', { version: 0, selection: { anchor: at, focus: at }, editState });
+  const after = editor.binding.viewStore.getSnapshot();
+  expect(after.workerSelection?.focus).toEqual(at);
+  expect(after.editState).toEqual(editState);
+  expect(after.version).toBe(before.version);
+  expect(after.presentedThroughSeq).toBe(before.presentedThroughSeq);
+  expect(after.geometry).toBe(before.geometry);
+  expect(after.provisionalCaret).not.toBeNull();
+});
+
+for (const detail of [0, 1]) {
+  test(`pointerdown detail ${detail} paints a provisional caret synchronously at the presented body hit rect`, async () => {
+    const editor = await provisionalEditor();
+    const before = editor.binding.viewStore.getSnapshot();
+    fireEvent.pointerDown(editor.host, { ...editor.point, detail });
+    expect(caretAt(editor.caret())?.left).toBe('77px');
+    expect(caretAt(editor.caret())?.top).toBe('1206px');
+    expect(editor.caret()?.style.height).toBe('18px');
+    expect(editor.caret()?.style.opacity).toBe('1');
+    expect(editor.binding.viewStore.getSnapshot().geometry).toBe(before.geometry);
+    expect(editor.binding.viewStore.getSnapshot().workerSelection).toEqual(before.workerSelection);
+    expect(editor.queries).toHaveBeenCalledWith({ pages: [editor.displayPage] }, editor.native);
+    expect(editor.hitTestRegions).toHaveBeenCalledWith(0, 50, 10);
+    expect(editor.caretRect).toHaveBeenCalledWith(12);
+    expect(editor.dispose).not.toHaveBeenCalled();
+    expect(editor.load).not.toHaveBeenCalled();
+    await waitFor(() => expect(editor.commands).toHaveLength(1));
+    expect(editor.binding.viewStore.getSnapshot().provisionalCaret?.throughSeq).toBe(editor.commands[0]!.seq);
+    expect(editor.commands[0]).toMatchObject({ kind: 'selectPoint', payload: {
+      page, x: 50, y: 10, frameEpoch: 1, layoutRevision: 1, clickCount: 1,
+      modifiers: { shift: false, alt: false, ctrl: false, meta: false },
+    } });
+  });
+}
+
+test('repeated clicks on a presented page reuse its queries until unmount', async () => {
+  const editor = await provisionalEditor();
+  for (let click = 0; click < 8; click++) {
+    fireEvent.pointerDown(editor.host, { ...editor.point, clientX: 160 + click * 6 });
+    fireEvent.pointerUp(editor.host, { ...editor.point, clientX: 160 + click * 6, buttons: 0 });
+    await editor.acknowledge(click, 'noop', { version: 0 });
+    editor.present(frame(click + 2, editor.commands[click]!.seq));
+    await waitFor(() => expect(editor.binding.viewStore.getSnapshot().geometry?.frameEpoch).toBe(click + 2));
+  }
+  expect(editor.caretRect).toHaveBeenCalledTimes(8);
+  expect(editor.queries).toHaveBeenCalledTimes(1);
+  expect(editor.dispose).not.toHaveBeenCalled();
+  editor.unmount();
+  expect(editor.dispose).toHaveBeenCalledTimes(1);
+});
+
+test('consecutive detail-zero presses exclude double and triple clicks from the provisional caret', async () => {
+  const editor = await provisionalEditor();
+  let timeStamp = 100;
+  const press = () => {
+    const down = new PointerEvent('pointerdown', { ...editor.point, detail: 0, bubbles: true, cancelable: true });
+    Object.defineProperty(down, 'timeStamp', { value: timeStamp });
+    timeStamp += 100;
+    fireEvent(editor.host, down);
+    fireEvent.pointerUp(editor.host, { ...editor.point, detail: 0 });
+  };
+  press();
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).not.toBeNull();
+  await waitFor(() => expect(editor.commands).toHaveLength(1));
+  await editor.acknowledge(0, 'applied');
+  editor.present(frame(2, editor.commands[0]!.seq));
+  await waitFor(() => expect(editor.binding.viewStore.getSnapshot().geometry?.frameEpoch).toBe(2));
+  editor.caretRect.mockClear();
+  press();
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toBeNull();
+  expect(editor.caretRect).not.toHaveBeenCalled();
+  await waitFor(() => expect(editor.commands).toHaveLength(2));
+  expect(editor.commands[1]).toMatchObject({ payload: { clickCount: 2 } });
+  await editor.acknowledge(1, 'applied');
+  editor.present(frame(3, editor.commands[1]!.seq));
+  await waitFor(() => expect(editor.binding.viewStore.getSnapshot().geometry?.frameEpoch).toBe(3));
+  press();
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toBeNull();
+  expect(editor.caretRect).not.toHaveBeenCalled();
+  await waitFor(() => expect(editor.commands).toHaveLength(3));
+  expect(editor.commands[2]).toMatchObject({ payload: { clickCount: 3 } });
+});
+
+test('a covering frame replaces the provisional caret with its authoritative caret', async () => {
+  const editor = await provisionalEditor();
+  fireEvent.pointerDown(editor.host, editor.point);
+  expect(caretAt(editor.caret())?.left).toBe('77px');
+  await editor.acknowledge(0, 'applied', { version: 0 });
+  expect(caretAt(editor.caret())?.left).toBe('77px');
+  editor.present(frame(2, editor.commands[0]!.seq));
+  await waitFor(() => expect(caretAt(editor.caret())?.left).toBe('95px'));
+  expect(caretAt(editor.caret())?.top).toBe('1208px');
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toBeNull();
+});
+
+for (const excluded of ['shift-click', 'non-body hit', 'stale geometry', 'pending input', 'unloaded engine', 'double-click', 'triple-click', 'nonprimary press', 'secondary button', 'read-only', 'composition', 'modified click']) {
+  test(`provisional caret does not engage for ${excluded}`, async () => {
+    const editor = await provisionalEditor(excluded === 'non-body hit' ? 'header' : 'body', excluded !== 'unloaded engine');
+    const queryCount = editor.queries.mock.calls.length;
+    if (excluded === 'stale geometry') {
+      act(() => editor.binding.viewStore.acceptWorkerState(identity, {
+        epoch: 1, version: 1, throughSeq: 1, presentedThroughSeq: 0,
+        selection: undefined, editState: undefined,
+      }));
+    }
+    if (excluded === 'read-only') act(() => { editor.binding.admission.setReadOnly(true); });
+    if (excluded === 'composition') preedit(editor.textarea, 'compositionstart');
+    if (excluded === 'pending input') beforeinput(editor.textarea, 'insertText', 'x');
+    fireEvent.pointerDown(editor.host, { ...editor.point, shiftKey: excluded === 'shift-click',
+      isPrimary: excluded !== 'nonprimary press', button: excluded === 'secondary button' ? 2 : 0,
+      ctrlKey: excluded === 'modified click', detail: excluded === 'double-click' ? 2 : excluded === 'triple-click' ? 3 : 0 });
+    expect(editor.binding.viewStore.getSnapshot().provisionalCaret ?? null).toBeNull();
+    expect(caretAt(editor.caret())?.left).not.toBe('77px');
+    expect(editor.caretRect).not.toHaveBeenCalled();
+    if (excluded !== 'non-body hit') expect(editor.queries).toHaveBeenCalledTimes(queryCount);
+    expect(editor.load).toHaveBeenCalledTimes(excluded === 'unloaded engine' ? 1 : 0);
+  });
+}
+
+test('a navigate intent drops the provisional caret before another frame', async () => {
+  const editor = await provisionalEditor();
+  fireEvent.pointerDown(editor.host, editor.point);
+  expect(caretAt(editor.caret())?.left).toBe('77px');
+  await editor.acknowledge(0, 'applied');
+  fireEvent.keyDown(editor.textarea, { key: 'ArrowRight', code: 'ArrowRight' });
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toBeNull();
+  expect(editor.caret()).toBeNull();
+  await waitFor(() => expect(editor.commands[1]?.kind).toBe('navigate'));
+});
+
+test('composition start drops the provisional caret', async () => {
+  const editor = await provisionalEditor();
+  fireEvent.pointerDown(editor.host, editor.point);
+  expect(caretAt(editor.caret())?.left).toBe('77px');
+  preedit(editor.textarea, 'compositionstart');
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toBeNull();
+  expect(editor.caret()).toBeNull();
+});
+
+test('typing waits for the click frame before echo paints the predicted caret', async () => {
+  const editor = await provisionalEditor();
+  fireEvent.pointerDown(editor.host, editor.point);
+  expect(caretAt(editor.caret())?.left).toBe('77px');
+  beforeinput(editor.textarea, 'insertText', 'x');
+  expect(editor.events).not.toContain('echo:x');
+  expect(caretAt(editor.caret())?.left).toBe('77px');
+  await editor.acknowledge(0, 'applied');
+  await editor.acknowledge(1, 'applied');
+  const setCaret = spyOn(editor.binding.viewStore, 'setProvisionalCaret');
+  restorers.push(() => setCaret.mockRestore());
+  editor.present(frame(2, editor.commands[0]!.seq));
+  await waitFor(() => expect(editor.events).toContain('echo:x'));
+  const predicted = { source: 'echo' as const, throughSeq: editor.commands[1]!.seq, pageIndex: 0,
+    rect: { x: 40, y: 1200, width: 1, height: 40 } };
+  expect(setCaret).toHaveBeenCalledWith(predicted);
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toEqual(predicted);
+  expect(caretAt(editor.caret())?.left).toBe('40px');
+  expect(caretAt(editor.caret())?.top).toBe('1200px');
+});
+
+test('typing paints the predicted caret before any acknowledgement and holds it until covering geometry', async () => {
+  const editor = await mount(false, false, false, undefined, (revision) => revision === 1 ? 0 : 10);
+  const caret = () => editor.container.querySelector<HTMLElement>('[aria-hidden="true"]');
+  expect(caretAt(caret())?.left).toBe('0px');
+  beforeinput(editor.textarea, 'insertText', 'x');
+  expect(editor.events).toContain('echo:x');
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret?.source).toBe('echo');
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret?.rect).toEqual({ x: 10, y: 0, width: 1, height: 40 });
+  expect(caretAt(caret())?.left).toBe('10px');
+  await editor.acknowledge(0, 'applied');
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).not.toBeNull();
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret?.throughSeq).toBe(editor.commands[0]!.seq);
+  expect(caret()).not.toBeNull();
+  expect(caretAt(caret())?.left).toBe('10px');
+  editor.present(frame(2, editor.commands[0]!.seq, 'x'));
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toBeNull();
+  expect(caretAt(caret())?.left).toBe('10px');
+});
+
+test('typing a predicted key moves only the caret without republishing the editor snapshot', async () => {
+  const editor = await mount(false, false, false, undefined, () => 0);
+  const caret = () => editor.container.querySelector<HTMLElement>('[aria-hidden="true"]');
+  expect(caretAt(caret())?.left).toBe('0px');
+  let renders = 0;
+  const off = editor.binding.viewStore.subscribe(() => { renders += 1; });
+  try {
+    beforeinput(editor.textarea, 'insertText', 'x');
+    expect(editor.events).toContain('echo:x');
+    expect(editor.binding.viewStore.getSnapshot().provisionalCaret?.source).toBe('echo');
+    expect(caretAt(caret())?.left).toBe('10px');
+    expect(renders).toBe(0);
+  } finally { off(); }
+});
+
+test('an echo clear does not remove a click caret the painter did not publish', async () => {
+  const editor = await provisionalEditor();
+  fireEvent.pointerDown(editor.host, editor.point);
+  expect(caretAt(editor.caret())?.left).toBe('77px');
+  beforeinput(editor.textarea, 'insertText', 'x');
+  await editor.acknowledge(0, 'applied');
+  await editor.acknowledge(1, 'applied');
+  editor.present(frame(2, editor.commands[0]!.seq));
+  await waitFor(() => expect(editor.events).toContain('echo:x'));
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret?.source).toBe('echo');
+  let clickSeq = 999;
+  const click = { source: 'click' as const, get throughSeq() { return clickSeq; }, pageIndex: 0,
+    rect: { x: 77, y: 1206, width: 1, height: 18 } };
+  act(() => { editor.binding.viewStore.setProvisionalCaret(click); });
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toBe(click);
+  act(() => { editor.binding.echoPainter.disable('unsupported'); });
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret).toBe(click);
+  clickSeq = 1000;
+  expect(editor.binding.viewStore.getSnapshot().provisionalCaret?.throughSeq).toBe(1000);
+});
+
+test('touch presses allow native panning without selecting or focusing the input', async () => {
+  const editor = await mount();
+  const { host, capture } = pointerHost(editor.container);
+  const surface = editor.canvas.parentElement!;
+  expect(host.style.touchAction).toBe('pan-x pan-y');
+  expect(surface.style.touchAction).toBe('pan-x pan-y');
+  const down = new PointerEvent('pointerdown', { pointerId: 1, pointerType: 'touch', isPrimary: true,
+    button: 0, buttons: 1, clientX: 50, clientY: 10, bubbles: true, cancelable: true });
+  fireEvent(surface, down);
+  expect(down.defaultPrevented).toBe(false);
+  expect(capture).not.toHaveBeenCalled();
+  expect(editor.binding.admission.getSnapshot().originalUnackedIntents).toBe(0);
+  expect(document.activeElement).not.toBe(editor.textarea);
+});
+
+test('a touch tap places the caret on release and keeps the document input focused', async () => {
+  const editor = await mount();
+  const { host } = pointerHost(editor.container);
+  const point = { pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, clientX: 50, clientY: 10 };
+  fireEvent.pointerDown(host, { ...point, buttons: 1 });
+  expect(editor.binding.admission.getSnapshot().originalUnackedIntents).toBe(0);
+  fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 52 });
+  fireEvent.pointerUp(host, { ...point, clientX: 52 });
+  await waitFor(() => expect(editor.commands).toHaveLength(1));
+  expect(editor.commands[0]).toMatchObject({ kind: 'selectPoint', payload: { page, x: 52, y: 10, clickCount: 1 } });
+  const mouse = new MouseEvent('mousedown', { button: 0, bubbles: true, cancelable: true });
+  fireEvent(host, mouse);
+  expect(mouse.defaultPrevented).toBe(true);
+  expect(document.activeElement).toBe(editor.textarea);
+});
+
+for (const end of ['up', 'cancel', 'lost-capture'] as const) {
+  test(`a touch long press extends selection until pointer ${end}`, async () => {
+    const editor = await mount();
+    const { host, capture, release } = pointerHost(editor.container);
+    jest.useFakeTimers();
+    restorers.push(() => jest.useRealTimers());
+    const point = { pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, clientX: 50, clientY: 10 };
+    fireEvent.pointerDown(host, { ...point, buttons: 1 });
+    fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 57 });
+    act(() => { jest.advanceTimersByTime(499); });
+    expect(editor.binding.admission.getSnapshot().originalUnackedIntents).toBe(0);
+    expect(capture).not.toHaveBeenCalled();
+    expect(host.style.touchAction).toBe('pan-x pan-y');
+    act(() => { jest.advanceTimersByTime(1); });
+    expect(capture).toHaveBeenCalledWith(1);
+    expect(host.style.touchAction).toBe('none');
+    const move = new Event('touchmove', { bubbles: true, cancelable: true });
+    fireEvent(host, move);
+    expect(move.defaultPrevented).toBe(true);
+    fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 80 });
+    if (end === 'up') fireEvent.pointerUp(host, { ...point, clientX: 80 });
+    else if (end === 'cancel') fireEvent.pointerCancel(host, point);
+    else fireEvent.lostPointerCapture(host, point);
+    expect(release).toHaveBeenCalledWith(1);
+    expect(host.style.touchAction).toBe('pan-x pan-y');
+    fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 90 });
+    jest.useRealTimers();
+    await waitFor(() => expect(editor.commands).toHaveLength(2));
+    expect(editor.commands[0]).toMatchObject({ kind: 'selectPoint', payload: { page, x: 50, y: 10 } });
+    expect(editor.commands[1]).toMatchObject({ kind: 'extendSelection', payload: { page, x: 80, y: 10 } });
+  });
+}
+
+test('a touch long press keeps selecting when capture transfers from the canvas to the host', async () => {
+  const editor = await mount();
+  const { host, capture, release } = pointerHost(editor.container);
+  jest.useFakeTimers();
+  restorers.push(() => jest.useRealTimers());
+  const point = { pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, clientX: 50, clientY: 10 };
+  fireEvent.pointerDown(editor.canvas, { ...point, buttons: 1 });
+  act(() => { jest.advanceTimersByTime(500); });
+  expect(capture).toHaveBeenCalledWith(1);
+  fireEvent.lostPointerCapture(editor.canvas, { ...point, bubbles: true });
+  expect(release).not.toHaveBeenCalled();
+  expect(host.style.touchAction).toBe('none');
+  fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 80 });
+  fireEvent.pointerUp(host, { ...point, clientX: 80 });
+  expect(release).toHaveBeenCalledWith(1);
+  expect(host.style.touchAction).toBe('pan-x pan-y');
+  fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 90 });
+  jest.useRealTimers();
+  await waitFor(() => expect(editor.commands).toHaveLength(2));
+  expect(editor.commands[0]).toMatchObject({ kind: 'selectPoint', payload: { page, x: 50, y: 10 } });
+  expect(editor.commands[1]).toMatchObject({ kind: 'extendSelection', payload: { page, x: 80, y: 10 } });
+});
+
+test('a touch swipe cancels long press and keeps native scrolling', async () => {
+  const editor = await mount();
+  const { host, capture } = pointerHost(editor.container);
+  jest.useFakeTimers();
+  restorers.push(() => jest.useRealTimers());
+  const point = { pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, clientX: 50, clientY: 10 };
+  fireEvent.pointerDown(host, { ...point, buttons: 1 });
+  fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 80 });
+  act(() => { jest.advanceTimersByTime(500); });
+  const move = new Event('touchmove', { bubbles: true, cancelable: true });
+  fireEvent(host, move);
+  expect(move.defaultPrevented).toBe(false);
+  fireEvent.pointerUp(host, { ...point, clientX: 80 });
+  expect(capture).not.toHaveBeenCalled();
+  expect(host.style.touchAction).toBe('pan-x pan-y');
+  expect(editor.binding.admission.getSnapshot().originalUnackedIntents).toBe(0);
+  expect(editor.commands).toEqual([]);
+});
+
+test('touch taps seven pixels apart select a word then a paragraph', async () => {
+  const editor = await mount();
+  const { host } = pointerHost(editor.container);
+  for (const clientX of [50, 57, 64]) {
+    const point = { pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, clientX, clientY: 10 };
+    fireEvent.pointerDown(host, { ...point, buttons: 1 });
+    fireEvent.pointerUp(host, point);
+  }
+  await waitFor(() => expect(editor.commands).toHaveLength(3));
+  expect(editor.commands).toMatchObject([
+    { kind: 'selectPoint', payload: { clickCount: 1 } },
+    { kind: 'selectPoint', payload: { clickCount: 2 } },
+    { kind: 'selectPoint', payload: { clickCount: 3 } },
+  ]);
+});
+
+for (const end of ['move', 'release-away', 'cancel', 'lost-capture'] as const) {
+  test(`a touch ${end} does not place the caret or extend selection`, async () => {
+    const editor = await mount();
+    const { host } = pointerHost(editor.container);
+    const point = { pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, clientX: 50, clientY: 10 };
+    fireEvent.pointerDown(host, { ...point, buttons: 1 });
+    if (end === 'move') {
+      const move = new PointerEvent('pointermove', { ...point, buttons: 1, clientY: 30, bubbles: true, cancelable: true });
+      fireEvent(host, move);
+      expect(move.defaultPrevented).toBe(false);
+      fireEvent.pointerMove(host, { ...point, buttons: 1 });
+    } else if (end === 'cancel') fireEvent.pointerCancel(host, point);
+    else if (end === 'lost-capture') fireEvent.lostPointerCapture(host, point);
+    fireEvent.pointerUp(host, { ...point, clientY: end === 'release-away' ? 30 : 10 });
+    expect(editor.binding.admission.getSnapshot().originalUnackedIntents).toBe(0);
+    expect(editor.commands).toEqual([]);
+    expect(document.activeElement).not.toBe(editor.textarea);
+  });
+}
+
+for (const target of ['pages', 'outside']) {
+  test(`a second touch on ${target} cancels pending caret placement`, async () => {
+    const editor = await mount();
+    const { host } = pointerHost(editor.container);
+    const second = target === 'pages' ? host : document.body;
+    const point = { pointerType: 'touch', button: 0, clientX: 50, clientY: 10 };
+    fireEvent.pointerDown(host, { ...point, pointerId: 1, isPrimary: true, buttons: 1 });
+    fireEvent.pointerDown(second, { ...point, pointerId: 2, isPrimary: false, buttons: 1 });
+    fireEvent.pointerUp(second, { ...point, pointerId: 2, isPrimary: false });
+    fireEvent.pointerUp(host, { ...point, pointerId: 1, isPrimary: true });
+    expect(editor.binding.admission.getSnapshot().originalUnackedIntents).toBe(0);
+    expect(editor.commands).toEqual([]);
+    expect(document.activeElement).not.toBe(editor.textarea);
+  });
+}
+
+for (const pointerType of ['mouse', 'pen']) {
+  test(`${pointerType} dragging selects text and stops extending after release`, async () => {
+    const editor = await mount();
+    const { host, capture, release } = pointerHost(editor.container);
+    const point = { pointerId: 1, pointerType, isPrimary: true, button: 0, clientX: 50, clientY: 10 };
+    const down = new PointerEvent('pointerdown', { ...point, buttons: 1, bubbles: true, cancelable: true });
+    fireEvent(host, down);
+    expect(down.defaultPrevented).toBe(true);
+    expect(capture).toHaveBeenCalledWith(1);
+    fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 80 });
+    fireEvent.pointerUp(host, { ...point, clientX: 80 });
+    expect(release).toHaveBeenCalledWith(1);
+    fireEvent.pointerMove(host, { ...point, buttons: 1, clientX: 90 });
+    await waitFor(() => expect(editor.commands).toHaveLength(2));
+    expect(editor.commands[0]).toMatchObject({ kind: 'selectPoint', payload: { page, x: 50, y: 10 } });
+    expect(editor.commands[1]).toMatchObject({ kind: 'extendSelection', payload: { page, x: 80, y: 10 } });
+    expect(document.activeElement).toBe(editor.textarea);
+  });
+}
+
+for (const pointerType of ['mouse', 'touch']) {
+  test(`a ${pointerType} press outside the pages ends their click sequence`, async () => {
+    const counts: number[] = [];
+    const editor = await mount(false, false, false, undefined, undefined, {
+      onPartPoint: ({ clickCount }) => { counts.push(clickCount); return true; },
+      pageOverlays: <button type="button">Close header editing</button>,
+    });
+    const { host } = pointerHost(editor.container);
+    const press = (target: Element) => {
+      fireEvent.pointerDown(target, { pointerId: 1, pointerType, isPrimary: true, button: 0, clientX: 50, clientY: 10 });
+      fireEvent.pointerUp(target, { pointerId: 1, pointerType, isPrimary: true, button: 0, clientX: 50, clientY: 10 });
+    };
+    press(host);
+    press(host);
+    press(editor.getByRole('button', { name: 'Close header editing' }));
+    press(host);
+    press(host);
+    press(document.body);
+    press(host);
+    expect(counts).toEqual([1, 2, 1, 2, 1]);
+  });
+}
+
+test('a band press the part handler maps to the body selects that body point and focuses the input', async () => {
+  const points: number[] = [];
+  const editor = await mount(false, false, false, undefined, undefined, {
+    onPartPoint: ({ y }) => { points.push(y); return { bodyY: 30 }; },
+  });
+  const { host } = pointerHost(editor.container);
+  editor.textarea.blur();
+  fireEvent.pointerDown(host, { pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, clientX: 50, clientY: 10 });
+  expect(points).toEqual([10]);
+  await waitFor(() => expect(editor.commands).toHaveLength(1));
+  expect(editor.commands[0]).toMatchObject({ kind: 'selectPoint', payload: { page, x: 50, y: 30, clickCount: 1 } });
+  expect(document.activeElement).toBe(editor.textarea);
+});
+
+test('a band press the part handler consumes selects nothing', async () => {
+  const editor = await mount(false, false, false, undefined, undefined, { onPartPoint: () => true });
+  const { host } = pointerHost(editor.container);
+  editor.textarea.blur();
+  fireEvent.pointerDown(host, { pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, clientX: 50, clientY: 10 });
+  await act(async () => { await Promise.resolve(); });
+  expect(editor.commands).toHaveLength(0);
+  expect(document.activeElement).not.toBe(editor.textarea);
+});
+
+test('single_cell selection keeps the worker caret next to its highlight', async () => {
+  const editor = await mount(true, false, true);
+  await waitFor(() => expect(editor.container.querySelectorAll('[aria-hidden="true"]')).toHaveLength(2));
+});
+
+test('multi_cell selection hides the worker caret but keeps its highlight', async () => {
+  const editor = await mount(true, false, true, undefined, () => 10, {}, true);
+  await waitFor(() => expect(editor.container.querySelectorAll('[aria-hidden="true"]')).toHaveLength(1));
+});
+
+for (const change of ['scroll', 'ancestor zoom'] as const) {
+  test(`picture drag tracks current page coordinates after ${change}`, async () => {
+    const move = mock(() => {});
+    const editor = await mount(false, false, false, candidate => ({
+      identity, documentVersion: 'v1', coversThroughSeq: candidate.coversThroughSeq, frameEpoch: candidate.revision,
+      layoutRevision: candidate.payload.layoutRevision, caret: null, selectionRects: [],
+      pages: [{ page, bounds: { x: 0, y: 0, width: 200, height: 40 }, transform: [1, 0, 0, 1, 0, 0] }],
+      objects: { version: 'v1', frameEpoch: candidate.revision, layoutRevision: candidate.payload.layoutRevision,
+        selection: [], unbuiltPages: [], objects: [{ handle: 'picture', kind: 'image', story: 'body', floating: true,
+          rects: [{ ...page, x: 20, y: 5, width: 40, height: 20 }] }] },
+    }), undefined, { pictures: { canMove: () => true, canMoveInline: () => true, move, resize: mock(() => {}) } });
+    const host = editor.container.querySelector<HTMLElement>('[data-docx-pages-host]')!;
+    let top = 100;
+    let scale = 1;
+    Object.defineProperties(host, {
+      getBoundingClientRect: { value: () => ({ left: 0, top, width: 200 * scale, height: 40 * scale }) },
+      setPointerCapture: { value() {} }, hasPointerCapture: { value: () => true }, releasePointerCapture: { value() {} },
+    });
+    const point = { pointerId: 1, pointerType: 'mouse', button: 0, buttons: 1, clientX: 30, clientY: 110 };
+    fireEvent.pointerDown(host, point);
+    if (change === 'scroll') top = 80;
+    else scale = 2;
+    const end = { ...point, clientX: 50 * scale, clientY: top + 15 * scale };
+    fireEvent.pointerMove(host, end);
+    const preview = host.querySelector<HTMLElement>('.paged-editor__picture-drag-preview')!;
+    expect(preview.style.left).toBe('40px');
+    expect(preview.style.top).toBe('10px');
+    fireEvent.pointerUp(host, { ...end, buttons: 0 });
+    expect(move).toHaveBeenCalledWith({ kind: 'moveObject', payload: {
+      handle: 'picture', expectVersion: 'v1', hOffsetEmu: 40 * 9525, vOffsetEmu: 10 * 9525,
+    } });
+  });
+}
+
+test('rotated pictures remain selected without unsupported resize handles', async () => {
+  const editor = await pictureEditor(true, true, true);
+  await waitFor(() => expect(editor.overlay()?.querySelectorAll('[data-handle]').length).toBe(8));
+  for (const [index, rotation] of [90, 45, -90].entries()) {
+    editor.state.rotation = rotation;
+    editor.present(frame(index + 2, 0));
+    await waitFor(() => expect(editor.overlay()?.querySelectorAll('[data-handle]').length).toBe(0));
+    expect(editor.overlay()).not.toBeNull();
+  }
+});
+
+async function dragEditor(props: Partial<PeerlessPagedEditorProps> = {}) {
+  const editor = await mount(false, false, false, candidate => ({
+    identity, coversThroughSeq: candidate.coversThroughSeq, frameEpoch: candidate.revision,
+    layoutRevision: candidate.payload.layoutRevision,
+    pages: [{ page, bounds: { x: 30, y: 1200, width: 200, height: 40 }, transform: [1, 0, 0, 1, 30, 1200] }],
+    caret: null, selectionRects: [],
+  }), undefined, { zoom: 2, ...props });
+  const { host } = pointerHost(editor.container);
+  Object.defineProperty(host, 'getBoundingClientRect', { configurable: true, value: () => ({ left: 0, top: 0, width: 460, height: 2480 }) });
+  const point = { pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1, clientX: 100, clientY: 2420 };
+  return { ...editor, host, point };
+}
+
+test('a drag move held behind a slow reply is submitted before a later key, never after it', async () => {
+  const editor = await dragEditor();
+  fireEvent.pointerDown(editor.host, editor.point);
+  fireEvent.pointerMove(editor.host, { ...editor.point, clientX: 140 });
+  fireEvent.pointerMove(editor.host, { ...editor.point, clientX: 180 });
+  fireEvent.keyDown(editor.textarea, { key: 'ArrowRight', code: 'ArrowRight' });
+  for (let index = 0; index < 4; index += 1) await editor.acknowledge(index, 'noop');
+  await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
+  expect(editor.commands.map(({ kind }) => kind)).toEqual(['selectPoint', 'extendSelection', 'extendSelection', 'navigate']);
+  expect(editor.commands[2]!.payload).toMatchObject({ x: 60 });
+  fireEvent.pointerUp(editor.host, { ...editor.point, clientX: 180, buttons: 0 });
+  await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
+  expect(editor.commands).toHaveLength(4);
+});
+
+for (const end of ['unmount', 'source change'] as const) {
+  test(`a drag selection ends on ${end}`, async () => {
+    const dragging = mock((_active: boolean) => {});
+    const editor = await dragEditor({ onDragSelectionChange: dragging });
+    fireEvent.pointerDown(editor.host, editor.point);
+    fireEvent.pointerMove(editor.host, { ...editor.point, clientX: 140 });
+    fireEvent.pointerMove(editor.host, { ...editor.point, clientX: 180 });
+    expect(dragging.mock.calls).toEqual([[true]]);
+    if (end === 'unmount') editor.unmount();
+    else editor.rerender(<PeerlessPagedEditor zoom={2} onDragSelectionChange={dragging}
+      sessionOptions={{ ...editor.sessionOptions, source: Uint8Array.of(2) }} />);
+    await waitFor(() => expect(dragging.mock.calls).toEqual([[true], [false]]));
+  });
+}

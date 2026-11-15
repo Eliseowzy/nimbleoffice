@@ -1,0 +1,110 @@
+//! Typed facade for opening, editing, calculating, rendering, and saving XLSX files.
+
+#[cfg(feature = "fonts")]
+pub use fonts::OpenOptions;
+/// The font pack decoder shared by every engine.
+pub use nimbleoffice_fonts as fonts;
+#[cfg(not(feature = "fonts"))]
+pub use open_options::OpenOptions;
+
+mod authority;
+mod error;
+#[cfg(all(feature = "fonts", feature = "raster"))]
+mod font;
+mod move_range;
+mod sheet_json;
+#[cfg_attr(not(test), allow(dead_code))]
+mod snapshot;
+mod structured;
+mod types;
+mod workbook;
+
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use crate::workbook::recovery::decode as recovery_decode;
+}
+
+pub use error::Error;
+pub use snapshot::{
+    HydratedWorkbook, SnapshotBudget, SnapshotError, SnapshotProgress, SnapshotResult,
+    WorkbookSnapshotBuilder, WorkbookSnapshotEncoder,
+};
+pub use structured::{
+    DEFAULT_EXPORT_MAX_BYTES, DEFAULT_EXPORT_MAX_CELLS, DEFAULT_MARKDOWN_MAX_CELLS,
+    DEFAULT_MARKDOWN_MAX_COLUMNS, DEFAULT_MARKDOWN_MAX_ROWS, MAX_EXPORT_BYTES, MAX_EXPORT_CELLS,
+    MAX_MARKDOWN_CELLS, MAX_MARKDOWN_ROWS, MIN_MARKDOWN_BYTES, XlsxAnchor, XlsxAnchorScope,
+    XlsxCalculationFreshness, XlsxCalculationPolicy, XlsxCalculationState, XlsxCellMerge,
+    XlsxDateSystem, XlsxExport, XlsxExportCell, XlsxExportDefinedName, XlsxExportDiagnostic,
+    XlsxExportDiagnosticCode, XlsxExportFailure, XlsxExportFailureCode, XlsxExportHyperlink,
+    XlsxExportIncluded, XlsxExportMerge, XlsxExportObject, XlsxExportOptions, XlsxExportRefusal,
+    XlsxExportResult, XlsxExportScope, XlsxExportSeverity, XlsxExportSheet, XlsxExportTable,
+    XlsxExportValue, XlsxFormulaResult, XlsxMarkdownAnchor, XlsxMarkdownContent,
+    XlsxMarkdownOptions, XlsxObjectKind, XlsxSchemaVersion, XlsxSheetIdentity, XlsxSheetKind,
+    XlsxSheetVisibility, XlsxSourcePart, XlsxStructuredContent, export_result_json,
+    export_xlsx_markdown, export_xlsx_markdown_json, export_xlsx_structured,
+    export_xlsx_structured_json, render_xlsx_markdown, render_xlsx_markdown_json,
+};
+pub use types::{
+    CalculationOptions, CalculationResult, CellAddress, CellEdit, CellInput, EditProfile,
+    EditStage, HistoryState, MutationResult, NumberFormatKind, PngTarget, ProposalAcceptance,
+    ProposalEditInput, ProposalRequest, RenderOptions, RenderedPng, SelectionFormatting, SheetInfo,
+    TextSearchMatch, UnevaluatedCell, UpdateEvent, UpdateOrigin,
+};
+#[doc(hidden)]
+pub use workbook::PeerHydration;
+pub use workbook::batch::{
+    CalculationRequest, CellGuard, DocumentVersion, EditApplication, EditCalculation, EditFailure,
+    EditFailureCode, EditHistory, EditOperation, EditOutcome, EditPreview, EditReceipt,
+    EditRefusal, EditRequest, EditSource, EditStep, EditValidation, MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES, StepGuard, ValidationOutcome, outcome_json,
+};
+#[doc(hidden)]
+pub use workbook::reads::SheetInfoWire;
+pub use workbook::reads::{
+    CalculationStatus, ConditionalFormatInfo, DefinedNameInfo, DefinedNamesRequest,
+    DefinedNamesResult, UnevaluatedStatus,
+};
+pub use workbook::selection::{SelectionData, SelectionDirection, SelectionRegion};
+pub use workbook::target::{
+    CellPosition, CellRead, CellTarget, CellsRead, FindMatch, FindOutcome, FindRequest,
+    RangeAddress, RangeRead, RangeTarget, ReadCalculation, ReadOutcome, ReadRequest, SheetEntry,
+    TextFound, UnevaluatedTarget,
+};
+pub use workbook::{
+    DEFAULT_TEXT_SEARCH_LIMIT, MAX_COLLABORATION_BYTES, MAX_COLLABORATION_CLIENT_ID,
+    MAX_COLLABORATION_STATE_VECTOR_ENTRIES, MAX_DISPLAY_CELLS, MAX_PIXMAP_DIM, MAX_PIXMAP_PIXELS,
+    UpdateSubscription, Workbook,
+};
+
+pub use workbook::charts::{ChartInfo, ChartMutation};
+pub use xlsx_model::{ChartEdit, ChartSeriesName};
+pub use xlsx_parse::{
+    ChartMetadata, ChartSeriesInfo, HeaderFooterPair, HeaderFooterText, SheetHeaderFooter,
+};
+
+pub use xlsx_calc::set_progress_hook;
+pub use xlsx_model::addr::AddrError;
+pub use xlsx_model::{
+    AnchorCell, AnchorEditAs, AnchorExtent, AnchorPos, AutoFilter, Cell, CellRange, CellRef,
+    CellValue, ChartAnchor, ChartRef, ChartRefKind, ColId, ColStyle, Color, ConditionalFormatRule,
+    ConditionalFormatting, DateSystem, DefinedName, DifferentialFormat, ErrorValue, FreezePane,
+    Hyperlink, MAX_COLS, MAX_ROWS, RichRun, RowId, RunBaseline, RunStyle, RunUnderline, Sheet,
+    SheetChart, SheetFormat, SheetId, Stylesheet, Workbook as WorkbookModel,
+};
+pub use xlsx_ops::{
+    BorderLineStyle, BorderPatch, BorderPreset, CapturedFormat, CellState, HorizontalAlignment,
+    KeptFacets, NumberFormatMutation, Op, Proposal, ProposedEdit, Provenance, StylePatch,
+    StyleProperty, TextWrapping, Transaction, VerticalAlignment,
+};
+pub use xlsx_parse::translate_formula;
+pub use xlsx_render::{
+    Align, ChartA11yAttrs, ChartRegion, DisplayList, DrawCmd, GridGeometry, GridMeta,
+    HyperlinkRegion, PathStroke, PrintMetrics, Rect, RenderError, Viewport, viewport_for_range,
+    viewport_for_used_range, viewport_for_used_range_within,
+};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(not(feature = "fonts"))]
+mod open_options;

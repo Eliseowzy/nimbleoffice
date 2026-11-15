@@ -1,0 +1,276 @@
+import { layoutMetaSummary, type LayoutMetaV1 } from '../yrs/layoutMeta';
+import type { ResidentMeasurementConfig } from '../layout/measure';
+import type { Layout, LayoutOptions, MeasuredBlock } from '../layout/pagination';
+import type { DisplayListHeadersFooters } from '../layout/render/rustDisplayList';
+import type { Document, NoteKind, SectionProperties } from '../types/document';
+import type { YrsRenderEnv, YrsSession } from '../yrs';
+import { resolvedFinalSectionProperties } from './finalSection';
+
+interface ResidentRegionLayoutRetainedOutput {
+  layout: Layout;
+  headersFooters?: DisplayListHeadersFooters;
+  notesConverged: boolean;
+}
+
+interface RetainedKernelInputs {
+  measured: MeasuredBlock[];
+  options: LayoutOptions;
+}
+
+export interface ResidentRegionLayoutRequest {
+  bodyStory: 'body';
+  /** @internal Use saved page totals while the layout is partial. */
+  cachedPageTotals?: boolean;
+  options: Pick<LayoutOptions, 'contractVersion' | 'pageGap'>;
+  regions: {
+    sections: Array<{
+      sectionId?: string;
+      properties: SectionProperties;
+    }>;
+    settings?: Document['package']['settings'];
+    watermark?: SectionProperties['watermark'];
+  };
+  notes: {
+    contents: Array<{
+      id: number;
+      noteKind: NoteKind;
+      height: 0;
+    }>;
+  };
+  renderEnv: YrsRenderEnv;
+  measurement?: ResidentMeasurementConfig;
+}
+
+export interface ComputeLayoutInputs {
+  document: Document | null;
+  pageGap: number;
+  session: Pick<
+    YrsSession,
+    | 'layoutDocumentWithRegionsRetainedJson'
+    | 'residentWorkerProbe'
+    | 'retainedKernelInputsJson'
+  >;
+  renderEnv: YrsRenderEnv;
+  measurement: ResidentMeasurementConfig;
+  /** @internal See `ResidentRegionLayoutRequest.cachedPageTotals`. */
+  cachedPageTotals?: boolean;
+}
+
+export interface LayoutComputation {
+  layout: Layout;
+  notesConverged: boolean;
+}
+
+const kernelInputsByLayout = new WeakMap<
+  Layout,
+  {
+    measured: MeasuredBlock[];
+    options: LayoutOptions;
+    headersFooters?: DisplayListHeadersFooters;
+    /** The session layout revision that produced the layout. */
+    layoutRevision?: number;
+  }
+>();
+
+function orderedSections(document: Document | null): ResidentRegionLayoutRequest['regions']['sections'] {
+  const body = document?.package.document;
+  if (!body) return [{ properties: {} }];
+  const sections = (body.sections ?? []).map((section) => ({
+    sectionId: section.id ?? section.properties.sectionId,
+    properties: section.properties,
+  }));
+  sections.push({
+    sectionId: sections.at(-1)?.sectionId ?? body.finalSectionProperties?.sectionId,
+    properties: resolvedFinalSectionProperties(body) ?? {},
+  });
+  return sections;
+}
+
+export function buildResidentRegionLayoutRequest(
+  document: Document | null,
+  pageGap: number,
+  renderEnv: YrsRenderEnv
+): ResidentRegionLayoutRequest {
+  const contents: ResidentRegionLayoutRequest['notes']['contents'] = [];
+  for (const note of document?.package.footnotes ?? []) {
+    if (note.noteType && note.noteType !== 'normal') continue;
+    contents.push({ id: note.id, noteKind: 'footnote', height: 0 });
+  }
+  for (const note of document?.package.endnotes ?? []) {
+    if (note.noteType && note.noteType !== 'normal') continue;
+    contents.push({ id: note.id, noteKind: 'endnote', height: 0 });
+  }
+  return {
+    bodyStory: 'body',
+    options: {
+      contractVersion: document?.package.contractVersion,
+      pageGap,
+    },
+    regions: {
+      sections: orderedSections(document),
+      settings: document?.package.settings,
+      watermark: resolvedFinalSectionProperties(document?.package.document)?.watermark,
+    },
+    notes: { contents },
+    renderEnv: {
+      fontTheme: document?.package.theme,
+      compatibilityFlags: document?.package.settings?.compatibilityFlags,
+      ...renderEnv,
+      ...defaultParagraphStyleEnv(document, renderEnv),
+      ...chainFontSizeEnv(document, renderEnv),
+      tocStyleIds: [...new Set([
+        ...(renderEnv.tocStyleIds ?? []),
+        ...(document?.package.styles?.styles ?? [])
+          .filter((style) => style.type === 'paragraph' && typeof style.styleId === 'string' && style.styleId &&
+            [style.styleId, style.name].some((name) => /^TOC\s*\d+$/i.test(name ?? '')))
+          .map((style) => style.styleId),
+      ])],
+    },
+  };
+}
+
+function chainFontSizeEnv(
+  document: Document | null,
+  renderEnv: YrsRenderEnv
+): Pick<YrsRenderEnv, 'paragraphStyleFontSizes' | 'hyperlinkStyleFontSizes' | 'docDefaultFontSize' | 'docDefaultLanguage'> {
+  const styles = document?.package.styles;
+  if (!styles) return {};
+  const docDefault = styles.docDefaults?.rPr?.fontSize ?? 20;
+  const byId = new Map((styles.styles ?? []).map((style) => [style.styleId, style]));
+  const sizes: Record<string, number> = { ...(renderEnv.paragraphStyleFontSizes ?? {}) };
+  const hyperlinkSizes: Record<string, number> = { ...(renderEnv.hyperlinkStyleFontSizes ?? {}) };
+  for (const style of styles.styles ?? []) {
+    const hyperlink = style.type === 'character' && [style.styleId, style.name]
+      .some((name) => /^(?:Followed)?Hyperlink$/i.test(name ?? ''));
+    if (!style.styleId || (style.type !== 'paragraph' && !hyperlink)) continue;
+    const target = hyperlink ? hyperlinkSizes : sizes;
+    if (style.styleId in target) continue;
+    let size: number | undefined;
+    const seen = new Set<string>();
+    let current: typeof style | undefined = style;
+    while (current && !seen.has(current.styleId)) {
+      seen.add(current.styleId);
+      if (current.rPr?.fontSize != null) {
+        size = current.rPr.fontSize;
+        break;
+      }
+      current = current.basedOn ? byId.get(current.basedOn) : undefined;
+    }
+    const resolved = size ?? (hyperlink ? undefined : docDefault);
+    if (resolved !== undefined) target[style.styleId] = resolved / 2;
+  }
+  return {
+    ...(Object.keys(sizes).length > 0 ? { paragraphStyleFontSizes: sizes } : {}),
+    ...(Object.keys(hyperlinkSizes).length > 0 ? { hyperlinkStyleFontSizes: hyperlinkSizes } : {}),
+    ...(renderEnv.docDefaultFontSize == null
+      ? { docDefaultFontSize: docDefault / 2 }
+      : {}),
+    ...(renderEnv.docDefaultLanguage == null ? docDefaultLanguage(styles.docDefaults?.rPr?.language) : {}),
+  };
+}
+
+function docDefaultLanguage(
+  language: { latin?: string; eastAsia?: string; bidi?: string } | undefined
+): Pick<YrsRenderEnv, 'docDefaultLanguage'> {
+  const slots = Object.fromEntries(
+    (['latin', 'eastAsia', 'bidi'] as const)
+      .filter((slot) => typeof language?.[slot] === 'string' && language[slot] !== '')
+      .map((slot) => [slot, language![slot]])
+  );
+  return Object.keys(slots).length > 0 ? { docDefaultLanguage: slots } : {};
+}
+
+function defaultParagraphStyleEnv(
+  document: Document | null,
+  renderEnv: YrsRenderEnv
+): Pick<YrsRenderEnv, 'defaultParagraphStyleId'> {
+  if (renderEnv.defaultParagraphStyleId) return {};
+  const styles = document?.package.styles?.styles ?? [];
+  const explicit = styles.find(
+    (style) => style.type === 'paragraph' && style.default && style.styleId
+  )?.styleId;
+  if (explicit) return { defaultParagraphStyleId: explicit };
+  const normal = styles.some(
+    (style) => style.type === 'paragraph' && style.styleId === 'Normal'
+  );
+  if (normal) return { defaultParagraphStyleId: 'Normal' };
+  return {};
+}
+
+export function getLayoutKernelInputs(layout: Layout):
+  | {
+      measured: MeasuredBlock[];
+      options: unknown;
+      headersFooters?: DisplayListHeadersFooters;
+      layoutRevision?: number;
+    }
+  | undefined {
+  return kernelInputsByLayout.get(layout);
+}
+
+export function computeLayout(inputs: ComputeLayoutInputs): LayoutComputation {
+  const request = buildResidentRegionLayoutRequest(
+    inputs.document,
+    inputs.pageGap,
+    inputs.renderEnv
+  );
+  request.measurement = inputs.measurement;
+  if (inputs.cachedPageTotals) request.cachedPageTotals = true;
+  const session = inputs.session;
+  const output = JSON.parse(
+    session.layoutDocumentWithRegionsRetainedJson(JSON.stringify(request))
+  ) as ResidentRegionLayoutRetainedOutput;
+  const layoutRevision = session.residentWorkerProbe()!.layoutRevision;
+  let kernel: RetainedKernelInputs | null = null;
+  const fetchKernel = (): RetainedKernelInputs =>
+    (kernel ??= JSON.parse(
+      session.retainedKernelInputsJson(layoutRevision)
+    ) as RetainedKernelInputs);
+  kernelInputsByLayout.set(output.layout, {
+    get measured() {
+      return fetchKernel().measured;
+    },
+    get options() {
+      return fetchKernel().options;
+    },
+    ...(output.headersFooters ? { headersFooters: output.headersFooters } : {}),
+    layoutRevision,
+  });
+  return {
+    layout: output.layout,
+    notesConverged: output.notesConverged,
+  };
+}
+
+/**
+ * The layout a resident worker ran, from its region layout reply. The
+ * measured blocks stay in the worker, so the main-thread display fallback has
+ * to lay the document out on this thread first.
+ */
+export function workerLayoutComputation(
+  layoutReply: string | LayoutMetaV1,
+  layoutRevision?: number,
+  headersFooters?: string
+): LayoutComputation {
+  const output: ResidentRegionLayoutRetainedOutput = typeof layoutReply === 'string'
+    ? JSON.parse(layoutReply) as ResidentRegionLayoutRetainedOutput
+    : {
+        layout: layoutMetaSummary(layoutReply),
+        notesConverged: layoutReply.notesConverged,
+        headersFooters: JSON.parse(layoutReply.headersFooters ?? headersFooters ?? 'null') ?? undefined,
+      };
+  const unavailable = (): never => {
+    throw new Error('the measured blocks of a worker-run layout live in the worker');
+  };
+  kernelInputsByLayout.set(output.layout, {
+    get measured() {
+      return unavailable();
+    },
+    get options() {
+      return unavailable();
+    },
+    ...(output.headersFooters ? { headersFooters: output.headersFooters } : {}),
+    ...(layoutRevision !== undefined ? { layoutRevision } : {}),
+  });
+  return { layout: output.layout, notesConverged: output.notesConverged };
+}

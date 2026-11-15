@@ -1,0 +1,244 @@
+/**
+ * @nimbleoffice/docx (default entry point)
+ *
+ * Fat barrel that re-exports the parser, serializer, and the most-used types.
+ * No React/DOM imports. Adapter authors who only need a specific slice should
+ * prefer the smaller subpaths.
+ *
+ * @example
+ * ```ts
+ * import { parseDocx, serializeDocx, resolveColor } from '@nimbleoffice/docx';
+ * ```
+ * @packageDocumentation
+ * @public
+ */
+
+// ============================================================================
+// VERSION
+// ============================================================================
+
+import { version as packageVersion } from '../package.json';
+
+export const VERSION: string = packageVersion;
+
+// ============================================================================
+// PARSER / SERIALIZER
+// ============================================================================
+
+export { parseDocx } from './docx/parser';
+export { fontPreflight, preloadPreflightWasm } from './wasm/preflight';
+export type { FontPreflight, FontPreflightFace } from './wasm/preflight';
+export {
+  serializeDocument as serializeDocx,
+  serializeDocumentBody,
+  serializeSectionProperties,
+} from './docx/serializer';
+export { repackDocx, repackDocxWithWarnings, createDocx, updateMultipleFiles } from './docx/rezip';
+export type { RepackResult } from './docx/rezip';
+export { attemptSelectiveSave } from './docx/selectiveSave';
+
+// ============================================================================
+// STRUCTURED EXPORT
+// ============================================================================
+
+export {
+  DocxExportError,
+  exportDocxMarkdown,
+  exportDocxStructured,
+  exportDocxStructuredWithPages,
+  renderDocxMarkdown,
+  renderDocxMarkdownWithPages,
+} from './docx/structuredExport';
+export type * from './yrs/structuredExport';
+export type * from './yrs/pagedExport';
+export type * from './yrs/readTypes';
+
+export { compareDocx } from './docx/compare';
+export type {
+  DocxCompareDiagnostic,
+  DocxCompareDiagnosticCode,
+  DocxCompareLimits,
+  DocxCompareLocation,
+  DocxCompareOptions,
+  DocxCompareResult,
+  DocxComparedChange,
+  DocxCompareTextSpan,
+} from './docx/compare';
+
+// ============================================================================
+// CONTENT CONTROLS
+// ============================================================================
+
+export {
+  DocxContentControlsError,
+  findDocxContentControls,
+  listDocxContentControls,
+} from './docx/contentControls';
+export type * from './yrs/contentControls';
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+export {
+  twipsToPixels,
+  pixelsToTwips,
+  formatPx,
+  emuToPixels,
+  pointsToPixels,
+  halfPointsToPixels,
+  pixelsToEmu,
+  emuToTwips,
+  twipsToEmu,
+} from './utils/units';
+
+export {
+  resolveColor,
+  resolveHighlightColor,
+  resolveShadingColor,
+  parseColorString,
+  createThemeColor,
+  createRgbColor,
+  darkenColor,
+  lightenColor,
+  blendColors,
+  getContrastingColor,
+  isBlack,
+  isWhite,
+  colorsEqual,
+  generateThemeTintShadeMatrix,
+  getThemeTintShadeHex,
+  ensureHexPrefix,
+  resolveHighlightToCss,
+  type ThemeMatrixCell,
+} from './utils/colorResolver';
+
+export { type DocxInput, toArrayBuffer } from './utils/docxInput';
+
+// ============================================================================
+// FONT LOADER
+// ============================================================================
+
+export {
+  loadFont,
+  loadFonts,
+  loadFontFromBuffer,
+  isFontLoaded,
+  isLoading as isFontsLoading,
+  getLoadedFonts,
+  onFontsLoaded,
+  canRenderFont,
+  preloadCommonFonts,
+  setGoogleFontsEnabled,
+  isGoogleFontsEnabled,
+} from './utils/fontLoader';
+export { decodeFontFace } from './wasm/fontDecoder';
+
+export {
+  type PrintOptions,
+  getDefaultPrintOptions,
+  triggerPrint,
+  openPrintWindow,
+  parsePageRange,
+  formatPageRange,
+  isPrintSupported,
+} from './utils/print';
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+export type {
+  Document,
+  DocxPackage,
+  DocumentBody,
+  BlockContent,
+  Paragraph,
+  ParagraphContent,
+  Run,
+  RunContent,
+  TextContent,
+  Table,
+  TableRow,
+  TableCell,
+  Image,
+  Shape,
+  TextBox,
+  Hyperlink,
+  BookmarkStart,
+  BookmarkEnd,
+  Field,
+  Theme,
+  ThemeColorScheme,
+  ThemeFont,
+  ThemeFontScheme,
+  Style,
+  StyleDefinitions,
+  TextFormatting,
+  ParagraphFormatting,
+  SectionProperties,
+  HeaderFooter,
+  HeaderReference,
+  FooterReference,
+  Footnote,
+  Endnote,
+  ListLevel,
+  NumberingDefinitions,
+  Relationship,
+  Comment,
+  CommentRangeStart,
+  CommentRangeEnd,
+  TrackedChangeInfo,
+  TrackedRunChange,
+  Insertion,
+  Deletion,
+  MoveFrom,
+  MoveTo,
+} from './types/document';
+
+// ============================================================================
+// EDITOR PLUGIN API (Framework-Agnostic)
+// ============================================================================
+
+export type {
+  EditorPluginCore,
+  PluginPanelProps,
+  PanelConfig,
+  RenderedDomContext,
+  PositionCoordinates,
+  PointPosition,
+} from './plugin-api/types';
+
+// ============================================================================
+// MANAGER CLASSES (Framework-Agnostic Business Logic)
+// ============================================================================
+
+export {
+  Subscribable,
+  TableSelectionManager,
+  ErrorManager,
+  TABLE_DATA_ATTRIBUTES,
+  findTableFromClick,
+  getTableFromDocument,
+  updateTableInDocument,
+  deleteTableFromDocument,
+} from './managers';
+
+export type {
+  CellCoordinates,
+  TableSelectionSnapshot,
+  ErrorSeverity,
+  ErrorNotification,
+  ErrorManagerSnapshot,
+} from './managers';
+
+export type {
+  LayoutBlock,
+  Layout,
+  BlockExtent,
+  Page,
+  FootnoteContent,
+} from './layout/pagination/types';
+export type { ResolvedLine, ResolvedSegment } from './layout/pagination/types';
+
+export type { DocxParagraphText, DocxParagraphList } from './yrs/edits';

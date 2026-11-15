@@ -1,0 +1,91 @@
+{
+  "name": "@nimbleoffice/fonts",
+  "version": "0.4.2",
+  "description": "Bundled open fonts for the NimbleOffice engine: metric-compatible Latin faces (Carlito, Caladea, Liberation, Gelasio, Comic Relief), common presentation families (Inter, Roboto, Montserrat and more) plus Noto RTL script-coverage faces, with a lazy same-origin loader. Optional coverage faces ship separately in @nimbleoffice/fonts-cjk and @nimbleoffice/fonts-intl.",
+  "sideEffects": false,
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json",
+    "./cdn": {
+      "types": "./dist/cdn.d.ts",
+      "import": "./dist/cdn.js",
+      "default": "./dist/cdn.js"
+    },
+    "./progressive": {
+      "types": "./dist/progressive.d.ts",
+      "import": "./dist/progressive.js",
+      "default": "./dist/progressive.js"
+    }
+  },
+  "files": [
+    "assets/NimbleOfficeBaseLatin-*.ttf.zst",
+    "assets/base-latin.json",
+    "dist",
+    "LICENSE",
+    "LICENSES",
+    "README.md"
+  ],
+  "scripts": {
+    "prebuild": "bun run --filter '@nimbleoffice/fonts-cjk' --filter '@nimbleoffice/fonts-intl' --filter '@nimbleoffice/fonts-latin' build",
+    "build": "tsup && bun ../../scripts/build-fonts-decoder.ts",
+    "typecheck": "tsc --noEmit",
+    "export:catalog": "bun scripts/export-catalog.ts"
+  },
+  "peerDependencies": {
+    "@nimbleoffice/fonts-cjk": "workspace:*",
+    "@nimbleoffice/fonts-intl": "workspace:^0"
+  },
+  "peerDependenciesMeta": {
+    "@nimbleoffice/fonts-cjk": {
+      "optional": true
+    },
+    "@nimbleoffice/fonts-intl": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@nimbleoffice/fonts-cjk": "workspace:*",
+    "@nimbleoffice/fonts-intl": "workspace:*",
+    "@types/bun": "^1.0.0",
+    "@types/node": "^26.0.0",
+    "tsup": "^8.0.1",
+    "typescript": "^6.0.3",
+    "esbuild": "^0.28.1"
+  },
+  "keywords": [
+    "docx",
+    "xlsx",
+    "pptx",
+    "fonts",
+    "metric-compatible",
+    "carlito",
+    "caladea",
+    "liberation",
+    "noto",
+    "rtl"
+  ],
+  "author": "NimbleOffice",
+  "license": "(Apache-2.0 AND OFL-1.1)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eliseowzy/nimbleoffice.git",
+    "directory": "packages/fonts"
+  },
+  "bugs": {
+    "url": "https://github.com/Eliseowzy/nimbleoffice/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@nimbleoffice/fonts-latin": "workspace:*"
+  }
+}

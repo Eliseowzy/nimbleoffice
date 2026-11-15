@@ -1,0 +1,76 @@
+{
+  "pages": [
+    {
+      "columnBounds": [
+        {
+          "height": 864,
+          "width": 624,
+          "x": 96,
+          "y": 96
+        }
+      ],
+      "contentBounds": {
+        "height": 864,
+        "width": 624,
+        "x": 96,
+        "y": 96
+      },
+      "height": 1056,
+      "pageIndex": 0,
+      "primitives": [
+        {
+          "baselineY": 115.2,
+          "blockId": 0,
+          "color": "#000000",
+          "docEnd": 16,
+          "docStart": 1,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 17,
+          "fragmentDocStart": 1,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "First paragraph",
+          "toLine": 1,
+          "width": 120,
+          "x": 96
+        },
+        {
+          "baselineY": 139.2,
+          "blockId": 1,
+          "color": "#000000",
+          "docEnd": 34,
+          "docStart": 18,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 35,
+          "fragmentDocStart": 18,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Second paragraph",
+          "toLine": 1,
+          "width": 130,
+          "x": 96
+        },
+        {
+          "baselineY": 163.2,
+          "blockId": 2,
+          "color": "#000000",
+          "docEnd": 51,
+          "docStart": 36,
+          "font": "400 14.667px Calibri, sans-serif",
+          "fragmentDocEnd": 52,
+          "fragmentDocStart": 36,
+          "fromLine": 0,
+          "kind": "text",
+          "lineIndex": 0,
+          "text": "Third paragraph",
+          "toLine": 1,
+          "width": 120,
+          "x": 96
+        }
+      ],
+      "width": 816
+    }
+  ]
+}
