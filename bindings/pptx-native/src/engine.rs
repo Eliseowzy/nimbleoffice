@@ -405,6 +405,14 @@ impl PptxDocument {
     }
 
     #[napi(catch_unwind)]
+    pub fn theme_fonts_json(&self, env: Env, args: String) -> Result<String> {
+        let _call = EngineCall::new(env);
+        self.document(env)?
+            .theme_fonts_json(&args)
+            .map_err(|error| map_error(env, error))
+    }
+
+    #[napi(catch_unwind)]
     pub fn propose_json(&self, env: Env, args: String) -> Result<String> {
         let _call = EngineCall::new(env);
         self.document(env)?

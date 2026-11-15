@@ -19,6 +19,7 @@ export declare class PptxDocument {
   registerPeerFontsJson(fontsJson: string): void
   adoptPeerIdentity(): void
   replayJson(envelope: string): string
+  themeFontsJson(args: string): string
   proposeJson(args: string): string
   validateProposalJson(args: string): string
   listProposalsJson(): string
