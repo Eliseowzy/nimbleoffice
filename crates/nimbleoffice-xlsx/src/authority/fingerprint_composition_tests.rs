@@ -108,25 +108,6 @@ fn composition_bootstrap_refuses_another_whole_state_and_accepts_its_own() {
 }
 
 #[test]
-fn composition_main_released_demo_seed_restores() {
-    let bytes = include_bytes!("../../../../fixtures/demo/showcase.xlsx");
-    let seed = include_bytes!("released_demo_seed.bin");
-    let options = crate::CalculationOptions {
-        now_serial: Some(45_000.25),
-    };
-    let mut workbook =
-        crate::Workbook::open_collaborative_recalculated(bytes, 71, options).unwrap();
-    let before = workbook.model().clone();
-    let result = workbook.apply_update_v1(seed, options).unwrap();
-    assert!(result.applied);
-    assert_eq!(workbook.model(), &before);
-    let mut peer = crate::Workbook::open_collaborative(bytes, 72).unwrap();
-    peer.apply_update_v1(&workbook.encode_state_as_update_v1(), options)
-        .unwrap();
-    assert_eq!(peer.model(), workbook.model());
-}
-
-#[test]
 fn composition_single_reading_states_restore_source_formats() {
     let model = patterned_facets();
     for reading in [

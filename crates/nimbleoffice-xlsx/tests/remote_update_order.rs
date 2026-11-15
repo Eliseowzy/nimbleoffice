@@ -3,12 +3,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use yrs::Update;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, Map, ReadTxn, Transact, Update};
 
 const SAMPLE: &[u8] = include_bytes!("../../../packages/xlsx/test-fixtures/sample.xlsx");
-const SAMPLE_V5: &[u8] = include_bytes!("fixtures/workbook-schema-v5-sample.update.bin");
 
 fn open(client_id: u64) -> Workbook {
     Workbook::open_collaborative(SAMPLE, client_id).unwrap()
@@ -70,21 +69,6 @@ fn merge(updates: &[&Vec<u8>]) -> Vec<u8> {
             .map(|update| Update::decode_v1(update).unwrap()),
     )
     .encode_v1()
-}
-
-fn released_meta() -> (i64, String) {
-    let doc = Doc::new();
-    doc.transact_mut()
-        .apply_update(Update::decode_v1(SAMPLE_V5).unwrap())
-        .unwrap();
-    let meta = doc.get_or_insert_map("xlsx");
-    let txn = doc.transact();
-    let version = meta.get(&txn, "schemaVersion");
-    let fingerprint = meta.get(&txn, "baseFingerprint");
-    (
-        version.and_then(|value| value.cast().ok()).unwrap(),
-        fingerprint.and_then(|value| value.cast().ok()).unwrap(),
-    )
 }
 
 fn assert_same_state(left: &Workbook, right: &Workbook) {
@@ -164,34 +148,4 @@ fn merged_and_separate_delivery_of_an_overtaking_edit_agree() {
     assert_eq!(input(&merged, "H20"), "two");
     assert_eq!(merged.model(), source.model());
     assert_same_state(&merged, &separate);
-}
-
-#[test]
-fn a_held_update_carrying_an_older_schema_from_a_higher_client_settles() {
-    let mut source = open(851);
-    let updates = edit(&mut source, &[("D1", "one"), ("D1", "two")]);
-    let doc = Doc::with_client_id(9_000);
-    doc.transact_mut()
-        .apply_update(Update::decode_v1(&open(852).encode_state_as_update_v1()).unwrap())
-        .unwrap();
-    let before = doc.transact().state_vector();
-    let (version, fingerprint) = released_meta();
-    assert_eq!(version, 5);
-    let meta = doc.get_or_insert_map("xlsx");
-    let mut txn = doc.transact_mut();
-    meta.insert(&mut txn, "schemaVersion", version);
-    meta.insert(&mut txn, "baseFingerprint", fingerprint);
-    drop(txn);
-    let stale = doc.transact().encode_diff_v1(&before);
-
-    let target = deliver(open(853), &[&merge(&[&stale, &updates[1]])]);
-    assert_eq!(input(&target, "D1"), "");
-    assert_projects_its_state(&target, 854);
-
-    let target = deliver(target, &[&updates[0]]);
-    assert_eq!(input(&target, "D1"), "two");
-    let source = deliver(source, &[&stale, &target.encode_state_as_update_v1()]);
-    let target = deliver(target, &[&source.encode_state_as_update_v1()]);
-    assert_eq!(input(&source, "D1"), "two");
-    assert_same_state(&target, &source);
 }

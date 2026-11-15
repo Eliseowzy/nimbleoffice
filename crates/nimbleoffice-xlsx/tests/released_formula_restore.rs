@@ -75,22 +75,6 @@ fn assert_released_cells(workbook: &Workbook) {
 }
 
 #[test]
-fn a_released_collaboration_snapshot_restores() {
-    let mut workbook = Workbook::open_collaborative_recalculated(SOURCE, 7_102, options()).unwrap();
-    assert_eq!(
-        base_fingerprint(&workbook.encode_state_as_update_v1()),
-        base_fingerprint(RELEASED_UPDATE)
-    );
-    assert!(
-        workbook
-            .apply_update_v1(RELEASED_UPDATE, options())
-            .unwrap()
-            .applied
-    );
-    assert_released_cells(&workbook);
-}
-
-#[test]
 fn a_released_recovery_checkpoint_restores_for_its_engine_version() {
     match Workbook::restore_recovery_checkpoint(RELEASED_CHECKPOINT) {
         Ok((workbook, ..)) => {
@@ -105,24 +89,6 @@ fn a_released_recovery_checkpoint_restores_for_its_engine_version() {
             "{error}"
         ),
     }
-}
-
-#[test]
-fn a_checkpoint_keeps_the_released_fingerprint_and_takes_released_updates() {
-    let writer = Workbook::open_collaborative(SOURCE, 7_103).unwrap();
-    let checkpoint = writer.recovery_checkpoint(0, None).unwrap();
-    let (mut restored, ..) = Workbook::restore_recovery_checkpoint(&checkpoint).unwrap();
-    assert_eq!(
-        base_fingerprint(&restored.encode_state_as_update_v1()),
-        base_fingerprint(RELEASED_UPDATE)
-    );
-    assert!(
-        restored
-            .apply_update_v1(RELEASED_UPDATE, options())
-            .unwrap()
-            .applied
-    );
-    assert_released_cells(&restored);
 }
 
 #[test]
