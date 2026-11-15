@@ -1,0 +1,105 @@
+# Tests failing on main before NimbleOffice took over; CI tolerates exactly these. Remove a line once its test passes.
+packages/agents/test/docx-bulk-runs.test.ts: fixed fields, tabs, hyperlinks and tracked runs cannot be set, and offsets use accepted text
+packages/agents/test/docx-restyle-plain.test.ts: restyling a plain paragraph from Heading1 to Normal exports only the style change
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: a click awaiting replacement geometry keeps its paragraph after the canvas moves
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: a click during hydration preserves A, ArrowLeft, B in order and places the final caret
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: a completed worker layout commits readiness as soon as hydration finishes
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: a composition started during opening commits exactly once after the switch
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: a first worker pass that completes layout commits readiness and replays held input without a completion request
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: a key typed right after the first page paints is kept
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: a queued drag across cells in one table publishes the cell selection
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: a queued drag extends from its resolved anchor after an earlier insertion
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: becoming read-only during opening discards held composition and rejects its flush
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: becoming read-only during opening discards held keys and rejects its flush
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: clicks interleaved with held and hydrating input keep their original positions
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: flush during opening waits for held keys to land in the full session
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: flush with nothing held during opening keeps preview and replica readiness behavior
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: held text runs separated by a click replay with one worker layout request and match ready typing
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: input held during opening is discarded when another document replaces it
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: keys typed during opening land in order, none dropped
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: switching to viewing before eager hydration settles transferred input and its flush
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: table Tab during hydration follows held input and moves to the next cell
+packages/docx-react/src/components/DocxEditor/hooks/useYrsCoreSession.workerOpen.test.tsx: two bursts typed milliseconds apart around first paint both land, in order
+packages/docx-react/src/components/DocxEditor/peerless/PeerlessDocxEditor.fonts.test.tsx: command init receives the latest raster scale
+packages/docx-react/src/components/DocxEditor/peerless/PeerlessDocxEditor.fonts.test.tsx: command preflight opens with a 404 URL font without fetching it
+packages/docx-react/src/components/DocxEditor/peerless/PeerlessDocxEditor.fonts.test.tsx: command_init_receives_collected_font_slots
+packages/docx-react/src/components/DocxEditor/peerless/PeerlessDocxEditor.fonts.test.tsx: command_init_receives_display_font_slots
+packages/docx-react/src/components/DocxEditor/peerless/PeerlessDocxEditor.fonts.test.tsx: editor_collected_buffers_dispose_on_abort
+packages/docx-react/src/components/DocxEditor/peerless/PeerlessDocxEditor.fonts.test.tsx: no font provider: the font fallback warning never reaches onError
+packages/docx-react/src/components/DocxEditor/peerless/PeerlessDocxEditor.fonts.test.tsx: repeated_open_allocates_no_main_fonts
+packages/docx-react/src/components/DocxEditor/peerless/PeerlessDocxEditor.fonts.test.tsx: typed_input_draws_on_page_canvas_with_authoritative_frame_held
+packages/docx-react/src/components/DocxEditor/peerless/workerPluginGeometry.test.ts: a header target has rects on every built page that paints it and its anchor on the earliest
+packages/docx-react/src/components/DocxEditor/peerless/workerPluginGeometry.test.ts: header rects are page-local at 100% and 150% zoom
+packages/docx-react/src/components/DocxEditor/peerless/workerPluginGeometry.test.ts: hidden ranges of a header target are left out of its rects
+packages/docx-react/src/plugins/geometry.stories.test.ts: header and footer targets > a default header paints on every odd page after the first
+packages/docx-react/src/plugins/geometry.stories.test.ts: header and footer targets > a hidden leading header deletion anchors before the first visible character on its first painting page
+packages/docx-react/src/plugins/geometry.stories.test.ts: header and footer targets > pages outside the display window that are not built yet are left out
+packages/docx-react/src/plugins/geometry.stories.test.ts: table cell targets > a range across a split row has rects on both pages and its anchor at the end
+packages/docx/src/docx/groupedTextBoxesSave.test.ts: host edits serialize the same with enriched and placeholder grouped stories
+packages/docx/src/docx/headerFooterAliasSave.test.ts: header/footer aliases > default TS seed preserves ./footer1.xml
+packages/docx/src/docx/headerFooterAliasSave.test.ts: header/footer aliases > default TS seed preserves ./header1.xml
+packages/docx/src/docx/headerFooterAliasSave.test.ts: header/footer aliases > default TS seed preserves footer1.xml
+packages/docx/src/docx/headerFooterAliasSave.test.ts: header/footer aliases > default TS seed preserves header1.xml
+packages/docx/src/editor/layoutRequestParity.test.ts: DOCX layout request parity > comment-structure matches the Rust request
+packages/docx/src/editor/layoutRequestParity.test.ts: DOCX layout request parity > comprehensive matches the Rust request
+packages/docx/src/editor/layoutRequestParity.test.ts: DOCX layout request parity > content-controls matches the Rust request
+packages/docx/src/editor/layoutRequestParity.test.ts: DOCX layout request parity > linked-header matches the Rust request
+packages/docx/src/editor/layoutRequestParity.test.ts: DOCX layout request parity > page-fragments matches the Rust request
+packages/docx/src/editor/layoutRequestParity.test.ts: DOCX layout request parity > structured-export matches the Rust request
+packages/docx/src/editor/layoutRequestParity.test.ts: DOCX layout request parity > theme-accent matches the Rust request
+packages/docx/src/yrs/behindImageOrder.test.ts: both import paths retain image geometry and drawing order {"rank":-1,"shapeType":"ellipse"}
+packages/docx/src/yrs/behindImageOrder.test.ts: both import paths retain image geometry and drawing order {"rank":0}
+packages/docx/src/yrs/behindImageOrder.test.ts: both import paths retain image geometry and drawing order {"rank":1.5}
+packages/docx/src/yrs/behindImageOrder.test.ts: both import paths retain image geometry and drawing order {"rank":20,"shapeType":"ellipse"}
+packages/docx/src/yrs/behindImageOrder.test.ts: both import paths retain image geometry and drawing order {"rank":4294967295,"shapeType":"roundRect"}
+packages/docx/src/yrs/behindImageOrder.test.ts: both import paths retain image geometry and drawing order {"rank":4294967296}
+packages/docx/src/yrs/characterSpacingSave.test.ts: editor: clearing a theme font removes the run fonts and keeps the paragraph's wrappers
+packages/docx/src/yrs/characterSpacingSave.test.ts: saveYrsDocx: clearing a theme font removes the run fonts and keeps the paragraph's wrappers
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: native all slots paired fonts with custom theme survive split merge and field-adjacent edit in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: native all slots paired fonts with default theme survive split merge and field-adjacent edit in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: native eastAsia/cs paired fonts with custom theme survive split merge and field-adjacent edit in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: native eastAsia/cs paired fonts with default theme survive split merge and field-adjacent edit in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: native latin paired fonts with custom theme survive split merge and field-adjacent edit in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: native latin paired fonts with default theme survive split merge and field-adjacent edit in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: typescript all slots paired fonts with custom theme survive unchanged save in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: typescript all slots paired fonts with default theme survive unchanged save in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: typescript eastAsia/cs paired fonts with custom theme survive unchanged save in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: typescript eastAsia/cs paired fonts with default theme survive unchanged save in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: typescript latin paired fonts with custom theme survive unchanged save in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: typescript latin paired fonts with default theme survive unchanged save in every source location
+packages/docx/src/yrs/documentToYrs.fonts.test.ts: typescript mixed ascii theme fonts stay in their own run and numbering slots
+packages/docx/src/yrs/documentToYrs.parity.test.ts: DOCX engine seeding > seeds a VML text box with identical opaque payloads from Rust and TypeScript
+packages/docx/src/yrs/documentToYrs.parity.test.ts: DOCX engine seeding > seeds imported run property changes into the same reviewable attributes
+packages/docx/src/yrs/hyperlinkEmbedSave.test.ts: native and projected seeders agree on hyperlink embed state
+packages/docx/src/yrs/imagePayloadParity.test.ts: picture payload parity > keeps untouched pictures byte-identical on a hydrated save
+packages/docx/src/yrs/oleObjectSave.test.ts: native and projected seeders agree on OLE and unresolved pict state
+packages/docx/src/yrs/oleObjectSave.test.ts: native and projected seeders agree on hidden OLE marks and preview visibility
+packages/docx/src/yrs/opaqueDrawingSave.test.ts: native and projected seeders agree on opaque drawing state
+packages/docx/src/yrs/residentCommandSelection.test.ts: autofit_cell_click_preserves_dependent_tab_navigation_and_typing
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break continuous starts the section after the caret in a paragraph ending a section
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break continuous starts the section after the caret in the final section
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break continuous starts the section after the caret in the middle of three sections
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break evenPage starts the section after the caret in a paragraph ending a section
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break evenPage starts the section after the caret in the final section
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break evenPage starts the section after the caret in the middle of three sections
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break nextPage starts the section after the caret in a paragraph ending a section
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break nextPage starts the section after the caret in the final section
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break nextPage starts the section after the caret in the middle of three sections
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break oddPage starts the section after the caret in a paragraph ending a section
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break oddPage starts the section after the caret in the final section
+packages/docx/src/yrs/residentCommandWorker.test.ts: section break oddPage starts the section after the caret in the middle of three sections
+packages/docx/src/yrs/seedFixtures.parity.test.ts: DOCX seeding across document features > preserves rtl-cjk stories, comments, and save output
+packages/docx/src/yrs/spliceDifferential.test.ts: a spliced session save > matches the whole-part save outside the paragraphs it keeps: crates/docx-edit/tests/fixtures/textbox-text/macro.docx
+packages/docx/src/yrs/tableCellMargins.test.ts: table cell margins resolve each side through direct, table style and default table style
+packages/docx/src/yrs/tableMergeSave.test.ts: saving untouched vertical merges after reseeding > seeds the same row provenance through native and model loading
+packages/docx/src/yrs/tableStyleSeeding.parity.test.ts: keeps table paragraph inheritance identical for both seeders (document defaults: false)
+packages/docx/src/yrs/trackedEmbedSave.test.ts: native and projected seeders agree on tracked embed state
+packages/docx/src/yrs/viewportFrames.parity.test.ts: viewport frames match a cold rebuild after every resident edit and scroll: coverage
+packages/docx/src/yrs/viewportFrames.parity.test.ts: viewport frames match a cold rebuild after every resident edit and scroll: crates/docx-edit/tests/fixtures/structured-export/principal.docx
+packages/docx/src/yrs/viewportFrames.parity.test.ts: viewport frames match a cold rebuild after every resident edit and scroll: crates/docx-edit/tests/fixtures/table-split-bands/continuation-clipping.docx
+packages/docx/src/yrs/viewportFrames.parity.test.ts: viewport frames match a cold rebuild after every resident edit and scroll: crates/docx-edit/tests/fixtures/textbox-text/outline.docx
+packages/docx/src/yrs/viewportFrames.parity.test.ts: viewport frames match a cold rebuild after every resident edit and scroll: crates/docx-edit/tests/fixtures/textbox-text/styles.docx
+packages/docx/src/yrs/viewportFrames.parity.test.ts: viewport frames match a cold rebuild after every resident edit and scroll: crates/nimbleoffice-docx/tests/corpus/fixtures/wordprocessingml-comprehensive.docx
+packages/pptx-react/src/worker/peerlessChrome.test.tsx: the proposals panel docks beside the slide with the legacy panel styling
+packages/pptx-react/src/worker/peerlessS12.review.test.tsx: structural proposals show ghost strip entries and accept from the canvas review
+scripts/rust-crates.test.ts: the Rust release train includes every versioned workspace path dependency

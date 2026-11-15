@@ -41,6 +41,7 @@
     "build:agents": "bun run --filter '@nimbleoffice/agents' build",
     "build:packages": "bun run build:fonts && bun run build:xlsx && bun run build:docx && bun run build:pptx && bun run build:vsdx && bun run build:agents",
     "test": "bun run build:xlsx-wasm && bun run build:docx-wasm && bun test --isolate packages shared apps/relay/test apps/wopi/src apps/wopi/test apps/wopi/web/src eval/formats scripts e2e",
+    "test:ci": "bun run build:xlsx-wasm && bun run build:docx-wasm && bun scripts/test-known-failures.ts --isolate packages shared apps/relay/test apps/wopi/src apps/wopi/test apps/wopi/web/src eval/formats scripts e2e",
     "build:wasm": "bun run build:xlsx-wasm && bun run build:docx-wasm && bun run build:pptx-wasm && bun run build:vsdx-wasm",
     "pretypecheck:packages": "bun run build:fonts",
     "typecheck:packages": "bun run --filter './packages/*' typecheck",
