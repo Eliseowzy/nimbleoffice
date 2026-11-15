@@ -1115,12 +1115,16 @@ impl Presentation {
     /// theme's `ea` face is empty, as PowerPoint does. `None` (the default)
     /// leaves such text to the font fallbacks.
     pub fn set_default_east_asian_language(&self, language: Option<&str>) {
-        if self.renderer().set_default_east_asian_language(language) {
+        let changed = self.renderer().set_default_east_asian_language(language);
+        #[cfg(feature = "fonts")]
+        if changed {
             self.resolved_fonts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clear();
         }
+        #[cfg(not(feature = "fonts"))]
+        let _ = changed;
     }
 
     pub(crate) fn renderer(&self) -> MutexGuard<'_, SlideRenderer> {
