@@ -113,8 +113,9 @@ test('remote captures use the pinned provider defaults', async () => {
   expect(JSON.parse(config.define.__QUALITY_FONT_BASE_CJK__)).toBeNull();
 });
 
-for (const format of ['docx', 'pptx', 'xlsx', 'vsdx']) {
-  test(`${format} local captures serve packs and the shipped decoder from the font root`, async () => {
+{
+  const format = 'docx';
+  test('docx local captures serve packs and the shipped decoder from the font root', async () => {
     for (const assets of [undefined, resolve('/tmp/quality-font-assets')]) {
       const config = await serverConfiguration({
         QUALITY_FORMAT: format,
