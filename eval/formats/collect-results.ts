@@ -231,10 +231,10 @@ export async function main(args: string[]) {
     }
     groups.push({ ...g, report });
   }
-  const origin = manifest.origin.replace(/\/$/, '');
+  const origin = manifest.origin?.replace(/\/$/, '');
   const result = collectResults({ ...options, ...metadata, tasks, arms, reasons, groups,
     fixtures: { kind: metadata.fixtures.kind, count: new Set(groups.flatMap(g => g.report.results.map(r => tasks.find(t => t.id === r.task)!.fixture))).size,
-      url: origin + '/', metadata: origin + '/metadata.json', description: metadata.fixtures.description } });
+      url: origin ? origin + '/' : 'local', metadata: origin ? origin + '/metadata.json' : 'local', description: metadata.fixtures.description } });
   if (options.output) await writeFile(options.output, serialize(result));
   else process.stdout.write(serialize(result));
 }

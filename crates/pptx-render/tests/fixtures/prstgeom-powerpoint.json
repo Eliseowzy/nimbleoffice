@@ -1,6 +1,4 @@
 {
-  "source": "https://corpus.betteroffice.dev/pptx-prstgeom-600/source.pptx",
-  "reference": "https://corpus.betteroffice.dev/pptx-prstgeom-600/reference/reference.pdf",
   "engine": "Microsoft PowerPoint 16.113",
   "source_sha256": "dddbc865d948d1b481aafec6cee8cb0b0a65a2980b51b15414e534acd4ee4a26",
   "units": "CSS pixels",

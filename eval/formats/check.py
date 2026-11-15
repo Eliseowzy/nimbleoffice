@@ -75,6 +75,9 @@ def fixture(task):
         path = Path(local).expanduser().resolve() / name
         verified(path.read_bytes(), entry, name)
         return path
+    url = entry.get('source_url')
+    if not url:
+        raise ValueError(f'{name}: set FORMAT_EVAL_FIXTURES to a directory of generated fixtures')
     cache = Path(os.environ.get('QUALITY_ASSET_CACHE', '').strip() or Path.home() / '.cache' / 'nimbleoffice' / 'eval-assets')
     path = cache / f"{entry['sha256']}-{entry['bytes']}"
     if path.is_file():
@@ -87,7 +90,7 @@ def fixture(task):
     staging = cache / f'.tmp-{uuid.uuid4()}'
     try:
         subprocess.run(['curl', '-fsSL', '--retry', '3', '--max-time', '120', '--max-filesize', str(entry['bytes']),
-                        '-o', str(staging), f"{manifest['origin'].rstrip('/')}/{name}"], check=True)
+                        '-o', str(staging), url], check=True)
         verified(staging.read_bytes(), entry, name)
         os.replace(staging, path)
     finally:
