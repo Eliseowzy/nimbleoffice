@@ -1645,6 +1645,7 @@ mod tests {
                 }),
                 stroke: None,
                 shadow: None,
+                soft_edge: 0.0,
                 transform: Transform::default(),
             }],
         };

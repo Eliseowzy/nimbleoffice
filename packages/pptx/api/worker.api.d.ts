@@ -3587,6 +3587,8 @@ export interface ShapePrimitive extends PrimitiveBase {
     fill?: Paint;
     stroke?: Stroke;
     shadow?: Shadow;
+    /** `a:softEdge`: how far in from the outline the shape fades out, in CSS px. */
+    softEdge?: number;
 }
 /** An `a:blip` colour transform, colours already resolved to `#rrggbbaa`. */
 export type ImageEffect = {
