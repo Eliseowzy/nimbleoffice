@@ -53,6 +53,7 @@ export const NATIVE_ENTRIES: Record<string, Record<string, string>> = {
     './styles': 'src/styles/index.ts',
     './layout/pagination': 'src/layout/pagination/index.ts',
     './layout/render': 'src/layout/render/index.ts',
+    './viewer': 'src/viewer/index.ts',
     './layout': 'src/layout/index.ts',
     './plugin-api': 'src/plugin-api/index.ts',
     './plugin-api/RenderedDomContext': 'src/plugin-api/RenderedDomContext.ts',

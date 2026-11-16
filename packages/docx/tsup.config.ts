@@ -28,6 +28,7 @@ export default defineConfig([
       'utils/sidebarConstants': 'src/utils/sidebarConstants.ts',
       'utils/units': 'src/utils/units.ts',
       'editor/index': 'src/editor/index.ts',
+      'viewer/index': 'src/viewer/index.ts',
       'utils/autoScroll': 'src/utils/autoScroll.ts',
       // The yrs editing-core facade (the only JS entry to crates/docx-edit).
       // Its embedded wasm stays out of every other entry: the facade reaches

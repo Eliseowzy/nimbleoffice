@@ -64,7 +64,7 @@ test('the wasm packages never reference their native packages', () => {
 test('docx export sources cover exactly its public subpaths', () => {
   const manifest = JSON.parse(readFileSync(resolve(root, 'packages/docx/package.json'), 'utf8'));
   expect(Object.keys(NATIVE_ENTRIES.docx)).toEqual(Object.keys(manifest.exports));
-  expect(Object.keys(NATIVE_ENTRIES.docx)).toHaveLength(28);
+  expect(Object.keys(NATIVE_ENTRIES.docx)).toHaveLength(29);
   const config = readFileSync(resolve(root, 'packages/docx/tsup.config.ts'), 'utf8');
   for (const entry of Object.values(NATIVE_ENTRIES.docx)) expect(config).toContain(`'${entry}'`);
 });
