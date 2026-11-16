@@ -6,7 +6,7 @@ Package manager is bun, not npm.
 
 ```bash
 bun install
-bun run test             # builds every wasm bundle, then runs the TS tests
+bun run test             # builds the fonts and every wasm bundle, then runs the TS tests
 bun run typecheck        # every workspace
 bun run rust:check       # cargo fmt --check, clippy -D warnings, cargo test
 bun run build:packages   # the published TS packages, each building its wasm
