@@ -2247,7 +2247,44 @@ impl<'a> LayoutBuilder<'a> {
                     if shape.geometry == "custom" && !paths.is_empty() {
                         geometry_fallback = false;
                     }
+                    let halo = node_effects
+                        .as_ref()
+                        .filter(|_| !use_bg_fill && (fill.is_some() || outline.is_some()))
+                        .and_then(|effects| {
+                            let outlines = if paths.is_empty() {
+                                vec![path.clone()]
+                            } else {
+                                paths.iter().map(|part| part.commands.clone()).collect()
+                            };
+                            glow(effects, self.theme, space, outlines)
+                        });
+                    if let Some(halo) = halo
+                        && let Some(first) = halo.paths.first().map(|part| part.path.clone())
+                    {
+                        self.charge_shape()?;
+                        self.primitives.push(Primitive::Shape {
+                            clip: None,
+                            even_odd: false,
+                            object_id: shape.source_id,
+                            shape_id: Some(stable_id.clone()),
+                            name: shape.name.clone(),
+                            x: rect.x,
+                            y: rect.y,
+                            w: rect.w,
+                            h: rect.h,
+                            geometry: shape.geometry.clone(),
+                            path: first,
+                            geometry_fallback,
+                            adjust_values: BTreeMap::new(),
+                            fill: None,
+                            stroke: None,
+                            shadow: Some(halo),
+                            soft_edge: 0.0,
+                            transform,
+                        });
+                    }
                     let primitive = Primitive::Shape {
+                        soft_edge: soft_edge(node_effects.as_ref(), space),
                         clip: None,
                         even_odd: false,
                         object_id: shape.source_id,
@@ -2441,6 +2478,7 @@ impl<'a> LayoutBuilder<'a> {
                     geometry_fallback = false;
                 }
                 let primitive = Primitive::Shape {
+                    soft_edge: 0.0,
                     clip: None,
                     even_odd: false,
                     object_id: base.id,
@@ -2615,6 +2653,7 @@ impl<'a> LayoutBuilder<'a> {
                 return;
             }
             self.primitives.push(Primitive::Shape {
+                soft_edge: 0.0,
                 clip: None,
                 even_odd: false,
                 object_id,
@@ -2683,6 +2722,7 @@ impl<'a> LayoutBuilder<'a> {
                 (None, _) => clip.clone(),
             };
             self.primitives.push(Primitive::Shape {
+                soft_edge: 0.0,
                 clip: Some(op_clip),
                 even_odd: op.even_odd,
                 object_id,
@@ -2909,6 +2949,7 @@ impl<'a> LayoutBuilder<'a> {
             };
         }
         Primitive::Shape {
+            soft_edge: 0.0,
             clip: None,
             even_odd,
             object_id,
@@ -3675,6 +3716,7 @@ fn cell_cascade<'a>(text: &'a TextBody, inherited: &'a TextBody) -> BodyCascade<
 
 fn cell_fill(object_id: u32, rect: PxRect, fill: Option<Paint>) -> Primitive {
     Primitive::Shape {
+        soft_edge: 0.0,
         clip: None,
         even_odd: false,
         object_id,
@@ -3701,6 +3743,7 @@ fn cell_fill(object_id: u32, rect: PxRect, fill: Option<Paint>) -> Primitive {
 
 fn cell_border(object_id: u32, from: (f32, f32), to: (f32, f32), stroke: Stroke) -> Primitive {
     Primitive::Shape {
+        soft_edge: 0.0,
         clip: None,
         even_odd: false,
         object_id,
@@ -7203,6 +7246,54 @@ fn shadow(
     })
 }
 
+/// `a:glow` as a zero-offset shadow of the outline dilated by half the radius and
+/// blurred over the rest, or `None` when it would paint nothing.
+fn glow(
+    effects: &ShapeEffects,
+    theme: &Theme,
+    space: Space,
+    outlines: Vec<Vec<GeometryPathCommand>>,
+) -> Option<Shadow> {
+    let glow = effects.glow.as_ref()?;
+    let color = resolve_paint_color(glow.color.as_ref(), theme)?;
+    let radius = safe_geometry(glow.radius as f32 * (space.scale_x + space.scale_y) / 2.0);
+    if radius <= 0.0 || (color.len() == 9 && color.ends_with("00")) || outlines.is_empty() {
+        return None;
+    }
+    let stroke = Stroke {
+        color: "#000000".to_owned(),
+        width: radius,
+        dashed: false,
+        paint: None,
+        join: Some("round".to_owned()),
+        head_end: None,
+        tail_end: None,
+    };
+    Some(Shadow {
+        color,
+        blur: radius / 2.0,
+        dx: 0.0,
+        dy: 0.0,
+        scale_x: 1.0,
+        scale_y: 1.0,
+        paths: outlines
+            .into_iter()
+            .map(|path| crate::ShadowPath {
+                path,
+                fill: false,
+                stroke: Some(stroke.clone()),
+            })
+            .collect(),
+    })
+}
+
+/// `a:softEdge/@rad` in surface pixels.
+fn soft_edge(effects: Option<&ShapeEffects>, space: Space) -> f32 {
+    effects.map_or(0.0, |effects| {
+        safe_geometry(effects.soft_edge_radius as f32 * (space.scale_x + space.scale_y) / 2.0)
+    })
+}
+
 fn safe_scale(value: f32) -> f32 {
     if value.is_finite() { value } else { 1.0 }
 }
@@ -10035,6 +10126,7 @@ mod tests {
                 direction: 2_700_000,
                 ..Default::default()
             }),
+            ..ShapeEffects::default()
         };
         let box_ = PxRect {
             x: 10.0,
@@ -10103,6 +10195,46 @@ mod tests {
     }
 
     #[test]
+    fn a_glow_is_an_unshifted_halo_around_every_outline() {
+        let theme = Theme::default();
+        let effects = |alpha| ShapeEffects {
+            glow: Some(ooxml_drawingml::Glow {
+                color: Some(ColorValue {
+                    rgb: Some("4472C4".to_owned()),
+                    alpha: Some(alpha),
+                    ..ColorValue::default()
+                }),
+                radius: 127_000,
+            }),
+            ..ShapeEffects::default()
+        };
+        let outline = vec![GeometryPathCommand::Close];
+        let halo = glow(
+            &effects(0.4),
+            &theme,
+            Space::root(),
+            vec![outline.clone(), outline.clone()],
+        )
+        .expect("a painted glow");
+        assert_eq!((halo.dx, halo.dy), (0.0, 0.0));
+        assert_eq!(halo.paths.len(), 2);
+        assert!(
+            halo.paths
+                .iter()
+                .all(|part| !part.fill && part.path == outline)
+        );
+        let stroke = halo.paths[0].stroke.as_ref().unwrap();
+        assert!((stroke.width - 127_000.0 / 9_525.0).abs() < 1e-3);
+        assert_eq!(stroke.color, "#000000", "the tint carries the alpha once");
+        assert!((halo.blur - stroke.width / 2.0).abs() < 1e-3);
+        assert!(halo.color.starts_with("#4472C4"));
+        assert_eq!(
+            glow(&effects(0.0), &theme, Space::root(), vec![outline]),
+            None
+        );
+    }
+
+    #[test]
     fn a_scaled_shadow_keeps_the_point_its_alignment_names() {
         let theme = Theme::default();
         let scaled = |alignment: &str, sx: f64| ShapeEffects {
@@ -10117,6 +10249,7 @@ mod tests {
                 alignment: alignment.to_owned(),
                 ..Default::default()
             }),
+            ..ShapeEffects::default()
         };
         let box_ = PxRect {
             x: 100.0,

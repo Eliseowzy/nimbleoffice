@@ -453,6 +453,7 @@ impl ChartSink<'_> {
         stroke: Option<Stroke>,
     ) -> Primitive {
         Primitive::Shape {
+            soft_edge: 0.0,
             clip: None,
             even_odd: false,
             object_id: self.object_id,

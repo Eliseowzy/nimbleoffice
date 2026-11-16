@@ -65,6 +65,21 @@ pub struct ShapeOutline {
 pub struct ShapeEffects {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_shadow: Option<OuterShadow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glow: Option<Glow>,
+    /// `a:softEdge/@rad` in EMUs.
+    #[serde(default, skip_serializing_if = "is_zero_emu")]
+    pub soft_edge_radius: i64,
+}
+
+/// `a:glow`: a blurred halo of `color` reaching `radius` EMUs past the outline.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Glow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<ColorValue>,
+    #[serde(default, skip_serializing_if = "is_zero_emu")]
+    pub radius: i64,
 }
 
 /// Outer shadow in EMUs and 60000ths of a degree.

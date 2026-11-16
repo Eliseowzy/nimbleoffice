@@ -320,6 +320,9 @@ pub enum Primitive {
         stroke: Option<Stroke>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shadow: Option<Shadow>,
+        /// `a:softEdge`: how far in from the outline the shape fades to transparent, in CSS px.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        soft_edge: f32,
         #[serde(default, skip_serializing_if = "Transform::is_identity")]
         transform: Transform,
     },
