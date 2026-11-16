@@ -17,6 +17,7 @@ export default defineConfig([
       'types/content': '../../../packages/docx/src/types/content.ts',
       'layout/pagination/index': '../../../packages/docx/src/layout/pagination/index.ts',
       'layout/render/index': '../../../packages/docx/src/layout/render/index.ts',
+      'viewer/index': '../../../packages/docx/src/viewer/index.ts',
       'layout/index': '../../../packages/docx/src/layout/index.ts',
       'plugin-api/index': '../../../packages/docx/src/plugin-api/index.ts',
       'plugin-api/RenderedDomContext': '../../../packages/docx/src/plugin-api/RenderedDomContext.ts',

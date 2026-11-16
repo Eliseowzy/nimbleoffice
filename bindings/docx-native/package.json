@@ -43,6 +43,11 @@
       "browser": "./dist/browser.js",
       "import": "./dist/layout/render/index.mjs"
     },
+    "./viewer": {
+      "types": "./dist/viewer/index.d.mts",
+      "browser": "./dist/browser.js",
+      "import": "./dist/viewer/index.mjs"
+    },
     "./layout": {
       "types": "./dist/layout/index.d.mts",
       "browser": "./dist/browser.js",

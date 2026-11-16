@@ -45,6 +45,11 @@
       "import": "./dist/layout/render/index.mjs",
       "default": "./dist/layout/render/index.mjs"
     },
+    "./viewer": {
+      "types": "./dist/viewer/index.d.mts",
+      "import": "./dist/viewer/index.mjs",
+      "default": "./dist/viewer/index.mjs"
+    },
     "./layout": {
       "types": "./dist/layout/index.d.mts",
       "import": "./dist/layout/index.mjs",
