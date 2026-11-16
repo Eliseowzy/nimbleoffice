@@ -561,6 +561,7 @@ fn an_unmarked_shape_keeps_its_original_display_list() {
     assert_eq!(
         rendered.display_list.primitives,
         vec![Primitive::Shape {
+            soft_edge: 0.0,
             object_id: 2,
             shape_id: Some(shape_id),
             name: "Backdrop".to_owned(),

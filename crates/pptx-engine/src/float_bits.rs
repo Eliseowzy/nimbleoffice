@@ -875,8 +875,22 @@ impl FloatBitsWalk for ooxml_drawingml::ColorValue {
 
 impl FloatBitsWalk for ooxml_drawingml::ShapeEffects {
     fn float_bits(&self, out: &mut Vec<u64>) {
-        let Self { outer_shadow } = self;
+        let Self {
+            outer_shadow,
+            glow,
+            soft_edge_radius,
+        } = self;
         outer_shadow.float_bits(out);
+        glow.float_bits(out);
+        soft_edge_radius.float_bits(out);
+    }
+}
+
+impl FloatBitsWalk for ooxml_drawingml::Glow {
+    fn float_bits(&self, out: &mut Vec<u64>) {
+        let Self { color, radius } = self;
+        color.float_bits(out);
+        radius.float_bits(out);
     }
 }
 
@@ -1268,6 +1282,7 @@ mod tests {
                 scale_y: 1.0,
                 ..OuterShadow::default()
             }),
+            ..ShapeEffects::default()
         }
     }
 

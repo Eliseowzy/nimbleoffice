@@ -52,9 +52,9 @@ use pptx_render::{
     Shadow as SlideShadow, Stroke as SlideStroke, SurfaceDisplayList, Transform as SlideTransform,
 };
 use tiny_skia::{
-    Color, ColorU8, FillRule, FilterQuality, GradientStop, IntRect, IntSize, LinearGradient, Mask,
-    Paint, Path, PathBuilder, Pattern, Pixmap, PixmapPaint, Point, RadialGradient, Rect,
-    SpreadMode, Stroke, StrokeDash, Transform,
+    BlendMode, Color, ColorU8, FillRule, FilterQuality, GradientStop, IntRect, IntSize, LineJoin,
+    LinearGradient, Mask, Paint, Path, PathBuilder, Pattern, Pixmap, PixmapPaint, Point,
+    PremultipliedColorU8, RadialGradient, Rect, SpreadMode, Stroke, StrokeDash, Transform,
 };
 
 /// Media bytes keyed by the `asset_id` an image primitive carries — an OPC part
@@ -375,6 +375,7 @@ impl Painter<'_, '_> {
                 clip: shape_clip,
                 even_odd,
                 shadow,
+                soft_edge,
                 ..
             } => self.paint_shape(
                 *x,
@@ -389,6 +390,7 @@ impl Painter<'_, '_> {
                 clip,
                 shape_clip.as_deref(),
                 *even_odd,
+                *soft_edge,
             ),
             Primitive::Image {
                 x,
@@ -544,6 +546,7 @@ impl Painter<'_, '_> {
         clip: Option<&Mask>,
         shape_clip: Option<&[GeometryPathCommand]>,
         even_odd: bool,
+        soft_edge: f32,
     ) -> Result<(), String> {
         let Some(path) = geometry_path(commands, x, y, w, h) else {
             return Ok(());
@@ -587,6 +590,18 @@ impl Painter<'_, '_> {
         if let Some(shadow) = shadow {
             self.paint_shadow(x, y, w, h, &path, fill, stroke, shadow, transform, clip)?;
         }
+        if soft_edge.is_finite() && soft_edge > 0.0 {
+            return self.paint_soft_edged(
+                [x, y, w, h],
+                &path,
+                fill,
+                stroke,
+                rule,
+                soft_edge,
+                transform,
+                clip,
+            );
+        }
         if let Some(fill) = fill {
             let paint = shader_paint(fill, x, y, w, h)?;
             self.pixmap.fill_path(&path, &paint, rule, transform, clip);
@@ -594,6 +609,95 @@ impl Painter<'_, '_> {
         if let Some(stroke) = stroke {
             self.stroke_path(&path, stroke, [x, y, w, h], transform, clip)?;
         }
+        Ok(())
+    }
+
+    /// Paints the shape into a scratch layer whose alpha fades to nothing at the
+    /// outline: the fill shrunk by 0.8 `radius` and blurred, fitted to PowerPoint.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_soft_edged(
+        &mut self,
+        bounds: [f32; 4],
+        path: &Path,
+        fill: Option<&SlidePaint>,
+        stroke: Option<&SlideStroke>,
+        rule: FillRule,
+        radius: f32,
+        transform: Transform,
+        clip: Option<&Mask>,
+    ) -> Result<(), String> {
+        let [x, y, w, h] = bounds;
+        let Some(device) = path.clone().transform(transform) else {
+            return Ok(());
+        };
+        let device = device.bounds();
+        let reach = stroke.map_or(0.0, |stroke| stroke.width.max(0.0)) * self.scale + 2.0;
+        let left = (device.left() - reach).floor().max(0.0);
+        let top = (device.top() - reach).floor().max(0.0);
+        let right = (device.right() + reach)
+            .ceil()
+            .min(self.pixmap.width() as f32);
+        let bottom = (device.bottom() + reach)
+            .ceil()
+            .min(self.pixmap.height() as f32);
+        if right <= left || bottom <= top {
+            return Ok(());
+        }
+        let (layer_w, layer_h) = ((right - left) as u32, (bottom - top) as u32);
+        let pixels = 2 * u64::from(layer_w) * u64::from(layer_h);
+        if pixels > self.max_shadow_pixels - self.shadow_pixels {
+            return Ok(());
+        }
+        self.shadow_pixels += pixels;
+        let (Some(mut layer), Some(mut mask)) =
+            (Pixmap::new(layer_w, layer_h), Pixmap::new(layer_w, layer_h))
+        else {
+            return Ok(());
+        };
+        let local = Transform::from_translate(-left, -top).pre_concat(transform);
+        if let Some(fill) = fill {
+            let paint = shader_paint(fill, x, y, w, h)?;
+            layer.fill_path(path, &paint, rule, local, None);
+        }
+        if let Some(stroke) = stroke
+            && let Some((paint, stroke)) = stroke_paint(stroke, bounds)?
+        {
+            layer.stroke_path(path, &paint, &stroke, local, None);
+        }
+        let mut solid = Paint::default();
+        solid.set_color(Color::WHITE);
+        mask.fill_path(path, &solid, rule, local, None);
+        let mut erase = Paint {
+            blend_mode: BlendMode::Clear,
+            ..Paint::default()
+        };
+        erase.set_color(Color::WHITE);
+        let inset = Stroke {
+            width: radius * 1.6,
+            line_join: LineJoin::Round,
+            ..Stroke::default()
+        };
+        mask.stroke_path(path, &erase, &inset, local, None);
+        blur::blur(&mut mask, blur::box_radius(radius * self.scale * 0.4));
+        for (pixel, coverage) in layer.pixels_mut().iter_mut().zip(mask.pixels()) {
+            let keep = u16::from(coverage.alpha());
+            let scale = |channel: u8| ((u16::from(channel) * keep + 127) / 255) as u8;
+            *pixel = PremultipliedColorU8::from_rgba(
+                scale(pixel.red()),
+                scale(pixel.green()),
+                scale(pixel.blue()),
+                scale(pixel.alpha()),
+            )
+            .unwrap_or(PremultipliedColorU8::TRANSPARENT);
+        }
+        self.pixmap.draw_pixmap(
+            left as i32,
+            top as i32,
+            layer.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            clip,
+        );
         Ok(())
     }
 
@@ -1655,6 +1759,7 @@ mod tests {
                 }
             } else {
                 Primitive::Shape {
+                    soft_edge: 0.0,
                     clip: None,
                     even_odd: false,
                     shadow: None,
@@ -1946,6 +2051,7 @@ mod tests {
             path.extend(rect(0.25, 0.25, 0.75, 0.75));
             let mut list = empty_list(80.0, 80.0);
             list.primitives.push(Primitive::Shape {
+                soft_edge: 0.0,
                 object_id: 1,
                 shape_id: None,
                 name: "metafile".into(),
@@ -2008,6 +2114,7 @@ mod tests {
         let mut list = empty_list(256.0, 256.0);
         for object_id in 0..8 {
             list.primitives.push(Primitive::Shape {
+                soft_edge: 0.0,
                 clip: None,
                 even_odd: false,
                 object_id,
@@ -2070,10 +2177,65 @@ mod tests {
     }
 
     #[test]
+    fn a_soft_edge_fades_the_outline_but_keeps_the_middle() {
+        let fonts = FontStore::new();
+        let images = AssetMap::default();
+        let square = |soft_edge: f32| Primitive::Shape {
+            soft_edge,
+            clip: None,
+            even_odd: false,
+            object_id: 1,
+            shape_id: None,
+            name: "card".into(),
+            x: 20.0,
+            y: 20.0,
+            w: 80.0,
+            h: 80.0,
+            geometry: "rect".into(),
+            path: vec![
+                GeometryPathCommand::Move { x: 0.0, y: 0.0 },
+                GeometryPathCommand::Line { x: 1.0, y: 0.0 },
+                GeometryPathCommand::Line { x: 1.0, y: 1.0 },
+                GeometryPathCommand::Line { x: 0.0, y: 1.0 },
+                GeometryPathCommand::Close,
+            ],
+            geometry_fallback: false,
+            adjust_values: Default::default(),
+            fill: Some(SlidePaint::Solid {
+                color: "#000000".into(),
+            }),
+            stroke: None,
+            shadow: None,
+            transform: SlideTransform::default(),
+        };
+        let render = |primitive| {
+            let mut list = empty_list(120.0, 120.0);
+            list.primitives.push(primitive);
+            let rendered = render_slide(
+                &list,
+                &resources(&fonts, &images),
+                &RenderOptions::default(),
+            )
+            .expect("render");
+            Pixmap::decode_png(&rendered.bytes).expect("decode")
+        };
+        let ink = |pixmap: &Pixmap, x: u32| 255 - pixmap.pixel(x, 60).unwrap().demultiply().red();
+
+        let hard = render(square(0.0));
+        let soft = render(square(10.0));
+        assert_eq!(ink(&hard, 21), 255);
+        assert!(ink(&soft, 21) < 40, "the outline fades out");
+        assert!(ink(&soft, 26) > ink(&soft, 21), "ink rises inward");
+        assert_eq!(ink(&soft, 60), 255, "the middle stays solid");
+        assert_eq!(ink(&soft, 110), 0, "nothing spills outside");
+    }
+
+    #[test]
     fn a_shadow_lays_soft_ink_outside_the_shape_it_belongs_to() {
         let fonts = FontStore::new();
         let images = AssetMap::default();
         let square = |shadow: Option<SlideShadow>| Primitive::Shape {
+            soft_edge: 0.0,
             clip: None,
             even_odd: false,
             object_id: 1,
@@ -2152,6 +2314,7 @@ mod tests {
     ) -> SurfaceDisplayList {
         let mut list = empty_list(160.0, 160.0);
         list.primitives.push(Primitive::Shape {
+            soft_edge: 0.0,
             clip: None,
             even_odd: false,
             object_id: 1,
@@ -3238,6 +3401,7 @@ mod tests {
             h: 100.0,
             label: "offscreen".into(),
             primitives: vec![Primitive::Shape {
+                soft_edge: 0.0,
                 clip: None,
                 even_odd: false,
                 object_id: 2,

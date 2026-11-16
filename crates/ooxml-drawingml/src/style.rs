@@ -166,6 +166,12 @@ pub fn style_effects(
             placeholder_color(reference, theme).as_ref(),
         );
     }
+    if let Some(glow) = &mut effects.glow {
+        glow.color = substitute_color(
+            glow.color.as_ref(),
+            placeholder_color(reference, theme).as_ref(),
+        );
+    }
     Some(effects)
 }
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ooxml_drawingml::{
-    ColorValue, GradientFill, GradientStop, LineEnd, OuterShadow, ShapeEffects, ShapeFill,
+    ColorValue, Glow, GradientFill, GradientStop, LineEnd, OuterShadow, ShapeEffects, ShapeFill,
     ShapeOutline, ShapeStyle, StyleReference,
 };
 
@@ -1731,30 +1731,41 @@ fn parse_line_element(line: &XmlElement) -> Option<ShapeOutline> {
 
 pub(crate) fn parse_effects(element: &XmlElement) -> Option<ShapeEffects> {
     let list = element.child("effectLst")?;
-    let Some(shadow) = list.child("outerShdw") else {
-        return Some(ShapeEffects::default());
-    };
+    let outer_shadow = list.child("outerShdw").map(|shadow| OuterShadow {
+        color: parse_color_container(shadow),
+        blur_radius: numeric_attribute(Some(shadow), "blurRad")
+            .unwrap_or_default()
+            .max(0),
+        distance: numeric_attribute(Some(shadow), "dist")
+            .unwrap_or_default()
+            .max(0),
+        direction: numeric_attribute(Some(shadow), "dir").unwrap_or_default(),
+        rotate_with_shape: shadow
+            .attribute("rotWithShape")
+            .is_none_or(|value| value != "0" && value != "false"),
+        scale_x: shadow_scale(shadow, "sx"),
+        scale_y: shadow_scale(shadow, "sy"),
+        alignment: shadow
+            .attribute("algn")
+            .filter(|value| RECT_ALIGNMENTS.contains(value))
+            .unwrap_or("b")
+            .to_owned(),
+    });
+    let glow = list.child("glow").map(|glow| Glow {
+        color: parse_color_container(glow),
+        radius: numeric_attribute(Some(glow), "rad")
+            .unwrap_or_default()
+            .max(0),
+    });
+    let soft_edge_radius = list
+        .child("softEdge")
+        .and_then(|soft| numeric_attribute(Some(soft), "rad"))
+        .unwrap_or_default()
+        .max(0);
     Some(ShapeEffects {
-        outer_shadow: Some(OuterShadow {
-            color: parse_color_container(shadow),
-            blur_radius: numeric_attribute(Some(shadow), "blurRad")
-                .unwrap_or_default()
-                .max(0),
-            distance: numeric_attribute(Some(shadow), "dist")
-                .unwrap_or_default()
-                .max(0),
-            direction: numeric_attribute(Some(shadow), "dir").unwrap_or_default(),
-            rotate_with_shape: shadow
-                .attribute("rotWithShape")
-                .is_none_or(|value| value != "0" && value != "false"),
-            scale_x: shadow_scale(shadow, "sx"),
-            scale_y: shadow_scale(shadow, "sy"),
-            alignment: shadow
-                .attribute("algn")
-                .filter(|value| RECT_ALIGNMENTS.contains(value))
-                .unwrap_or("b")
-                .to_owned(),
-        }),
+        outer_shadow,
+        glow,
+        soft_edge_radius,
     })
 }
 
@@ -3984,6 +3995,34 @@ mod tests {
         let actual = values.get(name).unwrap();
         assert_eq!(actual.value, expected);
         assert_eq!(actual.extent_power, expected_power);
+    }
+
+    #[test]
+    fn glow_and_soft_edge_read_alongside_or_without_a_shadow() {
+        let limits = ParseLimits::default();
+        let mut budget = ParseBudget::new(&limits);
+        let root = parse_xml(
+            br#"<p:spPr><a:effectLst><a:glow rad="127000"><a:srgbClr val="4472C4"><a:alpha val="40000"/></a:srgbClr></a:glow><a:softEdge rad="63500"/></a:effectLst></p:spPr>"#,
+            "ppt/slides/slide1.xml",
+            &mut budget,
+        )
+        .unwrap();
+        let effects = parse_effects(&root).unwrap();
+        assert!(effects.outer_shadow.is_none());
+        let glow = effects.glow.unwrap();
+        assert_eq!(glow.radius, 127_000);
+        assert_eq!(glow.color.unwrap().rgb.as_deref(), Some("4472C4"));
+        assert_eq!(effects.soft_edge_radius, 63_500);
+
+        let root = parse_xml(
+            br#"<p:spPr><a:effectLst><a:glow rad="-5"/><a:softEdge rad="-1"/></a:effectLst></p:spPr>"#,
+            "ppt/slides/slide1.xml",
+            &mut budget,
+        )
+        .unwrap();
+        let effects = parse_effects(&root).unwrap();
+        assert_eq!(effects.glow.unwrap().radius, 0);
+        assert_eq!(effects.soft_edge_radius, 0);
     }
 
     #[test]

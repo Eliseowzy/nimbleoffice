@@ -196,6 +196,7 @@ fn compile(slide: ComposedSlide) -> Result<SurfaceDisplayList, String> {
                 );
                 primitives.extend(
                     geometry::preset_primitives(Primitive::Shape {
+                        soft_edge: 0.0,
                         clip: None,
                         even_odd: false,
                         object_id: base.id,
