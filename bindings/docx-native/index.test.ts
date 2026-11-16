@@ -17,7 +17,7 @@ function distFiles(directory = new URL('./dist/', import.meta.url)): URL[] {
 describe('@nimbleoffice/docx-native', () => {
   test('exposes exactly the wasm package subpaths with a browser guard', () => {
     expect(Object.keys(manifest.exports)).toEqual(Object.keys(wasmManifest.exports));
-    expect(Object.keys(manifest.exports)).toHaveLength(28);
+    expect(Object.keys(manifest.exports)).toHaveLength(29);
     for (const [entry, target] of Object.entries(wasmManifest.exports) as [string, { types: string; import: string }][]) {
       expect(manifest.exports[entry]).toEqual({
         types: target.types,
