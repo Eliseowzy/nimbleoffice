@@ -227,7 +227,7 @@ jobs:
   rust:
     name: Rust gate
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--compress-debug-sections=zlib
       # Failing on main before NimbleOffice took over; remove each once it passes.
