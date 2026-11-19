@@ -75,7 +75,7 @@ async function pagePoint(page: Page, fx: number, fy: number) {
   // The preview's canvas is replaced when the whole document takes over.
   let box: Awaited<ReturnType<ReturnType<Page['locator']>['boundingBox']>> = null;
   await expect.poll(async () => (box = await page.locator('canvas[data-page-index="0"]').boundingBox())).not.toBeNull();
-  return { x: box!.x + fx * box!.width, y: box!.y + fy * box!.height };
+  return { x: Math.round(box!.x + fx * box!.width), y: Math.round(box!.y + fy * box!.height) };
 }
 
 /** The first line of the first paragraph: one inch down and in, plus half a line. */
@@ -190,7 +190,7 @@ test('readPositionAtPoint answers from the worker right after the first paint, a
 test('a double-click selects the word, also when the pointer moves a little between the clicks', async ({ page }) => {
   await open(page);
   const instantiations = await wasmInstantiations(page);
-  const { x, y } = await pagePoint(page, 0.35, FIRST_LINE.fy);
+  const { x, y } = await pagePoint(page, 0.36, FIRST_LINE.fy);
   let read = await pointAt(page, x, y);
   await expect.poll(async () => (read = await pointAt(page, x, y)) !== null).toBe(true);
   const word = wordAround(await paragraph(page, 1), read!.target.start.offset);
@@ -245,7 +245,7 @@ test('select-all copies the whole body', async ({ page }) => {
 test('a proposal clears the selection, and a triple-click right after it selects', async ({ page }) => {
   await open(page);
   const instantiations = await wasmInstantiations(page);
-  const { x, y } = await pagePoint(page, 0.35, FIRST_LINE.fy);
+  const { x, y } = await pagePoint(page, 0.36, FIRST_LINE.fy);
   let read = await pointAt(page, x, y);
   await expect.poll(async () => (read = await pointAt(page, x, y)) !== null).toBe(true);
   await page.mouse.click(x, y, { clickCount: 2 });
