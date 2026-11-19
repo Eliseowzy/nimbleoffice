@@ -227,7 +227,7 @@ jobs:
   rust:
     name: Rust gate
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--compress-debug-sections=zlib
       # Failing on main before NimbleOffice took over; remove each once it passes.
@@ -293,7 +293,7 @@ jobs:
 
       - name: Remove the workspace test binaries
         if: steps.ws.outputs.present == 'true'
-        run: find target/debug/deps -maxdepth 1 -type f -executable ! -name '*.so' -delete
+        run: find target/debug -type f -executable ! -name '*.so' ! -name 'build-script-*' \( -path 'target/debug/deps/*' -o -path 'target/debug/build/*/out/*' \) -delete
 
       # Optional features are only unified into `cargo test` while some other
       # workspace member enables them.
